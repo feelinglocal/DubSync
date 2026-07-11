@@ -13,10 +13,10 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
             <p>Keep the source structure when it is right. See exactly what changed when it is not.</p>
           </header>
           <div className="feature-list">
-            <Feature className="is-wide" icon={<ScanLine />} title="Frame-accurate timing">Cue boundaries come from acoustic word timestamps and optional forced alignment.</Feature>
+            <Feature icon={<ScanLine />} title="Frame-accurate timing">Cue boundaries come from acoustic word timestamps and optional forced alignment.</Feature>
             <Feature icon={<Users />} title="Speaker-aware cues">Speaker changes remain separate in close exchanges and overlapping dialogue.</Feature>
             <Feature icon={<FileSearch />} title="Reviewable changes">Every text decision, uncertain cue, and timing warning appears in QC artifacts.</Feature>
-            <Feature className="is-wide" icon={<FileAudio />} title="Works with or without an SRT">Sync a supplied subtitle file, or create a new speaker-aware SRT directly from audio.</Feature>
+            <Feature icon={<FileAudio />} title="Works with or without an SRT">Sync a supplied subtitle file, or create a new speaker-aware SRT directly from audio.</Feature>
           </div>
         </div>
       </section>
@@ -94,8 +94,8 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
   )
 }
 
-function Feature({ className = '', icon, title, children }: { className?: string; icon: React.ReactNode; title: string; children: React.ReactNode }) {
-  return <article className={`feature-item ${className}`.trim()}><span>{icon}</span><div><h3>{title}</h3><p>{children}</p></div></article>
+function Feature({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+  return <article className="feature-item"><span>{icon}</span><div><h3>{title}</h3><p>{children}</p></div></article>
 }
 
 function WorkflowStep({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {

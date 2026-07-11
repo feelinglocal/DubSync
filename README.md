@@ -354,7 +354,7 @@ Latest local offline verification in this workspace:
 |---|---|---|
 | `python -m pytest --cov=dubsync --cov-report=term-missing` | `205 passed, 5 deselected`, coverage `85.22%` | Normal offline suite; paid/live smoke tests deselected |
 | `npm run test:coverage` | `24 passed`; statements `90.49%`, lines `94.28%` | React workflow, access gate, API client, session, legal, error, and media lifecycle tests |
-| `npm run test:e2e` | `5 passed` | Generate, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, and mobile layout |
+| `npm run test:e2e` | `6 passed` | Generate, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
 | Production web `generate` smoke | PASS | 3.444-second WAV, 1 cue, 0 QC flags, `$0.000376` recorded provider cost on Render commit `5c79356` |
 | Render JSON Schema validation | PASS | `render.yaml` validates against Render's published schema |

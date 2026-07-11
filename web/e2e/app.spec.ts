@@ -130,3 +130,31 @@ test('mobile first viewport has no horizontal overflow and introduces the next s
   expect(pricingFits).toBe(true)
   await expect(page.getByRole('heading', { name: 'Built for subtitle professionals' })).toBeInViewport()
 })
+
+test('workspace selects and feature rows use consistent alignment', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await page.goto('/')
+
+  const selectGeometry = await page.locator('.select-control').evaluateAll((controls) => controls.map((control) => {
+    const controlBox = control.getBoundingClientRect()
+    const iconBox = control.querySelector('svg')?.getBoundingClientRect()
+    return {
+      iconInset: iconBox ? controlBox.right - iconBox.right : 0,
+      iconCentered: iconBox ? Math.abs((controlBox.top + controlBox.height / 2) - (iconBox.top + iconBox.height / 2)) : 999,
+    }
+  }))
+  expect(selectGeometry).toHaveLength(2)
+  for (const geometry of selectGeometry) {
+    expect(geometry.iconInset).toBeGreaterThanOrEqual(12)
+    expect(geometry.iconCentered).toBeLessThanOrEqual(1)
+  }
+
+  const featureGeometry = await page.locator('.feature-item').evaluateAll((items) => items.map((item) => {
+    const box = item.getBoundingClientRect()
+    return { x: box.x, width: box.width }
+  }))
+  expect(featureGeometry).toHaveLength(4)
+  expect(Math.abs(featureGeometry[0].x - featureGeometry[2].x)).toBeLessThanOrEqual(1)
+  expect(Math.abs(featureGeometry[1].x - featureGeometry[3].x)).toBeLessThanOrEqual(1)
+  expect(Math.max(...featureGeometry.map(({ width }) => width)) - Math.min(...featureGeometry.map(({ width }) => width))).toBeLessThanOrEqual(1)
+})

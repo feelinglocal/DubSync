@@ -1,4 +1,4 @@
-import { AudioLines, FileText, LockKeyhole, Play } from 'lucide-react'
+import { AudioLines, ChevronDown, FileText, LockKeyhole, Play } from 'lucide-react'
 import { FormEvent, useEffect, useMemo, useState } from 'react'
 
 import { createJob, downloadJobArtifact, loadJob } from '../api'
@@ -121,10 +121,10 @@ export function Workspace({ config }: { config: PublicConfig }) {
             {mode === 'sync' && <UploadField label="Original SRT" kind="subtitle" accept=".srt,application/x-subrip,text/plain" file={subtitle} required onChange={setSubtitle} />}
           </div>
           <div className={config.access_code_required ? 'workspace-options has-access-code' : 'workspace-options'}>
-            <label><span>Frame rate</span><select value={fps} onChange={(event) => setFps(event.target.value)}>{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select></label>
-            <label><span>Language</span><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select></label>
+            <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
+            <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
             {config.access_code_required && config.jobs_available && (
-              <label><span>Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
+              <label><span className="field-label">Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
             )}
             <button className="primary-button" type="submit" disabled={!canSubmit}><Play />{submitting ? 'Uploading' : mode === 'sync' ? 'Start sync' : 'Generate SRT'}</button>
           </div>
