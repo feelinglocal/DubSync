@@ -1,0 +1,24 @@
+{
+  "name": "DubSync",
+  "short_name": "DubSync",
+  "description": "Subtitle synchronization and audio-to-SRT generation for dubbed dialogue.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#006cff",
+  "icons": [
+    {
+      "src": "/brand/dubsync-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/brand/dubsync-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

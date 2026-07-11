@@ -3,9 +3,86 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Frame-accurate subtitle synchronization and audio-to-SRT generation." />
+    <meta name="description" content="Sync an existing SRT to dubbed dialogue audio, or generate a speaker-aware SRT from audio. Download review-ready subtitles with QC reports." />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
     <meta name="theme-color" content="#ffffff" />
-    <title>DubSync</title>
+    <link rel="canonical" href="https://dubsync.onrender.com/" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any" />
+    <link rel="icon" href="/brand/dubsync-icon-48.png" type="image/png" sizes="48x48" />
+    <link rel="apple-touch-icon" href="/brand/dubsync-apple-touch.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="DubSync" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:title" content="Subtitle Sync &amp; Audio-to-SRT for Dubbing | DubSync" />
+    <meta property="og:description" content="Sync an existing SRT to dubbed dialogue audio, or generate a speaker-aware SRT from audio. Download review-ready subtitles with QC reports." />
+    <meta property="og:url" content="https://dubsync.onrender.com/" />
+    <meta property="og:image" content="https://dubsync.onrender.com/brand/dubsync-social.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="DubSync. Timing follows the performance." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Subtitle Sync &amp; Audio-to-SRT for Dubbing | DubSync" />
+    <meta name="twitter:description" content="Sync an existing SRT to dubbed dialogue audio, or generate a speaker-aware SRT from audio. Download review-ready subtitles with QC reports." />
+    <meta name="twitter:image" content="https://dubsync.onrender.com/brand/dubsync-social.png" />
+    <script type="application/ld+json" data-home-schema>
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://dubsync.onrender.com/#website",
+            "url": "https://dubsync.onrender.com/",
+            "name": "DubSync",
+            "alternateName": "DubSync Subtitle Sync",
+            "inLanguage": "en"
+          },
+          {
+            "@type": "WebApplication",
+            "@id": "https://dubsync.onrender.com/#app",
+            "url": "https://dubsync.onrender.com/",
+            "name": "DubSync",
+            "description": "Subtitle synchronization and audio-to-SRT generation for dubbed dialogue.",
+            "applicationCategory": "MultimediaApplication",
+            "operatingSystem": "Any",
+            "browserRequirements": "Requires JavaScript",
+            "featureList": [
+              "Synchronize an existing SRT to dubbed dialogue audio",
+              "Generate a speaker-aware SRT from audio",
+              "Download subtitle timing and text-change QC reports"
+            ]
+          },
+          {
+            "@type": "FAQPage",
+            "@id": "https://dubsync.onrender.com/#faq",
+            "mainEntity": [
+              {
+                "@type": "Question",
+                "name": "What audio formats are supported?",
+                "acceptedAnswer": { "@type": "Answer", "text": "WAV, MP3, M4A, FLAC, AAC, and OGG dialogue tracks are accepted." }
+              },
+              {
+                "@type": "Question",
+                "name": "Does DubSync change my subtitle text?",
+                "acceptedAnswer": { "@type": "Answer", "text": "Sync mode preserves unchanged cues. Spoken differences are reconciled and listed in the QC report." }
+              },
+              {
+                "@type": "Question",
+                "name": "Where does timing come from?",
+                "acceptedAnswer": { "@type": "Answer", "text": "Only acoustic word timestamps and optional forced alignment. Language models never set timestamps." }
+              },
+              {
+                "@type": "Question",
+                "name": "Can DubSync create automatic captions?",
+                "acceptedAnswer": { "@type": "Answer", "text": "Audio-to-SRT mode creates dialogue subtitles from audio. Add non-speech sound descriptions during review when accessibility captions require them." }
+              }
+            ]
+          }
+        ]
+      }
+    </script>
+    <script src="/theme-init.js"></script>
+    <title>Subtitle Sync &amp; Audio-to-SRT for Dubbing | DubSync</title>
   </head>
   <body>
     <div id="root"></div>

@@ -68,7 +68,7 @@ describe('DubSync workspace', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
     render(<App />)
 
-    expect(screen.getByRole('heading', { name: 'Sync dialogue. Keep every cue honest.' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'SRT sync that follows the performance.' })).toBeVisible()
     expect(screen.getByLabelText('Dialogue audio')).toBeRequired()
     expect(screen.getByLabelText('Original SRT')).toBeRequired()
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()

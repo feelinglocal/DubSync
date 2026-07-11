@@ -233,6 +233,7 @@ def create_app(
 def _mount_frontend(app: FastAPI, static_dir: Path) -> None:
     index = static_dir / "index.html"
     assets = static_dir / "assets"
+    frontend_routes = {"", "terms", "privacy", "payments"}
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
@@ -240,9 +241,14 @@ def _mount_frontend(app: FastAPI, static_dir: Path) -> None:
     def frontend(full_path: str):
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found.")
-        if index.exists():
+        if full_path in frontend_routes and index.exists():
             return FileResponse(index, media_type="text/html")
-        return JSONResponse({"service": "dubsync", "status": "frontend_not_built"}, status_code=503)
+        requested_file = static_dir / full_path
+        if requested_file.is_file() and _inside(requested_file, static_dir):
+            return FileResponse(requested_file)
+        if not index.exists():
+            return JSONResponse({"service": "dubsync", "status": "frontend_not_built"}, status_code=503)
+        raise HTTPException(status_code=404, detail="Page not found.")
 
 
 def _authorized_job(service: JobService, job_id: str, authorization: str | None) -> JobRecord:

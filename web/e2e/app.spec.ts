@@ -183,7 +183,7 @@ test('mobile first viewport has no horizontal overflow and introduces the next s
   expect(dimensions.scrollWidth).toBe(dimensions.clientWidth)
   const pricingFits = await page.locator('.pricing-table-wrap').evaluate((element) => element.scrollWidth <= element.clientWidth)
   expect(pricingFits).toBe(true)
-  await expect(page.getByRole('heading', { name: 'Built for subtitle professionals' })).toBeInViewport()
+  await expect(page.getByRole('heading', { name: 'Professional subtitle sync and auto captioning' })).toBeInViewport()
 })
 
 test('workspace selects and feature rows use consistent alignment', async ({ page }) => {

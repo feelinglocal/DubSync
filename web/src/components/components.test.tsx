@@ -52,7 +52,7 @@ describe('shared components', () => {
     render(<Header />)
     await user.click(screen.getByRole('button', { name: 'Open menu' }))
     expect(screen.getByRole('button', { name: 'Close menu' })).toHaveAttribute('aria-expanded', 'true')
-    await user.click(screen.getByRole('link', { name: 'Features' }))
+    await user.click(screen.getByRole('link', { name: 'Subtitle QC' }))
     expect(screen.getByRole('button', { name: 'Open menu' })).toHaveAttribute('aria-expanded', 'false')
   })
 

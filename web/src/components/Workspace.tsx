@@ -144,8 +144,8 @@ export function Workspace({ config }: { config: PublicConfig }) {
     <section className="workspace-section" id="workspace">
       <div className="workspace-inner">
         <div className="workspace-heading">
-          <h1>Sync dialogue. Keep every cue honest.</h1>
-          <p>Frame-accurate subtitle timing from the audio itself.</p>
+          <h1>SRT sync that follows the performance.</h1>
+          <p>Sync existing subtitles to dubbed audio, or generate speaker-aware captions from audio.</p>
         </div>
         <form onSubmit={submit} className="workspace-form" noValidate>
           <div className="mode-control" role="group" aria-label="Workflow mode">
