@@ -1,0 +1,73 @@
+asr:
+  provider: elevenlabs
+  model_id: scribe_v2
+  diarize: true
+  # Optional: improve ASR spelling for names/terms in the episode.
+  # keyterms:
+  #   - Drachen-Evolutionssystem
+  # character_names:
+  #   - Luna
+  #   - Matthew
+
+llm:
+  provider: gemini
+  model: gemini-3.5-flash
+  adjudication:
+    confidence_gate: 0.7
+    scene_gap_seconds: 4.0
+    thinking_level: high
+    audio_snippet_double_check:
+      enabled: true
+      pad_seconds: 2.0
+      max_duration_seconds: 20.0
+  punctuation:
+    model: gemini-3.1-flash-lite
+    scene_gap_seconds: 4.0
+    thinking_level: low
+  speaker_mapping:
+    model: gemini-3.1-flash-lite
+
+vad:
+  provider: energy
+  threshold_dbfs: -45.0
+  window_ms: 100
+  min_region_ms: 100
+  min_coverage: 0.2
+  boundary_refinement:
+    enabled: true
+    start_pad_ms: 40
+    end_pad_ms: 40
+    max_end_extension_ms: 300
+    max_leading_silence_ms: 150
+    max_trailing_silence_ms: 300
+
+timing:
+  max_word_duration: 2.0
+  max_intra_cue_gap: 1.5
+  max_cps: 30
+  min_cps: 2
+
+generation:
+  max_gap_seconds: 0.8
+  max_cue_duration_seconds: 5.0
+
+output:
+  no_overlaps: true
+
+# Optional local overlap backstop. Requires pyannote model access and a
+# HUGGINGFACE_ACCESS_TOKEN in .env.
+# overlap_detection:
+#   provider: pyannote
+#   model: pyannote/speaker-diarization-community-1
+
+# Optional speaker-character inference. This can spend LLM tokens.
+# speaker_mapping:
+#   provider: llm
+
+# Optional precision alignment. This is commented out because ctc-forced-aligner
+# needs Microsoft Visual C++ Build Tools before it can install on this machine.
+# forced_alignment:
+#   provider: mms
+#   language: deu
+#   romanize: true
+#   batch_size: 4

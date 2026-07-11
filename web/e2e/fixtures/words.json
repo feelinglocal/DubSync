@@ -1,0 +1,13 @@
+{
+  "words": [
+    {"text": "Every", "start": 0.10, "end": 0.28, "confidence": 0.99, "speaker_id": "speaker_1"},
+    {"text": "word", "start": 0.30, "end": 0.47, "confidence": 0.99, "speaker_id": "speaker_1"},
+    {"text": "has", "start": 0.49, "end": 0.61, "confidence": 0.98, "speaker_id": "speaker_1"},
+    {"text": "a", "start": 0.63, "end": 0.69, "confidence": 0.98, "speaker_id": "speaker_1"},
+    {"text": "place.", "start": 0.71, "end": 0.95, "confidence": 0.99, "speaker_id": "speaker_1"},
+    {"text": "Timing", "start": 2.10, "end": 2.34, "confidence": 0.98, "speaker_id": "speaker_2"},
+    {"text": "follows", "start": 2.36, "end": 2.58, "confidence": 0.98, "speaker_id": "speaker_2"},
+    {"text": "the", "start": 2.60, "end": 2.70, "confidence": 0.97, "speaker_id": "speaker_2"},
+    {"text": "voice.", "start": 2.72, "end": 3.02, "confidence": 0.99, "speaker_id": "speaker_2"}
+  ]
+}

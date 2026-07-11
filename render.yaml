@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: dubsync
+    runtime: docker
+    plan: starter
+    region: singapore
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    maxShutdownDelaySeconds: 300
+    autoDeployTrigger: commit
+    disk:
+      name: dubsync-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DUBSYNC_DATA_DIR
+        value: /var/data
+      - key: DUBSYNC_PROVIDERS_PATH
+        value: /app/provider.yaml
+      - key: DUBSYNC_STYLE_PATH
+        value: /app/style_profile.yaml
+      - key: DUBSYNC_STATIC_DIR
+        value: /app/web/dist
+      - key: DUBSYNC_RETENTION_HOURS
+        value: "24"
+      - key: DUBSYNC_MAX_UPLOAD_BYTES
+        value: "2147483648"
+      - key: DUBSYNC_MAX_JOBS_PER_HOUR
+        value: "5"
+      - key: DUBSYNC_WORKER_THREADS
+        value: "1"
+      - key: DUBSYNC_CLEANUP_INTERVAL_SECONDS
+        value: "300"
+      - key: DUBSYNC_PROCESSING_INLINE
+        value: "0"
+      - key: DUBSYNC_ENABLE_DOCS
+        value: "0"
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

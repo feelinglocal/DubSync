@@ -1,0 +1,13 @@
+fps: 30.0
+max_lines_per_cue: 2
+max_chars_per_line: 26
+min_cue_dur: 0.5
+allow_zero_gap: true
+lead_in_ms: 0
+tail_ms: 40
+overlap_policy: stack
+drop_policy: keep_flagged
+cue_count: 68
+observed_min_duration: 0.5
+observed_max_duration: 3.5
+notes: []

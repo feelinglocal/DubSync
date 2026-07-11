@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dubsync"
+version = "0.1.0"
+description = "Frame-accurate SRT synchronization and dubbed dialogue reconciliation."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7",
+  "pysubs2>=1.7",
+  "python-dotenv>=1.0",
+  "PyYAML>=6.0",
+  "rapidfuzz>=3.9",
+  "rich>=13.7",
+  "click>=8.1,<8.3",
+  "typer>=0.12,<0.17",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27",
+  "jsonschema>=4.23",
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+]
+web = [
+  "fastapi>=0.115,<1",
+  "python-multipart>=0.0.18",
+  "uvicorn[standard]>=0.30,<1",
+]
+cloud = [
+  "anthropic>=0.49",
+  "assemblyai>=0.35",
+  "elevenlabs>=1.50",
+  "google-genai>=0.8",
+  "openai>=1.57",
+]
+local = [
+  "whisperx>=3.2",
+]
+precision = [
+  "ctc-forced-aligner>=0.3",
+]
+diarize-local = [
+  "pyannote.audio>=4.0",
+]
+
+[project.scripts]
+dubsync = "dubsync.cli:app"
+dubsync-web = "dubsync.web.app:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "regression: frozen episode slices for batch timing/order regressions",
+]
+
+[tool.coverage.run]
+source = ["dubsync"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

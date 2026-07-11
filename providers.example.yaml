@@ -1,0 +1,54 @@
+asr:
+  provider: elevenlabs
+  model_id: scribe_v2
+  diarize: true
+
+llm:
+  provider: gemini
+  model: gemini-3.5-flash
+  # Optional: reuse an existing Gemini explicit cache resource.
+  # cached_content: cachedContents/your-episode-context-cache
+  adjudication:
+    confidence_gate: 0.7
+    scene_gap_seconds: 4.0
+    audio_snippet_double_check:
+      enabled: false
+      pad_seconds: 2.0
+      max_duration_seconds: 20.0
+  punctuation:
+    model: gemini-3.1-flash-lite
+    scene_gap_seconds: 4.0
+    thinking_level: low
+  speaker_mapping:
+    model: gemini-3.1-flash-lite
+  # Optional for providers/models without built-in token price defaults:
+  # input_per_million: 2.0
+  # output_per_million: 10.0
+
+overlap_detection:
+  provider: pyannote
+  model: pyannote/speaker-diarization-community-1
+
+forced_alignment:
+  provider: mms
+  language: deu
+  romanize: true
+  batch_size: 4
+
+vad:
+  provider: energy
+  threshold_dbfs: -45.0
+  window_ms: 100
+  min_region_ms: 100
+  min_coverage: 0.2
+
+generation:
+  max_gap_seconds: 0.8
+  max_cue_duration_seconds: 5.0
+
+speaker_mapping:
+  # Use provider: llm to infer speaker clusters from subtitle context with the configured llm.
+  # provider: llm
+  # Or keep deterministic explicit mappings:
+  # fixture:
+  #   SPEAKER_00: Luna

@@ -1,0 +1,62 @@
+{
+  "ep7": {
+    "source_cues": [
+      {"index": 35, "start_ms": 71233, "end_ms": 72166, "lines": ["Und Drachenbandiger konnen"]},
+      {"index": 36, "start_ms": 73500, "end_ms": 74733, "lines": ["ja sogar seinen", "Willen steuern."]},
+      {"index": 42, "start_ms": 72166, "end_ms": 73500, "lines": ["seine Gefuhle", "beeinflussen,"]}
+    ],
+    "adlib_span": {
+      "case_id": "case-6",
+      "cue_ids": [],
+      "srt_text": "",
+      "asr_text": "seine Gefuhle beeinflussen,",
+      "start": 72.199,
+      "end": 73.519,
+      "asr_word_indices": [0, 1, 2]
+    },
+    "adlib_decision": {
+      "case_id": "case-6",
+      "verdict": "use_audio",
+      "final_text": "seine Gefuhle beeinflussen,",
+      "confidence": 1.0,
+      "reason": "spoken insertion matched source cue"
+    }
+  },
+  "ep9": {
+    "cues": [
+      {"index": 18, "start_ms": 51866, "end_ms": 53600, "lines": ["Das Ding ist", "mindestens Level 15."]},
+      {"index": 20, "start_ms": 57700, "end_ms": 59733, "lines": ["Du bist ein", "Level-1-Versager"]}
+    ],
+    "words": [
+      {"text": "Das", "start": 52.099, "end": 52.180, "confidence": 1.0},
+      {"text": "Ding", "start": 52.239, "end": 52.360, "confidence": 1.0},
+      {"text": "ist", "start": 52.399, "end": 52.500, "confidence": 1.0},
+      {"text": "mindestens", "start": 52.579, "end": 52.939, "confidence": 1.0},
+      {"text": "Level", "start": 52.979, "end": 53.159, "confidence": 1.0},
+      {"text": "funfzehn.", "start": 53.279, "end": 53.859, "confidence": 1.0},
+      {"text": "du", "start": 57.879, "end": 57.959, "confidence": 1.0},
+      {"text": "bist", "start": 58.020, "end": 58.159, "confidence": 1.0},
+      {"text": "ein", "start": 58.239, "end": 58.279, "confidence": 1.0},
+      {"text": "Level-eins-Versager", "start": 58.359, "end": 59.619, "confidence": 1.0}
+    ],
+    "spans": [
+      {"case_id": "case-4", "cue_ids": [18], "srt_text": "15", "asr_text": "funfzehn.", "asr_word_indices": [5]},
+      {"case_id": "case-5", "cue_ids": [20], "srt_text": "Level 1 Versager", "asr_text": "Level-eins-Versager", "asr_word_indices": [9]}
+    ],
+    "decisions": [
+      {"case_id": "case-4", "verdict": "keep_srt", "final_text": "15", "confidence": 1.0, "reason": "source number style wins"},
+      {"case_id": "case-5", "verdict": "keep_srt", "final_text": "Level 1 Versager", "confidence": 1.0, "reason": "source compound style wins"}
+    ]
+  },
+  "ep10": {
+    "cue": {"index": 16, "start_ms": 48266, "end_ms": 67400, "lines": ["Los geht's."]},
+    "words": [
+      {"text": "Los", "start": 48.299, "end": 48.500, "confidence": 0.96},
+      {"text": "geht's.", "start": 48.599, "end": 67.379, "confidence": 0.91}
+    ],
+    "vad": [
+      {"start": 48.2, "end": 48.9},
+      {"start": 67.0, "end": 69.0}
+    ]
+  }
+}
