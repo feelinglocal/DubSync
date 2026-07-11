@@ -270,7 +270,7 @@ def _mount_frontend(app: FastAPI, static_dir: Path) -> None:
                 headers={"X-Robots-Tag": "noindex, follow"},
             )
         requested_file = static_dir / full_path
-        if full_path in PUBLIC_ROOT_FILES and requested_file.is_file():
+        if full_path in PUBLIC_ROOT_FILES and requested_file.is_file() and _inside(requested_file, static_dir):
             return FileResponse(requested_file)
         if not index.exists():
             return JSONResponse({"service": "dubsync", "status": "frontend_not_built"}, status_code=503)
