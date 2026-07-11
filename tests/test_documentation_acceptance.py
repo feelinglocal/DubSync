@@ -13,9 +13,17 @@ def test_readme_includes_final_acceptance_report_sections():
         "### Measured Timings And Costs",
         "### Top 3 Risks",
         "Live API smoke tests were not run",
-        "150 passed, 5 deselected",
+        "195 passed, 5 deselected",
     ):
         assert expected in readme
+
+
+def test_render_blueprint_disk_omits_unsupported_shutdown_delay():
+    blueprint = yaml.safe_load(Path("render.yaml").read_text(encoding="utf-8"))
+    service = blueprint["services"][0]
+
+    assert service["disk"]["mountPath"] == "/var/data"
+    assert "maxShutdownDelaySeconds" not in service
 
 
 def test_readme_describes_forced_alignment_as_implemented_optional_path():

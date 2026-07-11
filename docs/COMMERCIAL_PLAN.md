@@ -98,7 +98,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Web service: Starter, one instance.
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
-- Graceful shutdown: 300 seconds.
+- Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
 - Secrets: `ELEVENLABS_API_KEY` and `GEMINI_API_KEY`, entered in Render only.
 - Runtime data: `/var/data`.
 
