@@ -345,6 +345,37 @@ def test_health_and_security_headers_are_present(tmp_path, monkeypatch):
     assert "default-src 'self'" in response.headers["content-security-policy"]
 
 
+def test_frontend_serves_crawler_assets_and_rejects_unknown_routes(tmp_path):
+    static_dir = tmp_path / "site"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<html><title>DubSync</title></html>", encoding="utf-8")
+    (static_dir / "robots.txt").write_text("User-agent: *\nAllow: /\n", encoding="utf-8")
+    (static_dir / "sitemap.xml").write_text("<?xml version='1.0'?><urlset></urlset>", encoding="utf-8")
+    (static_dir / "favicon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    settings = replace(_settings(tmp_path), static_dir=static_dir)
+    app = create_app(settings=settings, processor=_fake_processor)
+
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/terms").status_code == 200
+        assert client.get("/privacy").status_code == 200
+        assert client.get("/payments").status_code == 200
+
+        robots = client.get("/robots.txt")
+        sitemap = client.get("/sitemap.xml")
+        favicon = client.get("/favicon.svg")
+
+        assert robots.status_code == 200
+        assert robots.headers["content-type"].startswith("text/plain")
+        assert robots.text.startswith("User-agent:")
+        assert sitemap.status_code == 200
+        assert sitemap.headers["content-type"].startswith(("application/xml", "text/xml"))
+        assert sitemap.text.startswith("<?xml")
+        assert favicon.status_code == 200
+        assert favicon.headers["content-type"].startswith("image/svg+xml")
+        assert client.get("/not-a-real-page").status_code == 404
+
+
 def test_job_service_deletes_expired_job_without_waiting_for_another_request(tmp_path):
     settings = replace(_settings(tmp_path), cleanup_interval_seconds=0.05)
     service = JobService(settings, _fake_processor)

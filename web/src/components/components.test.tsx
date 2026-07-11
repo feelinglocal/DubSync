@@ -13,7 +13,23 @@ import { downsampleWaveform, formatAudioDuration, WaveformPreview } from './Wave
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  localStorage.clear()
+  delete document.documentElement.dataset.theme
 })
+
+function useSystemTheme(theme: 'light' | 'dark') {
+  const listeners = new Set<(event: MediaQueryListEvent) => void>()
+  vi.stubGlobal('matchMedia', vi.fn().mockImplementation((query: string) => ({
+    matches: query === '(prefers-color-scheme: dark)' && theme === 'dark',
+    media: query,
+    onchange: null,
+    addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  })))
+}
 
 function job(overrides: Partial<JobResponse> = {}): JobResponse {
   return {
@@ -31,12 +47,39 @@ function job(overrides: Partial<JobResponse> = {}): JobResponse {
 
 describe('shared components', () => {
   it('opens and closes the compact navigation', async () => {
+    useSystemTheme('light')
     const user = userEvent.setup()
     render(<Header />)
     await user.click(screen.getByRole('button', { name: 'Open menu' }))
     expect(screen.getByRole('button', { name: 'Close menu' })).toHaveAttribute('aria-expanded', 'true')
     await user.click(screen.getByRole('link', { name: 'Features' }))
     expect(screen.getByRole('button', { name: 'Open menu' })).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('uses the system theme until the visitor chooses and persists an override', async () => {
+    useSystemTheme('dark')
+    const user = userEvent.setup()
+    const { container } = render(<Header />)
+
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark')
+    expect(container.querySelector('img.brand-mark')).toHaveAttribute('src', '/brand/dubsync-mark.svg')
+
+    const toggle = screen.getByRole('button', { name: 'Use light theme' })
+    await user.click(toggle)
+
+    expect(document.documentElement).toHaveAttribute('data-theme', 'light')
+    expect(localStorage.getItem('dubsync-theme')).toBe('light')
+    expect(screen.getByRole('button', { name: 'Use dark theme' })).toBeVisible()
+  })
+
+  it('restores a saved theme instead of overriding it with the system theme', () => {
+    useSystemTheme('dark')
+    localStorage.setItem('dubsync-theme', 'light')
+
+    render(<Header />)
+
+    expect(document.documentElement).toHaveAttribute('data-theme', 'light')
+    expect(screen.getByRole('button', { name: 'Use dark theme' })).toBeVisible()
   })
 
   it('renders the terms, privacy, and payment policies', () => {

@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 WEB_SOURCE = ROOT / "web" / "src"
+WEB_PUBLIC = ROOT / "web" / "public"
 
 
 def test_web_uses_approved_palette_and_inter_without_decorative_gradients():
@@ -25,3 +26,35 @@ def test_visible_web_copy_has_no_dash_flourishes():
 
     assert "\N{EN DASH}" not in visible_source
     assert "\N{EM DASH}" not in visible_source
+
+
+def test_brand_and_crawler_assets_are_declared_and_shippable():
+    index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+    for fragment in (
+        'rel="canonical" href="https://dubsync.onrender.com/"',
+        'rel="icon" href="/favicon.svg"',
+        'rel="manifest" href="/site.webmanifest"',
+        'property="og:title"',
+        'property="og:image" content="https://dubsync.onrender.com/brand/dubsync-social.png"',
+        'name="twitter:card" content="summary_large_image"',
+        'type="application/ld+json"',
+        'src="/theme-init.js"',
+    ):
+        assert fragment in index
+
+    for relative_path in (
+        "favicon.svg",
+        "site.webmanifest",
+        "robots.txt",
+        "sitemap.xml",
+        "theme-init.js",
+        "brand/dubsync-mark.svg",
+        "brand/dubsync-icon-192.png",
+        "brand/dubsync-icon-512.png",
+        "brand/dubsync-apple-touch.png",
+        "brand/dubsync-social.png",
+    ):
+        asset = WEB_PUBLIC / relative_path
+        assert asset.is_file(), f"Missing public brand or SEO asset: {relative_path}"
+        assert asset.stat().st_size > 0

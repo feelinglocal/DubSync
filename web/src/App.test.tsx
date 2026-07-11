@@ -57,6 +57,10 @@ afterEach(() => {
   vi.restoreAllMocks()
   sessionStorage.clear()
   window.history.replaceState({}, '', '/')
+  document.title = ''
+  document.head.querySelector('link[rel="canonical"]')?.remove()
+  document.head.querySelector('meta[name="description"]')?.remove()
+  document.head.querySelector('meta[property="og:title"]')?.remove()
 })
 
 describe('DubSync workspace', () => {
@@ -70,6 +74,9 @@ describe('DubSync workspace', () => {
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
     expect(await screen.findByText('Files are deleted after 24 hours')).toBeVisible()
     expect(await screen.findByText(/Manual quote and invoice before paid processing/i)).toBeVisible()
+    expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
+    expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
+    expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
   })
 
   it('serves the dedicated payment and refund policy route', () => {
@@ -77,6 +84,8 @@ describe('DubSync workspace', () => {
     render(<App />)
 
     expect(screen.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
+    expect(document.title).toBe('Payments and Refunds | DubSync')
+    expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/payments')
   })
 
   it('switches to audio-only mode and submits a generate job without an SRT', async () => {

@@ -150,6 +150,29 @@ test('legal pages are reachable from direct production routes', async ({ page })
   await expect(page.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
 })
 
+test('brand, theme, and crawler surfaces use the production identity', async ({ page, request }) => {
+  await page.emulateMedia({ colorScheme: 'dark' })
+  await page.goto('/')
+
+  await expect(page).toHaveTitle('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await expect(page.locator('header img.brand-mark')).toHaveAttribute('src', '/brand/dubsync-mark.svg')
+  await page.getByRole('button', { name: 'Use light theme' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  await page.reload()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+
+  const robots = await request.get('/robots.txt')
+  const sitemap = await request.get('/sitemap.xml')
+  const favicon = await request.get('/favicon.svg')
+  const missing = await request.get('/not-a-real-page')
+  expect(robots.headers()['content-type']).toContain('text/plain')
+  expect((await robots.text()).startsWith('User-agent:')).toBe(true)
+  expect(sitemap.headers()['content-type']).toMatch(/application\/xml|text\/xml/)
+  expect(favicon.headers()['content-type']).toContain('image/svg+xml')
+  expect(missing.status()).toBe(404)
+})
+
 test('mobile first viewport has no horizontal overflow and introduces the next section', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
