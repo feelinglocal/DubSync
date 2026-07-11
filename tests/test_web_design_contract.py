@@ -1,11 +1,30 @@
 import json
 from pathlib import Path
 from struct import unpack
+from xml.etree import ElementTree
 
 
 ROOT = Path(__file__).parents[1]
 WEB_SOURCE = ROOT / "web" / "src"
 WEB_PUBLIC = ROOT / "web" / "public"
+
+
+def _cue_geometry(svg_path: Path):
+    root = ElementTree.fromstring(svg_path.read_text(encoding="utf-8"))
+    mask = next(element for element in root if element.tag.endswith("mask"))
+    cue_rects = [element for element in mask if element.tag.endswith("rect")][1:]
+    marker = next(
+        element
+        for element in root
+        if element.tag.endswith("rect") and element.attrib.get("fill") == "#FFF04B"
+    )
+    return (
+        [
+            tuple(float(rect.attrib[key]) for key in ("x", "y", "width", "height", "rx"))
+            for rect in cue_rects
+        ],
+        tuple(float(marker.attrib[key]) for key in ("x", "width")),
+    )
 
 
 def test_web_uses_approved_palette_and_inter_without_decorative_gradients():
@@ -88,3 +107,17 @@ def test_brand_and_crawler_assets_are_declared_and_shippable():
     generator = (ROOT / "web" / "scripts" / "build-brand-assets.mjs").read_text(encoding="utf-8")
     assert "width:64%;height:64%" in generator
     assert "document.fonts.ready" in generator
+
+
+def test_logo_cues_cross_the_yellow_timing_marker_like_the_reference():
+    expected_cues = [
+        (14.0, 19.0, 34.0, 7.0, 3.5),
+        (14.0, 38.0, 26.0, 7.0, 3.5),
+    ]
+
+    for svg_path in (WEB_PUBLIC / "brand" / "dubsync-mark.svg", WEB_PUBLIC / "favicon.svg"):
+        cues, (marker_x, marker_width) = _cue_geometry(svg_path)
+
+        assert cues == expected_cues
+        assert all(cue_x < marker_x for cue_x, _, _, _, _ in cues)
+        assert all(cue_x + cue_width > marker_x + marker_width for cue_x, _, cue_width, _, _ in cues)
