@@ -7,12 +7,13 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
+from html import escape
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..srt_io import SRTParseError, parse_srt_text
@@ -42,6 +43,22 @@ AUDIO_TYPES = {
 }
 FPS_VALUES = {23.976, 24.0, 25.0, 29.97, 30.0}
 LANGUAGE_RE = re.compile(r"^(auto|[A-Za-z]{2,8}(?:-[A-Za-z]{2,8})?)$")
+PUBLIC_ROOT_FILES = frozenset({"favicon.svg", "robots.txt", "site.webmanifest", "sitemap.xml", "theme-init.js"})
+FRONTEND_ROUTE_METADATA = {
+    "terms": (
+        "Terms of Service | DubSync",
+        "Terms for using DubSync subtitle synchronization and audio-to-SRT processing.",
+    ),
+    "privacy": (
+        "Privacy Policy | DubSync",
+        "How DubSync processes, protects, transfers, and deletes subtitle job data.",
+    ),
+    "payments": (
+        "Payments and Refunds | DubSync",
+        "Manual billing, tax handling, cancellations, reruns, and refund eligibility for DubSync jobs.",
+    ),
+}
+SITE_ORIGIN = "https://dubsync.onrender.com"
 
 
 def create_app(
@@ -233,22 +250,62 @@ def create_app(
 def _mount_frontend(app: FastAPI, static_dir: Path) -> None:
     index = static_dir / "index.html"
     assets = static_dir / "assets"
-    frontend_routes = {"", "terms", "privacy", "payments"}
+    brand = static_dir / "brand"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
+    if brand.exists():
+        app.mount("/brand", StaticFiles(directory=brand), name="brand")
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def frontend(full_path: str):
-        if full_path.startswith("api/"):
+        if full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found.")
-        if full_path in frontend_routes and index.exists():
+        if full_path.endswith("/") and full_path[:-1] in FRONTEND_ROUTE_METADATA:
+            return RedirectResponse(url=f"/{full_path[:-1]}", status_code=308)
+        if full_path == "" and index.exists():
             return FileResponse(index, media_type="text/html")
+        if full_path in FRONTEND_ROUTE_METADATA and index.exists():
+            return HTMLResponse(
+                _frontend_document(index, full_path),
+                headers={"X-Robots-Tag": "noindex, follow"},
+            )
         requested_file = static_dir / full_path
-        if requested_file.is_file() and _inside(requested_file, static_dir):
+        if full_path in PUBLIC_ROOT_FILES and requested_file.is_file():
             return FileResponse(requested_file)
         if not index.exists():
             return JSONResponse({"service": "dubsync", "status": "frontend_not_built"}, status_code=503)
         raise HTTPException(status_code=404, detail="Page not found.")
+
+
+def _frontend_document(index: Path, route: str) -> str:
+    title, description = FRONTEND_ROUTE_METADATA[route]
+    canonical = f"{SITE_ORIGIN}/{route}"
+    document = index.read_text(encoding="utf-8")
+    replacements = (
+        (r'(<meta name="description" content=")[^"]*(" />)', description),
+        (r'(<meta name="robots" content=")[^"]*(" />)', "noindex, follow"),
+        (r'(<link rel="canonical" href=")[^"]*(" />)', canonical),
+        (r'(<meta property="og:title" content=")[^"]*(" />)', title),
+        (r'(<meta property="og:description" content=")[^"]*(" />)', description),
+        (r'(<meta property="og:url" content=")[^"]*(" />)', canonical),
+        (r'(<meta name="twitter:title" content=")[^"]*(" />)', title),
+        (r'(<meta name="twitter:description" content=")[^"]*(" />)', description),
+    )
+    for pattern, value in replacements:
+        document = re.sub(
+            pattern,
+            lambda match, content=escape(value, quote=True): f"{match.group(1)}{content}{match.group(2)}",
+            document,
+            count=1,
+        )
+    document = re.sub(r"<title>.*?</title>", f"<title>{escape(title)}</title>", document, count=1, flags=re.DOTALL)
+    return re.sub(
+        r'\s*<script type="application/ld\+json" data-home-schema>.*?</script>',
+        "",
+        document,
+        count=1,
+        flags=re.DOTALL,
+    )
 
 
 def _authorized_job(service: JobService, job_id: str, authorization: str | None) -> JobRecord:

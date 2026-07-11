@@ -1,5 +1,6 @@
 const SITE_ORIGIN = 'https://dubsync.onrender.com'
 const SOCIAL_IMAGE = `${SITE_ORIGIN}/brand/dubsync-social.png`
+const SOCIAL_IMAGE_ALT = 'DubSync. Timing follows the performance.'
 
 interface RouteMetadata {
   title: string
@@ -70,4 +71,6 @@ export function applyRouteMetadata(path: string) {
   setMeta('meta[name="twitter:title"]', { name: 'twitter:title', content: metadata.title })
   setMeta('meta[name="twitter:description"]', { name: 'twitter:description', content: metadata.description })
   setMeta('meta[name="twitter:image"]', { name: 'twitter:image', content: SOCIAL_IMAGE })
+  setMeta('meta[name="twitter:image:alt"]', { name: 'twitter:image:alt', content: SOCIAL_IMAGE_ALT })
+  if (path !== '/') document.head.querySelector('script[data-home-schema]')?.remove()
 }
