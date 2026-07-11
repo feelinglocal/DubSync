@@ -422,6 +422,18 @@ def test_frontend_serves_crawler_assets_and_rejects_unknown_routes(tmp_path):
         assert client.get("/not-a-real-page").status_code == 404
 
 
+def test_frontend_refuses_allowlisted_file_that_resolves_outside_static_root(tmp_path, monkeypatch):
+    static_dir = tmp_path / "site"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<html><title>DubSync</title></html>", encoding="utf-8")
+    (static_dir / "robots.txt").write_text("outside target", encoding="utf-8")
+    monkeypatch.setattr("dubsync.web.app._inside", lambda _path, _directory: False)
+    app = create_app(settings=replace(_settings(tmp_path), static_dir=static_dir), processor=_fake_processor)
+
+    with TestClient(app) as client:
+        assert client.get("/robots.txt").status_code == 404
+
+
 def test_job_service_deletes_expired_job_without_waiting_for_another_request(tmp_path):
     settings = replace(_settings(tmp_path), cleanup_interval_seconds=0.05)
     service = JobService(settings, _fake_processor)
