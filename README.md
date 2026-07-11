@@ -1,0 +1,2 @@
+# DubSync
+Synchronize SRT
