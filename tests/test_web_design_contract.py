@@ -119,5 +119,6 @@ def test_logo_cues_cross_the_yellow_timing_marker_like_the_reference():
         cues, (marker_x, marker_width) = _cue_geometry(svg_path)
 
         assert cues == expected_cues
+        assert (marker_x, marker_width) == (27.0, 6.0)
         assert all(cue_x < marker_x for cue_x, _, _, _, _ in cues)
         assert all(cue_x + cue_width > marker_x + marker_width for cue_x, _, cue_width, _, _ in cues)
