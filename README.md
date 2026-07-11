@@ -8,8 +8,8 @@ Timing comes from acoustic data only: ASR word timestamps and optional forced al
 
 DubSync also includes a responsive React/FastAPI application with two customer workflows:
 
-- **Sync existing SRT:** upload dubbed dialogue audio plus the target-language SRT, then download a synchronized SRT and QC artifacts.
-- **Audio to SRT:** upload dubbed dialogue audio without an SRT, then generate an acoustically timed SRT and QC artifacts.
+- **Sync existing SRT:** upload dubbed dialogue audio plus the target-language SRT, then download a synchronized SRT and QC artifacts. Cue presentation rules are derived from that uploaded SRT.
+- **Audio to SRT:** upload dubbed dialogue audio without an SRT, choose a built-in subtitle preset, enter custom line/timing/CPS rules, or upload an example SRT to derive them, then generate an acoustically timed SRT and QC artifacts.
 
 The language selector defaults to provider auto-detection. An explicit language is forwarded to ElevenLabs Scribe and becomes part of the cached ASR configuration.
 
@@ -26,7 +26,7 @@ Set-Location ..
 dubsync-web
 ```
 
-Open `http://127.0.0.1:8000`. The server reads `provider.yaml`, `style_profile.yaml`, and API keys from `.env` by default. API documentation is disabled unless `DUBSYNC_ENABLE_DOCS=1`.
+Open `http://127.0.0.1:8000`. The server reads `provider.yaml`, `style_profile.yaml`, and API keys from `.env` by default. The DubSync default generation preset honors that configured style profile; every other web generation style is resolved per job. API documentation is disabled unless `DUBSYNC_ENABLE_DOCS=1`.
 
 For frontend development, run `npm run dev` inside `web` and run the FastAPI service separately. The production Docker image builds the frontend and serves it from the same origin as the API.
 
@@ -272,6 +272,8 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Frame-grid ceiling never snaps fractional model timings backward when enforcing minimum duration or forced-alignment ends.
 - Configured cue lead-in is clamped at zero so early speech cannot produce invalid negative SRT timestamps.
 - Fixture-backed ASR/LLM path for offline E2E tests.
+- Web audio generation resolves explicit presets, custom rules, and uploaded-example subtitle styles per job while preserving the configured profile for the DubSync default preset; the selected line, timing, gap, lead/tail, and CPS rules are recorded in `generate.json` and applied during output finalization.
+- Web sync derives its style from the user-supplied source SRT instead of applying the server's global generation profile.
 - ElevenLabs Scribe v2 ASR forwards configured keyterms and character names as `keyterms` while still requesting word timestamps and diarization.
 - Opt-in `--live` pytest smoke tests for Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
@@ -342,7 +344,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and the approved production ElevenLabs plus Gemini smoke job completed. The web surface includes gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
+Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and the approved production ElevenLabs plus Gemini smoke job completed. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
 
 Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 
@@ -352,9 +354,9 @@ Latest local offline verification in this workspace:
 
 | Command | Result | Runtime / cost evidence |
 |---|---|---|
-| `python -m pytest --cov=dubsync --cov-report=term-missing` | `205 passed, 5 deselected`, coverage `85.22%` | Normal offline suite; paid/live smoke tests deselected |
-| `npm run test:coverage` | `24 passed`; statements `90.49%`, lines `94.28%` | React workflow, access gate, API client, session, legal, error, and media lifecycle tests |
-| `npm run test:e2e` | `6 passed` | Generate, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
+| `python -m pytest --cov=dubsync --cov-report=term-missing` | `216 passed, 5 deselected`, coverage `85.00%` | Normal offline suite; paid/live smoke tests deselected |
+| `npm run test:coverage` | `26 passed`; statements `90.33%`, lines `92.74%` | React workflow, generation style controls, access gate, API client, session, legal, error, and media lifecycle tests |
+| `npm run test:e2e` | `7 passed` | Generate, SRT-derived style, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
 | Production web `generate` smoke | PASS | 3.444-second WAV, 1 cue, 0 QC flags, `$0.000376` recorded provider cost on Render commit `5c79356` |
 | Render JSON Schema validation | PASS | `render.yaml` validates against Render's published schema |

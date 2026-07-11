@@ -135,6 +135,10 @@ describe('DubSync workspace', () => {
     await user.clear(screen.getByLabelText('Maximum CPS'))
     await user.type(screen.getByLabelText('Maximum CPS'), '21')
     await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.clear(screen.getByLabelText('Minimum CPS'))
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('Minimum CPS is required.')
+    await user.type(screen.getByLabelText('Minimum CPS'), '3')
     await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))

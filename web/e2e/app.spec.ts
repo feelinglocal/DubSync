@@ -72,7 +72,7 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
   const content = await readFile(await download.path(), 'utf-8')
-  const cueLines = content.trim().split(/\n\n+/).map((block) => block.split(/\r?\n/).slice(2))
+  const cueLines = content.trim().split(/\r?\n\r?\n+/).map((block) => block.split(/\r?\n/).slice(2))
 
   expect(cueLines.length).toBeGreaterThan(1)
   expect(cueLines.every((lines) => lines.length === 1)).toBe(true)

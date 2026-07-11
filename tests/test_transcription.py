@@ -174,6 +174,45 @@ def test_generate_srt_applies_per_job_profile_and_reading_speed_constraints(tmp_
     assert generated["constraints"]["max_cps"] == 10.0
 
 
+def test_generate_srt_cps_extension_respects_the_maximum_cue_duration(tmp_path):
+    audio_path = tmp_path / "dialogue.wav"
+    audio_path.write_bytes(b"fixture audio")
+    words_path = tmp_path / "words.json"
+    words_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Deliberately", "start": 0.0, "end": 0.2, "confidence": 0.99},
+                    {"text": "lengthy.", "start": 0.21, "end": 0.4, "confidence": 0.99},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(f"asr:\n  fixture_path: '{words_path.as_posix()}'\n", encoding="utf-8")
+    output_path = tmp_path / "dialogue.generated.srt"
+
+    result = generate_srt_from_audio(
+        audio_path=audio_path,
+        output_path=output_path,
+        workdir=tmp_path / "work",
+        providers_path=providers_path,
+        no_llm=True,
+        style_profile=StyleProfile(max_lines_per_cue=1, max_chars_per_line=40, min_cue_dur=0.2, tail_ms=0),
+        generation_constraints=GenerationConstraints(
+            max_gap_seconds=0.5,
+            max_cue_duration_seconds=1.0,
+            min_cps=0.0,
+            max_cps=5.0,
+        ),
+    )
+
+    cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
+    assert cues[0].duration_ms <= 1000
+    assert any(flag["kind"] == "impossible_cps_fast" for flag in result.report["flags"])
+
+
 def test_cli_generate_exposes_audio_only_workflow(tmp_path):
     audio_path = tmp_path / "dialogue.wav"
     audio_path.write_bytes(b"fixture audio")

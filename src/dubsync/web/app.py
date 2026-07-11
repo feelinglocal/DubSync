@@ -7,6 +7,7 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated
 
@@ -14,6 +15,13 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..srt_io import SRTParseError, parse_srt_text
+from .generation_styles import (
+    GenerationStyleError,
+    parse_generation_style_request,
+    public_generation_styles,
+    resolve_generation_style,
+)
 from .jobs import JobMode, JobRecord, JobService, Processor, default_processor, new_job_record
 from .security import SlidingWindowRateLimiter, hash_job_token, valid_job_token
 from .settings import WebSettings
@@ -104,6 +112,7 @@ def create_app(
             "billing_enabled": False,
             "access_code_required": access_code_required,
             "jobs_available": jobs_available,
+            "generation_styles": public_generation_styles(),
         }
 
     @app.post("/api/jobs", status_code=202)
@@ -112,6 +121,7 @@ def create_app(
         mode: Annotated[str, Form()],
         audio: Annotated[UploadFile, File()],
         subtitle: Annotated[UploadFile | None, File()] = None,
+        style_sample: Annotated[UploadFile | None, File()] = None,
         fps: Annotated[float, Form()] = 30.0,
         language: Annotated[str, Form()] = "auto",
         style: Annotated[str, Form()] = "standard",
@@ -129,10 +139,44 @@ def create_app(
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
-        _validate_options(fps=fps, language=language, style=style)
+        _validate_options(fps=fps, language=language)
         audio_extension = _validate_audio(audio)
         if subtitle is not None:
             _validate_subtitle(subtitle)
+
+        resolved_style = "source"
+        style_sample_bytes: bytes | None = None
+        if normalized_mode == "generate":
+            try:
+                style_request = parse_generation_style_request(style)
+            except GenerationStyleError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            sample_cues = None
+            if style_request.source == "sample":
+                if style_sample is None:
+                    raise HTTPException(status_code=422, detail="An SRT style example is required.")
+                _validate_subtitle(style_sample)
+                style_sample_bytes = await _read_upload(style_sample, resolved_settings.max_srt_bytes)
+                try:
+                    sample_text = style_sample_bytes.decode("utf-8-sig")
+                    sample_cues = parse_srt_text(sample_text)
+                    if not sample_cues:
+                        raise SRTParseError("no subtitle cues were found")
+                except (UnicodeDecodeError, SRTParseError, ValueError) as exc:
+                    detail = str(exc).splitlines()[0] or "invalid SRT"
+                    raise HTTPException(status_code=422, detail=f"Could not read the SRT style example: {detail}") from exc
+            elif style_sample is not None:
+                await style_sample.close()
+            try:
+                resolved_style = resolve_generation_style(
+                    style_request,
+                    fps=fps,
+                    sample_cues=sample_cues,
+                ).model_dump_json()
+            except GenerationStyleError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        elif style_sample is not None:
+            await style_sample.close()
 
         service.store.delete_expired()
         job_id = uuid.uuid4().hex
@@ -145,6 +189,8 @@ def create_app(
             await _save_upload(audio, audio_path, resolved_settings.max_upload_bytes)
             if subtitle is not None and subtitle_path is not None:
                 await _save_upload(subtitle, subtitle_path, resolved_settings.max_srt_bytes)
+            if style_sample_bytes is not None:
+                (directory / "style-example.srt").write_bytes(style_sample_bytes)
             job = new_job_record(
                 job_id=job_id,
                 token_hash=hash_job_token(token),
@@ -154,7 +200,7 @@ def create_app(
                 srt_path=subtitle_path,
                 fps=fps,
                 language=language.lower(),
-                style=style.lower(),
+                style=resolved_style,
                 retention_hours=resolved_settings.retention_hours,
             )
             service.store.create(job)
@@ -221,13 +267,11 @@ def _validate_mode(mode: str) -> JobMode:
     return normalized  # type: ignore[return-value]
 
 
-def _validate_options(*, fps: float, language: str, style: str) -> None:
+def _validate_options(*, fps: float, language: str) -> None:
     if fps not in FPS_VALUES:
         raise HTTPException(status_code=422, detail="Unsupported frame rate.")
     if not LANGUAGE_RE.fullmatch(language.strip()):
         raise HTTPException(status_code=422, detail="Invalid language code.")
-    if style.strip().lower() != "standard":
-        raise HTTPException(status_code=422, detail="Unsupported style profile.")
 
 
 def _validate_audio(upload: UploadFile) -> str:
@@ -261,6 +305,20 @@ async def _save_upload(upload: UploadFile, destination: Path, limit: int) -> Non
     if size == 0:
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+
+
+async def _read_upload(upload: UploadFile, limit: int) -> bytes:
+    data = bytearray()
+    try:
+        while chunk := await upload.read(1024 * 1024):
+            data.extend(chunk)
+            if len(data) > limit:
+                raise HTTPException(status_code=413, detail="Uploaded file is too large.")
+    finally:
+        await upload.close()
+    if not data:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    return bytes(data)
 
 
 def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object]:
@@ -307,8 +365,14 @@ def _inside(path: Path, directory: Path) -> bool:
 
 
 def _client_key(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    return forwarded or (request.client.host if request.client else "unknown")
+    if os.getenv("RENDER", "").strip().lower() == "true":
+        forwarded = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",") if part.strip()]
+        if forwarded:
+            try:
+                return str(ip_address(forwarded[-1]))
+            except ValueError:
+                pass
+    return request.client.host if request.client else "unknown"
 
 
 def run() -> None:

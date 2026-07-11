@@ -13,6 +13,7 @@ from typing import Callable, Literal
 from dubsync.pipeline import sync_episode
 from dubsync.transcription import generate_srt_from_audio
 
+from .generation_styles import ResolvedGenerationStyle
 from .settings import WebSettings
 
 logger = logging.getLogger(__name__)
@@ -271,21 +272,35 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             job.audio_path,
             output_path,
             workdir,
-            style_path=settings.style_path,
+            style_path=None,
             providers_path=settings.providers_path,
             fps=job.fps,
             language=language,
         )
     else:
-        result = generate_srt_from_audio(
-            job.audio_path,
-            output_path,
-            workdir,
-            style_path=settings.style_path,
-            providers_path=settings.providers_path,
-            fps=job.fps,
-            language=language,
-        )
+        generate_options: dict[str, object] = {
+            "style_path": settings.style_path,
+            "providers_path": settings.providers_path,
+            "fps": job.fps,
+            "language": language,
+        }
+        if job.style.strip().lower() != "standard":
+            resolved_style = ResolvedGenerationStyle.model_validate_json(job.style)
+            uses_configured_default = resolved_style.source == "preset" and resolved_style.preset == "standard"
+            if uses_configured_default and settings.style_path is None:
+                generate_options = {
+                    **generate_options,
+                    "style_path": None,
+                    "style_profile": resolved_style.profile,
+                }
+            elif not uses_configured_default:
+                generate_options = {
+                    **generate_options,
+                    "style_path": None,
+                    "style_profile": resolved_style.profile,
+                    "generation_constraints": resolved_style.constraints,
+                }
+        result = generate_srt_from_audio(job.audio_path, output_path, workdir, **generate_options)
     summary = result.report.get("summary", {})
     cue_count = int(summary.get("cue_count", 0)) if isinstance(summary, dict) else 0
     changes = result.episode_workdir / "changes.diff.srt"

@@ -252,6 +252,29 @@ def test_sync_mode_requires_srt_and_rejects_unsupported_or_oversized_audio(tmp_p
         assert oversized.status_code == 413
 
 
+def test_render_rate_limit_uses_the_proxy_appended_client_address(tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    settings = replace(_settings(tmp_path), max_jobs_per_hour=1)
+    app = create_app(settings=settings, processor=_fake_processor)
+
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/api/jobs",
+            headers={"X-Forwarded-For": "198.51.100.11, 203.0.113.8"},
+            data={"mode": "generate", "fps": "30"},
+            files={"audio": ("first.wav", b"audio", "audio/wav")},
+        )
+        limited = client.post(
+            "/api/jobs",
+            headers={"X-Forwarded-For": "198.51.100.12, 203.0.113.8"},
+            data={"mode": "generate", "fps": "30"},
+            files={"audio": ("second.wav", b"audio", "audio/wav")},
+        )
+
+    assert accepted.status_code == 202
+    assert limited.status_code == 429
+
+
 def test_manual_job_access_code_is_required_without_exposing_the_secret(tmp_path):
     settings = replace(
         _settings(tmp_path),
@@ -462,6 +485,64 @@ def test_default_processor_applies_the_resolved_generation_style(tmp_path, monke
     assert calls["style_profile"].lead_in_ms == 60
     assert calls["generation_constraints"].max_cue_duration_seconds == 4.0
     assert calls["generation_constraints"].max_cps == 21.0
+
+
+def test_default_processor_preserves_the_configured_profile_for_the_standard_preset(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    configured_style = tmp_path / "configured-style.yaml"
+    configured_style.write_text("max_chars_per_line: 35\nmax_lines_per_cue: 2\n", encoding="utf-8")
+    settings = replace(settings, style_path=configured_style)
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-standard-style"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    resolved_style = {
+        "source": "preset",
+        "preset": "standard",
+        "profile": {"fps": 30.0, "max_lines_per_cue": 2, "max_chars_per_line": 26, "min_cue_dur": 0.5},
+        "constraints": {
+            "max_gap_seconds": 0.8,
+            "max_cue_duration_seconds": 5.0,
+            "min_cps": 2.0,
+            "max_cps": 30.0,
+        },
+    }
+    job = new_job_record(
+        job_id="standard-style",
+        token_hash=hash_job_token("token"),
+        mode="generate",
+        directory=directory,
+        audio_path=audio,
+        srt_path=None,
+        fps=30,
+        language="auto",
+        style=json.dumps(resolved_style),
+        retention_hours=24,
+    )
+    calls = {}
+
+    def fake_generate(_audio, output, _workdir, **kwargs):
+        calls.update(kwargs)
+        output.write_text("1\n00:00:00,000 --> 00:00:00,700\nReady.\n", encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output,
+            episode_workdir=artifacts,
+            report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.01),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.generate_srt_from_audio", fake_generate)
+
+    default_processor(job, settings)
+
+    assert calls["style_path"] == configured_style
+    assert "style_profile" not in calls
+    assert "generation_constraints" not in calls
 
 
 def test_default_processor_derives_sync_style_from_the_uploaded_srt(tmp_path, monkeypatch):

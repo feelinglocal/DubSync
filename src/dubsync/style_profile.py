@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import floor, isclose
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .models import Cue
 from .text_metrics import display_width
@@ -48,6 +48,19 @@ class StyleProfile(BaseModel):
         floor = self.snap_floor(ms)
         ceil = self.snap_ceil(ms)
         return min(abs(ms - floor), abs(ms - ceil)) <= tolerance_ms
+
+
+class GenerationConstraints(BaseModel):
+    max_gap_seconds: float = Field(default=0.8, gt=0)
+    max_cue_duration_seconds: float = Field(default=5.0, gt=0)
+    min_cps: float = Field(default=2.0, ge=0)
+    max_cps: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _ordered_cps_limits(self) -> "GenerationConstraints":
+        if self.min_cps > self.max_cps:
+            raise ValueError("min_cps cannot exceed max_cps")
+        return self
 
 
 def _candidate_error(timestamps: list[int], fps: float) -> float:

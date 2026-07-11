@@ -14,13 +14,24 @@ def finalize_cues_for_output(
     *,
     no_overlaps: bool = True,
     max_cps: float | None = None,
+    max_cue_duration_seconds: float | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     ordered = sorted(cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
     merged, flags = _merge_duplicate_overlaps(ordered)
     if max_cps is not None:
-        merged, readability_flags = _extend_fast_cues_into_following_gap(merged, profile, max_cps)
+        merged, readability_flags = _extend_fast_cues_into_following_gap(
+            merged,
+            profile,
+            max_cps,
+            max_cue_duration_seconds,
+        )
         flags.extend(readability_flags)
-        merged, merge_flags = _merge_fast_cues_with_following(merged, profile, max_cps)
+        merged, merge_flags = _merge_fast_cues_with_following(
+            merged,
+            profile,
+            max_cps,
+            max_cue_duration_seconds,
+        )
         flags.extend(merge_flags)
     finalized = merged
     if no_overlaps:
@@ -34,6 +45,7 @@ def _extend_fast_cues_into_following_gap(
     cues: list[Cue],
     profile: StyleProfile,
     max_cps: float,
+    max_cue_duration_seconds: float | None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     if max_cps <= 0 or not cues:
         return cues, []
@@ -41,7 +53,7 @@ def _extend_fast_cues_into_following_gap(
     flags: list[QCFlag] = []
     for index in range(len(adjusted)):
         cue = adjusted[index]
-        needed_end_ms = _end_for_cps(cue, profile, max_cps)
+        needed_end_ms = _end_for_cps(cue, profile, max_cps, max_cue_duration_seconds)
         if needed_end_ms <= cue.end_ms:
             continue
         if index + 1 >= len(adjusted):
@@ -62,6 +74,7 @@ def _merge_fast_cues_with_following(
     cues: list[Cue],
     profile: StyleProfile,
     max_cps: float,
+    max_cue_duration_seconds: float | None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     merged: list[Cue] = []
     flags: list[QCFlag] = []
@@ -89,6 +102,10 @@ def _merge_fast_cues_with_following(
             len(candidate.lines) <= profile.max_lines_per_cue
             and all(display_width(line) <= profile.max_chars_per_line for line in candidate.lines)
             and _cue_cps(candidate) <= max_cps
+            and (
+                max_cue_duration_seconds is None
+                or candidate.duration_ms <= max_cue_duration_seconds * 1000
+            )
         ):
             merged.append(candidate)
             flags.append(
@@ -109,7 +126,12 @@ def _merge_fast_cues_with_following(
     return merged, flags
 
 
-def _end_for_cps(cue: Cue, profile: StyleProfile, max_cps: float) -> int:
+def _end_for_cps(
+    cue: Cue,
+    profile: StyleProfile,
+    max_cps: float,
+    max_cue_duration_seconds: float | None,
+) -> int:
     width = display_width(cue.plain_text)
     if width <= 0:
         return cue.end_ms
@@ -118,6 +140,12 @@ def _end_for_cps(cue: Cue, profile: StyleProfile, max_cps: float) -> int:
     while _cps_for_width(width, cue.start_ms, end_ms) > max_cps:
         next_end_ms = profile.snap_ceil(end_ms + 1)
         end_ms = next_end_ms if next_end_ms > end_ms else end_ms + 1
+    if max_cue_duration_seconds is not None:
+        duration_cap_end_ms = max(
+            cue.start_ms + 1,
+            profile.snap_floor(cue.start_ms + max_cue_duration_seconds * 1000),
+        )
+        end_ms = min(end_ms, duration_cap_end_ms)
     return end_ms
 
 

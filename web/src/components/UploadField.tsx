@@ -6,7 +6,7 @@ interface UploadFieldProps {
   accept: string
   file: File | null
   required?: boolean
-  kind: 'audio' | 'subtitle'
+  kind: 'audio' | 'subtitle' | 'style'
   onChange: (file: File | null) => void
 }
 
@@ -19,7 +19,7 @@ export function UploadField({ label, accept, file, required = false, kind, onCha
       <div className={file ? 'upload-row has-file' : 'upload-row'}>
         <span className="upload-icon" aria-hidden="true"><Icon /></span>
         <div className="upload-copy">
-          <strong>{file?.name || (kind === 'audio' ? 'Choose dialogue audio' : 'Choose original SRT')}</strong>
+          <strong>{file?.name || (kind === 'audio' ? 'Choose dialogue audio' : kind === 'style' ? 'Choose style example SRT' : 'Choose original SRT')}</strong>
           <span>{file ? formatBytes(file.size) : kind === 'audio' ? 'WAV, MP3, M4A, FLAC, AAC or OGG' : 'SRT up to 20 MB'}</span>
         </div>
         {file ? <CheckCircle2 className="complete-icon" aria-label="Upload selected" /> : <Upload aria-hidden="true" />}

@@ -13,7 +13,7 @@ def test_readme_includes_final_acceptance_report_sections():
         "### Measured Timings And Costs",
         "### Top 3 Risks",
         "Production web `generate` smoke",
-        "205 passed, 5 deselected",
+        "216 passed, 5 deselected",
         "A second paid run was not made",
         "Production dependency audit",
     ):
