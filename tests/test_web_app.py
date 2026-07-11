@@ -348,22 +348,63 @@ def test_health_and_security_headers_are_present(tmp_path, monkeypatch):
 def test_frontend_serves_crawler_assets_and_rejects_unknown_routes(tmp_path):
     static_dir = tmp_path / "site"
     static_dir.mkdir()
-    (static_dir / "index.html").write_text("<html><title>DubSync</title></html>", encoding="utf-8")
+    (static_dir / "index.html").write_text(
+        """<!doctype html>
+<html><head>
+<meta name="description" content="Home description" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="https://dubsync.onrender.com/" />
+<meta property="og:title" content="Home | DubSync" />
+<meta property="og:description" content="Home description" />
+<meta property="og:url" content="https://dubsync.onrender.com/" />
+<meta name="twitter:title" content="Home | DubSync" />
+<meta name="twitter:description" content="Home description" />
+<script type="application/ld+json" data-home-schema>{"@type":"FAQPage"}</script>
+<title>Home | DubSync</title>
+</head><body></body></html>""",
+        encoding="utf-8",
+    )
     (static_dir / "robots.txt").write_text("User-agent: *\nAllow: /\n", encoding="utf-8")
     (static_dir / "sitemap.xml").write_text("<?xml version='1.0'?><urlset></urlset>", encoding="utf-8")
     (static_dir / "favicon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    brand_dir = static_dir / "brand"
+    brand_dir.mkdir()
+    (brand_dir / "dubsync-mark.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+    (static_dir / ".build-secret").write_text("must not be public", encoding="utf-8")
+    (static_dir / "api").write_text("must not shadow the API namespace", encoding="utf-8")
     settings = replace(_settings(tmp_path), static_dir=static_dir)
     app = create_app(settings=settings, processor=_fake_processor)
 
     with TestClient(app) as client:
-        assert client.get("/").status_code == 200
-        assert client.get("/terms").status_code == 200
-        assert client.get("/privacy").status_code == 200
-        assert client.get("/payments").status_code == 200
+        home = client.get("/")
+        assert home.status_code == 200
+        assert 'data-home-schema' in home.text
+
+        legal_metadata = {
+            "/terms": ("Terms of Service | DubSync", "Terms for using DubSync"),
+            "/privacy": ("Privacy Policy | DubSync", "How DubSync processes"),
+            "/payments": ("Payments and Refunds | DubSync", "Manual billing"),
+        }
+        for route, (title, description_start) in legal_metadata.items():
+            response = client.get(route)
+            assert response.status_code == 200
+            assert response.headers["x-robots-tag"] == "noindex, follow"
+            assert f"<title>{title}</title>" in response.text
+            assert f'content="{description_start}' in response.text
+            assert f'href="https://dubsync.onrender.com{route}"' in response.text
+            assert f'property="og:url" content="https://dubsync.onrender.com{route}"' in response.text
+            assert 'content="noindex, follow"' in response.text
+            assert 'data-home-schema' not in response.text
+            assert '"@type":"FAQPage"' not in response.text
+
+            slash_response = client.get(f"{route}/", follow_redirects=False)
+            assert slash_response.status_code == 308
+            assert slash_response.headers["location"] == route
 
         robots = client.get("/robots.txt")
         sitemap = client.get("/sitemap.xml")
         favicon = client.get("/favicon.svg")
+        brand = client.get("/brand/dubsync-mark.svg")
 
         assert robots.status_code == 200
         assert robots.headers["content-type"].startswith("text/plain")
@@ -373,6 +414,11 @@ def test_frontend_serves_crawler_assets_and_rejects_unknown_routes(tmp_path):
         assert sitemap.text.startswith("<?xml")
         assert favicon.status_code == 200
         assert favicon.headers["content-type"].startswith("image/svg+xml")
+        assert brand.status_code == 200
+        assert brand.headers["content-type"].startswith("image/svg+xml")
+        assert client.get("/.build-secret").status_code == 404
+        assert client.get("/api").status_code == 404
+        assert client.get("/api/unknown").status_code == 404
         assert client.get("/not-a-real-page").status_code == 404
 
 

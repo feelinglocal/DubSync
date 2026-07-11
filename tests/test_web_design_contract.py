@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from struct import unpack
 
 
 ROOT = Path(__file__).parents[1]
@@ -38,6 +40,7 @@ def test_brand_and_crawler_assets_are_declared_and_shippable():
         'property="og:title"',
         'property="og:image" content="https://dubsync.onrender.com/brand/dubsync-social.png"',
         'name="twitter:card" content="summary_large_image"',
+        'name="twitter:image:alt" content="DubSync. Timing follows the performance."',
         'type="application/ld+json"',
         'src="/theme-init.js"',
     ):
@@ -52,9 +55,36 @@ def test_brand_and_crawler_assets_are_declared_and_shippable():
         "brand/dubsync-mark.svg",
         "brand/dubsync-icon-192.png",
         "brand/dubsync-icon-512.png",
+        "brand/dubsync-maskable-192.png",
+        "brand/dubsync-maskable-512.png",
         "brand/dubsync-apple-touch.png",
         "brand/dubsync-social.png",
     ):
         asset = WEB_PUBLIC / relative_path
         assert asset.is_file(), f"Missing public brand or SEO asset: {relative_path}"
         assert asset.stat().st_size > 0
+
+    manifest = json.loads((WEB_PUBLIC / "site.webmanifest").read_text(encoding="utf-8"))
+    declared_icons = {(icon["sizes"], icon["purpose"], icon["src"]) for icon in manifest["icons"]}
+    assert declared_icons == {
+        ("192x192", "any", "/brand/dubsync-icon-192.png"),
+        ("512x512", "any", "/brand/dubsync-icon-512.png"),
+        ("192x192", "maskable", "/brand/dubsync-maskable-192.png"),
+        ("512x512", "maskable", "/brand/dubsync-maskable-512.png"),
+    }
+
+    for name, expected_size, expected_color_type in (
+        ("dubsync-icon-192.png", 192, 6),
+        ("dubsync-icon-512.png", 512, 6),
+        ("dubsync-apple-touch.png", 180, 2),
+        ("dubsync-maskable-192.png", 192, 2),
+        ("dubsync-maskable-512.png", 512, 2),
+    ):
+        payload = (WEB_PUBLIC / "brand" / name).read_bytes()
+        width, height = unpack(">II", payload[16:24])
+        assert (width, height) == (expected_size, expected_size)
+        assert payload[25] == expected_color_type
+
+    generator = (ROOT / "web" / "scripts" / "build-brand-assets.mjs").read_text(encoding="utf-8")
+    assert "width:64%;height:64%" in generator
+    assert "document.fonts.ready" in generator
