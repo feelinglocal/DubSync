@@ -1,6 +1,6 @@
 # Brand, Theme, and SEO TDD Evidence
 
-Date: 2026-07-11  
+Date: 2026-07-11
 Branch: `codex/brand-seo-theme`
 
 ## Source
