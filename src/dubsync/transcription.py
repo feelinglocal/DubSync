@@ -108,6 +108,8 @@ def generate_srt_from_audio(
                 cues,
                 punctuation_adapter,
                 scene_gap_seconds=_punctuation_scene_gap(provider_config),
+                max_chars_per_line=profile.max_chars_per_line,
+                max_lines_per_cue=profile.max_lines_per_cue,
             )
             flags.extend(punctuation_flags)
             _record_punctuation_cost(cost_meter, punctuation_adapter, provider_config)

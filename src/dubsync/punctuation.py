@@ -5,6 +5,7 @@ import unicodedata
 from typing import Protocol
 
 from .models import Cue, QCFlag
+from .text_metrics import display_width, wrap_visual_width
 
 
 class PunctuationValidationError(ValueError):
@@ -34,6 +35,8 @@ def apply_punctuation_pass(
     cues: list[Cue],
     adapter: PunctuationAdapter,
     scene_gap_seconds: float = 4.0,
+    max_chars_per_line: int | None = None,
+    max_lines_per_cue: int | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     proposed: dict[int, str] = {}
     for batch in _scene_batches(cues, scene_gap_seconds):
@@ -67,6 +70,15 @@ def apply_punctuation_pass(
             continue
 
         lines = next_text.splitlines() or [next_text]
+        width_exceeded = max_chars_per_line is not None and any(
+            display_width(line) > max_chars_per_line for line in lines
+        )
+        line_count_exceeded = max_lines_per_cue is not None and len(lines) > max_lines_per_cue
+        if width_exceeded or line_count_exceeded:
+            plain_text = next_text.replace("\n", " ")
+            lines = [plain_text]
+            if max_chars_per_line is not None:
+                lines = wrap_visual_width(plain_text, max_chars_per_line) or [plain_text]
         updated.append(cue.with_lines(lines))
     return updated, flags
 

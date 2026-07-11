@@ -12,8 +12,9 @@ def test_readme_includes_final_acceptance_report_sections():
         "## Readiness Report",
         "### Measured Timings And Costs",
         "### Top 3 Risks",
-        "single approved paid web smoke remains pending",
-        "201 passed, 5 deselected",
+        "Production web `generate` smoke",
+        "205 passed, 5 deselected",
+        "A second paid run was not made",
         "Production dependency audit",
     ):
         assert expected in readme

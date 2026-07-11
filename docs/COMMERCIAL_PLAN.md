@@ -193,6 +193,13 @@ Before accepting paid customer media:
 - Replace manual pricing copy only when a working payment path exists.
 - Keep a human-review warning visible in Terms and delivery documentation.
 
+Release evidence from 2026-07-11:
+
+- `https://dubsync.onrender.com` served Git commit `5c79356` with job access required and intake available.
+- One authorized 3.444-second `generate` job completed through ElevenLabs Scribe and the configured Gemini punctuation pass.
+- The protected result contained one cue, zero QC flags, downloadable SRT/QC artifacts, and `$0.000376` recorded provider cost.
+- The run exposed one punctuation-stage line-length warning. The shared punctuation pass now reapplies the active style width, with unit and generate-path regression coverage. No second paid run was made under the one-job approval.
+
 ## 8. Product metrics
 
 Track operational data without retaining customer dialogue:

@@ -8,7 +8,8 @@ import yaml
 from typer.testing import CliRunner
 
 from dubsync.cli import app
-from dubsync.models import AudioSnippet
+from dubsync.models import AudioSnippet, Cue
+from dubsync.pipeline import _punctuation_cache_key
 from dubsync.srt_io import parse_srt_text
 
 
@@ -19,6 +20,16 @@ def test_cli_profile_writes_style_profile(tmp_path, sample_srt_path):
     data = yaml.safe_load((tmp_path / "style.yaml").read_text(encoding="utf-8"))
     assert data["fps"] == 30.0
     assert data["max_chars_per_line"] == 26
+
+
+def test_punctuation_cache_key_includes_line_constraints():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello there"])]
+    config = {"llm": {"provider": "fixture", "model": "fixture-punctuation", "punctuation": {}}}
+
+    house_style = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
+    wider_style = _punctuation_cache_key(cues, config, max_chars_per_line=42, max_lines_per_cue=2)
+
+    assert house_style.digest != wider_style.digest
 
 
 def test_cli_profile_rejects_malformed_sample_with_clear_message(tmp_path):

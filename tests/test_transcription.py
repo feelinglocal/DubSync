@@ -81,6 +81,52 @@ def test_generate_srt_from_audio_with_fixture_provider_writes_downloadable_artif
     assert (result.episode_workdir / "cost.json").exists()
 
 
+def test_generate_srt_reflows_punctuation_to_the_style_width(tmp_path):
+    audio_path = tmp_path / "dialogue.wav"
+    audio_path.write_bytes(b"fixture audio")
+    words_path = tmp_path / "words.json"
+    words_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": text, "start": index * 0.3, "end": index * 0.3 + 0.2, "confidence": 0.99}
+                    for index, text in enumerate(["Hello", "this", "is", "the", "Dubsync", "Cloud", "test"])
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(
+        "\n".join(
+            [
+                "asr:",
+                f"  fixture_path: '{words_path.as_posix()}'",
+                "llm:",
+                "  provider: fixture",
+                "  punctuation:",
+                "    1: 'Hello, this is the Dubsync Cloud test.'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    style_path = tmp_path / "style.yaml"
+    style_path.write_text("max_chars_per_line: 26\nmax_lines_per_cue: 2\n", encoding="utf-8")
+    output_path = tmp_path / "dialogue.generated.srt"
+
+    result = generate_srt_from_audio(
+        audio_path=audio_path,
+        output_path=output_path,
+        workdir=tmp_path / "work",
+        providers_path=providers_path,
+        style_path=style_path,
+    )
+
+    cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
+    assert cues[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
+    assert result.report["summary"]["style_violations"] == 0
+
+
 def test_cli_generate_exposes_audio_only_workflow(tmp_path):
     audio_path = tmp_path / "dialogue.wav"
     audio_path.write_bytes(b"fixture audio")

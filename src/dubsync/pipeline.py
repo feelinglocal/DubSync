@@ -277,14 +277,30 @@ def sync_episode(
         punctuation_adapter = punctuation_adapter_from_config(provider_config)
         if punctuation_adapter is not None:
             punctuation_input = rebuilt
-            cached_punctuation = _load_cached_punctuation(episode_workdir, punctuation_input, provider_config)
+            cached_punctuation = _load_cached_punctuation(
+                episode_workdir,
+                punctuation_input,
+                provider_config,
+                max_chars_per_line=profile.max_chars_per_line,
+                max_lines_per_cue=profile.max_lines_per_cue,
+            )
             if cached_punctuation is None:
                 rebuilt, punctuation_flags = apply_punctuation_pass(
                     punctuation_input,
                     punctuation_adapter,
                     scene_gap_seconds=_punctuation_scene_gap_seconds(provider_config),
+                    max_chars_per_line=profile.max_chars_per_line,
+                    max_lines_per_cue=profile.max_lines_per_cue,
                 )
-                _write_cached_punctuation(episode_workdir, punctuation_input, provider_config, rebuilt, punctuation_flags)
+                _write_cached_punctuation(
+                    episode_workdir,
+                    punctuation_input,
+                    provider_config,
+                    rebuilt,
+                    punctuation_flags,
+                    max_chars_per_line=profile.max_chars_per_line,
+                    max_lines_per_cue=profile.max_lines_per_cue,
+                )
                 _record_llm_usage_events(cost_meter, punctuation_adapter, provider_config, pass_name="punctuation")
             else:
                 rebuilt, punctuation_flags = cached_punctuation
@@ -452,9 +468,19 @@ def _load_cached_punctuation(
     episode_workdir: Path,
     cues: list[Cue],
     provider_config: dict[str, object],
+    *,
+    max_chars_per_line: int,
+    max_lines_per_cue: int,
 ) -> tuple[list[Cue], list[QCFlag]] | None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
-    payload = cache.read(_punctuation_cache_key(cues, provider_config))
+    payload = cache.read(
+        _punctuation_cache_key(
+            cues,
+            provider_config,
+            max_chars_per_line=max_chars_per_line,
+            max_lines_per_cue=max_lines_per_cue,
+        )
+    )
     if payload is None:
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("cues"), list) or not isinstance(payload.get("flags"), list):
@@ -471,10 +497,18 @@ def _write_cached_punctuation(
     provider_config: dict[str, object],
     output_cues: list[Cue],
     flags: list[QCFlag],
+    *,
+    max_chars_per_line: int,
+    max_lines_per_cue: int,
 ) -> None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     cache.write(
-        _punctuation_cache_key(input_cues, provider_config),
+        _punctuation_cache_key(
+            input_cues,
+            provider_config,
+            max_chars_per_line=max_chars_per_line,
+            max_lines_per_cue=max_lines_per_cue,
+        ),
         {
             "cues": [cue.model_dump() for cue in output_cues],
             "flags": [flag.model_dump() for flag in flags],
@@ -526,13 +560,23 @@ def _adjudication_cache_key(
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))
 
 
-def _punctuation_cache_key(cues: list[Cue], provider_config: dict[str, object]) -> CacheKey:
+def _punctuation_cache_key(
+    cues: list[Cue],
+    provider_config: dict[str, object],
+    *,
+    max_chars_per_line: int,
+    max_lines_per_cue: int,
+) -> CacheKey:
     llm_config = llm_config_for_pass(provider_config, "punctuation")
     provider = str(llm_config.get("provider", "gemini")).lower()
     model = str(llm_config.get("model") or _default_llm_model(provider))
     payload = {
         "pass": "punctuation",
         "scene_gap_seconds": _punctuation_scene_gap_seconds(provider_config),
+        "line_constraints": {
+            "max_chars_per_line": max_chars_per_line,
+            "max_lines_per_cue": max_lines_per_cue,
+        },
         "cues": [cue.model_dump(mode="json") for cue in cues],
     }
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))

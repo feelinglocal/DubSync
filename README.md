@@ -342,9 +342,9 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, and fixture-backed automated tests cover both customer workflows. The web surface includes gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
+Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and the approved production ElevenLabs plus Gemini smoke job completed. The web surface includes gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
 
-Still unverified or intentionally outside this release: the final paid-provider smoke through the updated deployment, real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
+Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 
 ### Measured Timings And Costs
 
@@ -352,36 +352,37 @@ Latest local offline verification in this workspace:
 
 | Command | Result | Runtime / cost evidence |
 |---|---|---|
-| `python -m pytest --cov=dubsync --cov-report=term-missing` | `201 passed, 5 deselected`, coverage `84.79%` | Normal offline suite; paid/live smoke tests deselected |
+| `python -m pytest --cov=dubsync --cov-report=term-missing` | `205 passed, 5 deselected`, coverage `85.22%` | Normal offline suite; paid/live smoke tests deselected |
 | `npm run test:coverage` | `24 passed`; statements `90.49%`, lines `94.28%` | React workflow, access gate, API client, session, legal, error, and media lifecycle tests |
 | `npm run test:e2e` | `5 passed` | Generate, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, and mobile layout |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
+| Production web `generate` smoke | PASS | 3.444-second WAV, 1 cue, 0 QC flags, `$0.000376` recorded provider cost on Render commit `5c79356` |
 | Render JSON Schema validation | PASS | `render.yaml` validates against Render's published schema |
 | Production dependency audit | PASS | `npm audit` and isolated `pip-audit` for `.[cloud,web]` report no known vulnerabilities |
 | `python -m dubsync --help` | PASS | Exposes `sync`, `batch`, `generate`, `profile`, and `report` |
 | `python -m dubsync profile Examples\"srt test.srt" -o tmp_profile_smoke.yaml` | PASS | Reproduces the 30 fps, 2-line, 26-char, 0.5s min-duration house profile |
 | Fixture-backed sync tests | PASS | Cost meter records fixture/local/resumed paths as zero API cost |
 
-The single approved paid web smoke remains pending until the updated commit is deployed and the Render job access secret is set. Published-cost metering is implemented for uncached ASR duration and LLM token usage when provider usage metadata is available.
+On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.onrender.com` in `generate` mode. ElevenLabs Scribe produced one cue and the configured Gemini punctuation pass completed without a provider error. The protected result reported `$0.000376` total provider cost, and all three artifacts downloaded successfully. QC reported zero flags and one line-length warning; that warning exposed a punctuation-stage reflow defect, which is now covered by unit and generate-pipeline regression tests. A second paid run was not made because approval covered one provider-backed job.
 
-`render.yaml` was schema-validated, but the Docker image was not built locally because Docker is unavailable on this machine. External deployment also requires a real Git repository/remote and Render authorization.
+`render.yaml` was schema-validated, but the Docker image was not built locally because Docker is unavailable on this machine. The connected GitHub repository and Render service provide the production Docker build evidence.
 
 ### Top 3 Risks
 
-1. Live-provider drift: ElevenLabs, Gemini, OpenAI, Anthropic, AssemblyAI, WhisperX, pyannote, and MMS adapters are protected by deterministic fakes, but real SDK/runtime behavior still needs opt-in smoke runs before production use.
+1. Live-provider drift: the ElevenLabs plus Gemini generate path has one production smoke result; OpenAI, Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run.
 2. Real-episode quality: synthetic fixtures prove timing, improv replacement, overlap, dropped-line, and source-error paths, but the PLAN targets need a golden episode set to measure cue-start MAE, improv precision/recall, and review burden on actual delivered material.
 3. Language quality beyond generic handling: CJK/full-width behavior is covered, but production quality for Japanese/Thai/Chinese/Korean and code-switching will benefit from language-specific tokenization and per-language house-style samples.
 
 ## Known Gaps
 
-- The updated deployed route still needs its single approved paid ElevenLabs and Gemini smoke job after the Render access secret is set.
+- The approved ElevenLabs plus Gemini smoke covered commit `5c79356`; the punctuation reflow correction that followed is verified offline and was not given a second paid run.
 - WhisperX local transcription is wired through the documented Python API: `load_model`, `load_audio`, `transcribe`, `load_align_model`, `align`, and optional diarization.
 - Live pyannote execution was not smoke-tested; it requires `dubsync[diarize-local]`, accepted model terms, and a Hugging Face token or local model path.
 - MMS forced alignment is implemented behind `dubsync[precision]`, but real model execution was not smoke-tested in this workspace.
 - Deterministic energy VAD is wired; optional Silero VAD is available with energy fallback, but production quality should be validated on a golden set.
 - CJK/Thai/Hangul/Japanese text now uses character-level tokenization and visual-width line checks; language-specific morphological tokenizers remain a future quality upgrade.
 - Live LLM speaker-to-character inference is implemented through the configured LLM adapter, but was not smoke-tested against real provider responses in this workspace.
-- Live LLM token cost metering is covered with deterministic response-shape tests, but was not smoke-tested against real Gemini/OpenAI/Anthropic responses in this workspace.
+- Live Gemini punctuation completed in the production web smoke; OpenAI and Anthropic usage metering remains covered only by deterministic response-shape tests.
 - Audio-snippet double-checks are implemented for Gemini inline audio, but were not live-smoke-tested against the real Gemini API in this workspace. Automatic Gemini context-cache creation/deletion remains unimplemented because it creates third-party resources and can incur storage billing; provide `cached_content` to reuse a cache created outside DubSync.
 - OpenAI and Anthropic token prices require explicit config overrides until model-specific billing defaults are confirmed.
 - The commercial web workspace supports submission, status, and downloads; a browser cue editor remains intentionally out of scope until customer QC behavior proves it is needed.

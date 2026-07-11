@@ -45,6 +45,36 @@ def test_punctuation_pass_preserves_valid_proposed_line_breaks():
     assert updated[0].lines == ["Hello,", "there."]
 
 
+def test_punctuation_pass_reflows_an_overlong_model_line():
+    cues = [Cue(index=1, start_ms=0, end_ms=2700, lines=["Hello this is the Dubsync", "Cloud test"])]
+    adapter = StaticPunctuationAdapter({1: "Hello, this is the Dubsync Cloud test."})
+
+    updated, flags = apply_punctuation_pass(
+        cues,
+        adapter,
+        max_chars_per_line=26,
+        max_lines_per_cue=2,
+    )
+
+    assert flags == []
+    assert updated[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
+
+
+def test_punctuation_pass_reflows_excess_model_lines():
+    cues = [Cue(index=1, start_ms=0, end_ms=2700, lines=["Hello this is the Dubsync", "Cloud test"])]
+    adapter = StaticPunctuationAdapter({1: "Hello,\nthis is the Dubsync\nCloud test."})
+
+    updated, flags = apply_punctuation_pass(
+        cues,
+        adapter,
+        max_chars_per_line=26,
+        max_lines_per_cue=2,
+    )
+
+    assert flags == []
+    assert updated[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
+
+
 def test_cli_sync_applies_fixture_punctuation_pass(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
