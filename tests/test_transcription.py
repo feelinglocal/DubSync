@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 from dubsync.cli import app
 from dubsync.models import Word
 from dubsync.srt_io import parse_srt_text
-from dubsync.style_profile import StyleProfile
+from dubsync.style_profile import GenerationConstraints, StyleProfile
 from dubsync.transcription import build_cues_from_words, generate_srt_from_audio
 
 
@@ -125,6 +125,53 @@ def test_generate_srt_reflows_punctuation_to_the_style_width(tmp_path):
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
     assert cues[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
     assert result.report["summary"]["style_violations"] == 0
+
+
+def test_generate_srt_applies_per_job_profile_and_reading_speed_constraints(tmp_path):
+    audio_path = tmp_path / "dialogue.wav"
+    audio_path.write_bytes(b"fixture audio")
+    words_path = tmp_path / "words.json"
+    words_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Every", "start": 0.0, "end": 0.12, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "word", "start": 0.13, "end": 0.24, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "fits.", "start": 0.25, "end": 0.4, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(f"asr:\n  fixture_path: '{words_path.as_posix()}'\n", encoding="utf-8")
+    output_path = tmp_path / "dialogue.generated.srt"
+    profile = StyleProfile(max_lines_per_cue=1, max_chars_per_line=18, min_cue_dur=0.4, tail_ms=0)
+    constraints = GenerationConstraints(
+        max_gap_seconds=0.5,
+        max_cue_duration_seconds=3.0,
+        min_cps=2.0,
+        max_cps=10.0,
+    )
+
+    result = generate_srt_from_audio(
+        audio_path=audio_path,
+        output_path=output_path,
+        workdir=tmp_path / "work",
+        providers_path=providers_path,
+        no_llm=True,
+        style_profile=profile,
+        generation_constraints=constraints,
+    )
+
+    cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 1 for cue in cues)
+    assert all(len(line) <= 18 for cue in cues for line in cue.lines)
+    assert cues[-1].end_ms >= 1600
+    assert result.report["summary"]["style_violations"] == 0
+    generated = json.loads((result.episode_workdir / "generate.json").read_text(encoding="utf-8"))
+    assert generated["profile"]["max_chars_per_line"] == 18
+    assert generated["constraints"]["max_cps"] == 10.0
 
 
 def test_cli_generate_exposes_audio_only_workflow(tmp_path):

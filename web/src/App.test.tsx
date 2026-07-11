@@ -17,6 +17,40 @@ const configResponse = {
   billing_enabled: false,
   access_code_required: false,
   jobs_available: true,
+  generation_styles: {
+    default_preset: 'standard',
+    presets: [
+      {
+        id: 'standard',
+        name: 'DubSync default',
+        values: {
+          max_lines_per_cue: 2, max_chars_per_line: 26,
+          min_cue_duration_seconds: 0.5, max_cue_duration_seconds: 5,
+          min_cps: 2, max_cps: 30, max_gap_seconds: 0.8, lead_in_ms: 0, tail_ms: 40,
+        },
+      },
+      {
+        id: 'streaming',
+        name: 'Streaming',
+        values: {
+          max_lines_per_cue: 2, max_chars_per_line: 42,
+          min_cue_duration_seconds: 1, max_cue_duration_seconds: 7,
+          min_cps: 2, max_cps: 20, max_gap_seconds: 1, lead_in_ms: 0, tail_ms: 120,
+        },
+      },
+    ],
+    custom_limits: {
+      max_lines_per_cue: { min: 1, max: 4, step: 1 },
+      max_chars_per_line: { min: 10, max: 80, step: 1 },
+      min_cue_duration_seconds: { min: 0.2, max: 5, step: 0.1 },
+      max_cue_duration_seconds: { min: 0.5, max: 20, step: 0.1 },
+      min_cps: { min: 0, max: 10, step: 0.5 },
+      max_cps: { min: 5, max: 60, step: 0.5 },
+      max_gap_seconds: { min: 0.1, max: 5, step: 0.1 },
+      lead_in_ms: { min: 0, max: 1000, step: 10 },
+      tail_ms: { min: 0, max: 1000, step: 10 },
+    },
+  },
 }
 
 afterEach(() => {
@@ -77,8 +111,62 @@ describe('DubSync workspace', () => {
     const [, options] = fetchMock.mock.calls[1]
     expect((options?.body as FormData).get('mode')).toBe('generate')
     expect((options?.body as FormData).get('subtitle')).toBeNull()
+    expect(JSON.parse(String((options?.body as FormData).get('style')))).toEqual({ source: 'preset', preset: 'standard' })
     expect(await screen.findByText('12 cues ready')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Download SRT' })).toBeEnabled()
+  })
+
+  it('offers preset and custom subtitle styles only for audio generation', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'styled-job', token: 'styled-token', mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 3, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(screen.queryByRole('group', { name: 'Subtitle style source' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    expect(screen.getByRole('group', { name: 'Subtitle style source' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Custom' }))
+    await user.clear(screen.getByLabelText('Characters per line'))
+    await user.type(screen.getByLabelText('Characters per line'), '34')
+    await user.clear(screen.getByLabelText('Maximum CPS'))
+    await user.type(screen.getByLabelText('Maximum CPS'), '21')
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const style = JSON.parse(String((fetchMock.mock.calls[1][1]?.body as FormData).get('style')))
+    expect(style.source).toBe('custom')
+    expect(style.values.max_chars_per_line).toBe(34)
+    expect(style.values.max_cps).toBe(21)
+  })
+
+  it('requires and uploads an SRT example when sample-derived style is selected', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'sample-job', token: 'sample-token', mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.click(screen.getByRole('button', { name: 'From SRT' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeDisabled()
+    const example = new File(['1\n00:00:00,000 --> 00:00:01,000\nExample.\n'], 'example.srt', { type: 'application/x-subrip' })
+    await user.upload(screen.getByLabelText('Style example SRT'), example)
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeEnabled()
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const body = fetchMock.mock.calls[1][1]?.body as FormData
+    expect(JSON.parse(String(body.get('style')))).toEqual({ source: 'sample' })
+    expect(body.get('style_sample')).toBe(example)
   })
 
   it('requires the access code issued with a manual quote', async () => {

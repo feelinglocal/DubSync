@@ -47,6 +47,38 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   expect(content).toContain('Timing follows the voice.')
 })
 
+test('audio generation derives cue shape from an uploaded SRT style example', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Generate from audio' }).click()
+  await page.getByRole('button', { name: 'From SRT' }).click()
+  await page.getByLabel('Dialogue audio').setInputFiles({
+    name: 'dialogue.wav',
+    mimeType: 'audio/wav',
+    buffer: Buffer.from('fixture audio'),
+  })
+  await page.getByLabel('Style example SRT').setInputFiles({
+    name: 'compact-style.srt',
+    mimeType: 'application/x-subrip',
+    buffer: Buffer.from(
+      '1\n00:00:00,000 --> 00:00:01,000\nCompact line\n\n' +
+      '2\n00:00:01,200 --> 00:00:02,200\nShort words\n',
+    ),
+  })
+  await page.getByLabel('Job access code').fill('fixture-access-code')
+
+  await page.getByRole('button', { name: 'Generate SRT' }).click()
+  await expect(page.getByText(/cues ready/)).toBeVisible()
+  const downloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Download SRT' }).click()
+  const download = await downloadPromise
+  const content = await readFile(await download.path(), 'utf-8')
+  const cueLines = content.trim().split(/\n\n+/).map((block) => block.split(/\r?\n/).slice(2))
+
+  expect(cueLines.length).toBeGreaterThan(1)
+  expect(cueLines.every((lines) => lines.length === 1)).toBe(true)
+  expect(cueLines.flat().every((line) => line.length <= 12)).toBe(true)
+})
+
 test('sync mode survives refresh and protects job artifacts', async ({ page, request }) => {
   await page.goto('/')
   await page.getByLabel('Dialogue audio').setInputFiles({

@@ -74,6 +74,158 @@ def test_create_generate_job_processes_and_protects_status_and_download(tmp_path
         assert "attachment" in download.headers["content-disposition"]
 
 
+def test_public_config_exposes_generation_style_presets_and_custom_limits(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+
+    with TestClient(app) as client:
+        response = client.get("/api/config")
+
+    styles = response.json()["generation_styles"]
+    assert styles["default_preset"] == "standard"
+    assert [preset["id"] for preset in styles["presets"]] == ["standard", "streaming", "broadcast", "short_form"]
+    assert styles["presets"][0]["values"] == {
+        "max_lines_per_cue": 2,
+        "max_chars_per_line": 26,
+        "min_cue_duration_seconds": 0.5,
+        "max_cue_duration_seconds": 5.0,
+        "min_cps": 2.0,
+        "max_cps": 30.0,
+        "max_gap_seconds": 0.8,
+        "lead_in_ms": 0,
+        "tail_ms": 40,
+    }
+    assert styles["custom_limits"]["max_chars_per_line"] == {"min": 10, "max": 80, "step": 1}
+
+
+def test_generate_job_resolves_preset_and_custom_styles_before_queueing(tmp_path):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    custom_values = {
+        "max_lines_per_cue": 1,
+        "max_chars_per_line": 34,
+        "min_cue_duration_seconds": 0.7,
+        "max_cue_duration_seconds": 4.5,
+        "min_cps": 3.0,
+        "max_cps": 21.0,
+        "max_gap_seconds": 0.6,
+        "lead_in_ms": 80,
+        "tail_ms": 120,
+    }
+
+    with TestClient(app) as client:
+        preset = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "25", "style": json.dumps({"source": "preset", "preset": "streaming"})},
+            files={"audio": ("preset.wav", b"fixture audio", "audio/wav")},
+        )
+        custom = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "style": json.dumps({"source": "custom", "values": custom_values})},
+            files={"audio": ("custom.wav", b"fixture audio", "audio/wav")},
+        )
+
+    assert preset.status_code == 202
+    assert custom.status_code == 202
+    preset_style = json.loads(captured[0].style)
+    custom_style = json.loads(captured[1].style)
+    assert preset_style["source"] == "preset"
+    assert preset_style["preset"] == "streaming"
+    assert preset_style["profile"]["fps"] == 25.0
+    assert preset_style["profile"]["max_chars_per_line"] == 42
+    assert preset_style["constraints"]["max_cps"] == 20.0
+    assert custom_style["source"] == "custom"
+    assert custom_style["profile"]["max_lines_per_cue"] == 1
+    assert custom_style["profile"]["lead_in_ms"] == 80
+    assert custom_style["constraints"]["max_cue_duration_seconds"] == 4.5
+
+
+def test_generate_job_rejects_invalid_custom_style_ranges(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+    values = {
+        "max_lines_per_cue": 2,
+        "max_chars_per_line": 26,
+        "min_cue_duration_seconds": 6.0,
+        "max_cue_duration_seconds": 2.0,
+        "min_cps": 2.0,
+        "max_cps": 30.0,
+        "max_gap_seconds": 0.8,
+        "lead_in_ms": 0,
+        "tail_ms": 40,
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "style": json.dumps({"source": "custom", "values": values})},
+            files={"audio": ("dialogue.wav", b"fixture audio", "audio/wav")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Custom minimum cue duration cannot exceed maximum cue duration."
+
+
+def test_generate_job_derives_style_from_uploaded_srt_example(tmp_path):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    style_example = (
+        "1\n00:00:00,000 --> 00:00:01,500\nA deliberately wider subtitle example line\n\n"
+        "2\n00:00:02,000 --> 00:00:06,000\nFirst line\nSecond line\nThird line\n"
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "24", "style": json.dumps({"source": "sample"})},
+            files={
+                "audio": ("dialogue.wav", b"fixture audio", "audio/wav"),
+                "style_sample": ("house-style.srt", style_example.encode(), "application/x-subrip"),
+            },
+        )
+
+    assert response.status_code == 202
+    resolved = json.loads(captured[0].style)
+    assert resolved["source"] == "sample"
+    assert resolved["profile"]["fps"] == 24.0
+    assert resolved["profile"]["cue_count"] == 2
+    assert resolved["profile"]["max_lines_per_cue"] == 3
+    assert resolved["profile"]["max_chars_per_line"] == len("A deliberately wider subtitle example line")
+    assert resolved["constraints"]["max_cue_duration_seconds"] == 4.0
+
+
+def test_generate_job_requires_a_valid_srt_for_sample_style(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+
+    with TestClient(app) as client:
+        missing = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "style": json.dumps({"source": "sample"})},
+            files={"audio": ("missing.wav", b"fixture audio", "audio/wav")},
+        )
+        malformed = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "style": json.dumps({"source": "sample"})},
+            files={
+                "audio": ("malformed.wav", b"fixture audio", "audio/wav"),
+                "style_sample": ("broken.srt", b"not an srt", "application/x-subrip"),
+            },
+        )
+
+    assert missing.status_code == 422
+    assert missing.json()["detail"] == "An SRT style example is required."
+    assert malformed.status_code == 422
+    assert malformed.json()["detail"].startswith("Could not read the SRT style example:")
+
+
 def test_sync_mode_requires_srt_and_rejects_unsupported_or_oversized_audio(tmp_path):
     app = create_app(settings=_settings(tmp_path, max_upload_bytes=16), processor=_fake_processor)
     with TestClient(app) as client:
@@ -243,6 +395,121 @@ def test_default_processor_forwards_selected_language_to_generate_pipeline(tmp_p
     default_processor(job, settings)
 
     assert calls["language"] == "de"
+
+
+def test_default_processor_applies_the_resolved_generation_style(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-custom-style"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    resolved_style = {
+        "source": "custom",
+        "preset": None,
+        "profile": {
+            "fps": 30.0,
+            "max_lines_per_cue": 1,
+            "max_chars_per_line": 32,
+            "min_cue_dur": 0.7,
+            "allow_zero_gap": True,
+            "lead_in_ms": 60,
+            "tail_ms": 100,
+            "overlap_policy": "stack",
+            "drop_policy": "keep_flagged",
+            "notes": [],
+        },
+        "constraints": {
+            "max_gap_seconds": 0.6,
+            "max_cue_duration_seconds": 4.0,
+            "min_cps": 3.0,
+            "max_cps": 21.0,
+        },
+    }
+    job = new_job_record(
+        job_id="custom-style",
+        token_hash=hash_job_token("token"),
+        mode="generate",
+        directory=directory,
+        audio_path=audio,
+        srt_path=None,
+        fps=30,
+        language="auto",
+        style=json.dumps(resolved_style),
+        retention_hours=24,
+    )
+    calls = {}
+
+    def fake_generate(_audio, output, _workdir, **kwargs):
+        calls.update(kwargs)
+        output.write_text("1\n00:00:00,000 --> 00:00:00,700\nReady.\n", encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output,
+            episode_workdir=artifacts,
+            report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.01),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.generate_srt_from_audio", fake_generate)
+
+    default_processor(job, settings)
+
+    assert calls["style_profile"].max_chars_per_line == 32
+    assert calls["style_profile"].lead_in_ms == 60
+    assert calls["generation_constraints"].max_cue_duration_seconds == 4.0
+    assert calls["generation_constraints"].max_cps == 21.0
+
+
+def test_default_processor_derives_sync_style_from_the_uploaded_srt(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    global_style = tmp_path / "global-style.yaml"
+    global_style.write_text("max_chars_per_line: 26\n", encoding="utf-8")
+    settings = replace(settings, style_path=global_style)
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-source-style"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    source = directory / "original.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:01,000\nSource style.\n", encoding="utf-8")
+    job = new_job_record(
+        job_id="source-style",
+        token_hash=hash_job_token("token"),
+        mode="sync",
+        directory=directory,
+        audio_path=audio,
+        srt_path=source,
+        fps=25,
+        language="auto",
+        style="source",
+        retention_hours=24,
+    )
+    calls = {}
+
+    def fake_sync(_srt, _audio, output, _workdir, **kwargs):
+        calls.update(kwargs)
+        output.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output,
+            episode_workdir=artifacts,
+            report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.01),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.sync_episode", fake_sync)
+
+    default_processor(job, settings)
+
+    assert calls["style_path"] is None
+    assert calls["fps"] == 25
 
 
 def test_web_settings_loads_dotenv_from_current_working_directory(tmp_path, monkeypatch):
