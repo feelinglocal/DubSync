@@ -82,10 +82,15 @@ def create_app(
     def health() -> dict[str, object]:
         if not service.store.healthcheck():
             raise HTTPException(status_code=503, detail="Storage is unavailable.")
-        return {"status": "ok", "service": "dubsync", "version": app.version}
+        payload: dict[str, object] = {"status": "ok", "service": "dubsync", "version": app.version}
+        if commit := os.getenv("RENDER_GIT_COMMIT"):
+            payload["commit"] = commit
+        return payload
 
     @app.get("/api/config")
     def public_config() -> dict[str, object]:
+        access_code_required = resolved_settings.require_job_access_code or bool(resolved_settings.job_access_code)
+        jobs_available = not resolved_settings.require_job_access_code or bool(resolved_settings.job_access_code)
         return {
             "retention_hours": resolved_settings.retention_hours,
             "max_upload_bytes": resolved_settings.max_upload_bytes,
@@ -97,6 +102,8 @@ def create_app(
                 "precision": {"usd_per_minute": 0.25, "minimum_usd": 10.0},
             },
             "billing_enabled": False,
+            "access_code_required": access_code_required,
+            "jobs_available": jobs_available,
         }
 
     @app.post("/api/jobs", status_code=202)
@@ -108,10 +115,17 @@ def create_app(
         fps: Annotated[float, Form()] = 30.0,
         language: Annotated[str, Form()] = "auto",
         style: Annotated[str, Form()] = "standard",
+        access_code: Annotated[str, Form()] = "",
     ) -> dict[str, object]:
         client_key = _client_key(request)
         if not limiter.allow(client_key):
             raise HTTPException(status_code=429, detail="Too many jobs. Try again later.")
+        if resolved_settings.require_job_access_code and not resolved_settings.job_access_code:
+            raise HTTPException(status_code=503, detail="Job access is not configured.")
+        if resolved_settings.job_access_code and not secrets.compare_digest(
+            access_code.strip(), resolved_settings.job_access_code
+        ):
+            raise HTTPException(status_code=403, detail="A valid job access code is required.")
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")

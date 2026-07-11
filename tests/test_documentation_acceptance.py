@@ -12,8 +12,9 @@ def test_readme_includes_final_acceptance_report_sections():
         "## Readiness Report",
         "### Measured Timings And Costs",
         "### Top 3 Risks",
-        "Live API smoke tests were not run",
-        "195 passed, 5 deselected",
+        "single approved paid web smoke remains pending",
+        "201 passed, 5 deselected",
+        "Production dependency audit",
     ):
         assert expected in readme
 
@@ -24,6 +25,17 @@ def test_render_blueprint_disk_omits_unsupported_shutdown_delay():
 
     assert service["disk"]["mountPath"] == "/var/data"
     assert "maxShutdownDelaySeconds" not in service
+
+
+def test_production_deployment_requires_job_gate_and_patched_installer():
+    blueprint = yaml.safe_load(Path("render.yaml").read_text(encoding="utf-8"))
+    env = {item["key"]: item for item in blueprint["services"][0]["envVars"]}
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+
+    assert env["DUBSYNC_REQUIRE_JOB_ACCESS_CODE"]["value"] == "1"
+    assert env["DUBSYNC_JOB_ACCESS_CODE"]["sync"] is False
+    assert 'python -m pip install --upgrade "pip>=26.1.2"' in dockerfile
+    assert dockerfile.index('python -m pip install --upgrade "pip>=26.1.2"') < dockerfile.index('python -m pip install ".[cloud,web]"')
 
 
 def test_readme_describes_forced_alignment_as_implemented_optional_path():

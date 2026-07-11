@@ -13,6 +13,8 @@ export interface PublicConfig {
   fps_values: number[]
   pricing: Record<'generate' | 'sync' | 'precision', PricingTier>
   billing_enabled: boolean
+  access_code_required: boolean
+  jobs_available: boolean
 }
 
 export interface JobResult {
@@ -43,4 +45,6 @@ export const defaultConfig: PublicConfig = {
     precision: { usd_per_minute: 0.25, minimum_usd: 10 },
   },
   billing_enabled: false,
+  access_code_required: false,
+  jobs_available: false,
 }

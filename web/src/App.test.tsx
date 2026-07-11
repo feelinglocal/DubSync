@@ -15,11 +15,14 @@ const configResponse = {
     precision: { usd_per_minute: 0.25, minimum_usd: 10 },
   },
   billing_enabled: false,
+  access_code_required: false,
+  jobs_available: true,
 }
 
 afterEach(() => {
   vi.restoreAllMocks()
   sessionStorage.clear()
+  window.history.replaceState({}, '', '/')
 })
 
 describe('DubSync workspace', () => {
@@ -32,6 +35,14 @@ describe('DubSync workspace', () => {
     expect(screen.getByLabelText('Original SRT')).toBeRequired()
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
     expect(await screen.findByText('Files are deleted after 24 hours')).toBeVisible()
+    expect(await screen.findByText(/Manual quote and invoice before paid processing/i)).toBeVisible()
+  })
+
+  it('serves the dedicated payment and refund policy route', () => {
+    window.history.replaceState({}, '', '/payments')
+    render(<App />)
+
+    expect(screen.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
   })
 
   it('switches to audio-only mode and submits a generate job without an SRT', async () => {
@@ -68,6 +79,41 @@ describe('DubSync workspace', () => {
     expect((options?.body as FormData).get('subtitle')).toBeNull()
     expect(await screen.findByText('12 cues ready')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Download SRT' })).toBeEnabled()
+  })
+
+  it('requires the access code issued with a manual quote', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      access_code_required: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'quoted-job', token: 'job-token', mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 1, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeDisabled()
+    await user.type(screen.getByLabelText('Job access code'), 'quote-code-1234')
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('access_code')).toBe('quote-code-1234')
+  })
+
+  it('disables production intake when the access gate is not configured', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ...configResponse,
+      access_code_required: true,
+      jobs_available: false,
+    }), { status: 200 }))
+    render(<App />)
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Job intake is temporarily unavailable')
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
   })
 
   it('restores an in-progress job after a page refresh', async () => {

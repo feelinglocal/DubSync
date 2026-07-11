@@ -15,12 +15,22 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [subtitle, setSubtitle] = useState<File | null>(null)
   const [fps, setFps] = useState('30')
   const [language, setLanguage] = useState('auto')
+  const [accessCode, setAccessCode] = useState('')
   const [job, setJob] = useState<JobResponse | null>(null)
   const [token, setToken] = useState(restoredAccess?.token || '')
   const [submitting, setSubmitting] = useState(false)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [error, setError] = useState('')
-  const canSubmit = useMemo(() => Boolean(audio && (mode === 'generate' || subtitle) && !submitting), [audio, mode, subtitle, submitting])
+  const canSubmit = useMemo(
+    () => Boolean(
+      config.jobs_available
+      && audio
+      && (mode === 'generate' || subtitle)
+      && (!config.access_code_required || accessCode.trim())
+      && !submitting
+    ),
+    [accessCode, audio, config.access_code_required, config.jobs_available, mode, subtitle, submitting],
+  )
 
   useEffect(() => {
     if (!restoredAccess || job) return
@@ -57,6 +67,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
     body.set('fps', fps)
     body.set('language', language)
     body.set('style', 'standard')
+    if (config.access_code_required) body.set('access_code', accessCode.trim())
     try {
       const created = await createJob(body)
       const nextToken = created.token || ''
@@ -109,16 +120,19 @@ export function Workspace({ config }: { config: PublicConfig }) {
             <UploadField label="Dialogue audio" kind="audio" accept={config.audio_extensions.join(',')} file={audio} required onChange={setAudio} />
             {mode === 'sync' && <UploadField label="Original SRT" kind="subtitle" accept=".srt,application/x-subrip,text/plain" file={subtitle} required onChange={setSubtitle} />}
           </div>
-          <div className="workspace-options">
+          <div className={config.access_code_required ? 'workspace-options has-access-code' : 'workspace-options'}>
             <label><span>Frame rate</span><select value={fps} onChange={(event) => setFps(event.target.value)}>{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select></label>
             <label><span>Language</span><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select></label>
-            <label><span>Style</span><select value="standard" disabled><option value="standard">Standard</option></select></label>
+            {config.access_code_required && config.jobs_available && (
+              <label><span>Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
+            )}
             <button className="primary-button" type="submit" disabled={!canSubmit}><Play />{submitting ? 'Uploading' : mode === 'sync' ? 'Start sync' : 'Generate SRT'}</button>
           </div>
+          {!config.jobs_available && <div className="service-notice" role="status">Job intake is temporarily unavailable. Contact <a href="mailto:reyhanputraph@gmail.com">reyhanputraph@gmail.com</a>.</div>}
           {error && <div className="form-error" role="alert">{error}</div>}
         </form>
         <div className="retention-note"><LockKeyhole />Files are deleted after {config.retention_hours} hours</div>
-        <WaveformPreview file={audio} />
+        {audio && <WaveformPreview file={audio} />}
         {job && <JobPanel job={job} onDownload={download} downloading={downloading} />}
       </div>
     </section>

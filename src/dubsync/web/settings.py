@@ -20,11 +20,16 @@ class WebSettings:
     max_jobs_per_hour: int = 5
     worker_threads: int = 1
     cleanup_interval_seconds: float = 300.0
+    job_access_code: str | None = None
+    require_job_access_code: bool = False
 
     @classmethod
     def from_env(cls) -> "WebSettings":
         load_dotenv(Path.cwd() / ".env", override=False)
         style_value = os.getenv("DUBSYNC_STYLE_PATH", "style_profile.yaml").strip()
+        access_code = os.getenv("DUBSYNC_JOB_ACCESS_CODE", "").strip() or None
+        if access_code is not None and len(access_code) < 12:
+            raise ValueError("DUBSYNC_JOB_ACCESS_CODE must contain at least 12 characters")
         return cls(
             data_dir=Path(os.getenv("DUBSYNC_DATA_DIR", "runtime-data")),
             providers_path=Path(os.getenv("DUBSYNC_PROVIDERS_PATH", "provider.yaml")),
@@ -37,6 +42,11 @@ class WebSettings:
             max_jobs_per_hour=_env_int("DUBSYNC_MAX_JOBS_PER_HOUR", 5),
             worker_threads=_env_int("DUBSYNC_WORKER_THREADS", 1),
             cleanup_interval_seconds=_env_float("DUBSYNC_CLEANUP_INTERVAL_SECONDS", 300.0),
+            job_access_code=access_code,
+            require_job_access_code=_env_bool(
+                "DUBSYNC_REQUIRE_JOB_ACCESS_CODE",
+                os.getenv("RENDER", "").strip().lower() == "true",
+            ),
         )
 
     def ensure_directories(self) -> None:

@@ -13,7 +13,7 @@ DubSync also includes a responsive React/FastAPI application with two customer w
 
 The language selector defaults to provider auto-detection. An explicit language is forwarded to ElevenLabs Scribe and becomes part of the cached ASR configuration.
 
-The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Every job receives a secret browser-held access token, uploads and results expire after 24 hours, and the API limits job creation per source IP. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
+The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Manual quotes issue a rotating job access code before paid processing, and every accepted job receives a separate secret browser-held result token. Uploads and results expire after 24 hours, and the API limits job creation per source IP. Production job intake fails closed when the access code is not configured. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
 
 Local web setup:
 
@@ -38,8 +38,9 @@ To deploy:
 
 1. Put this workspace in a real private Git repository and connect that repository to Render.
 2. Create a Blueprint from `render.yaml`.
-3. Enter `ELEVENLABS_API_KEY` and `GEMINI_API_KEY` as Render secrets. Never commit `.env`.
-4. Confirm `/api/health`, then run one paid-provider generate job and one sync job through the web UI before accepting customer media.
+3. Enter `ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. Never commit `.env`.
+4. Confirm `/api/health`, `/api/config` reports `jobs_available: true`, and the deployed commit matches the release SHA.
+5. Run one short paid-provider generate job through the web UI. The fixture-backed E2E suite covers sync behavior without provider spend.
 
 Local schema check after installing the development extra:
 
@@ -47,7 +48,7 @@ Local schema check after installing the development extra:
 .venv\Scripts\python.exe -c "import json, urllib.request, yaml; from jsonschema import Draft7Validator; data=yaml.safe_load(open('render.yaml', encoding='utf-8')); schema=json.load(urllib.request.urlopen('https://render.com/schema/render.yaml.json')); errors=list(Draft7Validator(schema).iter_errors(data)); print('VALID' if not errors else errors); raise SystemExit(bool(errors))"
 ```
 
-Supabase is not required for this MVP. Move metadata to a shared database and media to object storage before enabling multiple service instances or persistent customer history.
+Supabase is not required for this MVP. Move metadata to a shared database and media to object storage before enabling multiple service instances or persistent customer history. Rotate `DUBSYNC_JOB_ACCESS_CODE` whenever it is shared outside an accepted quote or a customer engagement ends.
 
 ## Windows Quickstart
 
@@ -341,9 +342,9 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-Current local status: the CLI and commercial web MVP are implemented and fixture-backed automated tests cover both customer workflows. Optional live/cloud adapters remain behind explicit provider config and opt-in smoke tests. The web surface includes job creation, polling, refresh recovery, protected downloads, legal pages, retention cleanup, and the Render deployment definition.
+Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, and fixture-backed automated tests cover both customer workflows. The web surface includes gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
 
-Still unverified or intentionally outside this release: live paid-provider web jobs, a deployed Render Blueprint, real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, payment collection, and a browser cue editor.
+Still unverified or intentionally outside this release: the final paid-provider smoke through the updated deployment, real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 
 ### Measured Timings And Costs
 
@@ -351,16 +352,17 @@ Latest local offline verification in this workspace:
 
 | Command | Result | Runtime / cost evidence |
 |---|---|---|
-| `python -m pytest --cov=dubsync --cov-report=term-missing` | `195 passed, 5 deselected`, coverage `84.73%` | Normal offline suite; paid/live smoke tests deselected |
-| `npm run test:coverage` | `18 passed`; all coverage metrics above 90% | React component, API client, session, error, and media lifecycle tests |
-| `npm run test:e2e` | `4 passed` | Generate, sync, token protection, refresh recovery, legal routes, and mobile layout |
+| `python -m pytest --cov=dubsync --cov-report=term-missing` | `201 passed, 5 deselected`, coverage `84.79%` | Normal offline suite; paid/live smoke tests deselected |
+| `npm run test:coverage` | `24 passed`; statements `90.49%`, lines `94.28%` | React workflow, access gate, API client, session, legal, error, and media lifecycle tests |
+| `npm run test:e2e` | `5 passed` | Generate, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, and mobile layout |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
 | Render JSON Schema validation | PASS | `render.yaml` validates against Render's published schema |
+| Production dependency audit | PASS | `npm audit` and isolated `pip-audit` for `.[cloud,web]` report no known vulnerabilities |
 | `python -m dubsync --help` | PASS | Exposes `sync`, `batch`, `generate`, `profile`, and `report` |
 | `python -m dubsync profile Examples\"srt test.srt" -o tmp_profile_smoke.yaml` | PASS | Reproduces the 30 fps, 2-line, 26-char, 0.5s min-duration house profile |
 | Fixture-backed sync tests | PASS | Cost meter records fixture/local/resumed paths as zero API cost |
 
-Live API smoke tests were not run in this workspace because they can spend API credits or require external model/model-card access. Published-cost metering is implemented for uncached ASR duration and LLM token usage when provider usage metadata is available.
+The single approved paid web smoke remains pending until the updated commit is deployed and the Render job access secret is set. Published-cost metering is implemented for uncached ASR duration and LLM token usage when provider usage metadata is available.
 
 `render.yaml` was schema-validated, but the Docker image was not built locally because Docker is unavailable on this machine. External deployment also requires a real Git repository/remote and Render authorization.
 
@@ -372,7 +374,7 @@ Live API smoke tests were not run in this workspace because they can spend API c
 
 ## Known Gaps
 
-- Live API smoke tests were not run; they are opt-in because they can spend API credits or require external model access.
+- The updated deployed route still needs its single approved paid ElevenLabs and Gemini smoke job after the Render access secret is set.
 - WhisperX local transcription is wired through the documented Python API: `load_model`, `load_audio`, `transcribe`, `load_align_model`, `align`, and optional diarization.
 - Live pyannote execution was not smoke-tested; it requires `dubsync[diarize-local]`, accepted model terms, and a Hugging Face token or local model path.
 - MMS forced alignment is implemented behind `dubsync[precision]`, but real model execution was not smoke-tested in this workspace.

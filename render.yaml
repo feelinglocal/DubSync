@@ -38,6 +38,10 @@ services:
         value: "0"
       - key: DUBSYNC_ENABLE_DOCS
         value: "0"
+      - key: DUBSYNC_REQUIRE_JOB_ACCESS_CODE
+        value: "1"
+      - key: DUBSYNC_JOB_ACCESS_CODE
+        sync: false
       - key: ELEVENLABS_API_KEY
         sync: false
       - key: GEMINI_API_KEY

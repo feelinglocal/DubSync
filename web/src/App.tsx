@@ -18,6 +18,7 @@ export default function App() {
 
   if (path === '/terms') return <LegalPage kind="terms" />
   if (path === '/privacy') return <LegalPage kind="privacy" />
+  if (path === '/payments') return <LegalPage kind="payments" />
 
   return (
     <div className="page-shell">

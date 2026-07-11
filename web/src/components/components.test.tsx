@@ -1,14 +1,19 @@
 import { useState } from 'react'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { JobResponse } from '../types'
 import { Header } from './Header'
 import { JobPanel } from './JobPanel'
 import { LegalPage } from './LegalPage'
 import { UploadField } from './UploadField'
-import { WaveformPreview } from './WaveformPreview'
+import { downsampleWaveform, formatAudioDuration, WaveformPreview } from './WaveformPreview'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 function job(overrides: Partial<JobResponse> = {}): JobResponse {
   return {
@@ -30,17 +35,27 @@ describe('shared components', () => {
     render(<Header />)
     await user.click(screen.getByRole('button', { name: 'Open menu' }))
     expect(screen.getByRole('button', { name: 'Close menu' })).toHaveAttribute('aria-expanded', 'true')
-    await user.click(screen.getByRole('button', { name: 'Close menu' }))
+    await user.click(screen.getByRole('link', { name: 'Features' }))
     expect(screen.getByRole('button', { name: 'Open menu' })).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('renders both legal documents', () => {
+  it('renders the terms, privacy, and payment policies', () => {
     const { rerender } = render(<LegalPage kind="terms" />)
     expect(screen.getByRole('heading', { name: 'Terms of Service' })).toBeVisible()
-    expect(screen.getByRole('heading', { name: /Fees and refunds/ })).toBeVisible()
+    expect(screen.getAllByText(/Reyhan Putra/).length).toBeGreaterThan(0)
     rerender(<LegalPage kind="privacy" />)
     expect(screen.getByRole('heading', { name: 'Privacy Policy' })).toBeVisible()
     expect(screen.getByRole('heading', { name: /Service providers/ })).toBeVisible()
+    rerender(<LegalPage kind="payments" />)
+    expect(screen.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: /When a full refund applies/ })).toBeVisible()
+    expect(screen.getByText(/within 7 calendar days/i)).toBeVisible()
+    expect(screen.getByText(/applicable taxes/i)).toBeVisible()
+  })
+
+  it('links the payment policy from the legal navigation', () => {
+    render(<LegalPage kind="terms" />)
+    expect(screen.getByRole('link', { name: 'Payments' })).toHaveAttribute('href', '/payments')
   })
 
   it('renders queued, processing, failed, and complete job states', async () => {
@@ -83,7 +98,14 @@ describe('shared components', () => {
     expect(screen.getByText('Choose dialogue audio')).toBeVisible()
   })
 
-  it('draws a waveform and replaces the object URL when the audio changes', async () => {
+  it('downsamples real decoded audio peaks without inventing cue content', () => {
+    expect(downsampleWaveform(new Float32Array([0, 0.5, -1, 0.25]), 2)).toEqual([0.5, 1])
+    expect(downsampleWaveform(new Float32Array(), 3)).toEqual([0, 0, 0])
+    expect(formatAudioDuration(59.6)).toBe('1:00 audio')
+    expect(formatAudioDuration(Number.NaN)).toBe('Waveform ready')
+  })
+
+  it('draws an audio preview and replaces the object URL when the file changes', async () => {
     const context = {
       clearRect: vi.fn(),
       beginPath: vi.fn(),
@@ -104,15 +126,48 @@ describe('shared components', () => {
     const { rerender, unmount } = render(<WaveformPreview file={first} />)
     expect(await screen.findByLabelText('Audio preview player')).toHaveAttribute('src', 'blob:first')
     expect(context.stroke).toHaveBeenCalled()
+    expect(screen.queryByLabelText('Subtitle cue preview')).not.toBeInTheDocument()
+    expect(screen.queryByText('Every word has a place.')).not.toBeInTheDocument()
 
     rerender(<WaveformPreview file={second} />)
     await waitFor(() => expect(screen.getByLabelText('Audio preview player')).toHaveAttribute('src', 'blob:second'))
     expect(revokeUrl).toHaveBeenCalledWith('blob:first')
     expect(createUrl).toHaveBeenCalledTimes(2)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Previous cue' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Next cue' }))
     unmount()
     expect(revokeUrl).toHaveBeenCalledWith('blob:second')
+  })
+
+  it('decodes the selected audio and draws peaks from its real channel data', async () => {
+    const context = {
+      clearRect: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn(),
+      lineTo: vi.fn(),
+      stroke: vi.fn(),
+      strokeStyle: '',
+      lineWidth: 0,
+    }
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context as unknown as CanvasRenderingContext2D)
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:decoded')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    vi.spyOn(File.prototype, 'arrayBuffer').mockResolvedValue(new ArrayBuffer(16))
+    const close = vi.fn().mockResolvedValue(undefined)
+    const decodeAudioData = vi.fn().mockResolvedValue({
+      duration: 65.2,
+      getChannelData: () => new Float32Array([0, 0.2, -0.8, 0.4, -1, 0.1]),
+    })
+    class FakeAudioContext {
+      decodeAudioData = decodeAudioData
+      close = close
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+
+    render(<WaveformPreview file={new File(['audio'], 'decoded.wav', { type: 'audio/wav' })} />)
+
+    expect(await screen.findByText('1:05 audio')).toBeVisible()
+    expect(decodeAudioData).toHaveBeenCalledOnce()
+    expect(context.lineTo.mock.calls.length).toBeGreaterThan(2)
+    await waitFor(() => expect(close).toHaveBeenCalled())
   })
 })

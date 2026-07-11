@@ -25,6 +25,8 @@ export default defineConfig({
       DUBSYNC_STATIC_DIR: 'web/dist',
       DUBSYNC_PROCESSING_INLINE: '1',
       DUBSYNC_MAX_JOBS_PER_HOUR: '50',
+      DUBSYNC_REQUIRE_JOB_ACCESS_CODE: '0',
+      DUBSYNC_JOB_ACCESS_CODE: 'fixture-access-code',
     },
   },
 })

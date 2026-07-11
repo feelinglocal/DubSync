@@ -100,13 +100,70 @@ def test_sync_mode_requires_srt_and_rejects_unsupported_or_oversized_audio(tmp_p
         assert oversized.status_code == 413
 
 
-def test_health_and_security_headers_are_present(tmp_path):
+def test_manual_job_access_code_is_required_without_exposing_the_secret(tmp_path):
+    settings = replace(
+        _settings(tmp_path),
+        job_access_code="quoted-access-code-1234",
+        require_job_access_code=True,
+    )
+    app = create_app(settings=settings, processor=_fake_processor)
+    with TestClient(app) as client:
+        config = client.get("/api/config")
+        missing = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30"},
+            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
+        )
+        invalid = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "access_code": "wrong-code"},
+            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
+        )
+        accepted = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "access_code": "quoted-access-code-1234"},
+            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
+        )
+
+    assert config.status_code == 200
+    assert config.json()["access_code_required"] is True
+    assert config.json()["jobs_available"] is True
+    assert "quoted-access-code-1234" not in config.text
+    assert missing.status_code == 403
+    assert invalid.status_code == 403
+    assert accepted.status_code == 202
+
+
+def test_production_job_intake_fails_closed_when_access_code_is_missing(tmp_path):
+    settings = replace(_settings(tmp_path), require_job_access_code=True)
+    app = create_app(settings=settings, processor=_fake_processor)
+    with TestClient(app) as client:
+        config = client.get("/api/config")
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30", "access_code": "anything"},
+            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
+        )
+
+    assert config.json()["access_code_required"] is True
+    assert config.json()["jobs_available"] is False
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Job access is not configured."
+
+
+def test_health_and_security_headers_are_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "abc123def456")
     app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
     with TestClient(app) as client:
         response = client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {
+        "status": "ok",
+        "service": "dubsync",
+        "version": "0.2.0",
+        "commit": "abc123def456",
+    }
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"

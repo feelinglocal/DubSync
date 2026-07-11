@@ -1,6 +1,6 @@
 # DubSync Commercial MVP Plan
 
-**Status:** implemented locally; deployment configuration validated as of 2026-07-11  
+**Status:** implemented, tested locally, and deployed to the Render default domain as of 2026-07-11
 **Engine contract:** `PLAN.md` remains authoritative for subtitle timing and reconciliation behavior.  
 **Product contact:** reyhanputraph@gmail.com
 
@@ -40,12 +40,14 @@ The first commercial version intentionally has no accounts, subscriptions, colla
 ### Commercial surface
 
 - Clean responsive React workspace and complete landing content.
-- Pricing, features, FAQ, contact, Terms of Service, and Privacy Policy.
+- Pricing, features, FAQ, contact, Terms of Service, Privacy Policy, and Payments and Refunds Policy.
+- Manual quote access code required before paid provider processing.
 - Job status and protected downloads.
 - Secret 256-bit job tokens; only token hashes are stored.
 - Tab-scoped job recovery after refresh.
 - Strict extension, content-type, empty-file, and byte-limit validation.
 - Five jobs per source IP per hour by default.
+- Production intake fails closed when the job access code is missing.
 - Files and metadata expire after 24 hours, with an independent cleanup timer.
 - Security headers and a strict Content Security Policy.
 - No advertising analytics, account cookies, or billing integration.
@@ -99,7 +101,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY` and `GEMINI_API_KEY`, entered in Render only.
+- Secrets: `ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -112,7 +114,7 @@ Current baseline infrastructure cost:
 
 Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes source audio to 16 kHz mono before provider upload, which materially reduces service-initiated bandwidth.
 
-Local release verification validated `render.yaml` against Render's published JSON Schema. A container build and external Blueprint deployment were not run because this machine has no Docker engine, Render CLI, usable Git repository, or connected remote.
+Local release verification validates `render.yaml` against Render's published JSON Schema. GitHub auto-deploys the Docker service to Render. The health endpoint includes Render's injected commit SHA so a release can be verified without relying on dashboard status alone.
 
 ## 5. Pricing and margin policy
 
@@ -179,13 +181,15 @@ Do not introduce subscriptions yet. Start with manual quotes or one-time payment
 
 Before accepting paid customer media:
 
-- Put the project in a real private Git repository and connect it to Render.
-- Validate the Blueprint with the Render CLI or API.
+- Keep the GitHub repository connected to the Render service.
+- Validate the Blueprint against Render's published schema.
 - Set paid ElevenLabs and Gemini credentials in Render.
-- Run one live generate job and one live sync job through the web route.
+- Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
+- Run one short live generate job through the web route for each provider or model change.
+- Keep fixture-backed sync and generate browser tests green on every release.
 - Confirm provider data settings and contract terms appropriate for customer media.
 - Add uptime/error alerts and disk-usage alerts.
-- Confirm the operator legal name, business address, Indonesian governing-law choice, refund policy, and tax handling with qualified counsel/accounting advice.
+- Keep the operator identity, Indonesian governing-law choice, refund policy, and tax handling current; obtain qualified legal and tax review before material sales volume.
 - Replace manual pricing copy only when a working payment path exists.
 - Keep a human-review warning visible in Terms and delivery documentation.
 

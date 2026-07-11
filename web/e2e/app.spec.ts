@@ -2,6 +2,27 @@ import { readFile } from 'node:fs/promises'
 
 import { expect, test } from '@playwright/test'
 
+function sineWaveWav(durationSeconds = 1, sampleRate = 8_000) {
+  const sampleCount = durationSeconds * sampleRate
+  const output = Buffer.alloc(44 + sampleCount * 2)
+  output.write('RIFF', 0)
+  output.writeUInt32LE(36 + sampleCount * 2, 4)
+  output.write('WAVEfmt ', 8)
+  output.writeUInt32LE(16, 16)
+  output.writeUInt16LE(1, 20)
+  output.writeUInt16LE(1, 22)
+  output.writeUInt32LE(sampleRate, 24)
+  output.writeUInt32LE(sampleRate * 2, 28)
+  output.writeUInt16LE(2, 32)
+  output.writeUInt16LE(16, 34)
+  output.write('data', 36)
+  output.writeUInt32LE(sampleCount * 2, 40)
+  for (let index = 0; index < sampleCount; index += 1) {
+    output.writeInt16LE(Math.round(Math.sin((index / sampleRate) * Math.PI * 2 * 220) * 18_000), 44 + index * 2)
+  }
+  return output
+}
+
 test('audio-only job uploads, processes, and downloads an SRT', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Generate from audio' }).click()
@@ -10,6 +31,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
     mimeType: 'audio/wav',
     buffer: Buffer.from('fixture audio'),
   })
+  await page.getByLabel('Job access code').fill('fixture-access-code')
 
   const submit = page.getByRole('button', { name: 'Generate SRT' })
   await expect(submit).toBeEnabled()
@@ -40,6 +62,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
       '2\r\n00:00:20,000 --> 00:00:21,000\r\nTiming follows the voice.\r\n',
     ),
   })
+  await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Start sync' }).click()
   await expect(page.getByText('2 cues ready')).toBeVisible()
@@ -64,11 +87,35 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
   expect(content).toContain('Timing follows the voice.')
 })
 
+test('selected audio paints a decoded nonblank waveform', async ({ page }) => {
+  await page.goto('/')
+  await page.getByLabel('Dialogue audio').setInputFiles({
+    name: 'tone.wav',
+    mimeType: 'audio/wav',
+    buffer: sineWaveWav(),
+  })
+
+  await expect(page.getByText('0:01 audio')).toBeVisible()
+  const bluePixels = await page.getByLabel('Dialogue waveform').evaluate((canvas: HTMLCanvasElement) => {
+    const context = canvas.getContext('2d')
+    if (!context) return 0
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data
+    let count = 0
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (pixels[index] < 25 && pixels[index + 1] > 80 && pixels[index + 1] < 150 && pixels[index + 2] > 220 && pixels[index + 3] > 0) count += 1
+    }
+    return count
+  })
+  expect(bluePixels).toBeGreaterThan(100)
+})
+
 test('legal pages are reachable from direct production routes', async ({ page }) => {
   await page.goto('/terms')
   await expect(page.getByRole('heading', { name: 'Terms of Service' })).toBeVisible()
   await page.goto('/privacy')
   await expect(page.getByRole('heading', { name: 'Privacy Policy' })).toBeVisible()
+  await page.goto('/payments')
+  await expect(page.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
 })
 
 test('mobile first viewport has no horizontal overflow and introduces the next section', async ({ page }) => {
@@ -79,5 +126,7 @@ test('mobile first viewport has no horizontal overflow and introduces the next s
     scrollWidth: document.documentElement.scrollWidth,
   }))
   expect(dimensions.scrollWidth).toBe(dimensions.clientWidth)
+  const pricingFits = await page.locator('.pricing-table-wrap').evaluate((element) => element.scrollWidth <= element.clientWidth)
+  expect(pricingFits).toBe(true)
   await expect(page.getByRole('heading', { name: 'Built for subtitle professionals' })).toBeInViewport()
 })
