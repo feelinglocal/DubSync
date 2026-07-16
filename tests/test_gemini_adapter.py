@@ -4,12 +4,14 @@ import json
 import sys
 import types
 
+import pytest
+
 from dubsync.llm_providers import GeminiLLMAdapter, _adjudication_prompt, _punctuation_prompt, llm_adapter_from_config
 from dubsync.models import AudioSnippet, Cue, DivergenceSpan
 
 
 def test_google_genai_sdk_supports_medium_thinking_level():
-    from google.genai import types as google_types
+    google_types = pytest.importorskip("google.genai.types", reason="requires the optional cloud dependencies")
 
     assert google_types.ThinkingLevel.MEDIUM.value == "MEDIUM"
 

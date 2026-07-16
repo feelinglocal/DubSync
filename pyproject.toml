@@ -35,7 +35,7 @@ cloud = [
   "anthropic>=0.49",
   "assemblyai>=0.35",
   "elevenlabs>=1.50",
-  "google-genai>=2.10,<3",
+  "google-genai>=1.56,<3",
   "openai>=1.57",
 ]
 local = [

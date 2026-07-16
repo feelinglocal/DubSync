@@ -162,4 +162,4 @@ def test_readme_mentions_improv_precision_recall_metrics():
 def test_cloud_dependencies_require_medium_thinking_compatible_google_genai():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "google-genai>=2.10,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
+    assert "google-genai>=1.56,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
