@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .audio import normalize_audio
+from .audio import AudioNormalizationLimits, normalize_audio
 from .cache import JsonDiskCache
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
@@ -60,6 +60,7 @@ def generate_srt_from_audio(
     language: str | None = None,
     style_profile: StyleProfile | None = None,
     generation_constraints: GenerationConstraints | None = None,
+    audio_limits: AudioNormalizationLimits | None = None,
 ) -> TranscriptionResult:
     episode_workdir = workdir / audio_path.stem
     episode_workdir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +77,11 @@ def generate_srt_from_audio(
 
     audio_for_asr = audio_path
     if not asr_config.get("fixture_path"):
-        audio_for_asr = normalize_audio(audio_path, episode_workdir / "audio.16k.wav")
+        audio_for_asr = normalize_audio(
+            audio_path,
+            episode_workdir / "audio.16k.wav",
+            limits=audio_limits,
+        )
 
     provider = str(asr_config.get("provider", "fixture"))
     model = str(asr_config.get("model_id", asr_config.get("model", provider)))

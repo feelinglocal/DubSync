@@ -1,4 +1,8 @@
 import { defineConfig } from '@playwright/test'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const e2eDataDir = join(tmpdir(), `dubsync-e2e-${process.pid}-${Date.now()}`)
 
 export default defineConfig({
   testDir: './e2e',
@@ -19,12 +23,12 @@ export default defineConfig({
     reuseExistingServer: true,
     timeout: 30_000,
     env: {
-      DUBSYNC_DATA_DIR: 'runtime-data/e2e',
+      DUBSYNC_DATA_DIR: e2eDataDir,
       DUBSYNC_PROVIDERS_PATH: 'web/e2e/fixtures/providers.yaml',
       DUBSYNC_STYLE_PATH: 'style_profile.yaml',
       DUBSYNC_STATIC_DIR: 'web/dist',
-      DUBSYNC_PROCESSING_INLINE: '1',
-      DUBSYNC_MAX_JOBS_PER_HOUR: '50',
+      DUBSYNC_PROCESSING_INLINE: '0',
+      DUBSYNC_MAX_SUBMISSIONS_PER_HOUR: '50',
       DUBSYNC_REQUIRE_JOB_ACCESS_CODE: '0',
       DUBSYNC_JOB_ACCESS_CODE: 'fixture-access-code',
     },

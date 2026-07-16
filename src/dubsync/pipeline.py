@@ -10,7 +10,7 @@ from rapidfuzz import fuzz
 from .adjudication import AdjudicationEngine, KeepSRTAdapter
 from .aligner import align_cues_to_words
 from .asr_timing import clamp_asr_word_durations
-from .audio import normalize_audio
+from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache
 from .changes import apply_adjudication_decisions
@@ -87,6 +87,7 @@ def sync_episode(
     resume: str | None = None,
     local: bool = False,
     language: str | None = None,
+    audio_limits: AudioNormalizationLimits | None = None,
 ) -> PipelineResult:
     resume_stage = _normalize_resume_stage(resume)
     episode_workdir = workdir / srt_path.stem
@@ -112,7 +113,11 @@ def sync_episode(
     else:
         asr_config = provider_config.get("asr", {}) if isinstance(provider_config, dict) else {}
         if isinstance(asr_config, dict) and not asr_config.get("fixture_path"):
-            audio_for_asr = normalize_audio(audio_path, episode_workdir / "audio.16k.wav")
+            audio_for_asr = normalize_audio(
+                audio_path,
+                episode_workdir / "audio.16k.wav",
+                limits=audio_limits,
+            )
         raw_adapter = adapter_from_config(provider_config)
         if isinstance(asr_config, dict):
             asr_provider = str(asr_config.get("provider", "fixture"))

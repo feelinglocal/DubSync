@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createJob, downloadJobArtifact, loadConfig, loadJob } from './api'
+import { createBatch, createJob, downloadJobArtifact, loadConfig, loadJob } from './api'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -29,6 +29,25 @@ describe('web API client', () => {
     await expect(createJob(body)).rejects.toThrow('Audio is empty.')
     await expect(createJob(body)).rejects.toThrow('Could not start the job.')
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/jobs', { method: 'POST', body })
+  })
+
+  it('sends the quote access code in a preflight header for jobs and batches', async () => {
+    const body = new FormData()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ id: 'job-1' }), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ id: 'batch-1', jobs: [] }), { status: 202 }))
+
+    await createJob(body, 'quote-code-1234')
+    await createBatch(body, 'quote-code-1234')
+
+    const expectedOptions = {
+      method: 'POST',
+      body,
+      headers: { 'X-DubSync-Access-Code': 'quote-code-1234' },
+    }
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/jobs', expectedOptions)
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/batches', expectedOptions)
+    expect(body.has('access_code')).toBe(false)
   })
 
   it('loads a protected job and rejects an unavailable one', async () => {
@@ -74,5 +93,22 @@ describe('web API client', () => {
     expect(click).toHaveBeenCalledOnce()
     await expect(downloadJobArtifact('job-4', 'secret', 'srt')).rejects.toThrow('Could not download this file.')
   })
-})
 
+  it('decodes RFC 5987 download filenames used for spaces and Unicode', async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.download).toBe('Caf\u00e9 episode-dubsync-synced.srt')
+    })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(new Blob(['subtitle']), {
+        status: 200,
+        headers: {
+          'content-disposition': "attachment; filename*=utf-8''Caf%C3%A9%20episode-dubsync-synced.srt",
+        },
+      }),
+    )
+
+    await downloadJobArtifact('job-5', 'secret', 'srt')
+
+    expect(click).toHaveBeenCalledOnce()
+  })
+})

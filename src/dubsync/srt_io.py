@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 from .models import Cue
 
@@ -12,6 +14,17 @@ TIMESTAMP_RE = re.compile(
 
 class SRTParseError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class SRTParseLimits:
+    max_lines: int
+    max_cues: int
+    max_line_chars: int
+
+    def __post_init__(self) -> None:
+        if min(self.max_lines, self.max_cues, self.max_line_chars) <= 0:
+            raise ValueError("SRT parse limits must be greater than zero")
 
 
 def parse_timestamp(value: str) -> int:
@@ -31,25 +44,68 @@ def format_timestamp(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 
-def _split_blocks(text: str) -> list[list[str]]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
-    blocks: list[list[str]] = []
+def _iter_lines(text: str, limits: SRTParseLimits | None) -> Iterator[tuple[int, str]]:
+    start = 0
+    cursor = 0
+    line_number = 0
+    text_length = len(text)
+    while cursor < text_length:
+        character = text[cursor]
+        if character not in {"\r", "\n"}:
+            cursor += 1
+            continue
+        line_number += 1
+        line = text[start:cursor]
+        if line_number == 1:
+            line = line.lstrip("\ufeff")
+        _validate_line_limit(line, line_number=line_number, limits=limits)
+        yield line_number, line
+        cursor += 2 if character == "\r" and cursor + 1 < text_length and text[cursor + 1] == "\n" else 1
+        start = cursor
+
+    if start < text_length:
+        line_number += 1
+        line = text[start:]
+        if line_number == 1:
+            line = line.lstrip("\ufeff")
+        _validate_line_limit(line, line_number=line_number, limits=limits)
+        yield line_number, line
+
+
+def _validate_line_limit(
+    line: str,
+    *,
+    line_number: int,
+    limits: SRTParseLimits | None,
+) -> None:
+    if limits is None:
+        return
+    if line_number > limits.max_lines:
+        raise SRTParseError(f"subtitle exceeds {limits.max_lines} lines")
+    if len(line) > limits.max_line_chars:
+        raise SRTParseError(
+            f"subtitle line {line_number} exceeds {limits.max_line_chars} characters"
+        )
+
+
+def _split_blocks(text: str, limits: SRTParseLimits | None = None) -> Iterator[list[str]]:
     current: list[str] = []
-    for line in normalized.split("\n"):
+    for _, line in _iter_lines(text, limits):
         if line.strip() == "":
             if current:
-                blocks.append(current)
+                yield current
                 current = []
             continue
         current.append(line)
     if current:
-        blocks.append(current)
-    return blocks
+        yield current
 
 
-def parse_srt_text(text: str) -> list[Cue]:
+def parse_srt_text(text: str, *, limits: SRTParseLimits | None = None) -> list[Cue]:
     cues: list[Cue] = []
-    for block_number, block in enumerate(_split_blocks(text), start=1):
+    for block_number, block in enumerate(_split_blocks(text, limits), start=1):
+        if limits is not None and block_number > limits.max_cues:
+            raise SRTParseError(f"subtitle exceeds {limits.max_cues} cues")
         if len(block) < 3:
             raise SRTParseError(f"block {block_number} is incomplete")
         try:

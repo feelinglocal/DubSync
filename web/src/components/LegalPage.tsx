@@ -16,7 +16,7 @@ export type LegalKind = 'terms' | 'privacy' | 'payments'
 
 const termsSections: Section[] = [
   { title: '1. Acceptance', paragraphs: ['By accessing or using DubSync, you agree to these Terms. If you use the service for an organization, you confirm that you can bind that organization. Do not use DubSync if you do not agree.'] },
-  { title: '2. Operator and contact', paragraphs: ['DubSync is operated by Reyhan Putra as an individual business based in Indonesia. Legal, billing, privacy, and support notices may be sent to reyhanputraph@gmail.com.'] },
+  { title: '2. Operator and contact', paragraphs: ['DubSync is operated by Reyhan Putra as an individual business based in Indonesia. Legal, billing, privacy, and support notices may be sent to rey@feelslocal.com.'] },
   { title: '3. The service', paragraphs: ['DubSync synchronizes subtitle files to dialogue audio and can generate subtitle files from audio. It is not an archival storage product, a full subtitle editor, or a substitute for professional localization review. Features may change as the service develops.'] },
   { title: '4. Your content and permissions', paragraphs: ['You retain ownership of your audio, subtitles, and outputs. You grant DubSync a limited and temporary license to host, copy, transform, and send that content to service providers only as needed to provide, secure, and troubleshoot the requested job.', 'You must hold all rights, licenses, consents, and permissions required to upload and process the content, including rights relating to copyright, performers, voices, personal data, and confidential material.'] },
   { title: '5. Automated processing and providers', paragraphs: ['DubSync uses speech recognition, language models, hosting, and infrastructure providers. These providers process data under their own terms and privacy commitments. Subtitle timing comes from acoustic timestamps and optional forced alignment. Language models do not set cue timestamps.'] },
@@ -30,11 +30,11 @@ const termsSections: Section[] = [
   { title: '13. Limitation of liability', paragraphs: ['To the fullest extent permitted by law, DubSync is not liable for indirect, incidental, special, consequential, exemplary, or punitive damages, or for lost revenue, profit, data, goodwill, or business opportunity. DubSync\'s aggregate liability for a claim is limited to the greater of the amount paid for the affected job or USD 100. This limit does not apply where liability cannot legally be limited.'] },
   { title: '14. Indemnity', paragraphs: ['To the extent permitted by law, you will defend and indemnify DubSync against third-party claims arising from your content, your lack of required rights or consent, your unlawful use of the service, or your material breach of these Terms.'] },
   { title: '15. Governing law and disputes', paragraphs: ['These Terms are governed by the laws of the Republic of Indonesia, without regard to conflict-of-law rules, except where mandatory local law applies. Before filing a claim, each party will try in good faith for 30 days to resolve the dispute by contacting the other party.'] },
-  { title: '16. Changes and contact', paragraphs: ['DubSync may update these Terms for legal, security, or product reasons. Material changes will be posted with a new effective date. Questions may be sent to reyhanputraph@gmail.com.'] },
+  { title: '16. Changes and contact', paragraphs: ['DubSync may update these Terms for legal, security, or product reasons. Material changes will be posted with a new effective date. Questions may be sent to rey@feelslocal.com.'] },
 ]
 
 const privacySections: Section[] = [
-  { title: '1. Operator and data controller', paragraphs: ['Reyhan Putra operates DubSync as an individual business based in Indonesia and acts as the controller of personal data processed for the service. Privacy questions and recorded rights requests may be sent to reyhanputraph@gmail.com.'] },
+  { title: '1. Operator and data controller', paragraphs: ['Reyhan Putra operates DubSync as an individual business based in Indonesia and acts as the controller of personal data processed for the service. Privacy questions and recorded rights requests may be sent to rey@feelslocal.com.'] },
   { title: '2. Data we process', paragraphs: ['DubSync processes audio, subtitle files, generated outputs, QC artifacts, filenames, technical job metadata, approximate request source such as IP address, and messages you send to support. Do not upload personal data that is unnecessary for the job.'] },
   { title: '3. Why we process it', paragraphs: ['We use this data to provide requested subtitle processing, secure and rate-limit the service, diagnose failures, answer support requests, calculate job cost, prevent abuse, and comply with legal obligations.'] },
   { title: '4. Service providers', paragraphs: ['DubSync runs primarily on Render infrastructure. Cloud processing can send content to ElevenLabs for speech recognition and Google Gemini for bounded language reasoning. Other providers are used only when configured for a specific job. Their processing is governed by their own terms and data practices.', 'DubSync does not promise zero retention by a provider unless that setting is confirmed for the relevant account and job.'] },
@@ -44,7 +44,7 @@ const privacySections: Section[] = [
   { title: '8. Security', paragraphs: ['DubSync uses secret job links, restricted download paths, upload limits, encryption in transit, isolated job directories, security headers, and automatic deletion. No internet service can guarantee absolute security. Protect your job link because anyone who has it can access the job until it expires.'] },
   { title: '9. Cookies and analytics', paragraphs: ['The current service does not use advertising trackers or behavioral analytics. Essential hosting and security systems may process request metadata. If analytics or account cookies are introduced, this policy will be updated before they are used.'] },
   { title: '10. Children', paragraphs: ['DubSync is intended for professional users and is not directed to children. Do not knowingly submit a child\'s personal data without a lawful basis and all required consent.'] },
-  { title: '11. Changes and contact', paragraphs: ['This policy may be updated as the service, providers, or legal obligations change. The effective date will be revised. Contact reyhanputraph@gmail.com with privacy questions or requests.'] },
+  { title: '11. Changes and contact', paragraphs: ['This policy may be updated as the service, providers, or legal obligations change. The effective date will be revised. Contact rey@feelslocal.com with privacy questions or requests.'] },
 ]
 
 const paymentSections: Section[] = [
@@ -54,9 +54,9 @@ const paymentSections: Section[] = [
   { title: '4. When a full refund applies', paragraphs: ['A full refund applies when DubSync receives your cancellation before the job enters paid provider processing, when you were charged more than once for the same job, or when DubSync cannot start the accepted job and no reasonable alternative is agreed.'] },
   { title: '5. Rerun or refund for service failure', paragraphs: ['If DubSync completes processing but fails to make the promised output available because of a confirmed DubSync or provider error, you may choose one no-cost rerun. If the rerun cannot correct the failure within five business days, you may request a refund for the affected job.'] },
   { title: '6. When a completed job is not refundable', paragraphs: ['Once paid provider processing has completed and the output is available, the job is not refundable solely because you changed your mind, supplied incorrect or poor-quality source media, lacked required rights, selected the wrong workflow or language, or expected an outcome beyond the accepted quote. This does not limit a refund required by law or the service-failure protection above.'] },
-  { title: '7. How to request a refund', paragraphs: ['Email reyhanputraph@gmail.com within 7 calendar days after the affected job completes. Include the job ID, invoice reference, reason, and any useful QC evidence. Do not send API keys, payment-card details, or unnecessary personal data. DubSync will acknowledge the request within two business days and normally decide it within five business days.'] },
+  { title: '7. How to request a refund', paragraphs: ['Email rey@feelslocal.com within 7 calendar days after the affected job completes. Include the job ID, invoice reference, reason, and any useful QC evidence. Do not send API keys, payment-card details, or unnecessary personal data. DubSync will acknowledge the request within two business days and normally decide it within five business days.'] },
   { title: '8. Refund timing and method', paragraphs: ['Approved refunds are returned to the original payment method where practical. DubSync initiates the refund within 10 business days after approval. Your bank or payment provider may take additional time to post it. Currency conversion and third-party fees outside DubSync\'s control may affect the final amount received.'] },
-  { title: '9. Consumer rights and contact', paragraphs: ['Nothing in this policy removes a mandatory consumer right or remedy that applies to you. Questions, cancellation notices, and complaints may be sent to Reyhan Putra at reyhanputraph@gmail.com.'] },
+  { title: '9. Consumer rights and contact', paragraphs: ['Nothing in this policy removes a mandatory consumer right or remedy that applies to you. Questions, cancellation notices, and complaints may be sent to Reyhan Putra at rey@feelslocal.com.'] },
 ]
 
 const documents: Record<LegalKind, LegalDocument> = {
@@ -86,7 +86,7 @@ export function LegalPage({ kind }: { kind: LegalKind }) {
         <header className="legal-heading">
           <h1>{document.title}</h1>
           <p>{document.summary}</p>
-          <span>Effective July 11, 2026</span>
+          <span>Effective July 16, 2026</span>
         </header>
         <div className="legal-content">
           {document.sections.map((section) => (

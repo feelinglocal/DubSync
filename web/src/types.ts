@@ -43,6 +43,7 @@ export interface GenerationStylesConfig {
 export interface PublicConfig {
   retention_hours: number
   max_upload_bytes: number
+  max_srt_bytes: number
   audio_extensions: string[]
   fps_values: number[]
   pricing: Record<'generate' | 'sync' | 'precision', PricingTier>
@@ -60,6 +61,9 @@ export interface JobResult {
 export interface JobResponse {
   id: string
   token?: string
+  source_name?: string | null
+  batch_id?: string | null
+  batch_position?: number | null
   mode: JobMode
   status: JobStatus
   progress: number
@@ -69,9 +73,15 @@ export interface JobResponse {
   downloads: string[]
 }
 
+export interface BatchResponse {
+  id: string
+  jobs: JobResponse[]
+}
+
 export const defaultConfig: PublicConfig = {
   retention_hours: 24,
-  max_upload_bytes: 2_147_483_648,
+  max_upload_bytes: 536_870_912,
+  max_srt_bytes: 2_097_152,
   audio_extensions: ['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav'],
   fps_values: [23.976, 24, 25, 29.97, 30],
   pricing: {

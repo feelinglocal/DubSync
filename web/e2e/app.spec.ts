@@ -36,7 +36,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   const submit = page.getByRole('button', { name: 'Generate SRT' })
   await expect(submit).toBeEnabled()
   await submit.click()
-  await expect(page.getByText('2 cues ready')).toBeVisible()
+  await expect(page.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 })
 
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
@@ -67,7 +67,7 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
   await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Generate SRT' }).click()
-  await expect(page.getByText(/cues ready/)).toBeVisible()
+  await expect(page.getByText(/cues ready/)).toBeVisible({ timeout: 15_000 })
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
@@ -97,7 +97,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
   await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Start sync' }).click()
-  await expect(page.getByText('2 cues ready')).toBeVisible()
+  await expect(page.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 })
   const access = await page.evaluate(() => (JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)[0])
   expect(access.id).toBeTruthy()
   expect(access.token).toBeTruthy()
@@ -142,10 +142,11 @@ test('matched files submit as one sequential batch and keep per-source download 
   await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Start sync' }).click()
-  await expect(page.getByText('Batch results')).toBeVisible()
-  await expect(page.getByText('001')).toBeVisible()
-  await expect(page.getByText('002')).toBeVisible()
-  await expect(page.getByText(/cues ready/)).toHaveCount(2)
+  const batchResults = page.getByRole('region', { name: 'Batch results' })
+  await expect(batchResults).toBeVisible()
+  await expect(batchResults.getByText('001', { exact: true })).toBeVisible()
+  await expect(batchResults.getByText('002', { exact: true })).toBeVisible()
+  await expect(batchResults.getByText(/cues ready/)).toHaveCount(2, { timeout: 30_000 })
 
   const accesses = await page.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)
   expect(accesses).toHaveLength(2)
@@ -219,7 +220,9 @@ test('brand, theme, and crawler surfaces use the production identity', async ({ 
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await expect(page.locator('header img.brand-mark')).toHaveAttribute('src', '/brand/dubsync-mark.svg')
   await expect(page.getByText('Part of Feels Local')).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Contact' })).toHaveAttribute('href', 'mailto:rey@feelslocal.com')
+  await expect(
+    page.getByRole('navigation', { name: 'Legal navigation' }).getByRole('link', { name: 'Contact' }),
+  ).toHaveAttribute('href', 'mailto:rey@feelslocal.com')
   await page.getByRole('button', { name: 'Use light theme' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
   await page.reload()

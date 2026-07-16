@@ -2,7 +2,7 @@
 
 **Status:** implemented, tested locally, and deployed to the Render default domain as of 2026-07-11
 **Engine contract:** `PLAN.md` remains authoritative for subtitle timing and reconciliation behavior.  
-**Product contact:** reyhanputraph@gmail.com
+**Product contact:** rey@feelslocal.com
 
 ## 1. Product decision
 
@@ -23,12 +23,13 @@ The first commercial version intentionally has no accounts, subscriptions, colla
 ### Customer workflows
 
 1. **Sync existing SRT**
-   - Upload dialogue audio and an original SRT.
+   - Upload one dialogue-audio/SRT pair or up to 10 matched pairs in one batch.
+   - Match pairs by filename, process every child one by one, and keep later children running when one fails.
    - Preserve unchanged cue text and segmentation.
    - Re-time cues from word timestamps.
    - Reconcile spoken differences and improvised lines.
    - Keep speaker changes separate.
-   - Download the synced SRT, QC JSON, QC HTML, and text-change SRT when available.
+   - Download the synced SRT, QC JSON, QC HTML, and text-change SRT when available. SRT downloads preserve the source stem and add `-dubsync-synced.srt`.
 
 2. **Generate from audio**
    - Upload dialogue audio without an SRT.
@@ -44,11 +45,15 @@ The first commercial version intentionally has no accounts, subscriptions, colla
 - Manual quote access code required before paid provider processing.
 - Job status and protected downloads.
 - Secret 256-bit job tokens; only token hashes are stored.
-- Tab-scoped job recovery after refresh.
+- Tab-scoped recovery of every child job after refresh.
+- Atomic batch validation for up to 10 inputs, with aggregate upload limits and isolated child tokens.
 - Strict extension, content-type, empty-file, and byte-limit validation.
-- Five jobs per source IP per hour by default.
+- Five batch or single-file submissions per source IP per hour by default, with at most 10 outstanding child jobs.
+- Serialized upload intake, a 512 MiB request cap, predicted PCM reservations, a four-hour duration cap, a 1 GiB per-job ceiling, a 4 GiB retained commitment quota, and 2 GiB minimum free space protect the 10 GB persistent disk.
 - Production intake fails closed when the job access code is missing.
 - Files and metadata expire after 24 hours, with an independent cleanup timer.
+- Queued or processing jobs idle for 24 hours are dead-lettered during startup or cleanup and receive a fresh terminal retention window.
+- FFmpeg normalization and snippet extraction use a finite 30-minute subprocess timeout.
 - Security headers and a strict Content Security Policy.
 - No advertising analytics, account cookies, or billing integration.
 
@@ -163,10 +168,9 @@ Do not introduce subscriptions yet. Start with manual quotes or one-time payment
    - Expose a retry command for failed jobs.
    - Resume from the last complete stage instead of repeating paid provider calls.
 
-5. **Batch delivery**
-   - Upload multiple matched SRT/audio pairs.
-   - Return one ZIP with results and a batch summary.
-   - Keep each episode isolated so one failure does not discard successful jobs.
+5. **Batch archive delivery**
+   - Package the already isolated per-file results into one ZIP.
+   - Include a machine-readable batch summary without removing individual downloads.
 
 ### Later: only after revenue validates demand
 

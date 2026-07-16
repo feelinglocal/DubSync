@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
+import dubsync.web.app as web_app_module
 from dubsync.web.app import create_app
 from dubsync.web.jobs import JobRecord, JobService, ProcessedArtifacts, default_processor, new_job_record
 from dubsync.web.security import hash_job_token
@@ -25,7 +30,7 @@ def _settings(tmp_path: Path, *, max_upload_bytes: int = 1024 * 1024) -> WebSett
         max_upload_bytes=max_upload_bytes,
         retention_hours=24,
         processing_inline=True,
-        max_jobs_per_hour=20,
+        max_submissions_per_hour=20,
     )
 
 
@@ -71,16 +76,21 @@ def test_create_generate_job_processes_and_protects_status_and_download(tmp_path
         )
         assert download.status_code == 200
         assert "Ready." in download.text
-        assert "attachment" in download.headers["content-disposition"]
+        assert download.headers["content-disposition"] == (
+            'attachment; filename="dialogue-dubsync-synced.srt"'
+        )
 
 
 def test_public_config_exposes_generation_style_presets_and_custom_limits(tmp_path):
-    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+    settings = replace(_settings(tmp_path), max_srt_bytes=3 * 1024 * 1024)
+    app = create_app(settings=settings, processor=_fake_processor)
 
     with TestClient(app) as client:
         response = client.get("/api/config")
 
-    styles = response.json()["generation_styles"]
+    payload = response.json()
+    assert payload["max_srt_bytes"] == 3 * 1024 * 1024
+    styles = payload["generation_styles"]
     assert styles["default_preset"] == "standard"
     assert [preset["id"] for preset in styles["presets"]] == ["standard", "streaming", "broadcast", "short_form"]
     assert styles["presets"][0]["values"] == {
@@ -252,78 +262,142 @@ def test_sync_mode_requires_srt_and_rejects_unsupported_or_oversized_audio(tmp_p
         assert oversized.status_code == 413
 
 
-def test_render_rate_limit_uses_the_proxy_appended_client_address(tmp_path, monkeypatch):
-    monkeypatch.setenv("RENDER", "true")
-    settings = replace(_settings(tmp_path), max_jobs_per_hour=1)
+def test_retained_storage_quota_rejects_before_multipart_parsing(tmp_path, monkeypatch):
+    settings = replace(_settings(tmp_path), max_retained_storage_bytes=128)
+    retained = settings.data_dir / "job-retained"
+    retained.mkdir(parents=True)
+    (retained / "payload.bin").write_bytes(b"x" * 96)
     app = create_app(settings=settings, processor=_fake_processor)
 
+    async def unexpected_form(*_args, **_kwargs):
+        raise AssertionError("storage-rejected requests must not be parsed")
+
+    monkeypatch.setattr("starlette.requests.Request.form", unexpected_form)
     with TestClient(app) as client:
-        accepted = client.post(
-            "/api/jobs",
-            headers={"X-Forwarded-For": "198.51.100.11, 203.0.113.8"},
-            data={"mode": "generate", "fps": "30"},
-            files={"audio": ("first.wav", b"audio", "audio/wav")},
-        )
-        limited = client.post(
-            "/api/jobs",
-            headers={"X-Forwarded-For": "198.51.100.12, 203.0.113.8"},
-            data={"mode": "generate", "fps": "30"},
-            files={"audio": ("second.wav", b"audio", "audio/wav")},
-        )
-
-    assert accepted.status_code == 202
-    assert limited.status_code == 429
-
-
-def test_manual_job_access_code_is_required_without_exposing_the_secret(tmp_path):
-    settings = replace(
-        _settings(tmp_path),
-        job_access_code="quoted-access-code-1234",
-        require_job_access_code=True,
-    )
-    app = create_app(settings=settings, processor=_fake_processor)
-    with TestClient(app) as client:
-        config = client.get("/api/config")
-        missing = client.post(
-            "/api/jobs",
-            data={"mode": "generate", "fps": "30"},
-            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
-        )
-        invalid = client.post(
-            "/api/jobs",
-            data={"mode": "generate", "fps": "30", "access_code": "wrong-code"},
-            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
-        )
-        accepted = client.post(
-            "/api/jobs",
-            data={"mode": "generate", "fps": "30", "access_code": "quoted-access-code-1234"},
-            files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
-        )
-
-    assert config.status_code == 200
-    assert config.json()["access_code_required"] is True
-    assert config.json()["jobs_available"] is True
-    assert "quoted-access-code-1234" not in config.text
-    assert missing.status_code == 403
-    assert invalid.status_code == 403
-    assert accepted.status_code == 202
-
-
-def test_production_job_intake_fails_closed_when_access_code_is_missing(tmp_path):
-    settings = replace(_settings(tmp_path), require_job_access_code=True)
-    app = create_app(settings=settings, processor=_fake_processor)
-    with TestClient(app) as client:
-        config = client.get("/api/config")
         response = client.post(
             "/api/jobs",
-            data={"mode": "generate", "fps": "30", "access_code": "anything"},
+            data={"mode": "generate", "fps": "30"},
             files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
         )
 
-    assert config.json()["access_code_required"] is True
-    assert config.json()["jobs_available"] is False
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Job access is not configured."
+    assert response.status_code == 507
+    assert response.json() == {
+        "detail": "Storage capacity is temporarily unavailable. Wait for existing jobs to expire."
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_predicted_normalized_storage_rejects_after_copy_and_cleans_the_job(tmp_path):
+    settings = replace(
+        _settings(tmp_path),
+        max_retained_storage_bytes=1_000_000,
+        max_normalized_audio_bytes=2_000_000,
+        max_job_work_bytes=400,
+        max_job_storage_bytes=3_000_000,
+    )
+    app = create_app(
+        settings=settings,
+        audio_duration_probe=lambda *_args, **_kwargs: 1.0,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30"},
+            files={"audio": ("compressed.wav", b"audio", "audio/wav")},
+        )
+
+    assert response.status_code == 507
+    assert response.json() == {
+        "detail": "Storage capacity is temporarily unavailable. Wait for existing jobs to expire."
+    }
+    assert list(settings.data_dir.glob("job-*")) == []
+
+
+def test_concurrent_intake_is_rejected_before_a_second_upload_is_copied(tmp_path, monkeypatch):
+    settings = replace(_settings(tmp_path), processing_inline=False)
+    app = create_app(settings=settings, processor=_fake_processor)
+    first_save_started = threading.Event()
+    release_first_save = threading.Event()
+    save_calls = 0
+    original_save = web_app_module._save_upload
+
+    async def blocking_save(*args, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 1:
+            first_save_started.set()
+            await asyncio.to_thread(release_first_save.wait, 3.0)
+        return await original_save(*args, **kwargs)
+
+    monkeypatch.setattr("dubsync.web.app._save_upload", blocking_save)
+    request = {
+        "data": {"mode": "generate", "fps": "30"},
+        "files": {"audio": ("dialogue.wav", b"audio", "audio/wav")},
+    }
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(client.post, "/api/jobs", **request)
+        assert first_save_started.wait(timeout=2.0)
+        try:
+            second = client.post("/api/jobs", **request)
+        finally:
+            release_first_save.set()
+        accepted = first.result(timeout=3.0)
+
+    assert accepted.status_code == 202
+    assert second.status_code == 429
+    assert second.json() == {"detail": "Another upload is already being accepted. Try again shortly."}
+    assert save_calls == 1
+
+
+def test_single_upload_rejects_duplicate_file_parts_before_copying(tmp_path, monkeypatch):
+    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+    save_calls = 0
+    original_save = web_app_module._save_upload
+
+    async def recording_save(*args, **kwargs):
+        nonlocal save_calls
+        save_calls += 1
+        return await original_save(*args, **kwargs)
+
+    monkeypatch.setattr("dubsync.web.app._save_upload", recording_save)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "fps": "30"},
+            files=[
+                ("audio", ("first.wav", b"first", "audio/wav")),
+                ("audio", ("second.wav", b"second", "audio/wav")),
+            ],
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Exactly one audio file is required."}
+    assert save_calls == 0
+
+
+def test_single_submit_failure_removes_the_persisted_row_and_directory_without_masking_error(
+    tmp_path,
+    monkeypatch,
+):
+    settings = _settings(tmp_path)
+    app = create_app(settings=settings, processor=_fake_processor)
+
+    def failed_submit(_job):
+        raise RuntimeError("intentional submit failure")
+
+    monkeypatch.setattr(app.state.jobs, "submit", failed_submit)
+    with TestClient(app) as client:
+        with pytest.raises(RuntimeError, match="intentional submit failure"):
+            client.post(
+                "/api/jobs",
+                data={"mode": "generate", "fps": "30"},
+                files={"audio": ("dialogue.wav", b"audio", "audio/wav")},
+            )
+
+        assert app.state.jobs.store.pending() == []
+        assert [path for path in settings.data_dir.iterdir() if path.is_dir()] == []
 
 
 def test_health_and_security_headers_are_present(tmp_path, monkeypatch):
@@ -514,6 +588,10 @@ def test_default_processor_forwards_selected_language_to_generate_pipeline(tmp_p
     default_processor(job, settings)
 
     assert calls["language"] == "de"
+    assert calls["audio_limits"].job_directory == directory
+    assert calls["audio_limits"].max_duration_seconds == settings.max_audio_duration_seconds
+    assert calls["audio_limits"].max_output_bytes == settings.max_normalized_audio_bytes
+    assert calls["audio_limits"].max_job_storage_bytes == settings.max_job_storage_bytes
 
 
 def test_default_processor_applies_the_resolved_generation_style(tmp_path, monkeypatch):

@@ -88,7 +88,7 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
       <section className="contact-band" id="contact">
         <div className="section-inner contact-inner">
           <div><h2>Contact the operator</h2><p>Questions, billing requests, feedback, or a specific localization workflow.</p></div>
-          <a href="mailto:reyhanputraph@gmail.com">reyhanputraph@gmail.com</a>
+          <a href="mailto:rey@feelslocal.com">rey@feelslocal.com</a>
         </div>
       </section>
     </>

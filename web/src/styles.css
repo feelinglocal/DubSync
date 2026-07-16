@@ -311,6 +311,35 @@ p {
   gap: 12px;
 }
 
+.batch-naming-help {
+  margin-top: 10px;
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.batch-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.batch-file-list li {
+  overflow: hidden;
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-surface);
+  color: var(--color-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .upload-field {
   min-width: 0;
 }
@@ -617,6 +646,7 @@ p {
   color: var(--color-error);
   font-size: 13px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .service-notice {
@@ -759,6 +789,13 @@ p {
   font-weight: 660;
 }
 
+.job-source-name {
+  color: var(--color-ink);
+  font-size: 13px;
+  font-weight: 680;
+  overflow-wrap: anywhere;
+}
+
 .job-summary > div > span:last-child {
   color: var(--color-muted);
   font-size: 12px;
@@ -798,6 +835,22 @@ p {
   flex-wrap: wrap;
   gap: 8px;
   padding: 0 16px 16px 68px;
+}
+
+.batch-results {
+  margin-top: 18px;
+}
+
+.batch-results > h2 {
+  color: var(--color-ink);
+  font-size: 18px;
+  font-weight: 690;
+}
+
+.batch-results-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
 }
 
 .secondary-button,
@@ -1333,7 +1386,7 @@ button:active:not(:disabled),
   }
 
   .workspace-section {
-    padding: 28px 16px 36px;
+    padding: 28px 16px 20px;
   }
 
   .workspace-heading {
@@ -1419,6 +1472,10 @@ button:active:not(:disabled),
 
   .section-inner {
     padding: 52px 16px;
+  }
+
+  .feature-band .section-inner {
+    padding-top: 40px;
   }
 
   .section-heading {

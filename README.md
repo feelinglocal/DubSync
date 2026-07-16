@@ -8,12 +8,12 @@ Timing comes from acoustic data only: ASR word timestamps and optional forced al
 
 DubSync also includes a responsive React/FastAPI application with two customer workflows:
 
-- **Sync existing SRT:** upload dubbed dialogue audio plus the target-language SRT, then download a synchronized SRT and QC artifacts. Cue presentation rules are derived from that uploaded SRT.
-- **Audio to SRT:** upload dubbed dialogue audio without an SRT, choose a built-in subtitle preset, enter custom line/timing/CPS rules, or upload an example SRT to derive them, then generate an acoustically timed SRT and QC artifacts.
+- **Sync existing SRT:** upload one file pair or a batch of up to 10 matched audio/SRT pairs, then download synchronized SRT and QC artifacts for each source. Batch children run one by one, and cue presentation rules are derived from each uploaded SRT.
+- **Audio to SRT:** upload one audio file or a batch of up to 10, choose a built-in subtitle preset, enter custom line/timing/CPS rules, or upload an example SRT to derive them, then generate acoustically timed SRT and QC artifacts.
 
 The language selector defaults to provider auto-detection. An explicit language is forwarded to ElevenLabs Scribe and becomes part of the cached ASR configuration.
 
-The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Manual quotes issue a rotating job access code before paid processing, and every accepted job receives a separate secret browser-held result token. Uploads and results expire after 24 hours, and the API limits job creation per source IP. Production job intake fails closed when the access code is not configured. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
+The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Manual quotes issue a rotating job access code before paid processing, and every accepted child job receives a separate secret browser-held result token. Uploads and results expire 24 hours after each child finishes, and the API limits job creation per source IP. Production job intake fails closed when the access code is not configured. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
 
 Local web setup:
 
@@ -27,6 +27,8 @@ dubsync-web
 ```
 
 Open `http://127.0.0.1:8000`. The server reads `provider.yaml`, `style_profile.yaml`, and API keys from `.env` by default. The DubSync default generation preset honors that configured style profile; every other web generation style is resolved per job. API documentation is disabled unless `DUBSYNC_ENABLE_DOCS=1`.
+
+Job intake defaults to five submissions per source IP per hour (`DUBSYNC_MAX_SUBMISSIONS_PER_HOUR`) and ten outstanding child jobs (`DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS`). Single and batch request payloads are capped at 512 MiB, retained job commitments are capped at 4 GiB, and only one request may pass upload intake at a time so concurrent copies cannot exhaust the 10 GB disk. SRT files are capped at 2 MiB, 60,000 lines, and 20,000 cues, with bounded line lengths and an incremental parser so structurally hostile subtitle files fail before expensive processing. Before acceptance, non-fixture audio is probed with a 15-second deadline and its predicted 16 kHz PCM plus work allocation is reserved. Production also enforces a four-hour audio limit, a 1 GiB per-job ceiling, bounded normalized/snippet outputs, and 2 GiB of minimum free disk. Configure these bounds with the `DUBSYNC_MAX_*` and `DUBSYNC_MIN_FREE_STORAGE_BYTES` variables shown in `.env.example`. Existing deployments that only set `DUBSYNC_MAX_JOBS_PER_HOUR` retain that value as a fallback. Queued or processing jobs with no state update for 24 hours are dead-lettered on startup or periodic cleanup, then retained for the normal terminal retention window; configure that deadline with `DUBSYNC_ACTIVE_JOB_TIMEOUT_HOURS`. Every FFmpeg subprocess has a finite 1,800-second default timeout controlled by `DUBSYNC_FFMPEG_TIMEOUT_SECONDS`.
 
 For frontend development, run `npm run dev` inside `web` and run the FastAPI service separately. The production Docker image builds the frontend and serves it from the same origin as the API.
 
@@ -274,6 +276,9 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Fixture-backed ASR/LLM path for offline E2E tests.
 - Web audio generation resolves explicit presets, custom rules, and uploaded-example subtitle styles per job while preserving the configured profile for the DubSync default preset; the selected line, timing, gap, lead/tail, and CPS rules are recorded in `generate.json` and applied during output finalization.
 - Web sync derives its style from the user-supplied source SRT instead of applying the server's global generation profile.
+- Web batch intake accepts up to 10 matched audio/SRT pairs, matches them by case-insensitive filename stem, and submits them as one rate-limited request to the single sequential worker.
+- Browser-held access recovers every child in a submitted batch after refresh, while each child keeps an isolated token and failure state.
+- Downloaded SRT names preserve the validated source stem and append `-dubsync-synced.srt`.
 - ElevenLabs Scribe v2 ASR forwards configured keyterms and character names as `keyterms` while still requesting word timestamps and diarization.
 - Opt-in `--live` pytest smoke tests for Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
@@ -354,9 +359,9 @@ Latest local offline verification in this workspace:
 
 | Command | Result | Runtime / cost evidence |
 |---|---|---|
-| `python -m pytest --cov=dubsync --cov-report=term-missing` | `216 passed, 5 deselected`, coverage `85.00%` | Normal offline suite; paid/live smoke tests deselected |
-| `npm run test:coverage` | `26 passed`; statements `90.33%`, lines `92.74%` | React workflow, generation style controls, access gate, API client, session, legal, error, and media lifecycle tests |
-| `npm run test:e2e` | `7 passed` | Generate, SRT-derived style, sync, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
+| `python -m pytest --cov=dubsync --cov-report=term-missing` | `309 passed, 5 deselected`, coverage `85.22%` | Normal offline suite; paid/live smoke tests deselected |
+| `npm run test:coverage` | `54 passed`; statements `91.14%`, lines `94.02%` | React workflow, sequential batch behavior, recovery, generation style controls, access gate, API client, session, legal, error, and media lifecycle tests |
+| `npm run test:e2e` | `10 passed` | Generate, SRT-derived style, sync, sequential batch naming, access code, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
 | Production web `generate` smoke | PASS | 3.444-second WAV, 1 cue, 0 QC flags, `$0.000376` recorded provider cost on Render commit `5c79356` |
 | Render JSON Schema validation | PASS | `render.yaml` validates against Render's published schema |
@@ -393,7 +398,7 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 
 - If `dubsync.exe` is not on `PATH`, use `python -m dubsync`.
 - If `uv` is unavailable, use `python -m pip install -e ".[dev]"`.
-- If ffmpeg fails, confirm `ffmpeg -version` works in the same PowerShell session.
+- If ffmpeg fails, confirm `ffmpeg -version` works in the same PowerShell session. A timeout reports explicitly; increase `DUBSYNC_FFMPEG_TIMEOUT_SECONDS` only for validated long-running media.
 - If cloud providers fail, check `.env` keys and install `.[cloud]`.
 - If a punctuation pass changes words, DubSync rejects the batch and leaves a QC flag path for review.
 - If adjudication returns invalid structured output twice, DubSync preserves the source SRT text and emits an `invalid_llm_response` QC flag.

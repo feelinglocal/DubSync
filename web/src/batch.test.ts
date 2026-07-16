@@ -53,6 +53,37 @@ describe('sync batch file pairing', () => {
     ])
   })
 
+  it('normalizes canonically equivalent Unicode stems before matching', () => {
+    const audioFile = audio('Caf\u00e9.wav')
+    const subtitleFile = subtitle('Cafe\u0301.srt')
+
+    const result = pairSyncFiles([audioFile], [subtitleFile])
+
+    expect(result.error).toBeNull()
+    expect(result.pairs).toEqual([
+      { stem: 'Caf\u00e9', audio: audioFile, subtitle: subtitleFile },
+    ])
+  })
+
+  it('uses the same Unicode caseless key as the backend', () => {
+    const audioFile = audio('Straße.wav')
+    const subtitleFile = subtitle('STRASSE.srt')
+
+    const result = pairSyncFiles([audioFile], [subtitleFile])
+
+    expect(result.error).toBeNull()
+    expect(result.pairs[0]).toEqual({ stem: 'Straße', audio: audioFile, subtitle: subtitleFile })
+  })
+
+  it.each([
+    ['dotless i', 'ı.wav', 'i.srt', true],
+    ['capital sharp s', 'ẞ.wav', 'SS.srt', false],
+  ])('matches the backend uppercase contract for %s', (_label, audioName, subtitleName, matches) => {
+    const result = pairSyncFiles([audio(audioName)], [subtitle(subtitleName)])
+
+    expect(result.error === null).toBe(matches)
+  })
+
   it('rejects duplicate stems in either file group, including case-only duplicates', () => {
     const duplicateAudio = pairSyncFiles(
       [audio('001.wav'), audio('001.MP3')],

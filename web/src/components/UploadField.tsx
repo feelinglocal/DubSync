@@ -1,16 +1,19 @@
 import { CheckCircle2, FileAudio, FileText, Trash2, Upload } from 'lucide-react'
 import { useId } from 'react'
 
+import { formatBytes, formatFileLimit } from '../fileSize'
+
 interface UploadFieldProps {
   label: string
   accept: string
   file: File | null
   required?: boolean
   kind: 'audio' | 'subtitle' | 'style'
+  maxBytes?: number
   onChange: (file: File | null) => void
 }
 
-export function UploadField({ label, accept, file, required = false, kind, onChange }: UploadFieldProps) {
+export function UploadField({ label, accept, file, required = false, kind, maxBytes = 2 * 1024 * 1024, onChange }: UploadFieldProps) {
   const id = useId()
   const Icon = kind === 'audio' ? FileAudio : FileText
   return (
@@ -20,7 +23,7 @@ export function UploadField({ label, accept, file, required = false, kind, onCha
         <span className="upload-icon" aria-hidden="true"><Icon /></span>
         <div className="upload-copy">
           <strong>{file?.name || (kind === 'audio' ? 'Choose dialogue audio' : kind === 'style' ? 'Choose style example SRT' : 'Choose original SRT')}</strong>
-          <span>{file ? formatBytes(file.size) : kind === 'audio' ? 'WAV, MP3, M4A, FLAC, AAC or OGG' : 'SRT up to 20 MB'}</span>
+          <span>{file ? formatBytes(file.size) : kind === 'audio' ? 'WAV, MP3, M4A, FLAC, AAC or OGG' : `SRT up to ${formatFileLimit(maxBytes)}`}</span>
         </div>
         {file ? <CheckCircle2 className="complete-icon" aria-label="Upload selected" /> : <Upload aria-hidden="true" />}
         {file && (
@@ -40,9 +43,4 @@ export function UploadField({ label, accept, file, required = false, kind, onCha
       </div>
     </div>
   )
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }

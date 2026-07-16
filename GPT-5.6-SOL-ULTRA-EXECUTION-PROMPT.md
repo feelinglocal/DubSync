@@ -144,7 +144,7 @@ Build the actual workspace as the first screen, not a marketing-only hero.
 - Provide clear idle, uploading, queued, processing, completed, expired, failed, and validation states.
 - Recover an active job after refresh without persisting its bearer token beyond the browser tab.
 - Keep Terms, Privacy, pricing, FAQ, and contact reachable from normal navigation.
-- Use `reyhanputraph@gmail.com` for product contact.
+- Use `rey@feelslocal.com` for product contact.
 - At 390 px mobile width, there must be no horizontal scrolling or clipped controls.
 - At desktop and mobile first viewport, the app must show the primary workflow and a visible hint of the next content section.
 - Do not place visible tutorial prose or keyboard-shortcut instructions inside the product.

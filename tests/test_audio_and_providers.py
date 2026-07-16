@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-from dubsync.audio import normalize_audio
+import pytest
+
+from dubsync.audio import AudioNormalizeError, normalize_audio, probe_audio_duration
 from dubsync.cache import JsonDiskCache
 from dubsync.models import Word
 from dubsync.providers import CachedASRAdapter, WhisperXAdapter, adapter_from_config
@@ -25,9 +28,14 @@ def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
     source.write_bytes(b"audio")
     calls = []
 
-    def fake_run(cmd, check, capture_output, text):
+    timeouts = []
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
         calls.append(cmd)
-        dest.write_bytes(b"wav")
+        timeouts.append(timeout)
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(cmd, 0, "1.0", "")
+        Path(cmd[-1]).write_bytes(b"wav")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -35,17 +43,139 @@ def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
     result = normalize_audio(source, dest)
 
     assert result == dest
-    assert calls[0] == [
+    ffmpeg_call = next(call for call in calls if call[0] == "ffmpeg")
+    assert ffmpeg_call == [
         "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-y",
         "-i",
         str(source),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-t",
+        "14401",
         "-ac",
         "1",
         "-ar",
         "16000",
-        str(dest),
+        "-c:a",
+        "pcm_s16le",
+        "-fs",
+        "1080576",
+        "-f",
+        "wav",
+        str(dest.with_name(f"{dest.name}.partial")),
     ]
+    assert all(isinstance(timeout, float) for timeout in timeouts)
+    assert all(0 < timeout < float("inf") for timeout in timeouts)
+
+
+def test_normalize_audio_uses_configured_ffmpeg_timeout(tmp_path, monkeypatch):
+    source = tmp_path / "in.mp3"
+    dest = tmp_path / "out.wav"
+    source.write_bytes(b"audio")
+    seen = {}
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(cmd, 0, "1.0", "")
+        seen["timeout"] = timeout
+        Path(cmd[-1]).write_bytes(b"wav")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("DUBSYNC_FFMPEG_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    normalize_audio(source, dest)
+
+    assert seen["timeout"] == 12.5
+
+
+def test_normalize_audio_reports_ffmpeg_timeout_clearly(tmp_path, monkeypatch):
+    source = tmp_path / "in.mp3"
+    dest = tmp_path / "out.wav"
+    source.write_bytes(b"audio")
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(cmd, 0, "1.0", "")
+        Path(cmd[-1]).write_bytes(b"partial")
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AudioNormalizeError, match=r"timed out after 3 seconds"):
+        normalize_audio(source, dest, timeout_seconds=3)
+
+    assert not dest.exists()
+    assert not dest.with_name(f"{dest.name}.partial").exists()
+
+
+def test_normalize_audio_rejects_overlong_input_before_decoding(tmp_path, monkeypatch):
+    source = tmp_path / "too-long.mp3"
+    dest = tmp_path / "out.wav"
+    source.write_bytes(b"audio")
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "7201\n", "")
+
+    monkeypatch.setenv("DUBSYNC_MAX_AUDIO_DURATION_SECONDS", "7200")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AudioNormalizeError, match=r"longer than 7200 seconds"):
+        normalize_audio(source, dest)
+
+    assert [command[0] for command in commands] == ["ffprobe"]
+    assert not dest.exists()
+
+
+def test_normalize_audio_removes_output_that_reaches_the_byte_ceiling(tmp_path, monkeypatch):
+    source = tmp_path / "compressed.mp3"
+    dest = tmp_path / "out.wav"
+    source.write_bytes(b"audio")
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        if cmd[0] == "ffprobe":
+            return subprocess.CompletedProcess(cmd, 0, "1.0\n", "")
+        Path(cmd[-1]).write_bytes(b"x" * 32)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("DUBSYNC_MAX_NORMALIZED_AUDIO_BYTES", "32")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AudioNormalizeError, match=r"storage limit"):
+        normalize_audio(source, dest)
+
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    "probe_output",
+    ["", "N/A", '{"streams": []}', '{"format": {"duration": "nan"}}'],
+)
+def test_probe_audio_duration_fails_closed_without_a_finite_audio_duration(
+    tmp_path,
+    monkeypatch,
+    probe_output: str,
+):
+    source = tmp_path / "invalid-audio.bin"
+    source.write_bytes(b"audio")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 0, probe_output, ""),
+    )
+
+    with pytest.raises(AudioNormalizeError, match=r"duration could not be inspected"):
+        probe_audio_duration(source, timeout_seconds=2)
 
 
 def test_cached_asr_adapter_avoids_second_provider_call(tmp_path):

@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from struct import unpack
 from xml.etree import ElementTree
@@ -57,6 +58,16 @@ def test_public_contact_and_footer_use_the_feels_local_identity():
     assert "rey@feelslocal.com" in visible_source
     assert "reyhanputraph@gmail.com" not in visible_source
     assert "Operated by Reyhan Putra in Indonesia" not in visible_source
+
+
+def test_long_source_names_wrap_inside_mobile_status_surfaces():
+    css = (WEB_SOURCE / "styles.css").read_text(encoding="utf-8")
+
+    for selector in ("form-error", "job-source-name"):
+        rule = re.search(rf"\.{selector}\s*\{{(?P<body>[^}}]*)\}}", css)
+
+        assert rule is not None, f"Missing .{selector} style rule"
+        assert "overflow-wrap: anywhere" in rule.group("body")
 
 
 def test_brand_and_crawler_assets_are_declared_and_shippable():

@@ -20,6 +20,10 @@ from dubsync.web.settings import WebSettings
 SRT_BYTES = b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n"
 
 
+def _srt_bytes(text: str) -> bytes:
+    return f"1\n00:00:00,000 --> 00:00:00,500\n{text}\n".encode()
+
+
 def _settings(tmp_path: Path, *, processing_inline: bool = True) -> WebSettings:
     providers = tmp_path / "providers.yaml"
     providers.write_text("asr:\n  provider: fixture\n", encoding="utf-8")
@@ -31,7 +35,7 @@ def _settings(tmp_path: Path, *, processing_inline: bool = True) -> WebSettings:
         max_srt_bytes=1024 * 1024,
         retention_hours=24,
         processing_inline=processing_inline,
-        max_jobs_per_hour=100,
+        max_submissions_per_hour=100,
         worker_threads=1,
         cleanup_interval_seconds=60,
     )
@@ -83,7 +87,6 @@ def _post_batch(
             "fps": str(fps),
             "language": language,
             "style": style,
-            "access_code": "",
         },
         files=_multipart(audio_files, subtitle_files),
     )
@@ -107,7 +110,7 @@ def test_batch_accepts_ten_case_insensitive_pairs_and_preserves_audio_order_and_
     audio_stems = ["007", "Scene-A", "003", "010", "002", "009", "004", "008", "006", "001"]
     audio_files = [(f"{stem}.WAV", f"audio:{stem.casefold()}".encode()) for stem in audio_stems]
     subtitle_files = [
-        (f"{stem.swapcase()}.srt", f"subtitle:{stem.casefold()}".encode())
+        (f"{stem.swapcase()}.srt", _srt_bytes(f"subtitle:{stem.casefold()}"))
         for stem in reversed(audio_stems)
     ]
     processed: list[tuple[str, bytes, bytes]] = []
@@ -131,7 +134,7 @@ def test_batch_accepts_ten_case_insensitive_pairs_and_preserves_audio_order_and_
         assert len({job["token"] for job in batch["jobs"]}) == 10
 
         assert processed == [
-            (stem, f"audio:{stem.casefold()}".encode(), f"subtitle:{stem.casefold()}".encode())
+            (stem, f"audio:{stem.casefold()}".encode(), _srt_bytes(f"subtitle:{stem.casefold()}"))
             for stem in audio_stems
         ]
 
@@ -158,6 +161,31 @@ def test_batch_accepts_ten_case_insensitive_pairs_and_preserves_audio_order_and_
         )
         assert download.status_code == 200
         assert download.headers["content-disposition"] == 'attachment; filename="001-dubsync-synced.srt"'
+
+
+@pytest.mark.parametrize(
+    ("audio_name", "subtitle_name", "expected_status"),
+    [
+        pytest.param("ı.wav", "i.srt", 202, id="dotless-i-uppercase-match"),
+        pytest.param("ẞ.wav", "SS.srt", 422, id="capital-sharp-s-remains-distinct"),
+    ],
+)
+def test_batch_pairing_uses_the_same_nfkc_uppercase_contract_as_the_browser(
+    tmp_path,
+    audio_name: str,
+    subtitle_name: str,
+    expected_status: int,
+):
+    app = create_app(settings=_settings(tmp_path), processor=lambda job, _settings: _artifacts(job))
+
+    with TestClient(app) as client:
+        response = _post_batch(
+            client,
+            [(audio_name, b"audio")],
+            [(subtitle_name, SRT_BYTES)],
+        )
+
+    assert response.status_code == expected_status
 
 
 def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selection_order(tmp_path):
@@ -194,6 +222,72 @@ def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selecti
     assert all(job.fps == 25 for job in captured)
     assert all(job.language == "id" for job in captured)
     assert len({job.style for job in captured}) == 1
+
+
+def test_generate_batch_accepts_one_shared_sample_style_srt(tmp_path):
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path), processor=processor)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            data={
+                "mode": "generate",
+                "fps": "30",
+                "language": "auto",
+                "style": json.dumps({"source": "sample"}),
+            },
+            files=[
+                ("audio", ("one.wav", b"one", "audio/wav")),
+                ("audio", ("two.wav", b"two", "audio/wav")),
+                ("style_sample", ("example.srt", SRT_BYTES, "application/x-subrip")),
+            ],
+        )
+
+    assert response.status_code == 202
+    assert [job.source_name for job in captured] == ["one", "two"]
+    resolved_styles = [json.loads(job.style) for job in captured]
+    assert all(style["source"] == "sample" for style in resolved_styles)
+    assert resolved_styles[0] == resolved_styles[1]
+
+
+def test_batch_rejects_legacy_form_access_code_field(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=_artifacts)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            data={"mode": "generate", "fps": "30", "access_code": "legacy-form-value"},
+            files=[("audio", ("one.wav", b"one", "audio/wav"))],
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Unexpected batch form field."}
+
+
+def test_batch_accepts_the_access_code_only_from_the_request_header(tmp_path):
+    settings = replace(
+        _settings(tmp_path),
+        job_access_code="quoted-access-code-1234",
+        require_job_access_code=True,
+    )
+    app = create_app(
+        settings=settings,
+        processor=lambda job, _settings: _artifacts(job),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            headers={"X-DubSync-Access-Code": "quoted-access-code-1234"},
+            data={"mode": "generate", "fps": "30"},
+            files=[("audio", ("one.wav", b"one", "audio/wav"))],
+        )
+
+    assert response.status_code == 202
+    assert [job["source_name"] for job in response.json()["jobs"]] == ["one"]
 
 
 @pytest.mark.parametrize(
@@ -274,7 +368,7 @@ def test_batch_rejects_invalid_pair_sets_before_any_processor_runs(
 
 
 def test_batch_counts_as_one_rate_limit_event_instead_of_one_event_per_child(tmp_path):
-    settings = replace(_settings(tmp_path), max_jobs_per_hour=1)
+    settings = replace(_settings(tmp_path), max_submissions_per_hour=1)
     processed: list[str] = []
 
     def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
@@ -293,6 +387,47 @@ def test_batch_counts_as_one_rate_limit_event_instead_of_one_event_per_child(tmp
     assert accepted.status_code == 202
     assert processed == stems
     assert limited.status_code == 429
+
+
+def test_outstanding_child_limit_rejects_a_whole_batch_without_partial_rows(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        started.set()
+        assert release.wait(timeout=3.0)
+        return _artifacts(job)
+
+    settings = replace(
+        _settings(tmp_path, processing_inline=False),
+        max_outstanding_child_jobs=2,
+    )
+    app = create_app(settings=settings, processor=processor)
+
+    with TestClient(app) as client:
+        try:
+            first = _post_batch(client, [("first.wav", b"one")], [("first.srt", SRT_BYTES)])
+            assert first.status_code == 202
+            assert started.wait(timeout=2.0)
+
+            rejected = _post_batch(
+                client,
+                [("second.wav", b"two"), ("third.wav", b"three")],
+                [("second.srt", SRT_BYTES), ("third.srt", SRT_BYTES)],
+            )
+
+            assert rejected.status_code == 429
+            assert rejected.json() == {
+                "detail": "Too many files are already queued. Wait for current jobs to finish."
+            }
+            active_rows = app.state.jobs.store.pending()
+            assert [job.source_name for job in active_rows] == ["first"]
+        finally:
+            release.set()
+
+    with sqlite3.connect(app.state.jobs.store.db_path) as connection:
+        rows = connection.execute("SELECT source_name FROM jobs ORDER BY created_at").fetchall()
+    assert [row[0] for row in rows] == ["first"]
 
 
 def test_batch_processor_is_strictly_serial_and_continues_after_a_child_failure(tmp_path):
@@ -390,6 +525,41 @@ def test_expired_cleanup_preserves_active_batch_children(tmp_path, status: str):
         service.shutdown()
 
 
+@pytest.mark.parametrize("status", ["queued", "processing"])
+def test_expired_active_batch_children_remain_authorized(tmp_path, status: str):
+    settings = _settings(tmp_path)
+    app = create_app(settings=settings, processor=lambda job, _settings: _artifacts(job))
+    directory = settings.data_dir / f"job-authorized-{status}"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"audio")
+    active = replace(
+        new_job_record(
+            job_id=f"authorized-{status}",
+            token_hash=hash_job_token("active-token"),
+            mode="generate",
+            directory=directory,
+            audio_path=audio,
+            srt_path=None,
+            fps=30,
+            language="auto",
+            style="standard",
+            retention_hours=24,
+        ),
+        status=status,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    with TestClient(app) as client:
+        app.state.jobs.store.create(active)
+        response = client.get(
+            f"/api/jobs/{active.id}",
+            headers={"Authorization": "Bearer active-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == status
+
+
 @pytest.mark.parametrize("fails", [False, True], ids=["complete", "failed"])
 def test_job_retention_begins_when_processing_reaches_a_terminal_state(tmp_path, fails: bool):
     settings = _settings(tmp_path)
@@ -426,6 +596,39 @@ def test_job_retention_begins_when_processing_reaches_a_terminal_state(tmp_path,
         assert terminal.expires_at >= terminal_at + timedelta(hours=23, minutes=59)
         assert service.store.delete_expired(terminal_at) == 0
         assert service.store.delete_expired(terminal.expires_at + timedelta(microseconds=1)) == 1
+    finally:
+        service.shutdown()
+
+
+def test_expired_cleanup_keeps_the_row_when_its_directory_is_outside_job_storage(tmp_path):
+    settings = _settings(tmp_path)
+    service = JobService(settings, lambda job, _settings: _artifacts(job))
+    outside_directory = tmp_path / "outside-job"
+    outside_directory.mkdir()
+    audio = outside_directory / "audio.wav"
+    audio.write_bytes(b"audio")
+    job = new_job_record(
+        job_id="unsafe-cleanup",
+        token_hash=hash_job_token("token"),
+        mode="generate",
+        directory=outside_directory,
+        audio_path=audio,
+        srt_path=None,
+        fps=30,
+        language="auto",
+        style="standard",
+        retention_hours=24,
+    )
+    expired = replace(
+        job,
+        status="complete",
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    service.store.create(expired)
+    try:
+        assert service.store.delete_expired() == 0
+        assert service.store.get(expired.id) is not None
+        assert outside_directory.exists()
     finally:
         service.shutdown()
 

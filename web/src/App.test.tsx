@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -6,7 +6,8 @@ import App from './App'
 
 const configResponse = {
   retention_hours: 24,
-  max_upload_bytes: 2_147_483_648,
+  max_upload_bytes: 536_870_912,
+  max_srt_bytes: 2_097_152,
   audio_extensions: ['.mp3', '.wav'],
   fps_values: [24, 25, 30],
   pricing: {
@@ -100,7 +101,22 @@ describe('DubSync workspace', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('Match names: 001.wav + 001.srt. Up to 10 pairs.')).toBeVisible()
+    const help = 'Match names: 001.wav + 001.srt. Up to 10 pairs.'
+    expect(await screen.findByText(help)).toBeVisible()
+    expect(screen.getByLabelText('Dialogue audio')).toHaveAccessibleDescription(help)
+    expect(screen.getByLabelText('Original SRT')).toHaveAccessibleDescription(help)
+  })
+
+  it('shows the configured SRT limit for original and style-example uploads', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    const user = userEvent.setup()
+
+    render(<App />)
+
+    expect(await screen.findByText('SRT up to 2 MB each')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.click(screen.getByRole('button', { name: 'From SRT' }))
+    expect(screen.getByText('SRT up to 2 MB')).toBeVisible()
   })
 
   it('keeps batch submission disabled when audio and subtitle stems do not match', async () => {
@@ -177,6 +193,126 @@ describe('DubSync workspace', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
     expect(fetchMock.mock.calls[2][0]).toBe('/api/jobs/job-2/downloads/srt')
     expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
+  })
+
+  it('keeps every child token through mode switches and later completed submissions', async () => {
+    const laterJob = {
+      id: 'job-3', token: 'token-3', source_name: 'episode',
+      mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 8, cost_usd: 0.03 }, downloads: ['srt'],
+      expires_at: '2026-07-12T00:00:00Z', error: null,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(laterJob), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(['subtitle']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="002-dubsync-synced.srt"' },
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+    expect(await screen.findByText('4 cues ready')).toBeVisible()
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'job-1', token: 'token-1' },
+      { id: 'job-2', token: 'token-2' },
+    ]))
+
+    await user.click(screen.getByRole('button', { name: 'Sync existing SRT' }))
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+
+    await user.upload(
+      screen.getByLabelText('Dialogue audio'),
+      new File(['audio-3'], 'episode.wav', { type: 'audio/wav' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(await screen.findByText('8 cues ready')).toBeVisible()
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'job-1', token: 'token-1' },
+      { id: 'job-2', token: 'token-2' },
+      { id: 'job-3', token: 'token-3' },
+    ]))
+
+    await user.click(screen.getByRole('button', { name: 'Download 002 SRT' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+    expect(fetchMock.mock.calls[3][0]).toBe('/api/jobs/job-2/downloads/srt')
+    expect(fetchMock.mock.calls[3][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
+  })
+
+  it('prevents another submission while any child job is queued or processing', async () => {
+    const queuedBatch = {
+      id: 'batch-queued',
+      jobs: completedBatchResponse.jobs.map((job, index) => ({
+        ...job,
+        id: `queued-${index + 1}`,
+        token: `queued-token-${index + 1}`,
+        status: index === 0 ? 'queued' : 'processing',
+        progress: index === 0 ? 0 : 25,
+        result: null,
+        downloads: [],
+      })),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+      if (String(input) === '/api/config') {
+        return new Response(JSON.stringify(configResponse), { status: 200 })
+      }
+      if (options?.method === 'POST') {
+        return new Response(JSON.stringify(queuedBatch), { status: 202 })
+      }
+      const jobId = String(input).split('/').at(-1)
+      const job = queuedBatch.jobs.find((candidate) => candidate.id === jobId)
+      return new Response(JSON.stringify(job), { status: job ? 200 : 404 })
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByText('Waiting to start')).toBeVisible()
+    expect(screen.getByText('Processing dialogue')).toBeVisible()
+    expect(screen.getByRole('progressbar', { name: '001 progress' })).toHaveAttribute('value', '0')
+    expect(screen.getByRole('progressbar', { name: '002 progress' })).toHaveAttribute('value', '25')
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(
+      screen.getByLabelText('Dialogue audio'),
+      new File(['audio-3'], 'episode.wav', { type: 'audio/wav' }),
+    )
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1)
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'queued-1', token: 'queued-token-1' },
+      { id: 'queued-2', token: 'queued-token-2' },
+    ])
   })
 
   it('serves the dedicated payment and refund policy route', () => {
@@ -302,7 +438,10 @@ describe('DubSync workspace', () => {
     await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('access_code')).toBe('quote-code-1234')
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({
+      'X-DubSync-Access-Code': 'quote-code-1234',
+    })
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('access_code')).toBe(false)
   })
 
   it('disables production intake when the access gate is not configured', async () => {
@@ -318,6 +457,7 @@ describe('DubSync workspace', () => {
   })
 
   it('restores an in-progress job after a page refresh', async () => {
+    sessionStorage.clear()
     sessionStorage.setItem('dubsync:active-job', JSON.stringify({ id: 'restored-job', token: 'restored-token' }))
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
       const url = String(input)
@@ -346,6 +486,7 @@ describe('DubSync workspace', () => {
   })
 
   it('clears unusable restored access and shows the refresh error', async () => {
+    sessionStorage.clear()
     sessionStorage.setItem('dubsync:active-job', JSON.stringify({ id: 'expired-job', token: 'expired-token' }))
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
@@ -354,8 +495,106 @@ describe('DubSync workspace', () => {
 
     render(<App />)
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh the job.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh job "expired-job".')
     expect(sessionStorage.getItem('dubsync:active-job')).toBeNull()
+    expect(sessionStorage.getItem('dubsync:active-jobs')).toBeNull()
+  })
+
+  it('keeps restored access after a transient refresh failure', async () => {
+    const access = { id: 'retry-job', token: 'retry-token' }
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([access]))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      return new Response('', { status: 503 })
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh job "retry-job".')
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([access])
+  })
+
+  it('retries polling a queued job after a transient failure', async () => {
+    vi.useFakeTimers()
+    const access = { id: 'poll-job', token: 'poll-token' }
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([access]))
+    let jobLoads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      jobLoads += 1
+      if (jobLoads === 1) {
+        return new Response(JSON.stringify({
+          id: 'poll-job', mode: 'sync', status: 'queued', progress: 0,
+          result: null, downloads: [], expires_at: '2026-07-12T00:00:00Z', error: null,
+        }), { status: 200 })
+      }
+      if (jobLoads === 2) return new Response('', { status: 503 })
+      return new Response(JSON.stringify({
+        id: 'poll-job', mode: 'sync', status: 'complete', progress: 100,
+        result: { cue_count: 9, cost_usd: 0.02 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 200 })
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      expect(screen.getByText('Waiting to start')).toBeVisible()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(jobLoads).toBe(2)
+      expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([access])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(jobLoads).toBe(3)
+      expect(screen.getByText('9 cues ready')).toBeVisible()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not clear one child refresh error when a different child recovers', async () => {
+    vi.useFakeTimers()
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([
+      { id: 'expired-child', token: 'expired-token' },
+      { id: 'recovering-child', token: 'recovering-token' },
+    ]))
+    let recoveringLoads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      if (url === '/api/jobs/expired-child') return new Response('', { status: 404 })
+      if (url === '/api/jobs/recovering-child') {
+        recoveringLoads += 1
+        const complete = recoveringLoads > 1
+        return new Response(JSON.stringify({
+          id: 'recovering-child', mode: 'sync', status: complete ? 'complete' : 'queued',
+          progress: complete ? 100 : 0,
+          result: complete ? { cue_count: 4, cost_usd: 0.01 } : null,
+          downloads: complete ? ['srt'] : [], expires_at: '2026-07-12T00:00:00Z', error: null,
+        }), { status: 200 })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh job "expired-child".')
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+
+      expect(screen.getByText('4 cues ready')).toBeVisible()
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh job "expired-child".')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('shows API validation errors and permits another submission', async () => {
@@ -397,3 +636,10 @@ describe('DubSync workspace', () => {
     expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer download-token' })
   })
 })
+
+async function flushReactUpdates() {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}

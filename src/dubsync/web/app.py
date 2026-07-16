@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -8,39 +9,53 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from html import escape
-from ipaddress import ip_address
 from pathlib import Path
+from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ..srt_io import SRTParseError, parse_srt_text
+from ..audio import probe_audio_duration
+from .batch_uploads import (
+    AUDIO_EXTENSIONS,
+    MAX_BATCH_ITEMS,
+    batch_upload_plan as _batch_upload_plan,
+    validate_audio as _validate_audio,
+    validate_source_filename as _validate_source_filename,
+    validate_subtitle as _validate_subtitle,
+)
 from .generation_styles import (
     GenerationStyleError,
     parse_generation_style_request,
     public_generation_styles,
     resolve_generation_style,
 )
-from .jobs import JobMode, JobRecord, JobService, Processor, default_processor, new_job_record
+from .jobs import (
+    JobMode,
+    JobRecord,
+    JobService,
+    OutstandingJobLimitError,
+    Processor,
+    default_processor,
+    new_job_record,
+)
+from .intake_guard import (
+    BATCH_BODY_LIMIT_DETAIL,
+    SINGLE_BODY_LIMIT_DETAIL,
+    SecurityAndIntakeMiddleware,
+)
 from .security import SlidingWindowRateLimiter, hash_job_token, valid_job_token
 from .settings import WebSettings
+from .srt_uploads import read_validated_srt_upload
+from .storage_admission import reserve_processing_storage, requires_audio_normalization
 
-AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
-AUDIO_TYPES = {
-    "audio/aac",
-    "audio/flac",
-    "audio/m4a",
-    "audio/mp3",
-    "audio/mpeg",
-    "audio/ogg",
-    "audio/wav",
-    "audio/wave",
-    "audio/x-m4a",
-    "audio/x-wav",
-    "application/octet-stream",
-}
+logger = logging.getLogger(__name__)
+
 FPS_VALUES = {23.976, 24.0, 25.0, 29.97, 30.0}
 LANGUAGE_RE = re.compile(r"^(auto|[A-Za-z]{2,8}(?:-[A-Za-z]{2,8})?)$")
 PUBLIC_ROOT_FILES = frozenset({"favicon.svg", "robots.txt", "site.webmanifest", "sitemap.xml", "theme-init.js"})
@@ -59,17 +74,24 @@ FRONTEND_ROUTE_METADATA = {
     ),
 }
 SITE_ORIGIN = "https://dubsync.onrender.com"
+MAX_BATCH_PARSER_FILES = 21
+MAX_BATCH_PARSER_FIELDS = 5
+MAX_BATCH_FIELD_BYTES = 64 * 1024
+MAX_SINGLE_PARSER_FILES = 3
+MAX_SINGLE_PARSER_FIELDS = 4
 
 
 def create_app(
     *,
     settings: WebSettings | None = None,
     processor: Processor = default_processor,
+    audio_duration_probe: Callable[..., float] = probe_audio_duration,
 ) -> FastAPI:
     resolved_settings = settings or WebSettings.from_env()
     resolved_settings.ensure_directories()
     service = JobService(resolved_settings, processor)
-    limiter = SlidingWindowRateLimiter(resolved_settings.max_jobs_per_hour)
+    limiter = SlidingWindowRateLimiter(resolved_settings.max_submissions_per_hour)
+    normalization_required = requires_audio_normalization(resolved_settings, processor)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -86,22 +108,30 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.jobs = service
+    app.add_middleware(
+        SecurityAndIntakeMiddleware,
+        settings=resolved_settings,
+        limiter=limiter,
+        storage_usage_bytes=service.store.storage_usage_bytes,
+    )
 
-    @app.middleware("http")
-    async def security_headers(request: Request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
-            "script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; "
-            "connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; form-action 'self'"
-        )
-        if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
-        return response
+    def _rollback_intake(job_ids: list[str], directories: list[Path]) -> None:
+        try:
+            service.store.delete_many(job_ids)
+        except Exception:
+            logger.exception("Could not remove persisted jobs after intake failed")
+        for directory in directories:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def body_limit_exception_handler(request: Request, exc: StarletteHTTPException):
+        if exc.detail in {SINGLE_BODY_LIMIT_DETAIL, BATCH_BODY_LIMIT_DETAIL}:
+            exc = StarletteHTTPException(
+                status_code=413,
+                detail=exc.detail,
+                headers=exc.headers,
+            )
+        return await http_exception_handler(request, exc)
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -119,6 +149,9 @@ def create_app(
         return {
             "retention_hours": resolved_settings.retention_hours,
             "max_upload_bytes": resolved_settings.max_upload_bytes,
+            "max_srt_bytes": resolved_settings.max_srt_bytes,
+            "max_batch_upload_bytes": resolved_settings.max_batch_upload_bytes,
+            "max_batch_files": MAX_BATCH_ITEMS,
             "audio_extensions": sorted(AUDIO_EXTENSIONS),
             "fps_values": sorted(FPS_VALUES),
             "pricing": {
@@ -132,34 +165,33 @@ def create_app(
             "generation_styles": public_generation_styles(),
         }
 
-    @app.post("/api/jobs", status_code=202)
-    async def create_job(
-        request: Request,
-        mode: Annotated[str, Form()],
-        audio: Annotated[UploadFile, File()],
-        subtitle: Annotated[UploadFile | None, File()] = None,
-        style_sample: Annotated[UploadFile | None, File()] = None,
-        fps: Annotated[float, Form()] = 30.0,
-        language: Annotated[str, Form()] = "auto",
-        style: Annotated[str, Form()] = "standard",
-        access_code: Annotated[str, Form()] = "",
+    async def _create_single_job(
+        *,
+        mode: str,
+        audio: StarletteUploadFile,
+        subtitle: StarletteUploadFile | None,
+        style_sample: StarletteUploadFile | None,
+        fps: float,
+        language: str,
+        style: str,
     ) -> dict[str, object]:
-        client_key = _client_key(request)
-        if not limiter.allow(client_key):
-            raise HTTPException(status_code=429, detail="Too many jobs. Try again later.")
-        if resolved_settings.require_job_access_code and not resolved_settings.job_access_code:
-            raise HTTPException(status_code=503, detail="Job access is not configured.")
-        if resolved_settings.job_access_code and not secrets.compare_digest(
-            access_code.strip(), resolved_settings.job_access_code
-        ):
-            raise HTTPException(status_code=403, detail="A valid job access code is required.")
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
         _validate_options(fps=fps, language=language)
+        source_name = _validate_source_filename(audio)
         audio_extension = _validate_audio(audio)
+        subtitle_bytes: bytes | None = None
         if subtitle is not None:
             _validate_subtitle(subtitle)
+            validated_subtitle = await read_validated_srt_upload(
+                subtitle,
+                max_bytes=resolved_settings.max_srt_bytes,
+                max_line_bytes=resolved_settings.max_srt_line_bytes,
+                parse_limits=resolved_settings.srt_parse_limits,
+                label="SRT",
+            )
+            subtitle_bytes = validated_subtitle.data
 
         resolved_style = "source"
         style_sample_bytes: bytes | None = None
@@ -173,15 +205,15 @@ def create_app(
                 if style_sample is None:
                     raise HTTPException(status_code=422, detail="An SRT style example is required.")
                 _validate_subtitle(style_sample)
-                style_sample_bytes = await _read_upload(style_sample, resolved_settings.max_srt_bytes)
-                try:
-                    sample_text = style_sample_bytes.decode("utf-8-sig")
-                    sample_cues = parse_srt_text(sample_text)
-                    if not sample_cues:
-                        raise SRTParseError("no subtitle cues were found")
-                except (UnicodeDecodeError, SRTParseError, ValueError) as exc:
-                    detail = str(exc).splitlines()[0] or "invalid SRT"
-                    raise HTTPException(status_code=422, detail=f"Could not read the SRT style example: {detail}") from exc
+                validated_style = await read_validated_srt_upload(
+                    style_sample,
+                    max_bytes=resolved_settings.max_srt_bytes,
+                    max_line_bytes=resolved_settings.max_srt_line_bytes,
+                    parse_limits=resolved_settings.srt_parse_limits,
+                    label="SRT style example",
+                )
+                style_sample_bytes = validated_style.data
+                sample_cues = list(validated_style.cues)
             elif style_sample is not None:
                 await style_sample.close()
             try:
@@ -202,12 +234,21 @@ def create_app(
         directory.mkdir(parents=False, exist_ok=False)
         audio_path = directory / f"audio{audio_extension}"
         subtitle_path = directory / "original.srt" if subtitle is not None else None
+        succeeded = False
         try:
             await _save_upload(audio, audio_path, resolved_settings.max_upload_bytes)
-            if subtitle is not None and subtitle_path is not None:
-                await _save_upload(subtitle, subtitle_path, resolved_settings.max_srt_bytes)
+            if subtitle_bytes is not None and subtitle_path is not None:
+                subtitle_path.write_bytes(subtitle_bytes)
             if style_sample_bytes is not None:
                 (directory / "style-example.srt").write_bytes(style_sample_bytes)
+            await reserve_processing_storage(
+                directory=directory,
+                audio_path=audio_path,
+                settings=resolved_settings,
+                store=service.store,
+                normalization_required=normalization_required,
+                audio_duration_probe=audio_duration_probe,
+            )
             job = new_job_record(
                 job_id=job_id,
                 token_hash=hash_job_token(token),
@@ -219,16 +260,186 @@ def create_app(
                 language=language.lower(),
                 style=resolved_style,
                 retention_hours=resolved_settings.retention_hours,
+                source_name=source_name,
             )
-            service.store.create(job)
+            try:
+                service.store.create_many(
+                    [job],
+                    max_outstanding=resolved_settings.max_outstanding_child_jobs,
+                )
+            except OutstandingJobLimitError as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many files are already queued. Wait for current jobs to finish.",
+                ) from exc
             service.submit(job)
-        except Exception:
-            shutil.rmtree(directory, ignore_errors=True)
-            raise
-        latest = service.store.get(job_id)
-        if latest is None:
-            raise HTTPException(status_code=500, detail="Could not create job.")
-        return _public_job(latest, token=token)
+            latest = service.store.get(job_id)
+            if latest is None:
+                raise HTTPException(status_code=500, detail="Could not create job.")
+            response = _public_job(latest, token=token)
+            succeeded = True
+            return response
+        finally:
+            if not succeeded:
+                _rollback_intake([job_id], [directory])
+
+    @app.post("/api/jobs", status_code=202)
+    async def create_job(request: Request) -> dict[str, object]:
+        form = await _parse_single_form(request)
+        try:
+            _validate_single_form_shape(form)
+            audio_uploads = _batch_file_field(form, "audio")
+            subtitle_uploads = _batch_file_field(form, "subtitle")
+            style_samples = _batch_file_field(form, "style_sample")
+            if len(audio_uploads) != 1:
+                raise HTTPException(status_code=422, detail="Exactly one audio file is required.")
+            if len(subtitle_uploads) > 1:
+                raise HTTPException(status_code=422, detail="Only one original SRT is allowed.")
+            if len(style_samples) > 1:
+                raise HTTPException(status_code=422, detail="Only one SRT style example is allowed.")
+            return await _create_single_job(
+                mode=_batch_text_field(form, "mode"),
+                audio=audio_uploads[0],
+                subtitle=subtitle_uploads[0] if subtitle_uploads else None,
+                style_sample=style_samples[0] if style_samples else None,
+                fps=_batch_float_field(form, "fps", default=30.0),
+                language=_batch_text_field(form, "language", default="auto"),
+                style=_batch_text_field(form, "style", default="standard"),
+            )
+        finally:
+            await form.close()
+
+    @app.post("/api/batches", status_code=202)
+    async def create_batch(request: Request) -> dict[str, object]:
+        form = await _parse_batch_form(request)
+        try:
+            _validate_batch_form_shape(form)
+            normalized_mode = _validate_mode(_batch_text_field(form, "mode"))
+            fps = _batch_float_field(form, "fps", default=30.0)
+            language = _batch_text_field(form, "language", default="auto")
+            style = _batch_text_field(form, "style", default="standard")
+            _validate_options(fps=fps, language=language)
+
+            audio_uploads = _batch_file_field(form, "audio")
+            subtitle_uploads = _batch_file_field(form, "subtitle")
+            style_samples = _batch_file_field(form, "style_sample")
+            if len(style_samples) > 1:
+                raise HTTPException(status_code=422, detail="Only one SRT style example is allowed.")
+            style_sample = style_samples[0] if style_samples else None
+            plan = _batch_upload_plan(normalized_mode, audio_uploads, subtitle_uploads)
+
+            sized_uploads = [
+                *((upload, resolved_settings.max_upload_bytes) for _, upload, _, _ in plan),
+                *((upload, resolved_settings.max_srt_bytes) for _, _, _, upload in plan if upload is not None),
+                *(
+                    ((style_sample, resolved_settings.max_srt_bytes),)
+                    if style_sample is not None
+                    else ()
+                ),
+            ]
+            _validate_batch_upload_sizes(
+                sized_uploads,
+                aggregate_limit=resolved_settings.max_batch_upload_bytes,
+            )
+            resolved_style, style_sample_bytes = await _resolve_batch_style(
+                normalized_mode,
+                style=style,
+                fps=fps,
+                style_sample=style_sample,
+                settings=resolved_settings,
+            )
+            subtitle_payloads: list[bytes | None] = []
+            for _, _, _, subtitle in plan:
+                if subtitle is None:
+                    subtitle_payloads.append(None)
+                    continue
+                validated_subtitle = await read_validated_srt_upload(
+                    subtitle,
+                    max_bytes=resolved_settings.max_srt_bytes,
+                    max_line_bytes=resolved_settings.max_srt_line_bytes,
+                    parse_limits=resolved_settings.srt_parse_limits,
+                    label="SRT",
+                )
+                subtitle_payloads.append(validated_subtitle.data)
+
+            service.store.delete_expired()
+            batch_id = uuid.uuid4().hex
+            jobs: list[JobRecord] = []
+            tokens: list[str] = []
+            directories: list[Path] = []
+            succeeded = False
+            total_saved = (
+                (len(style_sample_bytes) if style_sample_bytes is not None else 0)
+                + sum(len(payload) for payload in subtitle_payloads if payload is not None)
+            )
+            try:
+                for position, ((source_name, audio, audio_extension, subtitle), subtitle_bytes) in enumerate(
+                    zip(plan, subtitle_payloads, strict=True)
+                ):
+                    job_id = uuid.uuid4().hex
+                    token = _unique_job_token(tokens)
+                    directory = (resolved_settings.data_dir / f"job-{job_id}").resolve()
+                    directory.mkdir(parents=False, exist_ok=False)
+                    directories.append(directory)
+                    audio_path = directory / f"audio{audio_extension}"
+                    subtitle_path = directory / "original.srt" if subtitle is not None else None
+                    total_saved += await _save_upload(audio, audio_path, resolved_settings.max_upload_bytes)
+                    if subtitle_bytes is not None and subtitle_path is not None:
+                        subtitle_path.write_bytes(subtitle_bytes)
+                    if total_saved > resolved_settings.max_batch_upload_bytes:
+                        raise HTTPException(status_code=413, detail="Batch uploads are too large.")
+                    await reserve_processing_storage(
+                        directory=directory,
+                        audio_path=audio_path,
+                        settings=resolved_settings,
+                        store=service.store,
+                        normalization_required=normalization_required,
+                        audio_duration_probe=audio_duration_probe,
+                    )
+                    jobs.append(
+                        new_job_record(
+                            job_id=job_id,
+                            token_hash=hash_job_token(token),
+                            mode=normalized_mode,
+                            directory=directory,
+                            audio_path=audio_path,
+                            srt_path=subtitle_path,
+                            fps=fps,
+                            language=language.lower(),
+                            style=resolved_style,
+                            retention_hours=resolved_settings.retention_hours,
+                            source_name=source_name,
+                            batch_id=batch_id,
+                            batch_position=position,
+                        )
+                    )
+                    tokens.append(token)
+
+                try:
+                    service.store.create_many(
+                        jobs,
+                        max_outstanding=resolved_settings.max_outstanding_child_jobs,
+                    )
+                except OutstandingJobLimitError as exc:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Too many files are already queued. Wait for current jobs to finish.",
+                    ) from exc
+                service.submit_batch(jobs)
+                public_jobs: list[dict[str, object]] = []
+                for job, token in zip(jobs, tokens, strict=True):
+                    latest = service.store.get(job.id)
+                    if latest is None:
+                        raise HTTPException(status_code=500, detail="Could not create batch job.")
+                    public_jobs.append(_public_job(latest, token=token))
+                response = {"id": batch_id, "jobs": public_jobs}
+                succeeded = True
+                return response
+            finally:
+                if not succeeded:
+                    _rollback_intake([job.id for job in jobs], directories)
+        finally:
+            await form.close()
 
     @app.get("/api/jobs/{job_id}")
     def job_status(job_id: str, authorization: Annotated[str | None, Header()] = None) -> dict[str, object]:
@@ -311,7 +522,12 @@ def _frontend_document(index: Path, route: str) -> str:
 def _authorized_job(service: JobService, job_id: str, authorization: str | None) -> JobRecord:
     job = service.store.get(job_id)
     token = _bearer_token(authorization)
-    if job is None or job.expires_at.timestamp() <= time.time() or not valid_job_token(token, job.token_hash):
+    expired = (
+        job is not None
+        and job.status in {"complete", "failed"}
+        and job.expires_at.timestamp() <= time.time()
+    )
+    if job is None or expired or not valid_job_token(token, job.token_hash):
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
 
@@ -321,6 +537,160 @@ def _bearer_token(authorization: str | None) -> str:
         return ""
     scheme, _, token = authorization.partition(" ")
     return token.strip() if scheme.lower() == "bearer" else ""
+
+
+async def _parse_single_form(request: Request) -> FormData:
+    try:
+        return await request.form(
+            max_files=MAX_SINGLE_PARSER_FILES,
+            max_fields=MAX_SINGLE_PARSER_FIELDS,
+            max_part_size=MAX_BATCH_FIELD_BYTES,
+        )
+    except StarletteHTTPException as exc:
+        detail = str(exc.detail)
+        if detail.startswith("Too many files.") or detail.startswith("Too many fields."):
+            raise HTTPException(
+                status_code=422,
+                detail="Single jobs accept one audio file, one original SRT, and one style example.",
+            ) from exc
+        raise
+
+
+def _validate_single_form_shape(form: FormData) -> None:
+    allowed_fields = {"mode", "fps", "language", "style"}
+    allowed_files = {"audio", "subtitle", "style_sample"}
+    for name, value in form.multi_items():
+        allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
+        if name not in allowed:
+            raise HTTPException(status_code=422, detail="Unexpected job form field.")
+
+
+async def _parse_batch_form(request: Request) -> FormData:
+    try:
+        return await request.form(
+            max_files=MAX_BATCH_PARSER_FILES,
+            max_fields=MAX_BATCH_PARSER_FIELDS,
+            max_part_size=MAX_BATCH_FIELD_BYTES,
+        )
+    except StarletteHTTPException as exc:
+        if str(exc.detail).startswith("Too many files."):
+            raise HTTPException(status_code=422, detail="Select no more than 10 file pairs.") from exc
+        raise
+
+
+def _validate_batch_form_shape(form: FormData) -> None:
+    allowed_fields = {"mode", "fps", "language", "style"}
+    allowed_files = {"audio", "subtitle", "style_sample"}
+    for name, value in form.multi_items():
+        allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
+        if name not in allowed:
+            raise HTTPException(status_code=422, detail="Unexpected batch form field.")
+
+
+def _batch_text_field(form: FormData, name: str, *, default: str | None = None) -> str:
+    values = form.getlist(name)
+    if not values:
+        if default is None:
+            raise HTTPException(status_code=422, detail=f"Missing {name} field.")
+        return default
+    if len(values) != 1 or not isinstance(values[0], str):
+        raise HTTPException(status_code=422, detail=f"Invalid {name} field.")
+    value = values[0]
+    if len(value.encode("utf-8")) > MAX_BATCH_FIELD_BYTES:
+        raise HTTPException(status_code=422, detail=f"The {name} field is too large.")
+    return value
+
+
+def _batch_float_field(form: FormData, name: str, *, default: float) -> float:
+    value = _batch_text_field(form, name, default=str(default))
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid {name} field.") from exc
+
+
+def _batch_file_field(form: FormData, name: str) -> list[StarletteUploadFile]:
+    values = form.getlist(name)
+    if any(not isinstance(value, StarletteUploadFile) for value in values):
+        raise HTTPException(status_code=422, detail=f"Invalid {name} upload field.")
+    return list(values)  # type: ignore[return-value]
+
+
+def _validate_batch_upload_sizes(
+    uploads: list[tuple[StarletteUploadFile, int]],
+    *,
+    aggregate_limit: int,
+) -> None:
+    aggregate_size = 0
+    for upload, per_file_limit in uploads:
+        size = upload.size
+        if size is None:
+            continue
+        if size <= 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if size > per_file_limit:
+            raise HTTPException(status_code=413, detail="Uploaded file is too large.")
+        aggregate_size += size
+        if aggregate_size > aggregate_limit:
+            raise HTTPException(status_code=413, detail="Batch uploads are too large.")
+
+
+async def _resolve_batch_style(
+    mode: JobMode,
+    *,
+    style: str,
+    fps: float,
+    style_sample: StarletteUploadFile | None,
+    settings: WebSettings,
+) -> tuple[str, bytes | None]:
+    if mode == "sync":
+        if style_sample is not None:
+            raise HTTPException(status_code=422, detail="Sync batches do not accept a style example.")
+        return "source", None
+
+    try:
+        style_request = parse_generation_style_request(style)
+    except GenerationStyleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    sample_cues = None
+    style_sample_bytes: bytes | None = None
+    if style_request.source == "sample":
+        if style_sample is None:
+            raise HTTPException(status_code=422, detail="An SRT style example is required.")
+        _validate_subtitle(style_sample)
+        validated_style = await read_validated_srt_upload(
+            style_sample,
+            max_bytes=settings.max_srt_bytes,
+            max_line_bytes=settings.max_srt_line_bytes,
+            parse_limits=settings.srt_parse_limits,
+            label="SRT style example",
+        )
+        style_sample_bytes = validated_style.data
+        sample_cues = list(validated_style.cues)
+    elif style_sample is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="A style example is only allowed with the sample style option.",
+        )
+
+    try:
+        resolved_style = resolve_generation_style(
+            style_request,
+            fps=fps,
+            sample_cues=sample_cues,
+        ).model_dump_json()
+    except GenerationStyleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return resolved_style, style_sample_bytes
+
+
+def _unique_job_token(existing: list[str]) -> str:
+    existing_tokens = set(existing)
+    while token := secrets.token_urlsafe(32):
+        if token not in existing_tokens:
+            return token
+    raise RuntimeError("Could not generate a job token")  # pragma: no cover
 
 
 def _validate_mode(mode: str) -> JobMode:
@@ -337,21 +707,7 @@ def _validate_options(*, fps: float, language: str) -> None:
         raise HTTPException(status_code=422, detail="Invalid language code.")
 
 
-def _validate_audio(upload: UploadFile) -> str:
-    extension = Path(upload.filename or "").suffix.lower()
-    if extension not in AUDIO_EXTENSIONS or upload.content_type not in AUDIO_TYPES:
-        raise HTTPException(status_code=415, detail="Unsupported audio file.")
-    return extension
-
-
-def _validate_subtitle(upload: UploadFile) -> None:
-    if Path(upload.filename or "").suffix.lower() != ".srt":
-        raise HTTPException(status_code=415, detail="Subtitle must be an SRT file.")
-    if upload.content_type not in {"application/octet-stream", "application/x-subrip", "text/plain"}:
-        raise HTTPException(status_code=415, detail="Unsupported subtitle file.")
-
-
-async def _save_upload(upload: UploadFile, destination: Path, limit: int) -> None:
+async def _save_upload(upload: UploadFile | StarletteUploadFile, destination: Path, limit: int) -> int:
     size = 0
     try:
         with destination.open("xb") as output:
@@ -368,20 +724,7 @@ async def _save_upload(upload: UploadFile, destination: Path, limit: int) -> Non
     if size == 0:
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
-
-
-async def _read_upload(upload: UploadFile, limit: int) -> bytes:
-    data = bytearray()
-    try:
-        while chunk := await upload.read(1024 * 1024):
-            data.extend(chunk)
-            if len(data) > limit:
-                raise HTTPException(status_code=413, detail="Uploaded file is too large.")
-    finally:
-        await upload.close()
-    if not data:
-        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
-    return bytes(data)
+    return size
 
 
 def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object]:
@@ -393,6 +736,9 @@ def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object
         "created_at": job.created_at.isoformat(),
         "expires_at": job.expires_at.isoformat(),
         "error": job.error,
+        "source_name": job.source_name,
+        "batch_id": job.batch_id,
+        "batch_position": job.batch_position,
         "result": None,
         "downloads": [],
     }
@@ -408,8 +754,13 @@ def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object
 
 
 def _download_artifact(job: JobRecord, kind: str) -> tuple[Path | None, str, str]:
+    output_filename = (
+        f"{job.source_name}-dubsync-synced.srt"
+        if job.source_name is not None
+        else ("dubsync.generated.srt" if job.mode == "generate" else "dubsync.synced.srt")
+    )
     artifacts = {
-        "srt": (job.output_srt, "dubsync.generated.srt" if job.mode == "generate" else "dubsync.synced.srt", "application/x-subrip"),
+        "srt": (job.output_srt, output_filename, "application/x-subrip"),
         "qc-json": (job.qc_json, "dubsync.qc.json", "application/json"),
         "qc-html": (job.qc_html, "dubsync.qc.html", "text/html"),
         "changes": (job.changes_srt, "dubsync.changes.srt", "application/x-subrip"),
@@ -425,17 +776,6 @@ def _inside(path: Path, directory: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _client_key(request: Request) -> str:
-    if os.getenv("RENDER", "").strip().lower() == "true":
-        forwarded = [part.strip() for part in request.headers.get("x-forwarded-for", "").split(",") if part.strip()]
-        if forwarded:
-            try:
-                return str(ip_address(forwarded[-1]))
-            except ValueError:
-                pass
-    return request.client.host if request.client else "unknown"
 
 
 def run() -> None:
