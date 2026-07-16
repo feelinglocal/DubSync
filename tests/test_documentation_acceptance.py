@@ -120,7 +120,7 @@ def test_readme_documents_gemini_thinking_level_controls():
     for expected in (
         "Gemini thinking-level controls",
         "thinking_config.thinking_level",
-        "punctuation defaults to `low`",
+        "punctuation defaults to `medium`",
     ):
         assert expected in readme
 
