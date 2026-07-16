@@ -406,7 +406,7 @@ def _confidence_gate_from_config(llm_config: dict[str, Any]) -> float:
 def _gemini_thinking_level_from_config(llm_config: dict[str, Any], pass_name: str | None) -> str | None:
     value = llm_config.get("thinking_level")
     if value is None and pass_name == "punctuation":
-        return "low"
+        return "medium"
     if value is None:
         return None
     if not isinstance(value, str):

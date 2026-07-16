@@ -185,7 +185,7 @@ llm:
   punctuation:
     model: gemini-3.1-flash-lite
     scene_gap_seconds: 4.0
-    thinking_level: low
+    thinking_level: medium
   speaker_mapping:
     model: gemini-3.1-flash-lite
   # Optional for providers/models without built-in defaults:
@@ -282,7 +282,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - ElevenLabs Scribe v2 ASR forwards configured keyterms and character names as `keyterms` while still requesting word timestamps and diarization.
 - Opt-in `--live` pytest smoke tests for Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
-- Gemini thinking-level controls are wired through `thinking_level` (`minimal`, `low`, `medium`, `high`) using `thinking_config.thinking_level`; punctuation defaults to `low` when using Gemini through `llm.punctuation`.
+- Gemini thinking-level controls are wired through `thinking_level` (`minimal`, `low`, `medium`, `high`) using `thinking_config.thinking_level`; punctuation defaults to `medium` when using Gemini through `llm.punctuation`.
 - Gemini explicit context-cache reuse is wired through `cached_content`, which may be set at `llm.cached_content` or overridden per pass. DubSync reuses an existing Gemini cache resource but does not create or delete remote caches automatically.
 - Optional adjudication audio-snippet double-checks extract padded WAV snippets from the local audio, persist `audio_snippets.json`, include snippet hashes in the LLM cache key, and send Gemini inline audio parts with `types.Part.from_bytes` when `llm.adjudication.audio_snippet_double_check.enabled: true`.
 - Improv replacement path with QC flags and acoustic timing from spoken ASR words.

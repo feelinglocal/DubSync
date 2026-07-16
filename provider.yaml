@@ -23,7 +23,7 @@ llm:
   punctuation:
     model: gemini-3.1-flash-lite
     scene_gap_seconds: 4.0
-    thinking_level: low
+    thinking_level: medium
   speaker_mapping:
     model: gemini-3.1-flash-lite
 
