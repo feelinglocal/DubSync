@@ -8,6 +8,12 @@ from dubsync.llm_providers import GeminiLLMAdapter, _adjudication_prompt, _punct
 from dubsync.models import AudioSnippet, Cue, DivergenceSpan
 
 
+def test_google_genai_sdk_supports_medium_thinking_level():
+    from google.genai import types as google_types
+
+    assert google_types.ThinkingLevel.MEDIUM.value == "MEDIUM"
+
+
 def test_gemini_adapter_uses_models_generate_content_for_structured_calls(monkeypatch):
     calls: list[dict[str, object]] = []
     responses = [

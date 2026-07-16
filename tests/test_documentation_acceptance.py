@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import yaml
 
@@ -156,3 +157,9 @@ def test_readme_mentions_improv_precision_recall_metrics():
         "0.85 recall",
     ):
         assert expected in readme
+
+
+def test_cloud_dependencies_require_medium_thinking_compatible_google_genai():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "google-genai>=2.10,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
