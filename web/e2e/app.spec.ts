@@ -41,7 +41,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
-  expect(download.suggestedFilename()).toBe('dubsync.generated.srt')
+  expect(download.suggestedFilename()).toBe('dialogue-dubsync-synced.srt')
   const content = await readFile(await download.path(), 'utf-8')
   expect(content).toContain('Every word has a place.')
   expect(content).toContain('Timing follows the voice.')
@@ -82,7 +82,7 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
 test('sync mode survives refresh and protects job artifacts', async ({ page, request }) => {
   await page.goto('/')
   await page.getByLabel('Dialogue audio').setInputFiles({
-    name: 'dialogue.wav',
+    name: 'original.wav',
     mimeType: 'audio/wav',
     buffer: Buffer.from('fixture audio'),
   })
@@ -98,7 +98,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
 
   await page.getByRole('button', { name: 'Start sync' }).click()
   await expect(page.getByText('2 cues ready')).toBeVisible()
-  const access = await page.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-job') || '{}') as { id: string; token: string })
+  const access = await page.evaluate(() => (JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)[0])
   expect(access.id).toBeTruthy()
   expect(access.token).toBeTruthy()
 
@@ -113,10 +113,71 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
-  expect(download.suggestedFilename()).toBe('dubsync.synced.srt')
+  expect(download.suggestedFilename()).toBe('original-dubsync-synced.srt')
   const content = await readFile(await download.path(), 'utf-8')
   expect(content).toContain('Every word has a place.')
   expect(content).toContain('Timing follows the voice.')
+})
+
+test('matched files submit as one sequential batch and keep per-source download names', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByText('Match names: 001.wav + 001.srt. Up to 10 pairs.')).toBeVisible()
+
+  await page.getByLabel('Dialogue audio').setInputFiles([
+    { name: '001.wav', mimeType: 'audio/wav', buffer: Buffer.from('fixture audio one') },
+    { name: '002.wav', mimeType: 'audio/wav', buffer: Buffer.from('fixture audio two') },
+  ])
+  await page.getByLabel('Original SRT').setInputFiles([
+    {
+      name: '002.srt',
+      mimeType: 'application/x-subrip',
+      buffer: Buffer.from('1\r\n00:00:10,000 --> 00:00:11,000\r\nSecond pair.\r\n'),
+    },
+    {
+      name: '001.srt',
+      mimeType: 'application/x-subrip',
+      buffer: Buffer.from('1\r\n00:00:10,000 --> 00:00:11,000\r\nFirst pair.\r\n'),
+    },
+  ])
+  await page.getByLabel('Job access code').fill('fixture-access-code')
+
+  await page.getByRole('button', { name: 'Start sync' }).click()
+  await expect(page.getByText('Batch results')).toBeVisible()
+  await expect(page.getByText('001')).toBeVisible()
+  await expect(page.getByText('002')).toBeVisible()
+  await expect(page.getByText(/cues ready/)).toHaveCount(2)
+
+  const accesses = await page.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)
+  expect(accesses).toHaveLength(2)
+  expect(accesses.every(({ id, token }) => Boolean(id && token))).toBe(true)
+
+  const firstDownloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Download 001 SRT' }).click()
+  expect((await firstDownloadPromise).suggestedFilename()).toBe('001-dubsync-synced.srt')
+
+  const secondDownloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Download 002 SRT' }).click()
+  expect((await secondDownloadPromise).suggestedFilename()).toBe('002-dubsync-synced.srt')
+})
+
+test('batch selection rejects an eleventh pair before submission', async ({ page }) => {
+  await page.goto('/')
+  const audioFiles = Array.from({ length: 11 }, (_, index) => ({
+    name: `${String(index + 1).padStart(3, '0')}.wav`,
+    mimeType: 'audio/wav',
+    buffer: Buffer.from('fixture audio'),
+  }))
+  const subtitleFiles = Array.from({ length: 11 }, (_, index) => ({
+    name: `${String(index + 1).padStart(3, '0')}.srt`,
+    mimeType: 'application/x-subrip',
+    buffer: Buffer.from('1\r\n00:00:00,000 --> 00:00:01,000\r\nFixture.\r\n'),
+  }))
+
+  await page.getByLabel('Dialogue audio').setInputFiles(audioFiles)
+  await page.getByLabel('Original SRT').setInputFiles(subtitleFiles)
+
+  await expect(page.getByRole('alert')).toContainText('Choose up to 10')
+  await expect(page.getByRole('button', { name: 'Start sync' })).toBeDisabled()
 })
 
 test('selected audio paints a decoded nonblank waveform', async ({ page }) => {
@@ -157,6 +218,8 @@ test('brand, theme, and crawler surfaces use the production identity', async ({ 
   await expect(page).toHaveTitle('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
   await expect(page.locator('header img.brand-mark')).toHaveAttribute('src', '/brand/dubsync-mark.svg')
+  await expect(page.getByText('Part of Feels Local')).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Contact' })).toHaveAttribute('href', 'mailto:rey@feelslocal.com')
   await page.getByRole('button', { name: 'Use light theme' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
   await page.reload()

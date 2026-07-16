@@ -455,7 +455,14 @@ def test_job_service_deletes_expired_job_without_waiting_for_another_request(tmp
             style="standard",
             retention_hours=24,
         )
-        service.store.create(replace(job, expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+        service.store.create(
+            replace(
+                job,
+                status="complete",
+                progress=100,
+                expires_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+        )
 
         deadline = time.monotonic() + 1
         while service.store.get("expired") is not None and time.monotonic() < deadline:

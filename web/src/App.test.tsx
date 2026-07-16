@@ -53,6 +53,22 @@ const configResponse = {
   },
 }
 
+const completedBatchResponse = {
+  id: 'batch-1',
+  jobs: [
+    {
+      id: 'job-1', token: 'token-1', source_name: '001', batch_id: 'batch-1', batch_position: 0,
+      mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 3, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    },
+    {
+      id: 'job-2', token: 'token-2', source_name: '002', batch_id: 'batch-1', batch_position: 1,
+      mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 4, cost_usd: 0.02 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    },
+  ],
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
   sessionStorage.clear()
@@ -77,6 +93,90 @@ describe('DubSync workspace', () => {
     expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
     expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
     expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
+  })
+
+  it('shows the simple file-pair naming instruction for batch sync', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+
+    render(<App />)
+
+    expect(await screen.findByText('Match names: 001.wav + 001.srt. Up to 10 pairs.')).toBeVisible()
+  })
+
+  it('keeps batch submission disabled when audio and subtitle stems do not match', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-3'], '003.srt', { type: 'application/x-subrip' }),
+    ])
+
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+  })
+
+  it('submits two named pairs in one multipart batch request and renders both child results', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    const firstAudio = new File(['audio-1'], '001.wav', { type: 'audio/wav' })
+    const secondAudio = new File(['audio-2'], '002.wav', { type: 'audio/wav' })
+    const firstSubtitle = new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' })
+    const secondSubtitle = new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' })
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [firstAudio, secondAudio])
+    await user.upload(screen.getByLabelText('Original SRT'), [secondSubtitle, firstSubtitle])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [url, options] = fetchMock.mock.calls[1]
+    const body = options?.body as FormData
+    expect(url).toBe('/api/batches')
+    expect(options?.method).toBe('POST')
+    expect((body.getAll('audio') as File[]).map((file) => file.name)).toEqual(['001.wav', '002.wav'])
+    expect((body.getAll('subtitle') as File[]).map((file) => file.name)).toEqual(['001.srt', '002.srt'])
+    expect(await screen.findByText('001')).toBeVisible()
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('002')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+  })
+
+  it('uses the selected child token when downloading a batch result', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(['subtitle']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="002-dubsync-synced.srt"' },
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+    await user.click(await screen.findByRole('button', { name: 'Download 002 SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/jobs/job-2/downloads/srt')
+    expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
   })
 
   it('serves the dedicated payment and refund policy route', () => {

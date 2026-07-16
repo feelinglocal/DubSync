@@ -49,6 +49,16 @@ def test_visible_web_copy_has_no_dash_flourishes():
     assert "\N{EM DASH}" not in visible_source
 
 
+def test_public_contact_and_footer_use_the_feels_local_identity():
+    files = [WEB_SOURCE / "App.tsx", *(WEB_SOURCE / "components").glob("*.tsx")]
+    visible_source = "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+    assert "Part of Feels Local" in visible_source
+    assert "rey@feelslocal.com" in visible_source
+    assert "reyhanputraph@gmail.com" not in visible_source
+    assert "Operated by Reyhan Putra in Indonesia" not in visible_source
+
+
 def test_brand_and_crawler_assets_are_declared_and_shippable():
     index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
 
