@@ -93,8 +93,15 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
 
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is False
-    assert config["llm"]["punctuation"]["thinking_level"] == "low"
+    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
     assert "cached_content: cachedContents/your-episode-context-cache" in example_text
+
+
+def test_production_punctuation_uses_flash_lite_with_medium_thinking():
+    config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
+
+    assert config["llm"]["punctuation"]["model"] == "gemini-3.1-flash-lite"
+    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
 
 
 def test_readme_names_remaining_unimplemented_plan_provider_controls():

@@ -34,7 +34,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert isinstance(punctuation, GeminiLLMAdapter)
     assert punctuation.model == "gemini-3.1-flash-lite"
     assert punctuation.api_key == "gemini-key"
-    assert punctuation.thinking_level == "low"
+    assert punctuation.thinking_level == "medium"
     assert isinstance(speaker_mapping, OpenAILLMAdapter)
     assert speaker_mapping.model == "gpt-5.5"
     assert speaker_mapping.api_key == "openai-key"
