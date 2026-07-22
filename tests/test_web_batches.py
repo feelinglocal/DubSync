@@ -263,6 +263,25 @@ def test_finished_batch_download_includes_successes_when_one_child_failed(tmp_pa
         ]
 
 
+def test_finished_batch_download_rejects_an_all_failed_batch(tmp_path):
+    def always_failing(_job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        raise RuntimeError("intentional per-child failure")
+
+    app = create_app(settings=_settings(tmp_path), processor=always_failing)
+    audio_files = [("001.wav", b"one"), ("002.wav", b"two")]
+    subtitle_files = [("001.srt", SRT_BYTES), ("002.srt", SRT_BYTES)]
+
+    with TestClient(app) as client:
+        batch = _post_batch(client, audio_files, subtitle_files).json()
+        download = client.post(
+            f"/api/batches/{batch['id']}/downloads/srt",
+            json=_batch_download_payload(batch),
+        )
+
+    assert download.status_code == 409
+    assert download.json() == {"detail": "No completed SRTs are available."}
+
+
 def test_batch_download_rejects_a_batch_that_is_still_processing(tmp_path):
     started = threading.Event()
     release = threading.Event()

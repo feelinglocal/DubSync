@@ -40,9 +40,26 @@ export async function downloadJobArtifact(jobId: string, token: string, kind: st
     headers: { Authorization: `Bearer ${token}` },
   })
   if (!response.ok) throw new Error('Could not download this file.')
+  await downloadResponse(response, `dubsync-${kind}`)
+}
+
+export async function downloadBatchSrtArchive(
+  batchId: string,
+  jobs: readonly { id: string; token: string }[],
+): Promise<void> {
+  const response = await fetch(`/api/batches/${encodeURIComponent(batchId)}/downloads/srt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobs }),
+  })
+  if (!response.ok) throw new Error('Could not download the completed SRTs.')
+  await downloadResponse(response, `dubsync-batch-${batchId}-synced-srts.zip`)
+}
+
+async function downloadResponse(response: Response, fallbackFilename: string): Promise<void> {
   const blob = await response.blob()
   const disposition = response.headers.get('content-disposition') || ''
-  const filename = filenameFromDisposition(disposition) || `dubsync-${kind}`
+  const filename = filenameFromDisposition(disposition) || fallbackFilename
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url

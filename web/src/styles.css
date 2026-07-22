@@ -841,10 +841,22 @@ p {
   margin-top: 18px;
 }
 
-.batch-results > h2 {
+.batch-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.batch-results-header h2 {
   color: var(--color-ink);
   font-size: 18px;
   font-weight: 690;
+}
+
+.batch-download-button {
+  flex: 0 0 auto;
 }
 
 .batch-results-list {
@@ -1468,6 +1480,15 @@ button:active:not(:disabled),
 
   .download-actions {
     padding-left: 16px;
+  }
+
+  .batch-results-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-download-button {
+    width: 100%;
   }
 
   .section-inner {

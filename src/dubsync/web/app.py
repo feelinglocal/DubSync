@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -7,15 +8,17 @@ import secrets
 import shutil
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
-from collections.abc import Callable
-from typing import Annotated
+from tempfile import SpooledTemporaryFile
+from typing import Annotated, BinaryIO
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -77,6 +80,9 @@ SITE_ORIGIN = "https://dubsync.onrender.com"
 MAX_BATCH_PARSER_FILES = 21
 MAX_BATCH_PARSER_FIELDS = 5
 MAX_BATCH_FIELD_BYTES = 64 * 1024
+MAX_BATCH_DOWNLOAD_BODY_BYTES = 16 * 1024
+BATCH_ARCHIVE_SPOOL_BYTES = 8 * 1024 * 1024
+ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
 MAX_SINGLE_PARSER_FIELDS = 4
 
@@ -454,6 +460,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="Download not found.")
         return FileResponse(path, filename=filename, media_type=media_type)
 
+    @app.post("/api/batches/{batch_id}/downloads/srt")
+    async def download_batch_srts(batch_id: str, request: Request):
+        credentials = await _parse_batch_download_credentials(request)
+        jobs = tuple(service.store.by_batch_id(batch_id))
+        _authorize_batch_download(jobs, credentials)
+        if any(job.status in {"queued", "processing"} for job in jobs):
+            raise HTTPException(status_code=409, detail="Batch processing is not finished.")
+
+        completed_jobs = tuple(job for job in jobs if job.status == "complete")
+        if not completed_jobs:
+            raise HTTPException(status_code=409, detail="No completed SRTs are available.")
+        sources = _batch_srt_sources(
+            completed_jobs,
+            max_source_bytes=resolved_settings.max_batch_upload_bytes,
+        )
+        archive = SpooledTemporaryFile(
+            max_size=min(BATCH_ARCHIVE_SPOOL_BYTES, resolved_settings.max_batch_upload_bytes),
+            mode="w+b",
+        )
+        try:
+            _write_batch_srt_archive(
+                archive,
+                sources,
+                max_source_bytes=resolved_settings.max_batch_upload_bytes,
+            )
+            archive.seek(0)
+        except Exception:
+            archive.close()
+            raise
+
+        filename = f"dubsync-batch-{batch_id[:8]}-synced-srts.zip"
+        return StreamingResponse(
+            _stream_and_close(archive),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     _mount_frontend(app, resolved_settings.static_dir)
     return app
 
@@ -537,6 +580,152 @@ def _bearer_token(authorization: str | None) -> str:
         return ""
     scheme, _, token = authorization.partition(" ")
     return token.strip() if scheme.lower() == "bearer" else ""
+
+
+async def _parse_batch_download_credentials(request: Request) -> tuple[tuple[str, str], ...]:
+    content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if content_type != "application/json":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/json.")
+
+    body = b""
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_BATCH_DOWNLOAD_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Batch download request body is too large.")
+        body = body + chunk
+
+    try:
+        payload = json.loads(body.decode("utf-8"), object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid batch download request.") from exc
+    if not isinstance(payload, dict) or set(payload) != {"jobs"}:
+        raise HTTPException(status_code=422, detail="Invalid batch download request.")
+
+    requested_jobs = payload["jobs"]
+    if (
+        not isinstance(requested_jobs, list)
+        or not requested_jobs
+        or len(requested_jobs) > MAX_BATCH_ITEMS
+    ):
+        raise HTTPException(status_code=422, detail="Invalid batch download request.")
+
+    credentials: tuple[tuple[str, str], ...] = ()
+    for requested_job in requested_jobs:
+        if not isinstance(requested_job, dict) or set(requested_job) != {"id", "token"}:
+            raise HTTPException(status_code=422, detail="Invalid batch download request.")
+        job_id = requested_job["id"]
+        token = requested_job["token"]
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or len(job_id) > 256
+            or not isinstance(token, str)
+            or not token
+            or len(token) > 1024
+        ):
+            raise HTTPException(status_code=422, detail="Invalid batch download request.")
+        credentials = (*credentials, (job_id, token))
+    return credentials
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("Duplicate JSON field")
+        payload = {**payload, key: value}
+    return payload
+
+
+def _authorize_batch_download(
+    jobs: tuple[JobRecord, ...],
+    credentials: tuple[tuple[str, str], ...],
+) -> None:
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    provided_ids = tuple(job_id for job_id, _token in credentials)
+    expected_ids = tuple(job.id for job in jobs)
+    ids_match = (
+        len(provided_ids) == len(expected_ids)
+        and len(frozenset(provided_ids)) == len(provided_ids)
+        and frozenset(provided_ids) == frozenset(expected_ids)
+    )
+    tokens_match = True
+    for job in jobs:
+        matching_tokens = tuple(token for job_id, token in credentials if job_id == job.id)
+        supplied_token = matching_tokens[0] if len(matching_tokens) == 1 else ""
+        tokens_match = valid_job_token(supplied_token, job.token_hash) and tokens_match
+
+    now = time.time()
+    has_expired_child = any(
+        job.status in {"complete", "failed"} and job.expires_at.timestamp() <= now
+        for job in jobs
+    )
+    if not ids_match or not tokens_match or has_expired_child:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+
+def _batch_srt_sources(
+    jobs: tuple[JobRecord, ...],
+    *,
+    max_source_bytes: int,
+) -> tuple[tuple[Path, str], ...]:
+    sources: tuple[tuple[Path, str], ...] = ()
+    source_bytes = 0
+    filenames: tuple[str, ...] = ()
+    for job in jobs:
+        path, filename, _media_type = _download_artifact(job, "srt")
+        if (
+            path is None
+            or not _safe_archive_filename(filename)
+            or filename in filenames
+        ):
+            raise HTTPException(status_code=404, detail="Download not found.")
+        try:
+            resolved_path = path.resolve(strict=True)
+            size = resolved_path.stat().st_size
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Download not found.") from exc
+        if not resolved_path.is_file() or not _inside(resolved_path, job.directory):
+            raise HTTPException(status_code=404, detail="Download not found.")
+        source_bytes += size
+        if source_bytes > max_source_bytes:
+            raise HTTPException(status_code=413, detail="Batch SRT archive is too large.")
+        sources = (*sources, (resolved_path, filename))
+        filenames = (*filenames, filename)
+    return sources
+
+
+def _safe_archive_filename(filename: str) -> bool:
+    return bool(filename) and filename not in {".", ".."} and "/" not in filename and "\\" not in filename
+
+
+def _write_batch_srt_archive(
+    archive: BinaryIO,
+    sources: tuple[tuple[Path, str], ...],
+    *,
+    max_source_bytes: int,
+) -> None:
+    source_bytes = 0
+    try:
+        with ZipFile(archive, mode="w", compression=ZIP_DEFLATED) as zip_file:
+            for path, filename in sources:
+                with path.open("rb") as source, zip_file.open(filename, mode="w") as target:
+                    while chunk := source.read(ARCHIVE_COPY_CHUNK_BYTES):
+                        source_bytes += len(chunk)
+                        if source_bytes > max_source_bytes:
+                            raise HTTPException(status_code=413, detail="Batch SRT archive is too large.")
+                        target.write(chunk)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="Download not found.") from exc
+
+
+def _stream_and_close(archive: BinaryIO) -> Iterator[bytes]:
+    try:
+        while chunk := archive.read(ARCHIVE_COPY_CHUNK_BYTES):
+            yield chunk
+    finally:
+        archive.close()
 
 
 async def _parse_single_form(request: Request) -> FormData:

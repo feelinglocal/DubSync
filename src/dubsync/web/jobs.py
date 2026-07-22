@@ -304,6 +304,18 @@ class JobStore:
             row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return _record(row) if row is not None else None
 
+    def by_batch_id(self, batch_id: str) -> list[JobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM jobs
+                WHERE batch_id = ?
+                ORDER BY batch_position, id
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [_record(row) for row in rows]
+
     def pending(self) -> list[JobRecord]:
         with self._connect() as connection:
             rows = connection.execute(

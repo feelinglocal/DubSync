@@ -1,7 +1,7 @@
-import { AudioLines, ChevronDown, FileText, LockKeyhole, Play } from 'lucide-react'
+import { AudioLines, ChevronDown, Download, FileText, LoaderCircle, LockKeyhole, Play } from 'lucide-react'
 import { FormEvent, useEffect, useId, useMemo, useRef, useState } from 'react'
 
-import { ApiError, createBatch, createJob, downloadJobArtifact, loadJob } from '../api'
+import { ApiError, createBatch, createJob, downloadBatchSrtArchive, downloadJobArtifact, loadJob } from '../api'
 import { pairSyncFiles, validateAudioFiles } from '../batch'
 import {
   clearActiveJobs,
@@ -44,6 +44,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [pollRevision, setPollRevision] = useState(0)
   const [submitting, setSubmitting] = useState(false)
   const [downloading, setDownloading] = useState<DownloadState | null>(null)
+  const [downloadingBatch, setDownloadingBatch] = useState(false)
   const [error, setError] = useState('')
   const [refreshErrors, setRefreshErrors] = useState<Record<string, string>>({})
   const customStyleValues = useMemo(() => valuesFromDraft(customStyle), [customStyle])
@@ -74,6 +75,10 @@ export function Workspace({ config }: { config: PublicConfig }) {
       && !submitting
     ),
     [accessCode, config.access_code_required, config.jobs_available, customStyleValidation.valid, hasBlockingJob, mode, selectionError, styleSample, styleSource, submitting],
+  )
+  const downloadableBatch = useMemo(
+    () => resolveDownloadableBatch(jobs, accesses),
+    [accesses, jobs],
   )
 
   useEffect(() => {
@@ -240,6 +245,19 @@ export function Workspace({ config }: { config: PublicConfig }) {
     }
   }
 
+  async function downloadBatch() {
+    if (!downloadableBatch) return
+    setDownloadingBatch(true)
+    setError('')
+    try {
+      await downloadBatchSrtArchive(downloadableBatch.id, downloadableBatch.jobs)
+    } catch (downloadError) {
+      setError(messageFrom(downloadError))
+    } finally {
+      setDownloadingBatch(false)
+    }
+  }
+
   function selectMode(nextMode: JobMode) {
     if (nextMode === mode) return
     setMode(nextMode)
@@ -310,7 +328,21 @@ export function Workspace({ config }: { config: PublicConfig }) {
         {audioFiles.length === 1 && <WaveformPreview file={audioFiles[0]} />}
         {isBatch ? (
           <section className="batch-results" aria-labelledby="batch-results-title">
-            <h2 id="batch-results-title">Batch results</h2>
+            <div className="batch-results-header">
+              <h2 id="batch-results-title">Batch results</h2>
+              {downloadableBatch && (
+                <button
+                  type="button"
+                  className="primary-button batch-download-button"
+                  onClick={downloadBatch}
+                  disabled={downloadingBatch || downloading !== null}
+                  aria-busy={downloadingBatch}
+                >
+                  {downloadingBatch ? <LoaderCircle className="spin" aria-hidden="true" /> : <Download aria-hidden="true" />}
+                  {downloadableBatch.allComplete ? 'Download all SRTs' : 'Download completed SRTs'}
+                </button>
+              )}
+            </div>
             <div className="batch-results-list">
               {jobs.map((job, index) => (
                 <JobPanel
@@ -318,7 +350,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
                   job={job}
                   sourceName={job.source_name || `File ${index + 1}`}
                   onDownload={(kind) => download(job, kind)}
-                  downloading={downloading?.jobId === job.id ? downloading.kind : null}
+                  downloading={downloadingBatch ? 'batch-srt' : downloading?.jobId === job.id ? downloading.kind : null}
                 />
               ))}
             </div>
@@ -352,6 +384,31 @@ function mergeById<T extends { id: string }>(current: readonly T[], incoming: re
   const merged = new Map(current.map((item) => [item.id, item]))
   incoming.forEach((item) => merged.set(item.id, item))
   return [...merged.values()]
+}
+
+function resolveDownloadableBatch(jobs: readonly JobResponse[], accesses: readonly ActiveJobAccess[]) {
+  if (jobs.length < 2) return null
+  const batchId = jobs[0].batch_id
+  if (!batchId || jobs.some((job) => job.batch_id !== batchId)) return null
+  if (jobs.some((job) => !['complete', 'failed'].includes(job.status))) return null
+
+  const completedSrtCount = jobs.filter(
+    (job) => job.status === 'complete' && job.downloads.includes('srt'),
+  ).length
+  if (completedSrtCount === 0) return null
+
+  const tokensByJobId = new Map(accesses.map((access) => [access.id, access.token]))
+  const protectedJobs = jobs.flatMap((job) => {
+    const token = tokensByJobId.get(job.id)
+    return token ? [{ id: job.id, token }] : []
+  })
+  if (protectedJobs.length !== jobs.length) return null
+
+  return {
+    id: batchId,
+    jobs: protectedJobs,
+    allComplete: completedSrtCount === jobs.length,
+  }
 }
 
 function isTerminalAccessError(error: unknown) {

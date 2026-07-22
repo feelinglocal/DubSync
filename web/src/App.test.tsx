@@ -196,13 +196,11 @@ describe('DubSync workspace', () => {
   })
 
   it('places one ZIP download action in the completed batch header and sends every child token', async () => {
+    let finishDownload: (response: Response) => void = () => undefined
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
-    fetchMock.mockResolvedValueOnce(new Response(new Blob(['zip']), {
-      status: 200,
-      headers: { 'content-disposition': 'attachment; filename="dubsync-batch-batch-1-synced-srts.zip"' },
-    }))
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finishDownload = resolve }))
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
     const user = userEvent.setup()
     render(<App />)
@@ -234,6 +232,43 @@ describe('DubSync workspace', () => {
         { id: 'job-2', token: 'token-2' },
       ],
     })
+    expect(downloadAll).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Download 001 SRT' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Download 002 SRT' })).toBeDisabled()
+
+    await act(async () => finishDownload(new Response(new Blob(['zip']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="dubsync-batch-batch-1-synced-srts.zip"' },
+    })))
+    await waitFor(() => expect(downloadAll).toBeEnabled())
+  })
+
+  it('hides the batch ZIP action when any child access token is missing', async () => {
+    const batchMissingOneToken = {
+      ...completedBatchResponse,
+      jobs: completedBatchResponse.jobs.map((job, index) => (
+        index === 0 ? job : { ...job, token: undefined }
+      )),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(batchMissingOneToken), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByText('4 cues ready')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
   })
 
   it('shows a completed-SRT ZIP action after a partial batch finishes', async () => {
