@@ -15,7 +15,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
             "provider": "gemini",
             "model": "gemini-3.5-flash",
             "api_key": "gemini-key",
-            "punctuation": {"model": "gemini-3.1-flash-lite"},
+            "punctuation": {"model": "gemini-3.5-flash-lite"},
             "speaker_mapping": {
                 "provider": "openai",
                 "model": "gpt-5.5",
@@ -32,7 +32,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert adjudication.model == "gemini-3.5-flash"
     assert adjudication.api_key == "gemini-key"
     assert isinstance(punctuation, GeminiLLMAdapter)
-    assert punctuation.model == "gemini-3.1-flash-lite"
+    assert punctuation.model == "gemini-3.5-flash-lite"
     assert punctuation.api_key == "gemini-key"
     assert punctuation.thinking_level == "medium"
     assert isinstance(speaker_mapping, OpenAILLMAdapter)
@@ -113,7 +113,7 @@ def test_punctuation_scene_gap_uses_llm_pass_override():
         "llm": {
             "provider": "gemini",
             "model": "gemini-3.5-flash",
-            "punctuation": {"model": "gemini-3.1-flash-lite", "scene_gap_seconds": 3.0},
+            "punctuation": {"model": "gemini-3.5-flash-lite", "scene_gap_seconds": 3.0},
         }
     }
 

@@ -94,15 +94,42 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
 
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is False
+    assert config["llm"]["punctuation"]["model"] == "gemini-3.5-flash-lite"
     assert config["llm"]["punctuation"]["thinking_level"] == "medium"
+    assert config["llm"]["speaker_mapping"]["model"] == "gemini-3.5-flash-lite"
+    assert "thinking_level" not in config["llm"]["speaker_mapping"]
     assert "cached_content: cachedContents/your-episode-context-cache" in example_text
 
 
-def test_production_punctuation_uses_flash_lite_with_medium_thinking():
+def test_production_flash_lite_passes_use_3_5_and_preserve_thinking_levels():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
-    assert config["llm"]["punctuation"]["model"] == "gemini-3.1-flash-lite"
+    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["punctuation"]["model"] == "gemini-3.5-flash-lite"
     assert config["llm"]["punctuation"]["thinking_level"] == "medium"
+    assert config["llm"]["speaker_mapping"]["model"] == "gemini-3.5-flash-lite"
+    assert "thinking_level" not in config["llm"]["speaker_mapping"]
+
+
+def test_documented_configuration_uses_3_5_flash_lite():
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert readme.count("model: gemini-3.5-flash-lite") == 2
+
+
+def test_repository_has_no_legacy_flash_lite_model_references():
+    legacy_model = "gemini-" + "3.1-flash-lite"
+    files = [Path("README.md"), Path("provider.yaml"), Path("providers.example.yaml")]
+    files.extend(Path("src").rglob("*.py"))
+    files.extend(Path("tests").rglob("*.py"))
+    files.extend(Path("docs").rglob("*.md"))
+
+    stale_references = [
+        str(path)
+        for path in files
+        if path.is_file() and legacy_model in path.read_text(encoding="utf-8")
+    ]
+    assert stale_references == []
 
 
 def test_readme_names_remaining_unimplemented_plan_provider_controls():

@@ -78,7 +78,7 @@ def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypat
                 "llm": {
                     "provider": "gemini",
                     "model": "gemini-3.5-flash",
-                    "punctuation": {"model": "gemini-3.1-flash-lite"},
+                    "punctuation": {"model": "gemini-3.5-flash-lite"},
                 },
             }
         ),
@@ -91,7 +91,7 @@ def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypat
 
     result = sync_episode(srt_path, audio_path, out_path, workdir, providers_path=providers_path)
 
-    assert result.cost_meter.total_usd == 0.012225
+    assert result.cost_meter.total_usd == 0.01234
     cost_data = json.loads((workdir / "episode" / "cost.json").read_text(encoding="utf-8"))
     assert [item for item in cost_data["items"] if item["kind"] == "tokens"] == [
         {
@@ -101,9 +101,9 @@ def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypat
             "usd": 0.012,
         },
         {
-            "provider": "gemini-3.1-flash-lite",
+            "provider": "gemini-3.5-flash-lite",
             "kind": "tokens",
             "units": {"input_tokens": 300.0, "output_tokens": 100.0},
-            "usd": 0.000225,
+            "usd": 0.00034,
         },
     ]
