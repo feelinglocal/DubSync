@@ -91,7 +91,7 @@ Sources: elevenlabs.io/docs + pricing pages, developers.openai.com/api/docs/guid
 | Model | Price (in/out per M) | Role fit |
 |---|---|---|
 | **Gemini 3.5 Flash** (`gemini-3.5-flash`, GA May 2026) | $1.50 / $9 ($0.15 cached input) | **Default for all LLM passes.** 1M context fits a whole episode + ASR JSON in one call; native audio input for snippet double-checks; structured outputs; thinking on by default (use `low` for punctuation batches, higher for adjudication) |
-| Gemini 3.1 Flash-Lite | $0.25 / $1.50 | Ultra-cheap downgrade option for punctuation-only passes if cost-sensitive |
+| **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`, GA July 2026) | $0.30 / $2.50 | Low-cost option for high-throughput punctuation and speaker-mapping passes; retain each pass's configured thinking level |
 | Gemini 3.1 Pro / 3.5 Pro (when GA) | $2 / $12 | Optional quality upgrade for adjudication on difficult episodes |
 | Claude Opus/Sonnet (Anthropic) | higher | Alternative adjudicator; no audio input → text-only usage |
 | GPT-5.x (OpenAI) | comparable | Same role; structured outputs solid |

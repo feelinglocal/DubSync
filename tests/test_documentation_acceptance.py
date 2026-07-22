@@ -113,8 +113,11 @@ def test_production_flash_lite_passes_use_3_5_and_preserve_thinking_levels():
 
 def test_documented_configuration_uses_3_5_flash_lite():
     readme = Path("README.md").read_text(encoding="utf-8")
+    plan = Path("PLAN.md").read_text(encoding="utf-8")
 
     assert readme.count("model: gemini-3.5-flash-lite") == 2
+    assert "**Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`" in plan
+    assert "Gemini " + "3.1 Flash-Lite" not in plan
 
 
 def test_repository_has_no_legacy_flash_lite_model_references():
