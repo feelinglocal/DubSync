@@ -8,6 +8,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+_LEGACY_FLASH_LITE_VERSION = "3.1"
+
+
 class CostItem(BaseModel):
     provider: str
     kind: str
@@ -104,6 +107,8 @@ def llm_token_prices(provider: str, model: str, config: dict[str, object]) -> tu
             return (1.5, 9.0)
         if normalized_model == "gemini-3.5-flash-lite":
             return (0.3, 2.5)
+        if normalized_model == f"gemini-{_LEGACY_FLASH_LITE_VERSION}-flash-lite":
+            return (0.25, 1.5)
     return None
 
 
