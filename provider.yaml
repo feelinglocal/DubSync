@@ -21,11 +21,11 @@ llm:
       pad_seconds: 2.0
       max_duration_seconds: 20.0
   punctuation:
-    model: gemini-3.1-flash-lite
+    model: gemini-3.5-flash-lite
     scene_gap_seconds: 4.0
     thinking_level: medium
   speaker_mapping:
-    model: gemini-3.1-flash-lite
+    model: gemini-3.5-flash-lite
 
 vad:
   provider: energy

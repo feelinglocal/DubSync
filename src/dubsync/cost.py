@@ -102,8 +102,8 @@ def llm_token_prices(provider: str, model: str, config: dict[str, object]) -> tu
     if normalized_provider == "gemini" or normalized_model.startswith("gemini-"):
         if normalized_model == "gemini-3.5-flash":
             return (1.5, 9.0)
-        if normalized_model == "gemini-3.1-flash-lite":
-            return (0.25, 1.5)
+        if normalized_model == "gemini-3.5-flash-lite":
+            return (0.3, 2.5)
     return None
 
 
