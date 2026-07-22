@@ -195,6 +195,76 @@ describe('DubSync workspace', () => {
     expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
   })
 
+  it('places one ZIP download action in the completed batch header and sends every child token', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(['zip']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="dubsync-batch-batch-1-synced-srts.zip"' },
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    const downloadAll = await screen.findByRole('button', { name: 'Download all SRTs' })
+    expect(downloadAll.closest('.batch-results-header')).not.toBeNull()
+    await user.click(downloadAll)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/batches/batch-1/downloads/srt')
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      jobs: [
+        { id: 'job-1', token: 'token-1' },
+        { id: 'job-2', token: 'token-2' },
+      ],
+    })
+  })
+
+  it('shows a completed-SRT ZIP action after a partial batch finishes', async () => {
+    const partialBatch = {
+      ...completedBatchResponse,
+      jobs: completedBatchResponse.jobs.map((job, index) => (
+        index === 0
+          ? job
+          : { ...job, status: 'failed', progress: 100, result: null, downloads: [], error: 'Job failed.' }
+      )),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(partialBatch), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByRole('button', { name: 'Download completed SRTs' })).toBeVisible()
+  })
+
   it('keeps every child token through mode switches and later completed submissions', async () => {
     const laterJob = {
       id: 'job-3', token: 'token-3', source_name: 'episode',
@@ -245,6 +315,7 @@ describe('DubSync workspace', () => {
     expect(await screen.findByText('8 cues ready')).toBeVisible()
     expect(screen.getByText('3 cues ready')).toBeVisible()
     expect(screen.getByText('4 cues ready')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
     await waitFor(() => expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
       { id: 'job-1', token: 'token-1' },
       { id: 'job-2', token: 'token-2' },
@@ -300,6 +371,7 @@ describe('DubSync workspace', () => {
     expect(screen.getByRole('progressbar', { name: '001 progress' })).toHaveAttribute('value', '0')
     expect(screen.getByRole('progressbar', { name: '002 progress' })).toHaveAttribute('value', '25')
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
     await user.upload(
       screen.getByLabelText('Dialogue audio'),

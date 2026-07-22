@@ -4,9 +4,11 @@ import json
 import sqlite3
 import threading
 import time
+from io import BytesIO
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -92,6 +94,17 @@ def _post_batch(
     )
 
 
+def _batch_download_payload(batch: dict[str, object]) -> dict[str, object]:
+    jobs = batch["jobs"]
+    assert isinstance(jobs, list)
+    return {
+        "jobs": [
+            {"id": child["id"], "token": child["token"]}
+            for child in jobs
+        ]
+    }
+
+
 def _database_row_counts(database: Path) -> dict[str, int]:
     with sqlite3.connect(database) as connection:
         tables = [
@@ -161,6 +174,134 @@ def test_batch_accepts_ten_case_insensitive_pairs_and_preserves_audio_order_and_
         )
         assert download.status_code == 200
         assert download.headers["content-disposition"] == 'attachment; filename="001-dubsync-synced.srt"'
+
+
+def test_completed_batch_download_returns_one_ordered_zip_with_every_named_srt(tmp_path):
+    def named_artifacts(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        artifacts = _artifacts(job)
+        artifacts.output_srt.write_bytes(_srt_bytes(f"subtitle:{job.source_name}"))
+        return artifacts
+
+    app = create_app(settings=_settings(tmp_path), processor=named_artifacts)
+    audio_files = [("002.wav", b"two"), ("001.wav", b"one"), ("003.wav", b"three")]
+    subtitle_files = [("003.srt", SRT_BYTES), ("001.srt", SRT_BYTES), ("002.srt", SRT_BYTES)]
+
+    with TestClient(app) as client:
+        created = _post_batch(client, audio_files, subtitle_files)
+        assert created.status_code == 202
+        batch = created.json()
+
+        download = client.post(
+            f"/api/batches/{batch['id']}/downloads/srt",
+            json=_batch_download_payload(batch),
+        )
+
+    assert download.status_code == 200
+    assert download.headers["content-type"] == "application/zip"
+    assert download.headers["content-disposition"] == (
+        f'attachment; filename="dubsync-batch-{batch["id"][:8]}-synced-srts.zip"'
+    )
+    with ZipFile(BytesIO(download.content)) as archive:
+        assert archive.namelist() == [
+            "002-dubsync-synced.srt",
+            "001-dubsync-synced.srt",
+            "003-dubsync-synced.srt",
+        ]
+        assert archive.read("002-dubsync-synced.srt") == _srt_bytes("subtitle:002")
+        assert archive.read("001-dubsync-synced.srt") == _srt_bytes("subtitle:001")
+        assert archive.read("003-dubsync-synced.srt") == _srt_bytes("subtitle:003")
+
+
+def test_batch_download_requires_the_exact_child_set_and_every_child_token(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=lambda job, _settings: _artifacts(job))
+    audio_files = [("001.wav", b"one"), ("002.wav", b"two")]
+    subtitle_files = [("001.srt", SRT_BYTES), ("002.srt", SRT_BYTES)]
+
+    with TestClient(app) as client:
+        batch = _post_batch(client, audio_files, subtitle_files).json()
+        payload = _batch_download_payload(batch)
+        jobs = payload["jobs"]
+        assert isinstance(jobs, list)
+
+        missing_child = client.post(
+            f"/api/batches/{batch['id']}/downloads/srt",
+            json={"jobs": jobs[:-1]},
+        )
+        wrong_token = client.post(
+            f"/api/batches/{batch['id']}/downloads/srt",
+            json={"jobs": [jobs[0], {**jobs[1], "token": "wrong-token"}]},
+        )
+
+    assert missing_child.status_code == 404
+    assert wrong_token.status_code == 404
+
+
+def test_finished_batch_download_includes_successes_when_one_child_failed(tmp_path):
+    def partially_failing(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        if job.source_name == "fails":
+            raise RuntimeError("intentional per-child failure")
+        artifacts = _artifacts(job)
+        artifacts.output_srt.write_bytes(_srt_bytes(job.source_name or "unknown"))
+        return artifacts
+
+    app = create_app(settings=_settings(tmp_path), processor=partially_failing)
+    audio_files = [("first.wav", b"one"), ("fails.wav", b"two"), ("last.wav", b"three")]
+    subtitle_files = [("last.srt", SRT_BYTES), ("first.srt", SRT_BYTES), ("fails.srt", SRT_BYTES)]
+
+    with TestClient(app) as client:
+        batch = _post_batch(client, audio_files, subtitle_files).json()
+        download = client.post(
+            f"/api/batches/{batch['id']}/downloads/srt",
+            json=_batch_download_payload(batch),
+        )
+
+    assert download.status_code == 200
+    with ZipFile(BytesIO(download.content)) as archive:
+        assert archive.namelist() == [
+            "first-dubsync-synced.srt",
+            "last-dubsync-synced.srt",
+        ]
+
+
+def test_batch_download_rejects_a_batch_that_is_still_processing(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        started.set()
+        assert release.wait(timeout=3)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path, processing_inline=False), processor=blocked_processor)
+    with TestClient(app) as client:
+        try:
+            batch = _post_batch(
+                client,
+                [("001.wav", b"one"), ("002.wav", b"two")],
+                [("001.srt", SRT_BYTES), ("002.srt", SRT_BYTES)],
+            ).json()
+            assert started.wait(timeout=1)
+
+            download = client.post(
+                f"/api/batches/{batch['id']}/downloads/srt",
+                json=_batch_download_payload(batch),
+            )
+            assert download.status_code == 409
+        finally:
+            release.set()
+
+
+def test_batch_download_request_body_is_bounded_before_json_parsing(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=lambda job, _settings: _artifacts(job))
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/batches/{'a' * 32}/downloads/srt",
+            content=b"x" * (16 * 1024 + 1),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
 
 
 @pytest.mark.parametrize(

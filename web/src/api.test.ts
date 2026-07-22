@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createBatch, createJob, downloadJobArtifact, loadConfig, loadJob } from './api'
+import { createBatch, createJob, downloadBatchSrtArchive, downloadJobArtifact, loadConfig, loadJob } from './api'
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -79,6 +79,32 @@ describe('web API client', () => {
     expect(click).toHaveBeenCalledOnce()
     expect(createUrl).toHaveBeenCalledOnce()
     expect(revokeUrl).toHaveBeenCalledWith('blob:download')
+  })
+
+  it('downloads every protected batch SRT as one server-named ZIP', async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.download).toBe('dubsync-batch-batch-1-synced-srts.zip')
+    })
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:batch-download')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(new Blob(['zip']), {
+        status: 200,
+        headers: { 'content-disposition': 'attachment; filename="dubsync-batch-batch-1-synced-srts.zip"' },
+      }),
+    )
+    const jobs = [
+      { id: 'job-1', token: 'token-1' },
+      { id: 'job-2', token: 'token-2' },
+    ]
+
+    await downloadBatchSrtArchive('batch-1', jobs)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/batches/batch-1/downloads/srt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobs }),
+    })
+    expect(click).toHaveBeenCalledOnce()
   })
 
   it('uses a fallback filename and reports failed downloads', async () => {

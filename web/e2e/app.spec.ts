@@ -152,6 +152,15 @@ test('matched files submit as one sequential batch and keep per-source download 
   expect(accesses).toHaveLength(2)
   expect(accesses.every(({ id, token }) => Boolean(id && token))).toBe(true)
 
+  const batchDownloadPromise = page.waitForEvent('download')
+  await batchResults.getByRole('button', { name: 'Download all SRTs' }).click()
+  const batchDownload = await batchDownloadPromise
+  expect(batchDownload.suggestedFilename()).toMatch(/^dubsync-batch-[a-f0-9]{8}-synced-srts\.zip$/)
+  const archive = await readFile(await batchDownload.path())
+  expect(archive.subarray(0, 4).toString('hex')).toBe('504b0304')
+  expect(archive.includes(Buffer.from('001-dubsync-synced.srt'))).toBe(true)
+  expect(archive.includes(Buffer.from('002-dubsync-synced.srt'))).toBe(true)
+
   const firstDownloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download 001 SRT' }).click()
   expect((await firstDownloadPromise).suggestedFilename()).toBe('001-dubsync-synced.srt')
