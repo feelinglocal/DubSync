@@ -3,7 +3,12 @@ from __future__ import annotations
 from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, SpeechRegion, Word
 from dubsync.output_order import finalize_cues_for_output
 from dubsync.changes import apply_adjudication_decisions
-from dubsync.pipeline import _adlib_cue_ids_by_case, _alignment_with_decision_words, _without_stale_verify_flags
+from dubsync.pipeline import (
+    _adlib_cue_ids_by_case,
+    _alignment_with_decision_words,
+    _remove_silent_generated_adlibs,
+    _without_stale_verify_flags,
+)
 from dubsync.recue import rebuild_cues
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import StyleProfile
@@ -138,6 +143,35 @@ def test_leading_unmatched_cue_never_gets_negative_timing_when_source_gap_will_n
     leading = next(cue for cue in rebuilt if cue.index == 1)
     following = next(cue for cue in rebuilt if cue.index == 2)
     assert 0 <= leading.start_ms < leading.end_ms <= following.start_ms
+
+
+def test_generated_adlib_with_detected_speech_is_not_removed_for_low_coverage():
+    cue = Cue(index=3, start_ms=1000, end_ms=2000, lines=["Ah!"])
+    flags = [
+        QCFlag(
+            kind="adlib_inserted",
+            cue_ids=[3],
+            message="Generated from an audio-only insertion.",
+        )
+    ]
+    activity_flags = [
+        QCFlag(
+            kind="cue_without_speech_activity",
+            cue_ids=[3],
+            message="Cue overlaps speech activity for only 10% of its duration.",
+            confidence=0.1,
+        )
+    ]
+
+    remaining, retained_flags, retained_activity_flags = _remove_silent_generated_adlibs(
+        [cue],
+        flags,
+        activity_flags,
+    )
+
+    assert remaining == [cue]
+    assert retained_flags == flags
+    assert retained_activity_flags == activity_flags
 
 
 def test_adlib_reconciliation_reuses_unmatched_source_cue():
