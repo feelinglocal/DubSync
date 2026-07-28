@@ -13,3 +13,18 @@ def test_clamp_asr_word_durations_enforces_max_even_inside_long_region():
     assert clamped[0].end == 2.0
     assert flags[0].kind == "asr_word_clamped"
     assert flags[0].old_text == "stretched 0.000 --> 18.000"
+
+
+def test_clamp_asr_word_endpoint_that_overruns_speech_region_limit():
+    words = [Word(text="Drachenei", start=1.94, end=3.12, confidence=0.9)]
+    regions = [SpeechRegion(start=1.6, end=2.6)]
+
+    clamped, flags = clamp_asr_word_durations(
+        words,
+        regions,
+        max_word_duration=2.0,
+    )
+
+    assert clamped[0].end == 2.6
+    assert flags[0].kind == "asr_word_clamped"
+    assert "speech region" in flags[0].message
