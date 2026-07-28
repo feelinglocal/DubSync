@@ -72,3 +72,96 @@ def test_adjudicated_cues_with_fewer_lexical_units_round_trip_through_srt():
     ]
     assert all(cue.plain_text for cue in transformed)
     assert all(cue.plain_text for cue in reparsed)
+
+
+def test_multiple_reordered_word_corrections_compose_in_one_cue():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Ja, hier wirst du nicht gebraucht."],
+        )
+    ]
+    spans = [
+        DivergenceSpan(
+            case_id="case-1",
+            cue_ids=[1],
+            srt_text="hier",
+            asr_text="du",
+            srt_token_indices=[1],
+            asr_word_indices=[1],
+        ),
+        DivergenceSpan(
+            case_id="case-2",
+            cue_ids=[1],
+            srt_text="du",
+            asr_text="hier",
+            srt_token_indices=[3],
+            asr_word_indices=[3],
+        ),
+    ]
+    decisions = [
+        AdjudicationDecision(
+            case_id="case-1",
+            verdict="use_audio",
+            final_text="du",
+            confidence=1.0,
+            reason="audio confirms the reordered subject",
+        ),
+        AdjudicationDecision(
+            case_id="case-2",
+            verdict="use_audio",
+            final_text="hier",
+            confidence=1.0,
+            reason="audio confirms the reordered adverb",
+        ),
+    ]
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        spans,
+        decisions,
+        StyleProfile(),
+    )
+
+    assert [cue.plain_text for cue in transformed] == [
+        "Ja, du wirst hier nicht gebraucht."
+    ]
+
+
+def test_empty_partial_audio_decision_removes_only_unspoken_words():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Das bildest du dir nur etwas ein, Nova."],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="etwas",
+        asr_text="",
+        srt_token_indices=[5],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="",
+        confidence=1.0,
+        reason="the actor omitted this word",
+    )
+
+    transformed, flags = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(drop_policy="keep_flagged"),
+    )
+
+    assert [cue.plain_text for cue in transformed] == [
+        "Das bildest du dir nur ein, Nova."
+    ]
+    assert [flag.kind for flag in flags] == ["text_changed"]
