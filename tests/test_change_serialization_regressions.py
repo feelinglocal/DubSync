@@ -236,6 +236,75 @@ def test_replacing_contraction_suffix_removes_orphan_apostrophe():
     assert transformed[0].plain_text == "Hier gibt es keine Monster."
 
 
+def test_replacing_curly_contraction_suffix_removes_orphan_apostrophe():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Hier gibt\u2019s keine Monster."],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="s",
+        asr_text="es",
+        srt_token_indices=[2],
+        asr_word_indices=[2],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="es",
+        confidence=1.0,
+        reason="the audio contains the expanded word",
+    )
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(),
+    )
+
+    assert transformed[0].plain_text == "Hier gibt es keine Monster."
+
+
+def test_deleting_before_unicode_ellipsis_does_not_leave_space():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Bleib noch\u2026"],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="noch",
+        asr_text="",
+        srt_token_indices=[1],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="",
+        confidence=1.0,
+        reason="the final word is not spoken",
+    )
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(),
+    )
+
+    assert transformed[0].plain_text == "Bleib\u2026"
+
+
 def test_context_only_final_text_deletes_indexed_middle_span_without_duplication():
     cues = [
         Cue(
