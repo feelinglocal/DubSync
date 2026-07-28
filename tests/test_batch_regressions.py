@@ -115,6 +115,31 @@ def test_trailing_unmatched_cue_preserves_source_gap_after_previous_match():
     assert trailing.duration_ms == 1100
 
 
+def test_leading_unmatched_cue_never_gets_negative_timing_when_source_gap_will_not_fit():
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1000, lines=["lead"]),
+        Cue(index=2, start_ms=10000, end_ms=11000, lines=["match"]),
+    ]
+    words = [
+        Word(text="match", start=1.0, end=1.5, confidence=0.9),
+    ]
+    alignment = AlignmentResult(
+        cue_word_indices={2: [0]},
+        unmatched_cue_ids=[1],
+    )
+
+    rebuilt, _ = rebuild_cues(
+        cues,
+        words,
+        alignment,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+    )
+
+    leading = next(cue for cue in rebuilt if cue.index == 1)
+    following = next(cue for cue in rebuilt if cue.index == 2)
+    assert 0 <= leading.start_ms < leading.end_ms <= following.start_ms
+
+
 def test_adlib_reconciliation_reuses_unmatched_source_cue():
     cues = [Cue(index=42, start_ms=72166, end_ms=73500, lines=["seine Gefuhle", "beeinflussen,"])]
     span = DivergenceSpan(
