@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from dubsync.models import Cue
 from dubsync.srt_io import parse_srt_text, write_srt
 from dubsync.style_profile import StyleProfile, derive_style_profile
 
@@ -39,3 +42,10 @@ def test_snap_ceil_never_returns_before_fractional_millisecond_input():
 
     assert snapped >= 1033.4
     assert snapped == 1066
+
+
+def test_write_srt_rejects_blank_cue_instead_of_serializing_invalid_block():
+    cues = [Cue(index=27, start_ms=59933, end_ms=61533, lines=[""])]
+
+    with pytest.raises(ValueError, match="cue 27 has no subtitle text"):
+        write_srt(cues)
