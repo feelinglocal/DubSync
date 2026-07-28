@@ -904,6 +904,167 @@ def test_cli_sync_reuses_cached_llm_punctuation_without_resume(tmp_path):
     assert (workdir / "episode" / "llm-cache").exists()
 
 
+def test_cli_sync_merges_bracketed_asr_insertion_into_source_cue(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "nicht von Bestien zerfleischt.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "nicht", "start": 0.10, "end": 0.32, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "von", "start": 0.35, "end": 0.52, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "den", "start": 0.55, "end": 0.68, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "Bestien", "start": 0.71, "end": 1.08, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "zerfleischt", "start": 1.11, "end": 1.58, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "den",
+                            "confidence": 0.98,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "audio confirms the inserted article",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == ["nicht von den Bestien zerfleischt."]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+
+
+def test_cli_sync_merges_continuation_insertion_into_following_cue(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "bin kein Bolton mehr.\n"
+        "\n"
+        "2\n"
+        "00:00:01,500 --> 00:00:02,500\n"
+        "diese kranke alte Frau\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "bin", "start": 0.10, "end": 0.22, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "kein", "start": 0.24, "end": 0.36, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Bolton", "start": 0.38, "end": 0.55, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "mehr", "start": 0.57, "end": 0.70, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Ich", "start": 0.90, "end": 1.02, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "diese", "start": 1.05, "end": 1.20, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "kranke", "start": 1.22, "end": 1.40, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "alte", "start": 1.42, "end": 1.56, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Frau", "start": 1.58, "end": 1.78, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "Ich,",
+                            "confidence": 0.98,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "audio confirms a continuation into the next cue",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == [
+        "bin kein Bolton mehr.",
+        "Ich, diese kranke alte Frau",
+    ]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+
+
 def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
