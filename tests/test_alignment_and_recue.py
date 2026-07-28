@@ -72,6 +72,25 @@ def test_alignment_normalizes_german_hyphen_compounds_and_ordinals():
     assert result.divergence_spans == []
 
 
+def test_fuzzy_name_variant_stays_visible_for_audio_adjudication():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "Komm jetzt, Tristen, bitte.\n"
+        "\n"
+    )
+    words = [
+        Word(text=text, start=index * 0.2, end=index * 0.2 + 0.15)
+        for index, text in enumerate(["Komm", "jetzt", "Tristan", "bitte"])
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text == "Tristen"
+    assert result.divergence_spans[0].asr_text == "Tristan"
+
+
 def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     calls = 0
     original_similarity = aligner._similarity
