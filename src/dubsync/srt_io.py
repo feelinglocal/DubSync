@@ -132,6 +132,8 @@ def parse_srt_text(text: str, *, limits: SRTParseLimits | None = None) -> list[C
 def write_srt(cues: list[Cue], *, renumber: bool = False) -> str:
     blocks: list[str] = []
     for output_index, cue in enumerate(cues, start=1):
+        if not cue.plain_text:
+            raise ValueError(f"cue {cue.index} has no subtitle text")
         cue_index = output_index if renumber else cue.index
         lines = [
             str(cue_index),

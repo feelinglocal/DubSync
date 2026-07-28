@@ -90,7 +90,8 @@ def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: in
         op = back[i].get(j, "")
         if op == "match":
             score = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
-            ops.append(_Op("match" if score >= MATCH_THRESHOLD else "replace", i - 1, j - 1, score))
+            kind = "match" if tokens[i - 1].normalized == words_norm[j - 1] else "replace"
+            ops.append(_Op(kind, i - 1, j - 1, score))
             i -= 1
             j -= 1
         elif op == "delete":
@@ -145,6 +146,39 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         speaker_ids = sorted({words[index].speaker_id for index in asr_indices if words[index].speaker_id})
         start = boundary_start(next_match)
         end = boundary_end(next_match)
+        pure_insertion = bool(asr_indices) and not srt_indices
+        left_anchor_cue_id = (
+            tokens[previous_match.srt_index].cue_id
+            if pure_insertion and previous_match is not None and previous_match.srt_index is not None
+            else None
+        )
+        right_anchor_cue_id = (
+            tokens[next_match.srt_index].cue_id
+            if pure_insertion and next_match is not None and next_match.srt_index is not None
+            else None
+        )
+        insertion_token_offset = None
+        if (
+            left_anchor_cue_id is not None
+            and left_anchor_cue_id == right_anchor_cue_id
+            and next_match is not None
+            and next_match.srt_index is not None
+        ):
+            insertion_token_offset = sum(
+                1
+                for token in tokens[: next_match.srt_index]
+                if token.cue_id == right_anchor_cue_id
+            )
+        left_anchor_word = (
+            words[previous_match.asr_index]
+            if pure_insertion and previous_match is not None and previous_match.asr_index is not None
+            else None
+        )
+        right_anchor_word = (
+            words[next_match.asr_index]
+            if pure_insertion and next_match is not None and next_match.asr_index is not None
+            else None
+        )
         case_number = len(spans) + 1
         spans.append(
             DivergenceSpan(
@@ -158,6 +192,13 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
                 speaker_ids=speaker_ids,
                 srt_token_indices=list(srt_indices),
                 asr_word_indices=list(asr_indices),
+                left_anchor_cue_id=left_anchor_cue_id,
+                right_anchor_cue_id=right_anchor_cue_id,
+                insertion_token_offset=insertion_token_offset,
+                left_anchor_end=left_anchor_word.end if left_anchor_word is not None else None,
+                right_anchor_start=right_anchor_word.start if right_anchor_word is not None else None,
+                left_anchor_speaker_id=left_anchor_word.speaker_id if left_anchor_word is not None else None,
+                right_anchor_speaker_id=right_anchor_word.speaker_id if right_anchor_word is not None else None,
             )
         )
         srt_indices.clear()

@@ -105,14 +105,24 @@ def _interpolated_timing(
         return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
 
     if previous is not None:
-        _, previous_timing = previous
-        start_ms = previous_timing.end_ms
+        previous_cue, previous_timing = previous
+        source_gap_ms = max(0, cue.start_ms - previous_cue.end_ms)
+        start_ms = profile.snap_floor(previous_timing.end_ms + source_gap_ms)
         end_ms = profile.snap_ceil(start_ms + duration_ms)
         return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
 
     if nxt is not None:
-        _, next_timing = nxt
-        end_ms = next_timing.start_ms
+        next_cue, next_timing = nxt
+        source_gap_ms = max(0, next_cue.start_ms - cue.end_ms)
+        gap_preserved_end_ms = min(
+            next_timing.start_ms,
+            profile.snap_ceil(next_timing.start_ms - source_gap_ms),
+        )
+        end_ms = (
+            gap_preserved_end_ms
+            if gap_preserved_end_ms >= duration_ms
+            else next_timing.start_ms
+        )
         start_ms = max(0, profile.snap_floor(end_ms - duration_ms))
         return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
 

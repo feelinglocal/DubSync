@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from .vad import (
     min_coverage_from_config,
     speech_activity_adapter_from_config,
     speech_activity_flags_for_cues,
+    trailing_silence_flags_for_cues,
 )
 from .verify import cps_sanity_flags, lint_cues, score_cues
 
@@ -55,6 +57,8 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "cps_duration_extended",
         "cue_on_silence",
         "cue_without_speech_activity",
+        "cue_with_excessive_trailing_silence",
+        "adlib_removed_without_speech_activity",
         "duplicate_cue_merged",
         "forced_alignment_refined",
         "impossible_cps_fast",
@@ -794,6 +798,9 @@ def _run_verify_stage(
     flags = _without_stale_verify_flags(flags)
     forced_alignments: list[ForcedAlignmentCue] = []
     effective_words = words
+    speech_regions = []
+    min_coverage = min_coverage_from_config(provider_config)
+    boundary_refinement = _boundary_refinement_config(provider_config)
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
         forced_alignments = forced_alignment_adapter.align(audio_for_asr, rebuilt)
@@ -813,14 +820,14 @@ def _run_verify_stage(
             words,
             speech_regions,
             max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
         )
         flags.extend(word_clamp_flags)
-        min_coverage = min_coverage_from_config(provider_config)
         rebuilt, timing_flags = refine_cues_to_speech_activity(
             rebuilt,
             speech_regions,
             profile,
-            _boundary_refinement_config(provider_config),
+            boundary_refinement,
             words=effective_words,
             alignment=alignment,
         )
@@ -834,14 +841,27 @@ def _run_verify_stage(
                     min_coverage,
                 )
             )
-        flags.extend(speech_activity_flags_for_cues(rebuilt, speech_regions, min_coverage))
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
         no_overlaps=_output_no_overlaps(provider_config),
-        max_cps=_timing_float_config(provider_config, "max_cps", 30.0),
     )
     flags.extend(final_order_flags)
+    if speech_regions:
+        activity_flags = speech_activity_flags_for_cues(rebuilt, speech_regions, min_coverage)
+        rebuilt, flags, activity_flags = _remove_silent_generated_adlibs(
+            rebuilt,
+            flags,
+            activity_flags,
+        )
+        flags.extend(activity_flags)
+        flags.extend(
+            trailing_silence_flags_for_cues(
+                rebuilt,
+                speech_regions,
+                max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+            )
+        )
     style_issues = lint_cues(rebuilt, profile)
     flags.extend(
         cps_sanity_flags(
@@ -881,6 +901,61 @@ def _run_verify_stage(
     _write_json(episode_workdir / "cost.json", cost_meter.as_dict())
 
     return PipelineResult(output_path, episode_workdir, cost_meter, report)
+
+
+def _remove_silent_generated_adlibs(
+    cues: list[Cue],
+    flags: list[QCFlag],
+    activity_flags: list[QCFlag],
+) -> tuple[list[Cue], list[QCFlag], list[QCFlag]]:
+    generated_cue_ids = {
+        cue_id
+        for flag in flags
+        if flag.kind == "adlib_inserted"
+        for cue_id in flag.cue_ids
+    }
+    if not generated_cue_ids:
+        return cues, flags, activity_flags
+
+    silent_cue_ids = {
+        cue_id
+        for flag in activity_flags
+        if (
+            flag.kind == "cue_without_speech_activity"
+            and flag.confidence is not None
+            and flag.confidence <= 0.0
+        )
+        for cue_id in flag.cue_ids
+        if cue_id in generated_cue_ids
+    }
+    if not silent_cue_ids:
+        return cues, flags, activity_flags
+
+    removed_cues = [cue for cue in cues if cue.index in silent_cue_ids]
+    remaining_cues = [cue for cue in cues if cue.index not in silent_cue_ids]
+    retained_flags = [
+        flag
+        for flag in flags
+        if not (flag.kind == "adlib_inserted" and any(cue_id in silent_cue_ids for cue_id in flag.cue_ids))
+    ]
+    retained_activity_flags = [
+        flag
+        for flag in activity_flags
+        if not any(cue_id in silent_cue_ids for cue_id in flag.cue_ids)
+    ]
+    removal_flags = [
+        QCFlag(
+            kind="adlib_removed_without_speech_activity",
+            cue_ids=[cue.index],
+            message="Generated ad-lib cue was removed because VAD found no speech activity in its displayed interval.",
+            old_text=cue.text,
+            new_text="",
+            start=cue.start_ms / 1000.0,
+            end=cue.end_ms / 1000.0,
+        )
+        for cue in removed_cues
+    ]
+    return remaining_cues, [*retained_flags, *removal_flags], retained_activity_flags
 
 
 def _without_stale_verify_flags(flags: list[QCFlag]) -> list[QCFlag]:
@@ -1021,6 +1096,7 @@ def _adlib_cue_ids_by_case(
     unmatched_cue_ids: list[int],
 ) -> tuple[dict[str, int], list[QCFlag]]:
     decisions_by_case = {decision.case_id: decision for decision in decisions}
+    cues_by_id = {cue.index: cue for cue in cues}
     next_index = max((cue.index for cue in cues), default=0) + 1
     cue_ids: dict[str, int] = {}
     flags: list[QCFlag] = []
@@ -1031,6 +1107,10 @@ def _adlib_cue_ids_by_case(
         if decision is None or decision.verdict == "keep_srt":
             continue
         if span.cue_ids or not decision.final_text.strip():
+            continue
+        anchored_cue_id = _anchored_adlib_cue_id(cues_by_id, span, decision.final_text)
+        if anchored_cue_id is not None:
+            cue_ids[span.case_id] = anchored_cue_id
             continue
         reconciled = _reconciled_adlib_source_cue(
             cues,
@@ -1056,6 +1136,72 @@ def _adlib_cue_ids_by_case(
         cue_ids[span.case_id] = next_index
         next_index += 1
     return cue_ids, flags
+
+
+def _anchored_adlib_cue_id(
+    cues_by_id: dict[int, Cue],
+    span: DivergenceSpan,
+    final_text: str,
+    max_gap_seconds: float = 0.2,
+    max_continuation_gap_seconds: float = 1.0,
+) -> int | None:
+    left_id = span.left_anchor_cue_id
+    right_id = span.right_anchor_cue_id
+    if (
+        left_id is not None
+        and left_id == right_id
+        and left_id in cues_by_id
+        and span.insertion_token_offset is not None
+    ):
+        return left_id
+
+    if (
+        right_id is not None
+        and right_id in cues_by_id
+        and len(alphanumeric_signature(final_text)) <= 3
+        and span.end is not None
+        and span.right_anchor_start is not None
+        and _anchor_speaker_is_compatible(span.speaker_ids, span.right_anchor_speaker_id)
+        and (
+            span.left_anchor_end is None
+            or span.start is None
+            or span.start >= span.left_anchor_end - 0.05
+        )
+    ):
+        gap = span.right_anchor_start - span.end
+        if -0.05 <= gap <= max_gap_seconds:
+            return right_id
+        if (
+            0 <= gap <= max_continuation_gap_seconds
+            and re.search(r"[,;:]\s*$", final_text)
+            and _anchor_speaker_is_confirmed(
+                span.speaker_ids,
+                span.right_anchor_speaker_id,
+            )
+        ):
+            return right_id
+
+    if (
+        left_id is not None
+        and left_id in cues_by_id
+        and len(alphanumeric_signature(final_text)) <= 3
+        and span.start is not None
+        and span.left_anchor_end is not None
+        and _anchor_speaker_is_compatible(span.speaker_ids, span.left_anchor_speaker_id)
+        and not re.search(r"[.!?…]\s*$", cues_by_id[left_id].plain_text)
+    ):
+        gap = span.start - span.left_anchor_end
+        if -0.05 <= gap <= max_gap_seconds:
+            return left_id
+    return None
+
+
+def _anchor_speaker_is_compatible(speaker_ids: list[str], anchor_speaker_id: str | None) -> bool:
+    return not speaker_ids or anchor_speaker_id is None or anchor_speaker_id in speaker_ids
+
+
+def _anchor_speaker_is_confirmed(speaker_ids: list[str], anchor_speaker_id: str | None) -> bool:
+    return anchor_speaker_id is not None and set(speaker_ids) == {anchor_speaker_id}
 
 
 def _reconciled_adlib_source_cue(
@@ -1105,7 +1251,9 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
             continue
         adlib_cue_id = adlib_cue_ids_by_case.get(span.case_id)
         if adlib_cue_id is not None:
-            cue_word_indices[adlib_cue_id] = sorted(set(span.asr_word_indices))
+            cue_word_indices[adlib_cue_id] = sorted(
+                set(cue_word_indices.get(adlib_cue_id, []) + span.asr_word_indices)
+            )
             continue
         for cue_id, spoken_indices in _span_word_indices_by_cue(span).items():
             combined = sorted(set(cue_word_indices.get(cue_id, []) + spoken_indices))

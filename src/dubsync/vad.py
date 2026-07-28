@@ -163,6 +163,42 @@ def speech_activity_flags_for_cues(
     return flags
 
 
+def trailing_silence_flags_for_cues(
+    cues: list[Cue],
+    regions: list[SpeechRegion],
+    max_trailing_silence_ms: int = 300,
+) -> list[QCFlag]:
+    flags: list[QCFlag] = []
+    for cue in cues:
+        cue_start = cue.start_ms / 1000.0
+        cue_end = cue.end_ms / 1000.0
+        overlapping = [
+            region
+            for region in regions
+            if region.end > cue_start and region.start < cue_end
+        ]
+        if not overlapping:
+            continue
+        last_speech_end = min(cue_end, max(region.end for region in overlapping))
+        trailing_silence_ms = round((cue_end - last_speech_end) * 1000)
+        if trailing_silence_ms <= max_trailing_silence_ms:
+            continue
+        flags.append(
+            QCFlag(
+                kind="cue_with_excessive_trailing_silence",
+                cue_ids=[cue.index],
+                message=(
+                    f"Cue remains visible for {trailing_silence_ms} ms after "
+                    f"the last detected speech activity; limit is {max_trailing_silence_ms} ms."
+                ),
+                old_text=cue.text,
+                start=last_speech_end,
+                end=cue_end,
+            )
+        )
+    return flags
+
+
 def dropped_line_flags_for_unmatched_cues(
     cues: list[Cue],
     unmatched_cue_ids: list[int],

@@ -8,25 +8,34 @@ def clamp_asr_word_durations(
     regions: list[SpeechRegion],
     *,
     max_word_duration: float = 2.0,
+    max_region_overrun: float = 0.3,
+    max_region_gap: float = 0.2,
 ) -> tuple[list[Word], list[QCFlag]]:
     if max_word_duration <= 0:
         raise ValueError("timing.max_word_duration must be positive")
+    if max_region_overrun < 0 or max_region_gap < 0:
+        raise ValueError("speech-region timing limits must be non-negative")
 
     clamped: list[Word] = []
     flags: list[QCFlag] = []
     sorted_regions = sorted(regions, key=lambda region: (region.start, region.end))
     for index, word in enumerate(words):
         duration = word.end - word.start
-        if duration <= max_word_duration:
+        region_end = _speech_envelope_end(word, sorted_regions, max_region_gap)
+        duration_is_outlier = duration > max_word_duration
+        region_overrun_is_outlier = (
+            region_end is not None
+            and word.end - region_end > max_region_overrun
+        )
+        if not duration_is_outlier and not region_overrun_is_outlier:
             clamped.append(word)
             continue
 
-        region = _region_containing_timestamp(word.start, sorted_regions)
         fallback_end = word.start + max_word_duration
         new_end = min(
             word.end,
-            fallback_end,
-            region.end if region is not None and region.end > word.start else fallback_end,
+            fallback_end if duration_is_outlier else word.end,
+            region_end if region_overrun_is_outlier and region_end is not None else word.end,
         )
         new_end = max(word.start, new_end)
         next_word = word.model_copy(update={"end": round(new_end, 3)})
@@ -35,7 +44,7 @@ def clamp_asr_word_durations(
             QCFlag(
                 kind="asr_word_clamped",
                 cue_ids=[],
-                message="ASR word duration exceeded timing.max_word_duration and was clamped to the containing speech region.",
+                message="ASR word endpoint exceeded the configured duration or speech region bounds and was clamped.",
                 old_text=f"{word.text} {word.start:.3f} --> {word.end:.3f}",
                 new_text=f"{next_word.text} {next_word.start:.3f} --> {next_word.end:.3f}",
                 start=next_word.start,
@@ -46,8 +55,25 @@ def clamp_asr_word_durations(
     return clamped, flags
 
 
-def _region_containing_timestamp(timestamp: float, regions: list[SpeechRegion]) -> SpeechRegion | None:
-    for region in regions:
-        if region.start <= timestamp <= region.end:
-            return region
-    return None
+def _speech_envelope_end(
+    word: Word,
+    regions: list[SpeechRegion],
+    max_region_gap: float,
+) -> float | None:
+    containing_index = next(
+        (
+            index
+            for index, region in enumerate(regions)
+            if region.start <= word.start <= region.end
+        ),
+        None,
+    )
+    if containing_index is None:
+        return None
+
+    envelope_end = regions[containing_index].end
+    for region in regions[containing_index + 1 :]:
+        if region.start > word.end or region.start - envelope_end > max_region_gap:
+            break
+        envelope_end = max(envelope_end, region.end)
+    return envelope_end

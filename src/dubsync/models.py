@@ -89,6 +89,13 @@ class DivergenceSpan(BaseModel):
     asr_word_indices: list[int] = Field(default_factory=list)
     context_before: list[CueContext] = Field(default_factory=list)
     context_after: list[CueContext] = Field(default_factory=list)
+    left_anchor_cue_id: int | None = None
+    right_anchor_cue_id: int | None = None
+    insertion_token_offset: int | None = Field(default=None, ge=0)
+    left_anchor_end: float | None = None
+    right_anchor_start: float | None = None
+    left_anchor_speaker_id: str | None = None
+    right_anchor_speaker_id: str | None = None
 
 
 class AudioSnippet(BaseModel):
