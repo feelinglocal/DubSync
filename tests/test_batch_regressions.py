@@ -88,6 +88,33 @@ def test_unmatched_kept_cue_is_interpolated_instead_of_source_timed():
     assert any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
 
 
+def test_trailing_unmatched_cue_preserves_source_gap_after_previous_match():
+    cues = [
+        Cue(index=56, start_ms=98800, end_ms=99566, lines=["Ach, komm schon."]),
+        Cue(index=57, start_ms=104333, end_ms=105433, lines=["Ahh!"]),
+    ]
+    words = [
+        Word(text="Ach", start=99.0, end=99.2, confidence=0.9),
+        Word(text="komm", start=99.25, end=99.45, confidence=0.9),
+        Word(text="schon", start=99.5, end=99.75, confidence=0.9),
+    ]
+    alignment = AlignmentResult(
+        cue_word_indices={56: [0, 1, 2]},
+        unmatched_cue_ids=[57],
+    )
+
+    rebuilt, _ = rebuild_cues(
+        cues,
+        words,
+        alignment,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+    )
+
+    trailing = next(cue for cue in rebuilt if cue.index == 57)
+    assert trailing.start_ms >= 104500
+    assert trailing.duration_ms == 1100
+
+
 def test_adlib_reconciliation_reuses_unmatched_source_cue():
     cues = [Cue(index=42, start_ms=72166, end_ms=73500, lines=["seine Gefuhle", "beeinflussen,"])]
     span = DivergenceSpan(
