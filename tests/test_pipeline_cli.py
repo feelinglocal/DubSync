@@ -1065,6 +1065,73 @@ def test_cli_sync_merges_continuation_insertion_into_following_cue(tmp_path):
     assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
 
 
+def test_cli_sync_reports_impossible_cps_without_extending_acoustic_timing(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    text = "this deliberately long subtitle must follow speech"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:00,500\n"
+        f"{text}\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {
+                        "text": word,
+                        "start": index * 0.05,
+                        "end": index * 0.05 + 0.04,
+                        "confidence": 0.99,
+                        "speaker_id": "A",
+                    }
+                    for index, word in enumerate(text.split())
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "timing": {"max_cps": 10},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--no-llm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert synced[0].end_ms == 500
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "impossible_cps_fast" for flag in report["flags"])
+
+
 def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
