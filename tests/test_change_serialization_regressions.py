@@ -234,3 +234,37 @@ def test_replacing_contraction_suffix_removes_orphan_apostrophe():
     )
 
     assert transformed[0].plain_text == "Hier gibt es keine Monster."
+
+
+def test_context_only_final_text_deletes_indexed_middle_span_without_duplication():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["hello unwanted world"],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="unwanted",
+        asr_text="",
+        srt_token_indices=[1],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="hello world",
+        confidence=1.0,
+        reason="the final response includes unchanged cue context",
+    )
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(),
+    )
+
+    assert transformed[0].plain_text == "hello world"
