@@ -1008,10 +1008,10 @@ def test_cli_sync_merges_continuation_insertion_into_following_cue(tmp_path):
                     {"text": "Bolton", "start": 0.38, "end": 0.55, "confidence": 0.99, "speaker_id": "A"},
                     {"text": "mehr", "start": 0.57, "end": 0.70, "confidence": 0.99, "speaker_id": "A"},
                     {"text": "Ich", "start": 0.90, "end": 1.02, "confidence": 0.98, "speaker_id": "A"},
-                    {"text": "diese", "start": 1.05, "end": 1.20, "confidence": 0.99, "speaker_id": "A"},
-                    {"text": "kranke", "start": 1.22, "end": 1.40, "confidence": 0.99, "speaker_id": "A"},
-                    {"text": "alte", "start": 1.42, "end": 1.56, "confidence": 0.99, "speaker_id": "A"},
-                    {"text": "Frau", "start": 1.58, "end": 1.78, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "diese", "start": 1.42, "end": 1.57, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "kranke", "start": 1.59, "end": 1.77, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "alte", "start": 1.79, "end": 1.93, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Frau", "start": 1.95, "end": 2.15, "confidence": 0.99, "speaker_id": "A"},
                 ]
             }
         ),
@@ -1293,6 +1293,117 @@ def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
     assert [cue.plain_text for cue in synced] == ["hello there", "surprise line", "goodbye now"]
     assert [cue.index for cue in synced] == [1, 2, 3]
+
+
+def test_cli_sync_removes_generated_adlib_without_speech_activity(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    vad_path = tmp_path / "episode.vad.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Du bildest dir nur etwas ein, Nova.\n"
+        "\n"
+        "2\n"
+        "00:00:19,166 --> 00:00:20,200\n"
+        "Informiere alle,\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Du", "start": 15.80, "end": 15.90, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "bildest", "start": 15.92, "end": 16.10, "confidence": 0.97, "speaker_id": "A"},
+                    {"text": "dir", "start": 16.12, "end": 16.20, "confidence": 0.97, "speaker_id": "A"},
+                    {"text": "nur", "start": 16.22, "end": 16.34, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "ein", "start": 16.36, "end": 16.50, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "Nova", "start": 16.52, "end": 16.70, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "Du", "start": 17.43, "end": 17.80, "confidence": 0.91, "speaker_id": "A"},
+                    {"text": "Informiere", "start": 19.46, "end": 19.80, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "alle", "start": 19.82, "end": 20.10, "confidence": 0.97, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vad_path.write_text(
+        json.dumps(
+            {
+                "regions": [
+                    {"start": 15.80, "end": 16.74, "confidence": 0.92},
+                    {"start": 19.46, "end": 20.12, "confidence": 0.93},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "vad": {"fixture_path": str(vad_path), "min_coverage": 0.2},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "ein",
+                            "confidence": 0.94,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "actor omitted one word",
+                        },
+                        "case-2": {
+                            "case_id": "case-2",
+                            "verdict": "use_audio",
+                            "final_text": "Du",
+                            "confidence": 0.91,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "ASR-only adlib lacks speech-region support",
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == [
+        "Du bildest dir nur ein, Nova.",
+        "Informiere alle,",
+    ]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "adlib_removed_without_speech_activity" for flag in report["flags"])
+    assert not any(flag["kind"] == "adlib_inserted" and flag["new_text"] == "Du" for flag in report["flags"])
 
 
 def test_cli_sync_resume_align_reuses_asr_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
