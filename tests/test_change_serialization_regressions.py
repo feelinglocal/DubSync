@@ -165,3 +165,72 @@ def test_empty_partial_audio_decision_removes_only_unspoken_words():
         "Das bildest du dir nur ein, Nova."
     ]
     assert [flag.kind for flag in flags] == ["text_changed"]
+
+
+def test_deleting_final_unspoken_word_does_not_leave_space_before_period():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Matthew, schmarotz nicht bei uns rum."],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="rum",
+        asr_text="",
+        srt_token_indices=[5],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="",
+        confidence=1.0,
+        reason="the final word is not spoken",
+    )
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(),
+    )
+
+    assert transformed[0].plain_text == "Matthew, schmarotz nicht bei uns."
+
+
+def test_replacing_contraction_suffix_removes_orphan_apostrophe():
+    cues = [
+        Cue(
+            index=1,
+            start_ms=0,
+            end_ms=3000,
+            lines=["Hier gibt's keine Monster."],
+        )
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="s",
+        asr_text="es",
+        srt_token_indices=[2],
+        asr_word_indices=[2],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="es",
+        confidence=1.0,
+        reason="the audio contains the expanded word",
+    )
+
+    transformed, _ = apply_adjudication_decisions(
+        cues,
+        [span],
+        [decision],
+        StyleProfile(),
+    )
+
+    assert transformed[0].plain_text == "Hier gibt es keine Monster."
