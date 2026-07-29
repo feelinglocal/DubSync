@@ -96,11 +96,11 @@ Published provisional prices must stay consistent across API and UI:
 
 | Workflow | Price | Minimum |
 |---|---:|---:|
-| Audio to SRT | $0.12/min | $3 |
-| Sync existing SRT | $0.18/min | $5 |
-| Precision processing | $0.25/min | $10 |
+| Audio to SRT | $0.40/min | $20 per quoted order |
+| Sync existing SRT | $0.60/min | $30 per quoted order |
+| Precision processing | $0.90/min | $50 per quoted order |
 
-Do not present Precision as generally available until a live forced-alignment validation passes. Every completed job must keep `cost.json` as the measured provider-cost source of truth.
+Apply one minimum to the full quoted order, including a multi-file batch, not to each uploaded file. Do not present Precision as generally available until a live forced-alignment validation passes. Every completed job must keep `cost.json` as the measured provider-cost source of truth.
 
 ## High-value feature order
 
@@ -265,4 +265,3 @@ Your final response must be concise and evidence-based. Include:
 7. The next three commercially useful features, selected from measured need rather than generic SaaS convention.
 
 Do not claim the product is deployed unless a Render service was actually created and its public URL was tested. Do not claim it is ready to accept paid customer media until the paid-provider web smokes, provider data settings, alerts, operator legal details, tax/refund policy, and counsel review are complete.
-

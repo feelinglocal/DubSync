@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -11,9 +11,9 @@ const configResponse = {
   audio_extensions: ['.mp3', '.wav'],
   fps_values: [24, 25, 30],
   pricing: {
-    generate: { usd_per_minute: 0.12, minimum_usd: 3 },
-    sync: { usd_per_minute: 0.18, minimum_usd: 5 },
-    precision: { usd_per_minute: 0.25, minimum_usd: 10 },
+    generate: { usd_per_minute: 0.40, minimum_usd: 20 },
+    sync: { usd_per_minute: 0.60, minimum_usd: 30 },
+    precision: { usd_per_minute: 0.90, minimum_usd: 50 },
   },
   billing_enabled: false,
   access_code_required: false,
@@ -94,6 +94,40 @@ describe('DubSync workspace', () => {
     expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
     expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
     expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
+  })
+
+  it('shows the agreed public rates and order minimums for every workflow', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    const generateRow = await screen.findByRole('row', { name: /Audio to SRT/i })
+    expect(within(generateRow).getByText('$0.40/min')).toBeVisible()
+    expect(within(generateRow).getByText('$20 minimum')).toBeVisible()
+
+    const syncRow = screen.getByRole('row', { name: /Sync existing SRT/i })
+    expect(within(syncRow).getByText('$0.60/min')).toBeVisible()
+    expect(within(syncRow).getByText('$30 minimum')).toBeVisible()
+
+    const precisionRow = screen.getByRole('row', { name: /Precision processing/i })
+    expect(within(precisionRow).getByText('$0.90/min')).toBeVisible()
+    expect(within(precisionRow).getByText('$50 minimum')).toBeVisible()
+  })
+
+  it('clearly marks precision processing as coming soon', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    const precisionRow = await screen.findByRole('row', { name: /Precision processing/i })
+    expect(within(precisionRow).getByText(/coming soon/i)).toBeVisible()
+  })
+
+  it('explains that one minimum applies to each quoted order, including multi-file batches', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    expect(await screen.findByText(
+      'The minimum applies once per quoted order, including multi-file batches.',
+    )).toBeVisible()
   })
 
   it('shows the simple file-pair naming instruction for batch sync', async () => {

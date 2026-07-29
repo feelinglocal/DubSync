@@ -45,14 +45,15 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
           <div className="pricing-table-wrap">
             <h2>Usage pricing</h2>
             <table>
-              <thead><tr><th>Workflow</th><th>Rate</th><th>Minimum</th></tr></thead>
+              <thead><tr><th>Workflow</th><th>Rate</th><th>Order minimum</th></tr></thead>
               <tbody>
                 <PriceRow name="Audio to SRT" tier={pricing.generate} />
                 <PriceRow name="Sync existing SRT" tier={pricing.sync} />
-                <PriceRow name="Precision processing" tier={pricing.precision} />
+                <PriceRow name="Precision processing (Coming soon)" tier={pricing.precision} />
               </tbody>
             </table>
-            <p>Manual quote and invoice before paid processing. Accepted quotes receive a job access code. Prices exclude applicable taxes unless the quote states otherwise.</p>
+            <p>The minimum applies once per quoted order, including multi-file batches.</p>
+            <p>We total the source-audio duration for all files, multiply it by the workflow rate, then charge whichever is higher: that total or the order minimum. Rates include standard setup, file handling, and delivery support. Manual quote and invoice before paid processing. Accepted quotes receive a job access code. Prices exclude applicable taxes unless the quote states otherwise.</p>
             <a className="text-link" href="/payments">Read the payment and refund policy</a>
           </div>
         </div>

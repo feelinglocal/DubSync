@@ -125,11 +125,13 @@ Local release verification validates `render.yaml` against Render's published JS
 
 Published early-access prices:
 
-| Workflow | Customer price | Minimum | Availability |
+| Workflow | Customer price | Minimum per quoted order | Availability |
 |---|---:|---:|---|
-| Audio to SRT | $0.12/min | $3 | Available |
-| Sync existing SRT | $0.18/min | $5 | Available |
-| Precision processing | $0.25/min | $10 | Sell only after live forced-alignment validation |
+| Audio to SRT | $0.40/min | $20 | Available |
+| Sync existing SRT | $0.60/min | $30 | Available |
+| Precision processing | $0.90/min | $50 | Sell only after live forced-alignment validation |
+
+For a single-file or multi-file order, quote `max(total source-audio minutes × workflow rate, order minimum)`. Apply one minimum to the whole quoted order, not one minimum per uploaded file. The published rates include standard setup, file handling, and delivery support; any manual subtitle editing or non-standard service must be quoted separately.
 
 Current provider price anchors:
 
@@ -143,7 +145,7 @@ Margin rule:
 job contribution = quoted price - measured provider cost - allocated Render cost - payment fee - refund/support reserve
 ```
 
-Target at least 70% gross margin after variable provider and infrastructure allocation. Review prices after the first 50 paid jobs and then quarterly. Minimum charges are important because setup, upload, support, and failure handling are mostly per job rather than per minute.
+Target at least 70% gross margin after variable provider and infrastructure allocation. Review prices after the first 50 paid jobs and then quarterly. Minimum charges are important because setup, upload, support, and failure handling are mostly per order rather than per minute.
 
 Do not introduce subscriptions yet. Start with manual quotes or one-time payment links once payments are enabled. Add subscriptions only after recurring use proves that customers prefer monthly commitments over per-job pricing.
 
