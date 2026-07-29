@@ -107,6 +107,20 @@ def test_public_config_exposes_generation_style_presets_and_custom_limits(tmp_pa
     assert styles["custom_limits"]["max_chars_per_line"] == {"min": 10, "max": 80, "step": 1}
 
 
+def test_public_config_exposes_agreed_order_pricing(tmp_path):
+    app = create_app(settings=_settings(tmp_path), processor=_fake_processor)
+
+    with TestClient(app) as client:
+        response = client.get("/api/config")
+
+    assert response.status_code == 200
+    assert response.json()["pricing"] == {
+        "generate": {"usd_per_minute": 0.40, "minimum_usd": 20.0},
+        "sync": {"usd_per_minute": 0.60, "minimum_usd": 30.0},
+        "precision": {"usd_per_minute": 0.90, "minimum_usd": 50.0},
+    }
+
+
 def test_generate_job_resolves_preset_and_custom_styles_before_queueing(tmp_path):
     captured: list[JobRecord] = []
 

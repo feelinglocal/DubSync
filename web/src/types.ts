@@ -85,9 +85,9 @@ export const defaultConfig: PublicConfig = {
   audio_extensions: ['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav'],
   fps_values: [23.976, 24, 25, 29.97, 30],
   pricing: {
-    generate: { usd_per_minute: 0.12, minimum_usd: 3 },
-    sync: { usd_per_minute: 0.18, minimum_usd: 5 },
-    precision: { usd_per_minute: 0.25, minimum_usd: 10 },
+    generate: { usd_per_minute: 0.40, minimum_usd: 20 },
+    sync: { usd_per_minute: 0.60, minimum_usd: 30 },
+    precision: { usd_per_minute: 0.90, minimum_usd: 50 },
   },
   billing_enabled: false,
   access_code_required: false,
