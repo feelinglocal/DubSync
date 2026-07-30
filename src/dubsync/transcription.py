@@ -321,4 +321,3 @@ def _ends_sentence(text: str) -> bool:
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
