@@ -157,4 +157,3 @@ def _hyphen_split_unspaced(text: str, max_width: int) -> list[str]:
     if current:
         lines.append(current)
     return lines
-
