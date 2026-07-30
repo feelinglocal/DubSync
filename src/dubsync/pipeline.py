@@ -1304,4 +1304,3 @@ def _partition_contiguous(indices: list[int], parts: int) -> list[list[int]]:
         partitions.append(list(indices[offset : offset + size]))
         offset += size
     return partitions
-
