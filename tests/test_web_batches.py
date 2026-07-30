@@ -640,15 +640,13 @@ def test_batch_processor_is_strictly_serial_and_continues_after_a_child_failure(
     assert max_active == 1
 
 
-def test_job_service_rejects_worker_thread_counts_other_than_one(tmp_path):
-    settings = replace(_settings(tmp_path), worker_threads=2)
-    service: JobService | None = None
-    try:
-        with pytest.raises(ValueError, match="1"):
-            service = JobService(settings, _artifacts)
-    finally:
-        if service is not None:
-            service.shutdown()
+def test_job_service_allows_two_workers_and_rejects_counts_outside_the_safe_bound(tmp_path):
+    service = JobService(replace(_settings(tmp_path), worker_threads=2), _artifacts)
+    service.shutdown()
+
+    for worker_threads in (0, 3):
+        with pytest.raises(ValueError, match="between 1 and 2"):
+            JobService(replace(_settings(tmp_path), worker_threads=worker_threads), _artifacts)
 
 
 @pytest.mark.parametrize("status", ["queued", "processing"])
