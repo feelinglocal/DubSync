@@ -11,6 +11,7 @@ from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
 from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
+from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .reports import write_qc_report
 from .srt_io import write_srt
@@ -138,7 +139,10 @@ def generate_srt_from_audio(
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
     )
     flags.extend(output_flags)
+    cues, profanity_flags = apply_german_profanity_censorship(cues)
+    flags.extend(profanity_flags)
     flags.extend(cps_sanity_flags(cues, max_cps=constraints.max_cps, min_cps=constraints.min_cps))
+    flags = censor_german_profanity_flags(flags)
 
     alignment = AlignmentResult(cue_word_indices=_cue_word_indices(cues, words))
     style_issues = lint_cues(cues, profile)
@@ -312,8 +316,9 @@ def _nonnegative_float(source: dict[str, object], key: str, default: float) -> f
 
 
 def _ends_sentence(text: str) -> bool:
-    return text.rstrip().endswith((".", "?", "!", "...", "…"))
+    return text.rstrip().endswith((".", "?", "!", "...", "\u2026"))
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
