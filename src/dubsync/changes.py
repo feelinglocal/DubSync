@@ -8,7 +8,7 @@ from .text_metrics import contains_character_level_script, display_width, token_
 from .tokenize import alphanumeric_signature
 
 
-_TERMINAL_PUNCTUATION_RE = re.compile(r"([,.;:!?…]+)\s*$")
+_TERMINAL_PUNCTUATION_RE = re.compile(r"([,.;:!?\u2026]+)\s*$")
 
 
 def apply_adjudication_decisions(
@@ -190,6 +190,36 @@ def apply_adjudication_decisions(
                 )
                 continue
 
+        if len(cue_ids) > 1 and span.srt_token_indices and len(alphanumeric_signature(decision.final_text)) == 1:
+            applied_multi_cue_edit = False
+            for position, cue_id in enumerate(cue_ids):
+                cue = cues_by_id[cue_id]
+                bounds = _span_token_bounds_for_cue(
+                    cue,
+                    span,
+                    cue_token_offsets[cue_id],
+                )
+                if bounds is None:
+                    continue
+                token_edits_by_cue.setdefault(cue_id, []).append(
+                    (bounds[0], bounds[1], decision.final_text if position == 0 else "")
+                )
+                applied_multi_cue_edit = True
+            if applied_multi_cue_edit:
+                flags.append(
+                    QCFlag(
+                        kind="text_changed",
+                        cue_ids=cue_ids,
+                        message=f"Adjudication verdict {decision.verdict}: {decision.reason}",
+                        confidence=decision.confidence,
+                        old_text="\n".join(cues_by_id[cue_id].text for cue_id in cue_ids),
+                        new_text=decision.final_text,
+                        start=span.start,
+                        end=span.end,
+                    )
+                )
+                continue
+
         replacement_texts = (
             [_cue_text_with_span_replacement(cues_by_id[cue_ids[0]], span, decision.final_text)]
             if len(cue_ids) == 1
@@ -227,7 +257,7 @@ def apply_adjudication_decisions(
     for cue_id, edits in token_edits_by_cue.items():
         changed_text = _apply_token_edits(cues_by_id[cue_id].plain_text, edits)
         final_token_edit_text_by_cue[cue_id] = changed_text
-        if not changed_text.strip():
+        if not alphanumeric_signature(changed_text):
             removed_cue_ids.add(cue_id)
             replacements_by_cue.pop(cue_id, None)
             continue
@@ -470,10 +500,15 @@ def _apply_token_edits(
             else start_character
         )
         stripped_replacement = replacement.strip()
+        if bounded_start == bounded_end == len(token_spans) and stripped_replacement:
+            terminal = _TERMINAL_PUNCTUATION_RE.search(source_text.rstrip())
+            if terminal is not None and not _TERMINAL_PUNCTUATION_RE.search(stripped_replacement):
+                start_character = terminal.start(1)
+                end_character = start_character
         replaces_contraction_suffix = (
             bounded_end > bounded_start
             and start_character > cursor
-            and source_text[start_character - 1] in {"'", "’"}
+            and source_text[start_character - 1] in {"'", "\u2019"}
         )
         if replaces_contraction_suffix:
             start_character -= 1
@@ -483,8 +518,15 @@ def _apply_token_edits(
             bounded_end > bounded_start
             and stripped_replacement
             and end_character < len(source_text)
+            and source_text[end_character] == "-"
+        ):
+            end_character += 1
+        if (
+            bounded_end > bounded_start
+            and stripped_replacement
+            and end_character < len(source_text)
             and source_text[end_character] in ",.;:!?"
-            and stripped_replacement.endswith(source_text[end_character])
+            and _TERMINAL_PUNCTUATION_RE.search(stripped_replacement)
         ):
             end_character += 1
         if start_character < cursor or bounded_start < previous_token_end:
@@ -499,7 +541,7 @@ def _apply_token_edits(
 
     pieces.append(source_text[cursor:])
     normalized = re.sub(r"\s+", " ", "".join(pieces)).strip()
-    normalized = re.sub(r"\s+([,.;:!?…])", r"\1", normalized)
+    normalized = re.sub(r"\s+([,.;:!?\u2026])", r"\1", normalized)
     return _restore_terminal_punctuation(normalized, source_text)
 
 
@@ -587,3 +629,4 @@ def _restore_terminal_punctuation(text: str, source_text: str) -> str:
     if match is None:
         return text
     return f"{stripped}{match.group(1)}"
+
