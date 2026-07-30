@@ -480,4 +480,3 @@ def test_audio_only_generation_censors_asr_profanity_in_all_public_artifacts(tmp
     assert '"M*st."' in generate_text
     assert "Mist" not in generate_text
     assert "Mist" not in report_text
-
