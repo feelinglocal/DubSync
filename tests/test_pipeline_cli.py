@@ -2091,4 +2091,3 @@ def test_cli_batch_accepts_fps_flag(tmp_path, shifted_srt_text, shifted_wordstre
     synced = parse_srt_text((folder / "ep1.synced.srt").read_text(encoding="utf-8"))
     assert synced[0].start_ms == 1000
     assert synced[0].end_ms % 40 == 0
-
