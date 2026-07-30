@@ -294,4 +294,3 @@ def test_terminal_punctuation_insertion_requires_narrow_confirmed_continuation(
     )
 
     assert [cue.plain_text for cue in transformed] == ["Hallo!", "Ja"]
-
