@@ -5,6 +5,7 @@ import unicodedata
 from dataclasses import dataclass
 
 from .models import Cue, Word
+from .profanity import normalize_german_profanity_token
 from .text_metrics import token_texts
 
 TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -25,7 +26,7 @@ _NUMBER_WORDS = {
     "five": "5",
     "fuenf": "5",
     "funf": "5",
-    "fünf": "5",
+    "f\u00fcnf": "5",
     "six": "6",
     "sechs": "6",
     "seven": "7",
@@ -41,7 +42,8 @@ _NUMBER_WORDS = {
     "twelve": "12",
     "zwoelf": "12",
     "zwolf": "12",
-    "zwölf": "12",
+    "zw\u00f6lf": "12",
+    "%": "prozent",
 }
 
 _GERMAN_ONES = {
@@ -118,7 +120,12 @@ class SRTToken:
 
 
 def normalize_token(value: str) -> str:
+    profanity = normalize_german_profanity_token(value)
+    if profanity is not None:
+        return profanity
     value = _fold_latin_number_text(unicodedata.normalize("NFC", value).lower())
+    if value in _NUMBER_WORDS:
+        return _NUMBER_WORDS[value]
     parts = TOKEN_RE.findall(value)
     normalized = "".join(_NUMBER_WORDS.get(part, part) for part in parts)
     return _NUMBER_WORDS.get(normalized, normalized)
@@ -161,3 +168,4 @@ def normalized_words(words: list[Word]) -> list[str]:
 
 def alphanumeric_signature(text: str) -> list[str]:
     return [normalize_token(part) for part in token_texts(text) if normalize_token(part)]
+
