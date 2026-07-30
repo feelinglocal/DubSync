@@ -32,8 +32,8 @@ class WebSettings:
     max_srt_line_chars: int = 4_096
     retention_hours: int = 24
     processing_inline: bool = False
-    max_submissions_per_hour: int = 5
-    max_outstanding_child_jobs: int = 10
+    max_submissions_per_hour: int = 20
+    max_outstanding_child_jobs: int = 20
     worker_threads: int = 1
     cleanup_interval_seconds: float = 300.0
     active_job_timeout_hours: float = 24.0
@@ -99,9 +99,9 @@ class WebSettings:
             max_submissions_per_hour=_env_int_with_legacy(
                 "DUBSYNC_MAX_SUBMISSIONS_PER_HOUR",
                 "DUBSYNC_MAX_JOBS_PER_HOUR",
-                5,
+                20,
             ),
-            max_outstanding_child_jobs=_env_int("DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS", 10),
+            max_outstanding_child_jobs=_env_int("DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS", 20),
             worker_threads=_env_int("DUBSYNC_WORKER_THREADS", 1),
             cleanup_interval_seconds=_env_float("DUBSYNC_CLEANUP_INTERVAL_SECONDS", 300.0),
             active_job_timeout_hours=_env_float("DUBSYNC_ACTIVE_JOB_TIMEOUT_HOURS", 24.0),
