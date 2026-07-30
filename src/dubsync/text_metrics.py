@@ -46,7 +46,15 @@ def token_texts(text: str) -> list[str]:
         if is_character_level_script(char) and char.isalnum():
             flush()
             tokens.append(char)
-        elif char.isalnum() or char == "_" or _is_inner_hyphen(char, buffer, normalized_text, index):
+        elif char == "%" and index > 0 and normalized_text[index - 1].isdigit():
+            flush()
+            tokens.append(char)
+        elif (
+            char.isalnum()
+            or char == "_"
+            or _is_inner_mask(char, buffer, normalized_text, index)
+            or _is_inner_hyphen(char, buffer, normalized_text, index)
+        ):
             buffer.append(char)
         else:
             flush()
@@ -56,7 +64,16 @@ def token_texts(text: str) -> list[str]:
 
 
 def _is_inner_hyphen(char: str, buffer: list[str], text: str, index: int) -> bool:
-    return char in {"-", "‑"} and bool(buffer) and index + 1 < len(text) and text[index + 1].isalnum()
+    return char in {"-", "\u2011"} and bool(buffer) and index + 1 < len(text) and text[index + 1].isalnum()
+
+
+def _is_inner_mask(char: str, buffer: list[str], text: str, index: int) -> bool:
+    if char != "*" or not buffer:
+        return False
+    next_index = index + 1
+    while next_index < len(text) and text[next_index] == "*":
+        next_index += 1
+    return next_index < len(text) and text[next_index].isalnum()
 
 
 def wrap_visual_width(text: str, max_width: int) -> list[str]:
@@ -140,3 +157,4 @@ def _hyphen_split_unspaced(text: str, max_width: int) -> list[str]:
     if current:
         lines.append(current)
     return lines
+
