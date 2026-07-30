@@ -168,4 +168,3 @@ def normalized_words(words: list[Word]) -> list[str]:
 
 def alphanumeric_signature(text: str) -> list[str]:
     return [normalize_token(part) for part in token_texts(text) if normalize_token(part)]
-
