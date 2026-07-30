@@ -30,6 +30,7 @@ from .output_order import finalize_cues_for_output
 from .overlap import apply_overlap_policy
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
 from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
+from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .recue import rebuild_cues
 from .reports import write_changes_diff, write_qc_report
@@ -874,6 +875,9 @@ def _run_verify_stage(
     if audio_for_asr != audio_path:
         flags.extend(silence_flags_for_cues(audio_for_asr, rebuilt))
 
+    rebuilt, profanity_flags = apply_german_profanity_censorship(rebuilt, source_cues)
+    flags.extend(profanity_flags)
+    flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(flags)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(write_srt(rebuilt, renumber=True), encoding="utf-8")
@@ -1188,10 +1192,26 @@ def _anchored_adlib_cue_id(
         and span.start is not None
         and span.left_anchor_end is not None
         and _anchor_speaker_is_compatible(span.speaker_ids, span.left_anchor_speaker_id)
-        and not re.search(r"[.!?…]\s*$", cues_by_id[left_id].plain_text)
     ):
         gap = span.start - span.left_anchor_end
-        if -0.05 <= gap <= max_gap_seconds:
+        left_has_terminal_punctuation = bool(
+            re.search(r"[.!?\u2026]\s*$", cues_by_id[left_id].plain_text)
+        )
+        narrow_confirmed_continuation = (
+            len(alphanumeric_signature(final_text)) == 1
+            and -0.05 <= gap <= 0.05
+            and _anchor_speaker_is_confirmed(
+                span.speaker_ids,
+                span.left_anchor_speaker_id,
+            )
+        )
+        if (
+            -0.05 <= gap <= max_gap_seconds
+            and (
+                not left_has_terminal_punctuation
+                or narrow_confirmed_continuation
+            )
+        ):
             return left_id
     return None
 

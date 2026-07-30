@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -12,7 +11,6 @@ GERMAN_PROFANITY_RULESET_VERSION = "de-v1-2026-07-30"
 LEXICON_VERSION = GERMAN_PROFANITY_RULESET_VERSION
 _TOKEN_RE = re.compile(r"[^\W\d_]+(?:\*+[^\W\d_]+)*", re.UNICODE)
 _MASK_RE = re.compile(r"\*+")
-_MASK_SUBSTITUTIONS = tuple("abcdefghijklmnopqrstuvwxyz") + ("ae", "oe", "ue", "ss")
 
 
 @dataclass(frozen=True)
@@ -28,7 +26,7 @@ class GermanProfanityTerm:
 class _SourceMask:
     position: int
     cue_id: int
-    canonical: str
+    canonicals: frozenset[str]
     token: str
 
 
@@ -38,8 +36,8 @@ class _SourceMask:
 GERMAN_PROFANITY_TERMS: tuple[GermanProfanityTerm, ...] = (
     GermanProfanityTerm(
         canonical="arschloch",
-        forms=("arschloch", "arschloecher"),
-        prefixes=("arschloch",),
+        forms=("arschloch", "arschloecher", "arschloechern"),
+        prefixes=(),
         mask_letters="a",
     ),
     GermanProfanityTerm(
@@ -81,38 +79,84 @@ GERMAN_PROFANITY_TERMS: tuple[GermanProfanityTerm, ...] = (
     ),
     GermanProfanityTerm(
         canonical="verarschen",
-        forms=("verarsch", "verarsche", "verarschen", "verarscht", "verarschte", "verarschung"),
-        prefixes=("verarsch",),
+        forms=(
+            "verarsch",
+            "verarsche",
+            "verarschst",
+            "verarschen",
+            "verarscht",
+            "verarschte",
+            "verarschten",
+            "verarschung",
+            "verarschungen",
+        ),
+        prefixes=(),
         mask_letters="a",
     ),
     GermanProfanityTerm(
         canonical="beschissen",
-        forms=("beschissen",),
-        prefixes=("beschiss",),
+        forms=(
+            "beschissen",
+            "beschissene",
+            "beschissener",
+            "beschissenes",
+            "beschissenen",
+            "beschissenem",
+        ),
+        prefixes=(),
         mask_letters="i",
     ),
     GermanProfanityTerm(
         canonical="arsch",
-        forms=("arsch", "aersche", "aerschen"),
-        prefixes=("arsch",),
+        forms=(
+            "arsch",
+            "aersche",
+            "aerschen",
+            "arschgeige",
+            "arschgeigen",
+            "arschgesicht",
+            "arschgesichter",
+            "arschkarte",
+        ),
+        prefixes=(),
         mask_letters="a",
     ),
     GermanProfanityTerm(
         canonical="ficken",
-        forms=("fick", "ficke", "ficken", "fickst", "fickt", "fickte", "fickten"),
-        prefixes=("fick", "gefick", "verfick"),
+        forms=(
+            "fick",
+            "ficke",
+            "ficken",
+            "fickst",
+            "fickt",
+            "fickte",
+            "fickten",
+            "gefickt",
+            "gefickte",
+            "gefickter",
+            "geficktes",
+            "gefickten",
+            "geficktem",
+            "verfickt",
+            "verfickte",
+            "verfickter",
+            "verficktes",
+            "verfickten",
+            "verficktem",
+        ),
+        prefixes=(),
         mask_letters="i",
     ),
     GermanProfanityTerm(
         canonical="fotze",
         forms=("fotze", "fotzen"),
-        prefixes=("fotz",),
+        prefixes=(),
         mask_letters="o",
     ),
     GermanProfanityTerm(
         canonical="hurensohn",
         forms=("hurensohn", "hurensoehne", "hurensoehnen"),
-        prefixes=("hurensohn",),
+        prefixes=(),
         mask_letters="u",
     ),
     GermanProfanityTerm(
@@ -123,20 +167,36 @@ GERMAN_PROFANITY_TERMS: tuple[GermanProfanityTerm, ...] = (
     ),
     GermanProfanityTerm(
         canonical="wichser",
-        forms=("wichser", "wichsern"),
-        prefixes=("wichs",),
+        forms=("wichser", "wichsern", "wichse", "wichsen", "wichst", "wichste", "wichsten", "gewichst"),
+        prefixes=(),
         mask_letters="i",
     ),
     GermanProfanityTerm(
         canonical="kacke",
-        forms=("kacke",),
-        prefixes=("kack",),
+        forms=("kacke", "kacken", "kackst", "kackt", "kackte", "kackten", "kackhaufen", "kackbratze"),
+        prefixes=(),
         mask_letters="a",
     ),
     GermanProfanityTerm(
         canonical="pisse",
-        forms=("pisse", "pisser", "pissern"),
-        prefixes=("piss", "verpiss", "angepiss"),
+        forms=(
+            "piss",
+            "pisse",
+            "pisser",
+            "pissern",
+            "pissen",
+            "pisst",
+            "pisste",
+            "pissten",
+            "verpiss",
+            "verpisse",
+            "verpissen",
+            "verpisst",
+            "verpisste",
+            "verpissten",
+            "angepisst",
+        ),
+        prefixes=(),
         mask_letters="i",
     ),
     GermanProfanityTerm(
@@ -244,15 +304,30 @@ GERMAN_PROFANITY_TERMS: tuple[GermanProfanityTerm, ...] = (
 )
 
 
-def canonicalize_german_profanity_token(value: str) -> str | None:
+def canonicalize_german_profanity_token(value: str, *, allow_prefix: bool = True) -> str | None:
     if not value:
         return None
     normalized = _normalize_form(value)
     if "*" not in normalized:
-        term = _match_uncensored_normalized(normalized)
+        term = _match_uncensored_normalized(normalized, allow_prefix=allow_prefix)
         return term.canonical if term is not None else None
     term = _match_masked_normalized(normalized)
     return term.canonical if term is not None else None
+
+
+def normalize_german_profanity_token(value: str) -> str | None:
+    """Return an alignment key without discarding inflections or compounds."""
+    if not value:
+        return None
+    normalized = _normalize_form(value)
+    if "*" not in normalized:
+        return normalized if _match_uncensored_normalized(normalized) is not None else None
+    candidates = {
+        candidate
+        for words in _masked_word_candidates(normalized).values()
+        for candidate in words
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def censor_german_profanity_text(text: str, source_text: str | None = None) -> str:
@@ -394,14 +469,14 @@ def _collect_source_masks(cues: list[Cue]) -> tuple[_SourceMask, ...]:
             token = match.group(0)
             if "*" not in token:
                 continue
-            canonical = canonicalize_german_profanity_token(token)
-            if canonical is None:
+            canonicals = _masked_canonical_candidates(_normalize_form(token))
+            if not canonicals:
                 continue
             masks.append(
                 _SourceMask(
                     position=len(masks),
                     cue_id=cue.index,
-                    canonical=canonical,
+                    canonicals=canonicals,
                     token=token,
                 )
             )
@@ -429,7 +504,7 @@ def _take_source_mask(
         (
             item
             for item in source_masks
-            if item.position not in used and item.cue_id == cue_id and item.canonical == canonical
+            if item.position not in used and item.cue_id == cue_id and canonical in item.canonicals
         ),
         None,
     )
@@ -439,7 +514,7 @@ def _take_source_mask(
             for item in source_masks
             if (
                 item.position not in used
-                and item.canonical == canonical
+                and canonical in item.canonicals
                 and (item.cue_id, canonical) not in reservations
             )
         ),
@@ -450,10 +525,12 @@ def _take_source_mask(
     return selected, used | {selected.position}
 
 
-def _match_uncensored_normalized(normalized: str) -> GermanProfanityTerm | None:
+def _match_uncensored_normalized(normalized: str, *, allow_prefix: bool = True) -> GermanProfanityTerm | None:
     exact = _FORM_TO_TERM.get(normalized)
     if exact is not None:
         return exact
+    if not allow_prefix:
+        return None
     return next(
         (
             term
@@ -465,20 +542,59 @@ def _match_uncensored_normalized(normalized: str) -> GermanProfanityTerm | None:
 
 
 def _match_masked_normalized(normalized: str) -> GermanProfanityTerm | None:
-    groups = _MASK_RE.findall(normalized)
-    if not groups or len(groups) > 2:
-        return None
-    matches: dict[str, GermanProfanityTerm] = {}
-    for substitutions in itertools.product(_MASK_SUBSTITUTIONS, repeat=len(groups)):
-        candidate = normalized
-        for substitution in substitutions:
-            candidate = _MASK_RE.sub(substitution, candidate, count=1)
-        term = _match_uncensored_normalized(candidate)
-        if term is not None:
-            matches[term.canonical] = term
+    matches = _masked_canonical_candidates(normalized)
     if len(matches) != 1:
         return None
-    return next(iter(matches.values()))
+    return _TERM_BY_CANONICAL[next(iter(matches))]
+
+
+def _masked_canonical_candidates(normalized: str) -> frozenset[str]:
+    return frozenset(_masked_word_candidates(normalized))
+
+
+def _merge_overlapping_literal(prefix: str, trailing_literal: str) -> str:
+    max_overlap = min(len(prefix), len(trailing_literal))
+    overlap = next(
+        (
+            size
+            for size in range(max_overlap, 0, -1)
+            if prefix.endswith(trailing_literal[:size])
+        ),
+        0,
+    )
+    return f"{prefix}{trailing_literal[overlap:]}"
+
+
+def _masked_word_candidates(normalized: str) -> dict[str, frozenset[str]]:
+    groups = _MASK_RE.findall(normalized)
+    if not groups:
+        return {}
+    pattern = re.compile(
+        "^"
+        + "[a-z]+".join(re.escape(part) for part in _MASK_RE.split(normalized))
+        + "$"
+    )
+    matches: dict[str, frozenset[str]] = {}
+    trailing_literal = _MASK_RE.split(normalized)[-1]
+    for term in GERMAN_PROFANITY_TERMS:
+        explicit_candidates = {
+            _normalize_form(form)
+            for form in (term.canonical, *term.forms)
+        }
+        matching_candidates = frozenset(
+            candidate for candidate in explicit_candidates if pattern.fullmatch(candidate)
+        )
+        if not matching_candidates:
+            prefix_candidates = {
+                _merge_overlapping_literal(_normalize_form(prefix), trailing_literal)
+                for prefix in term.prefixes
+            }
+            matching_candidates = frozenset(
+                candidate for candidate in prefix_candidates if pattern.fullmatch(candidate)
+            )
+        if matching_candidates:
+            matches[term.canonical] = matching_candidates
+    return matches
 
 
 def _replacement_for_token(token: str, term: GermanProfanityTerm) -> str:
