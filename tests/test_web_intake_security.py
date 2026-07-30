@@ -37,7 +37,7 @@ def _fake_processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifact
     return ProcessedArtifacts(output_srt=output, qc_json=qc_json, qc_html=qc_html, cost_usd=0.01, cue_count=1)
 
 
-def test_render_rate_limit_uses_the_first_forwarded_client_address(tmp_path, monkeypatch):
+def test_render_rate_limit_uses_the_proxy_appended_forwarded_client_address(tmp_path, monkeypatch):
     monkeypatch.setenv("RENDER", "true")
     settings = replace(_settings(tmp_path), max_submissions_per_hour=1)
     app = create_app(settings=settings, processor=_fake_processor)
@@ -49,13 +49,13 @@ def test_render_rate_limit_uses_the_first_forwarded_client_address(tmp_path, mon
             data={"mode": "generate", "fps": "30"},
             files={"audio": ("first.wav", b"audio", "audio/wav")},
         )
-        second_client = client.post(
+        spoofed_leftmost = client.post(
             "/api/jobs",
             headers={"X-Forwarded-For": "198.51.100.12, 203.0.113.8"},
             data={"mode": "generate", "fps": "30"},
             files={"audio": ("second.wav", b"audio", "audio/wav")},
         )
-        limited = client.post(
+        second_client = client.post(
             "/api/jobs",
             headers={"X-Forwarded-For": "198.51.100.11, 203.0.113.9"},
             data={"mode": "generate", "fps": "30"},
@@ -63,8 +63,8 @@ def test_render_rate_limit_uses_the_first_forwarded_client_address(tmp_path, mon
         )
 
     assert accepted.status_code == 202
+    assert spoofed_leftmost.status_code == 429
     assert second_client.status_code == 202
-    assert limited.status_code == 429
 
 
 @pytest.mark.parametrize("path", ["/api/jobs", "/api/batches"])
