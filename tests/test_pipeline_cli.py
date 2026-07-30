@@ -53,7 +53,7 @@ def test_cli_help_runs():
 
 def test_cli_sync_help_documents_resume_stages():
     result = CliRunner().invoke(app, ["sync", "--help"])
-    rendered_help = " ".join(result.output.replace("│", " ").split())
+    rendered_help = " ".join(result.output.replace("\u2502", " ").split())
 
     assert result.exit_code == 0, result.output
     assert "Resume from asr, align, adjudicate, rebuild, or verify" in rendered_help
@@ -471,6 +471,83 @@ def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
     assert low_confidence_flag["old_text"] == "old"
     assert low_confidence_flag["new_text"] == "new spoken line"
     assert not any(flag["kind"] == "unmatched_cue" for flag in report["flags"])
+
+
+def test_cli_sync_keeps_german_profanity_mask_without_llm_rewrite(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Das ist verd*mmt knapp.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Das", "start": 0.00, "end": 0.12, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "ist", "start": 0.14, "end": 0.25, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "verdammt", "start": 0.27, "end": 0.55, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "knapp", "start": 0.57, "end": 0.80, "confidence": 0.98, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "Das ist verdammt knapp.",
+                            "confidence": 0.97,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "ASR expanded censored German profanity",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert synced[0].plain_text == "Das ist verd*mmt knapp."
+    assert synced[0].start_ms == 0
+    assert synced[0].end_ms == 875
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
+    assert "verdammt" not in json.dumps(report, ensure_ascii=False)
 
 
 def test_cli_sync_empty_adjudication_text_preserves_parseable_cue(tmp_path):
@@ -2014,3 +2091,4 @@ def test_cli_batch_accepts_fps_flag(tmp_path, shifted_srt_text, shifted_wordstre
     synced = parse_srt_text((folder / "ep1.synced.srt").read_text(encoding="utf-8"))
     assert synced[0].start_ms == 1000
     assert synced[0].end_ms % 40 == 0
+
