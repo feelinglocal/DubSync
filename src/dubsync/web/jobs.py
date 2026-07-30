@@ -17,6 +17,7 @@ from dubsync.pipeline import sync_episode
 from dubsync.transcription import generate_srt_from_audio
 
 from .generation_styles import ResolvedGenerationStyle
+from .process_lock import ProcessLock
 from .settings import WebSettings
 
 logger = logging.getLogger(__name__)
@@ -327,14 +328,33 @@ class JobStore:
             ).fetchall()
         return [_record(row) for row in rows]
 
-    def mark_processing(self, job_id: str) -> JobRecord:
-        return self._update(
-            job_id,
-            expected_statuses=("queued", "processing"),
-            status="processing",
-            progress=25,
-            error=None,
-        )
+    def claim_processing(self, job_id: str) -> JobRecord | None:
+        updated_at = _iso(datetime.now(UTC))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'processing', progress = 25, error = NULL, updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (updated_at, job_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return _record(row) if row is not None else None
+
+    def requeue_interrupted_processing(self) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', progress = 5, error = NULL, updated_at = ?
+                WHERE status = 'processing'
+                """,
+                (_iso(datetime.now(UTC)),),
+            )
+        return cursor.rowcount
 
     def mark_complete(
         self,
@@ -502,24 +522,43 @@ Processor = Callable[[JobRecord, WebSettings], ProcessedArtifacts]
 
 class JobService:
     def __init__(self, settings: WebSettings, processor: Processor):
-        if settings.worker_threads != 1:
-            raise ValueError("DUBSYNC_WORKER_THREADS must be exactly 1")
+        if not 1 <= settings.worker_threads <= 2:
+            raise ValueError("DUBSYNC_WORKER_THREADS must be between 1 and 2")
         self.settings = settings
         self.store = JobStore(settings.data_dir)
         self.processor = processor
         self.executor = ThreadPoolExecutor(max_workers=settings.worker_threads, thread_name_prefix="dubsync-job")
+        self.process_lock = ProcessLock(self.store.data_dir / ".dubsync-process.lock")
         self.cleanup_stop = threading.Event()
         self.cleanup_thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._run_maintenance()
-        orphan_count = self.store.reconcile_orphaned_job_directories()
-        if orphan_count:
-            logger.warning("Removed %d orphaned DubSync job storage directories", orphan_count)
-        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, name="dubsync-cleanup", daemon=True)
-        self.cleanup_thread.start()
-        for job in self.store.pending():
-            self.submit(replace(job, status="queued", progress=5))
+        self.process_lock.acquire()
+        try:
+            self._run_maintenance()
+            requeued_count = self.store.requeue_interrupted_processing()
+            if requeued_count:
+                logger.warning("Requeued %d interrupted DubSync job(s)", requeued_count)
+            orphan_count = self.store.reconcile_orphaned_job_directories()
+            if orphan_count:
+                logger.warning("Removed %d orphaned DubSync job storage directories", orphan_count)
+            self.cleanup_thread = threading.Thread(
+                target=self._cleanup_loop,
+                name="dubsync-cleanup",
+                daemon=True,
+            )
+            self.cleanup_thread.start()
+            pending_batches: dict[str, list[JobRecord]] = {}
+            for job in self.store.pending():
+                if job.batch_id is not None:
+                    pending_batches.setdefault(job.batch_id, []).append(job)
+                    continue
+                self.submit(replace(job, status="queued", progress=5))
+            for jobs in pending_batches.values():
+                self.submit_batch(tuple(sorted(jobs, key=lambda item: (item.batch_position or 0, item.id))))
+        except BaseException:
+            self.shutdown()
+            raise
 
     def submit(self, job: JobRecord) -> None:
         if self.settings.processing_inline:
@@ -538,9 +577,12 @@ class JobService:
 
     def shutdown(self) -> None:
         self.cleanup_stop.set()
-        if self.cleanup_thread is not None:
-            self.cleanup_thread.join(timeout=max(1.0, self.settings.cleanup_interval_seconds * 2))
-        self.executor.shutdown(wait=True, cancel_futures=False)
+        try:
+            if self.cleanup_thread is not None and self.cleanup_thread.is_alive():
+                self.cleanup_thread.join()
+            self.executor.shutdown(wait=True, cancel_futures=False)
+        finally:
+            self.process_lock.release()
 
     def _cleanup_loop(self) -> None:
         while not self.cleanup_stop.wait(self.settings.cleanup_interval_seconds):
@@ -564,9 +606,13 @@ class JobService:
     def _process(self, job: JobRecord) -> None:
         terminal_expiry = lambda: datetime.now(UTC) + timedelta(hours=self.settings.retention_hours)
         try:
-            processing = self.store.mark_processing(job.id)
-            if processing.status != "processing":
-                return
+            processing = self.store.claim_processing(job.id)
+        except Exception:
+            logger.exception("Could not claim DubSync job %s", job.id)
+            return
+        if processing is None:
+            return
+        try:
             artifacts = self.processor(processing, self.settings)
             self.store.assert_job_storage_within_limit(
                 job.directory,

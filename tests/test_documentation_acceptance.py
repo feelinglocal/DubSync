@@ -14,7 +14,7 @@ def test_readme_includes_final_acceptance_report_sections():
         "### Measured Timings And Costs",
         "### Top 3 Risks",
         "Production web `generate` smoke",
-        "309 passed, 5 deselected",
+        "445 passed, 5 deselected",
         "A second paid run was not made",
         "Production dependency audit",
     ):
@@ -44,8 +44,9 @@ def test_runtime_blueprint_sets_bounded_job_and_ffmpeg_limits():
     blueprint = yaml.safe_load(Path("render.yaml").read_text(encoding="utf-8"))
     env = {item["key"]: item for item in blueprint["services"][0]["envVars"]}
 
-    assert env["DUBSYNC_MAX_SUBMISSIONS_PER_HOUR"]["value"] == "5"
-    assert env["DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS"]["value"] == "10"
+    assert env["DUBSYNC_MAX_SUBMISSIONS_PER_HOUR"]["value"] == "20"
+    assert env["DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS"]["value"] == "20"
+    assert env["DUBSYNC_WORKER_THREADS"]["value"] == "2"
     assert env["DUBSYNC_MAX_UPLOAD_BYTES"]["value"] == "536870912"
     assert env["DUBSYNC_MAX_BATCH_UPLOAD_BYTES"]["value"] == "536870912"
     assert env["DUBSYNC_MAX_SRT_BYTES"]["value"] == "2097152"
@@ -72,11 +73,14 @@ def test_readme_documents_production_disk_admission_limits():
     for expected in (
         "Single and batch request payloads are capped at 512 MiB",
         "retained job commitments are capped at 4 GiB",
-        "only one request may pass upload intake at a time",
+        "concurrent uploads reserve their combined inbound bytes before copying",
         "four-hour audio limit",
         "1 GiB per-job ceiling",
         "2 GiB of minimum free disk",
         "SRT files are capped at 2 MiB, 60,000 lines, and 20,000 cues",
+        "submits each batch as one serial work unit",
+        "two batches may run concurrently",
+        "data-directory process lock",
     ):
         assert expected in readme
 

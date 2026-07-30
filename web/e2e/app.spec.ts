@@ -23,6 +23,63 @@ function sineWaveWav(durationSeconds = 1, sampleRate = 8_000) {
   return output
 }
 
+test('two browser contexts share one access code without sharing job state', async ({ browser }) => {
+  const firstContext = await browser.newContext()
+  const secondContext = await browser.newContext()
+  const firstPage = await firstContext.newPage()
+  const secondPage = await secondContext.newPage()
+  const upload = Buffer.alloc(4 * 1024 * 1024, 1)
+
+  try {
+    await Promise.all([firstPage.goto('/'), secondPage.goto('/')])
+    await Promise.all([
+      firstPage.getByRole('button', { name: 'Generate from audio' }).click(),
+      secondPage.getByRole('button', { name: 'Generate from audio' }).click(),
+    ])
+    await Promise.all([
+      firstPage.getByLabel('Dialogue audio').setInputFiles({
+        name: 'device-a.wav',
+        mimeType: 'audio/wav',
+        buffer: upload,
+      }),
+      secondPage.getByLabel('Dialogue audio').setInputFiles({
+        name: 'device-b.wav',
+        mimeType: 'audio/wav',
+        buffer: upload,
+      }),
+      firstPage.getByLabel('Job access code').fill('fixture-access-code'),
+      secondPage.getByLabel('Job access code').fill('fixture-access-code'),
+    ])
+
+    await Promise.all([
+      firstPage.getByRole('button', { name: 'Generate SRT' }).click(),
+      secondPage.getByRole('button', { name: 'Generate SRT' }).click(),
+    ])
+    await Promise.all([
+      expect(firstPage.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 }),
+      expect(secondPage.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 }),
+    ])
+
+    const [firstAccess, secondAccess] = await Promise.all([
+      firstPage.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>),
+      secondPage.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>),
+    ])
+    expect(firstAccess).toHaveLength(1)
+    expect(secondAccess).toHaveLength(1)
+    expect(firstAccess[0].id).not.toBe(secondAccess[0].id)
+    expect(firstAccess[0].token).not.toBe(secondAccess[0].token)
+
+    expect((await firstContext.request.get(`/api/jobs/${firstAccess[0].id}`, {
+      headers: { Authorization: `Bearer ${secondAccess[0].token}` },
+    })).status()).toBe(404)
+    expect((await secondContext.request.get(`/api/jobs/${secondAccess[0].id}`, {
+      headers: { Authorization: `Bearer ${firstAccess[0].token}` },
+    })).status()).toBe(404)
+  } finally {
+    await Promise.all([firstContext.close(), secondContext.close()])
+  }
+})
+
 test('audio-only job uploads, processes, and downloads an SRT', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('button', { name: 'Generate from audio' }).click()
