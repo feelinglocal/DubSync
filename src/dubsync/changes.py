@@ -629,4 +629,3 @@ def _restore_terminal_punctuation(text: str, source_text: str) -> str:
     if match is None:
         return text
     return f"{stripped}{match.group(1)}"
-
