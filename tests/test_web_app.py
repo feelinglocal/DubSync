@@ -328,8 +328,13 @@ def test_predicted_normalized_storage_rejects_after_copy_and_cleans_the_job(tmp_
     assert list(settings.data_dir.glob("job-*")) == []
 
 
-def test_concurrent_intake_is_rejected_before_a_second_upload_is_copied(tmp_path, monkeypatch):
-    settings = replace(_settings(tmp_path), processing_inline=False)
+def test_concurrent_intake_reservations_reject_unsafe_combined_storage_before_copy(tmp_path, monkeypatch):
+    mebibyte = 1024 * 1024
+    settings = replace(
+        _settings(tmp_path),
+        processing_inline=False,
+        max_retained_storage_bytes=80 * mebibyte,
+    )
     app = create_app(settings=settings, processor=_fake_processor)
     first_save_started = threading.Event()
     release_first_save = threading.Event()
@@ -344,6 +349,10 @@ def test_concurrent_intake_is_rejected_before_a_second_upload_is_copied(tmp_path
             await asyncio.to_thread(release_first_save.wait, 3.0)
         return await original_save(*args, **kwargs)
 
+    monkeypatch.setattr(
+        "dubsync.web.intake_guard._request_body_reservation",
+        lambda *_args, **_kwargs: 48 * mebibyte,
+    )
     monkeypatch.setattr("dubsync.web.app._save_upload", blocking_save)
     request = {
         "data": {"mode": "generate", "fps": "30"},
@@ -360,8 +369,10 @@ def test_concurrent_intake_is_rejected_before_a_second_upload_is_copied(tmp_path
         accepted = first.result(timeout=3.0)
 
     assert accepted.status_code == 202
-    assert second.status_code == 429
-    assert second.json() == {"detail": "Another upload is already being accepted. Try again shortly."}
+    assert second.status_code == 507
+    assert second.json() == {
+        "detail": "Storage capacity is temporarily unavailable. Wait for existing jobs to expire."
+    }
     assert save_calls == 1
 
 
