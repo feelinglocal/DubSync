@@ -336,13 +336,16 @@ def test_web_settings_prefers_submission_limit_and_supports_legacy_fallback(tmp_
     assert legacy_settings.max_jobs_per_hour == 99
 
 
-def test_web_settings_defaults_to_ten_outstanding_child_jobs(tmp_path, monkeypatch):
+def test_web_settings_defaults_support_two_full_batches(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DUBSYNC_MAX_SUBMISSIONS_PER_HOUR", raising=False)
+    monkeypatch.delenv("DUBSYNC_MAX_JOBS_PER_HOUR", raising=False)
     monkeypatch.delenv("DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS", raising=False)
 
     settings = WebSettings.from_env()
 
-    assert settings.max_outstanding_child_jobs == 10
+    assert settings.max_submissions_per_hour == 20
+    assert settings.max_outstanding_child_jobs == 20
 
 
 def test_outstanding_child_limit_is_atomic_across_concurrent_writers(tmp_path):

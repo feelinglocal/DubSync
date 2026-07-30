@@ -99,7 +99,29 @@ class SecurityAndIntakeMiddleware:
         self.settings = settings
         self.limiter = limiter
         self.storage_usage_bytes = storage_usage_bytes
-        self.intake_lock = threading.Lock()
+        self.intake_reservation_lock = threading.Lock()
+        self.active_intake_reservation_bytes = 0
+
+    def _reserve_intake_storage(self, reservation: int) -> bool:
+        with self.intake_reservation_lock:
+            retained_bytes = self.storage_usage_bytes()
+            active_bytes = self.active_intake_reservation_bytes
+            if retained_bytes + active_bytes + reservation > self.settings.max_retained_storage_bytes:
+                return False
+
+            free_bytes = shutil.disk_usage(self.settings.data_dir).free
+            if free_bytes < active_bytes + reservation + self.settings.min_free_storage_bytes:
+                return False
+
+            self.active_intake_reservation_bytes = active_bytes + reservation
+            return True
+
+    def _release_intake_storage(self, reservation: int) -> None:
+        with self.intake_reservation_lock:
+            self.active_intake_reservation_bytes = max(
+                0,
+                self.active_intake_reservation_bytes - reservation,
+            )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -133,13 +155,8 @@ class SecurityAndIntakeMiddleware:
                 response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
                 await response(scope, receive, send_with_security_headers)
                 return
-            if not self.intake_lock.acquire(blocking=False):
-                response = JSONResponse(
-                    {"detail": "Another upload is already being accepted. Try again shortly."},
-                    status_code=429,
-                )
-                await response(scope, receive, send_with_security_headers)
-                return
+            reservation = 0
+            storage_reserved = False
             try:
                 response = job_intake_preflight(
                     request,
@@ -151,7 +168,7 @@ class SecurityAndIntakeMiddleware:
                     return
                 reservation = _request_body_reservation(request, path=path, settings=self.settings)
                 try:
-                    retained_bytes = self.storage_usage_bytes()
+                    storage_reserved = self._reserve_intake_storage(reservation)
                 except OSError:
                     response = JSONResponse(
                         {"detail": "Storage capacity could not be verified."},
@@ -159,23 +176,7 @@ class SecurityAndIntakeMiddleware:
                     )
                     await response(scope, receive, send_with_security_headers)
                     return
-                if retained_bytes + reservation > self.settings.max_retained_storage_bytes:
-                    response = JSONResponse(
-                        {"detail": STORAGE_CAPACITY_DETAIL},
-                        status_code=507,
-                    )
-                    await response(scope, receive, send_with_security_headers)
-                    return
-                try:
-                    free_bytes = shutil.disk_usage(self.settings.data_dir).free
-                except OSError:
-                    response = JSONResponse(
-                        {"detail": "Storage capacity could not be verified."},
-                        status_code=503,
-                    )
-                    await response(scope, receive, send_with_security_headers)
-                    return
-                if free_bytes < reservation + self.settings.min_free_storage_bytes:
+                if not storage_reserved:
                     response = JSONResponse(
                         {"detail": STORAGE_CAPACITY_DETAIL},
                         status_code=507,
@@ -190,7 +191,8 @@ class SecurityAndIntakeMiddleware:
                 )
                 await self.app(scope, guarded_receive, send_with_security_headers)
             finally:
-                self.intake_lock.release()
+                if storage_reserved:
+                    self._release_intake_storage(reservation)
             return
 
         await self.app(scope, guarded_receive, send_with_security_headers)
@@ -205,14 +207,11 @@ def _validate_job_access(settings: WebSettings, access_code: str) -> None:
 
 def _client_key(request: Request) -> str:
     if os.getenv("RENDER", "").strip().lower() == "true":
-        forwarded = [
-            part.strip()
-            for part in request.headers.get("x-forwarded-for", "").split(",")
-            if part.strip()
-        ]
-        if forwarded:
+        forwarded_headers = request.headers.getlist("x-forwarded-for")
+        if forwarded_headers:
+            candidate = forwarded_headers[-1].rsplit(",", maxsplit=1)[-1].strip()
             try:
-                return str(ip_address(forwarded[0]))
+                return str(ip_address(candidate))
             except ValueError:
                 pass
     return request.client.host if request.client else "unknown"

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+import sys
 import wave
+from array import array
+from collections.abc import Sequence
 from pathlib import Path
 
 from .models import Cue, QCFlag
@@ -30,7 +33,7 @@ def silence_flags_for_cues(audio_path: Path, cues: list[Cue], threshold_dbfs: fl
     return flags
 
 
-def _read_mono_pcm(audio_path: Path) -> tuple[list[int], int, int]:
+def _read_mono_pcm(audio_path: Path) -> tuple[array, int, int]:
     with wave.open(str(audio_path), "rb") as wav:
         channels = wav.getnchannels()
         sample_width = wav.getsampwidth()
@@ -40,17 +43,16 @@ def _read_mono_pcm(audio_path: Path) -> tuple[list[int], int, int]:
     if sample_width != 2:
         raise ValueError("silence gate currently supports 16-bit PCM WAV")
 
-    samples: list[int] = []
-    step = sample_width * channels
-    for offset in range(0, len(raw), step):
-        first_channel = raw[offset : offset + sample_width]
-        if len(first_channel) < sample_width:
-            continue
-        samples.append(int.from_bytes(first_channel, byteorder="little", signed=True))
+    samples = array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if channels > 1:
+        samples = samples[::channels]
     return samples, frame_rate, 32767
 
 
-def _dbfs(samples: list[int], max_value: int) -> float:
+def _dbfs(samples: Sequence[int], max_value: int) -> float:
     if not samples:
         return -math.inf
     square_sum = sum(sample * sample for sample in samples)

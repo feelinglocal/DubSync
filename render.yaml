@@ -57,11 +57,11 @@ services:
       - key: DUBSYNC_MAX_AUDIO_SNIPPET_BYTES
         value: "33554432"
       - key: DUBSYNC_MAX_SUBMISSIONS_PER_HOUR
-        value: "5"
+        value: "20"
       - key: DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS
-        value: "10"
+        value: "20"
       - key: DUBSYNC_WORKER_THREADS
-        value: "1"
+        value: "2"
       - key: DUBSYNC_CLEANUP_INTERVAL_SECONDS
         value: "300"
       - key: DUBSYNC_ACTIVE_JOB_TIMEOUT_HOURS
