@@ -119,24 +119,30 @@ def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
 
 
 def test_alignment_limits_unique_exact_retry_instead_of_unbounded_full_width(monkeypatch):
-    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 10_000)
-    token_count = 1_500
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
+    token_count = 300
     cues = [
-        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=[f"token{index}"])
+        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=["filler"])
         for index in range(token_count)
     ]
     words = [
-        Word(text=f"token{index}", start=index * 0.2, end=index * 0.2 + 0.1, confidence=0.99)
+        Word(text="filler", start=index * 0.2, end=index * 0.2 + 0.1, confidence=0.99)
         for index in range(token_count)
     ]
-    words[0] = Word(text="token1499", start=0.0, end=0.1, confidence=0.99)
-    words[-1] = Word(text="token0", start=299.8, end=299.9, confidence=0.99)
+    cues[20] = cues[20].with_lines(["needle"])
+    words[280] = words[280].model_copy(update={"text": "needle"})
 
     result = align_cues_to_words(cues, words)
 
+    assert result.anchor_coverage > 0.5
     assert result.diagnostics.unbanded_fallback is False
     assert result.diagnostics.band_limited is True
     assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+
+
+def test_alignment_retry_margins_progress_without_automatic_full_width():
+    assert aligner._retry_margins(64, 5_000) == [64, 256, 1_024]
+    assert aligner._retry_margins(64, 500) == [64, 256, 500]
 
 
 def test_band_windows_keep_distant_priors_disjoint_and_bounded():

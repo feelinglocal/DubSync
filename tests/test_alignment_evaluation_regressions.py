@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import dubsync.evaluation as evaluation_module
+from dubsync import aligner as aligner_module
 from dubsync.aligner import align_cues_to_words
 from dubsync.evaluation import evaluate_against_golden
-from dubsync.models import Word
+from dubsync.models import Cue, TokenMatch, Word
 from dubsync.srt_io import parse_srt_text
+from dubsync.tokenize import tokenize_cues
 
 
 def test_alignment_uses_cue_timing_prior_for_repeated_word():
@@ -78,6 +80,36 @@ def test_alignment_flags_scrambled_episode_when_model_fit_is_unavailable():
     result = align_cues_to_words(cues, words)
 
     assert any(flag.kind == "alignment_model_unavailable" for flag in result.flags)
+
+
+def test_alignment_model_sorts_observations_by_cue_center(monkeypatch):
+    cues = [
+        Cue(index=1, start_ms=10_000, end_ms=11_000, lines=["alpha"]),
+        Cue(index=2, start_ms=0, end_ms=1_000, lines=["beta"]),
+        Cue(index=3, start_ms=5_000, end_ms=6_000, lines=["gamma"]),
+    ]
+    tokens = tokenize_cues(cues)
+    words = [
+        Word(text="alpha", start=20.0, end=21.0),
+        Word(text="beta", start=0.0, end=1.0),
+        Word(text="gamma", start=10.0, end=11.0),
+    ]
+    matches = [
+        TokenMatch(cue_id=cue.index, srt_token_index=index, asr_word_index=index, score=1.0)
+        for index, cue in enumerate(cues)
+    ]
+    captured: list[tuple[float, float]] = []
+
+    def capture_fit(anchors: list[tuple[float, float]]):
+        captured.extend(anchors)
+        return None
+
+    monkeypatch.setattr(aligner_module, "_fit_time_transform", capture_fit)
+
+    flags = aligner_module._alignment_outlier_flags(matches, cues, tokens, words)
+
+    assert [cue_center for cue_center, _word_center in captured] == [0.5, 5.5, 10.5]
+    assert [flag.kind for flag in flags] == ["alignment_model_unavailable"]
 
 
 def test_alignment_outlier_threshold_scales_down_for_short_form_audio():
