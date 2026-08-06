@@ -20,6 +20,8 @@ from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
+    _PUNCTUATION_PROMPT_VERSION,
+    _SPEAKER_MAPPING_PROMPT_VERSION,
     drain_usage_events,
     llm_adapter_from_config,
     llm_config_for_pass,
@@ -39,7 +41,7 @@ from .silence import silence_flags_for_cues
 from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
-from .style_profile import StyleProfile, derive_style_profile
+from .style_profile import StyleProfile, derive_style_profile, detect_fps
 from .timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 from .tokenize import alphanumeric_signature
 from .vad import (
@@ -100,6 +102,7 @@ def sync_episode(
     cost_meter = CostMeter()
     cues = _source_cues_for_run(srt_path, episode_workdir, resume_stage)
     cues, source_order_flags = sort_cues_chronologically(cues)
+    fps_override_flags = _fps_override_mismatch_flags(cues, fps)
     style_artifact_path = episode_workdir / "style_profile.json"
     profile = load_style_profile(style_path) or _load_style_profile_for_resume(style_artifact_path, resume_stage) or derive_style_profile(cues)
     if fps is not None:
@@ -169,7 +172,7 @@ def sync_episode(
         alignment = _alignment_with_adjudication_context(alignment, cues)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
 
-    flags: list[QCFlag] = [*source_order_flags, *detect_source_errors(cues)]
+    flags: list[QCFlag] = [*source_order_flags, *fps_override_flags, *detect_source_errors(cues)]
     decisions: list[AdjudicationDecision] = []
     if resume_stage == "rebuild":
         decisions, adjudication_flags = _load_adjudication_artifact(episode_workdir / "adjudicate.json")
@@ -386,6 +389,28 @@ def _should_write_ingest_artifacts(
     return not (episode_workdir / "ingest.json").exists()
 
 
+def _fps_override_mismatch_flags(cues: list[Cue], fps: float | None) -> list[QCFlag]:
+    if fps is None or not cues:
+        return []
+    detected = detect_fps(cues)
+    # Treat the broadcast-equivalent pairs 23.976/24 and 29.97/30 as the same grid.
+    if abs(float(fps) - detected) <= 0.05:
+        return []
+    return [
+        QCFlag(
+            kind="fps_override_mismatch",
+            cue_ids=[],
+            message=(
+                f"Explicit {float(fps):g} fps override differs from the source SRT grid "
+                f"detected near {detected:g} fps; output uses the explicit override."
+            ),
+            severity="warning",
+            start=cues[0].start_ms / 1000.0,
+            end=cues[-1].end_ms / 1000.0,
+        )
+    ]
+
+
 def _load_style_profile_for_resume(path: Path, resume_stage: str | None) -> StyleProfile | None:
     if not _should_load_ingest_artifact(resume_stage):
         return None
@@ -582,6 +607,7 @@ def _punctuation_cache_key(
     model = str(llm_config.get("model") or _default_llm_model(provider))
     payload = {
         "pass": "punctuation",
+        "prompt_version": _PUNCTUATION_PROMPT_VERSION,
         "scene_gap_seconds": _punctuation_scene_gap_seconds(provider_config),
         "line_constraints": {
             "max_chars_per_line": max_chars_per_line,
@@ -599,6 +625,7 @@ def _speaker_mapping_cache_key(cues: list[Cue], provider_config: dict[str, objec
     mapping_config = provider_config.get("speaker_mapping", {}) if isinstance(provider_config, dict) else {}
     payload = {
         "pass": "speaker_mapping",
+        "prompt_version": _SPEAKER_MAPPING_PROMPT_VERSION,
         "cues": [cue.model_dump(mode="json") for cue in cues],
     }
     params = {**_llm_cache_params(llm_config), "speaker_mapping": mapping_config}
@@ -1034,7 +1061,7 @@ def _default_llm_model(provider: str) -> str:
     if provider == "gemini":
         return "gemini-3.5-flash"
     if provider == "openai":
-        return "gpt-5.5"
+        return "gpt-5.6-luna"
     if provider == "anthropic":
         return "claude-sonnet-5"
     return provider
@@ -1112,6 +1139,10 @@ def _adlib_cue_ids_by_case(
             continue
         if span.cue_ids or not decision.final_text.strip():
             continue
+        rejection_flag = _generated_adlib_rejection_flag(cues, span, decision.final_text)
+        if rejection_flag is not None:
+            flags.append(rejection_flag)
+            continue
         anchored_cue_id = _anchored_adlib_cue_id(cues_by_id, span, decision.final_text)
         if anchored_cue_id is not None:
             cue_ids[span.case_id] = anchored_cue_id
@@ -1140,6 +1171,50 @@ def _adlib_cue_ids_by_case(
         cue_ids[span.case_id] = next_index
         next_index += 1
     return cue_ids, flags
+
+
+def _generated_adlib_rejection_flag(
+    source_cues: list[Cue],
+    span: DivergenceSpan,
+    final_text: str,
+    source_margin_seconds: float = 5.0,
+) -> QCFlag | None:
+    if _is_repetitive_generated_text(final_text):
+        return QCFlag(
+            kind="adlib_rejected_repetitive_content",
+            cue_ids=[],
+            message="ASR-only text was held for review because it is highly repetitive and may be music or non-dialogue audio.",
+            severity="error",
+            new_text=final_text,
+            start=span.start,
+            end=span.end,
+        )
+    if not source_cues or (span.start is None and span.end is None):
+        return None
+    source_start = min(cue.start_ms for cue in source_cues) / 1000.0
+    source_end = max(cue.end_ms for cue in source_cues) / 1000.0
+    span_start = span.start if span.start is not None else span.end
+    span_end = span.end if span.end is not None else span.start
+    assert span_start is not None and span_end is not None
+    if span_end >= source_start - source_margin_seconds and span_start <= source_end + source_margin_seconds:
+        return None
+    return QCFlag(
+        kind="adlib_rejected_outside_source_span",
+        cue_ids=[],
+        message="ASR-only text was held for review because it falls outside the source subtitle span and safety margin.",
+        severity="error",
+        new_text=final_text,
+        start=span.start,
+        end=span.end,
+    )
+
+
+def _is_repetitive_generated_text(text: str) -> bool:
+    tokens = alphanumeric_signature(text)
+    if len(tokens) < 8 or len(set(tokens)) / len(tokens) > 0.6:
+        return False
+    trigrams = [tuple(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
+    return len(set(trigrams)) < len(trigrams)
 
 
 def _anchored_adlib_cue_id(

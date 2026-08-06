@@ -60,8 +60,12 @@ def refine_cues_to_speech_activity(
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
+        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000
+
         if start_ms == cue.start_ms and end_ms == cue.end_ms:
             refined.append(cue)
+            if minimum_unattainable:
+                flags.append(_min_duration_unattainable_flag(cue, cue, profile))
             continue
 
         next_cue = cue.with_timing(start_ms, end_ms)
@@ -77,8 +81,26 @@ def refine_cues_to_speech_activity(
                 end=next_cue.end_ms / 1000.0,
             )
         )
+        if minimum_unattainable:
+            flags.append(_min_duration_unattainable_flag(cue, next_cue, profile))
 
     return refined, flags
+
+
+def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfile) -> QCFlag:
+    return QCFlag(
+        kind="min_duration_unattainable",
+        cue_ids=[cue.index],
+        message=(
+            f"Cue could not reach the {profile.min_cue_dur:.3f}s minimum display duration "
+            "without crossing the following cue boundary."
+        ),
+        severity="error",
+        old_text=f"{old_cue.start_ms / 1000.0:.3f} --> {old_cue.end_ms / 1000.0:.3f}",
+        new_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
+        start=cue.start_ms / 1000.0,
+        end=cue.end_ms / 1000.0,
+    )
 
 
 def _regions_overlapping_cue(cue: Cue, regions: list[SpeechRegion]) -> tuple[SpeechRegion, SpeechRegion] | None:

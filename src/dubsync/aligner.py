@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
+from collections import Counter
 from dataclasses import dataclass
+from statistics import median
 
 from rapidfuzz import fuzz
 
@@ -11,6 +14,8 @@ MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
 NEG_INF = -1_000_000_000.0
+TIME_PRIOR_MAX_BONUS = 0.2
+TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -40,7 +45,190 @@ def _band_window(row: int, token_count: int, word_count: int, margin: int) -> tu
     return start, end
 
 
-def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: int = BAND_MARGIN) -> list[_Op]:
+def _timing_priors(
+    cues: list[Cue],
+    tokens: list[SRTToken],
+    words: list[Word],
+    words_norm: list[str],
+    preliminary_ops: list[_Op],
+) -> tuple[list[tuple[float, float]], list[float]] | None:
+    """Build a bounded time tie breaker when both timelines are usable.
+
+    Unique exact matches from the preliminary text-only alignment estimate a robust
+    global offset/rate for shifted episodes. The prior still contributes only a small
+    positive bonus and never penalizes a text match outside its local window.
+    """
+
+    cue_ids = [cue.index for cue in cues]
+    cue_intervals = [(cue.start_ms / 1000.0, cue.end_ms / 1000.0) for cue in cues]
+    word_intervals = [(word.start, word.end) for word in words]
+    if len(set(cue_ids)) != len(cue_ids):
+        return None
+    if not _ordered_usable_intervals(cue_intervals) or not _ordered_usable_intervals(
+        word_intervals
+    ):
+        return None
+
+    token_indices_by_cue: dict[int, list[int]] = {}
+    for token_index, token in enumerate(tokens):
+        token_indices_by_cue.setdefault(token.cue_id, []).append(token_index)
+
+    cue_by_id = {cue.index: cue for cue in cues}
+    token_priors: list[tuple[float, float] | None] = [None] * len(tokens)
+    for cue_id, token_indices in token_indices_by_cue.items():
+        cue = cue_by_id.get(cue_id)
+        if cue is None:
+            return None
+        start = cue.start_ms / 1000.0
+        duration = (cue.end_ms - cue.start_ms) / 1000.0
+        radius = max(TIME_PRIOR_MIN_RADIUS_SECONDS, duration)
+        count = len(token_indices)
+        for position, token_index in enumerate(token_indices):
+            expected = start + duration * ((position + 0.5) / count)
+            token_priors[token_index] = (expected, radius)
+
+    if any(prior is None for prior in token_priors):
+        return None
+    word_centers = [(start + end) / 2.0 for start, end in word_intervals]
+    complete_priors = [prior for prior in token_priors if prior is not None]
+    transform = _anchor_time_transform(
+        tokens,
+        words_norm,
+        preliminary_ops,
+        complete_priors,
+        word_centers,
+    )
+    if transform is None:
+        return complete_priors, word_centers
+    rate, offset = transform
+    transformed_priors = [
+        (offset + rate * expected, max(TIME_PRIOR_MIN_RADIUS_SECONDS, rate * radius))
+        for expected, radius in complete_priors
+    ]
+    return transformed_priors, word_centers
+
+
+def _anchor_time_transform(
+    tokens: list[SRTToken],
+    words_norm: list[str],
+    preliminary_ops: list[_Op],
+    token_time_priors: list[tuple[float, float]],
+    word_time_centers: list[float],
+) -> tuple[float, float] | None:
+    token_counts = Counter(token.normalized for token in tokens if token.normalized)
+    word_counts = Counter(word for word in words_norm if word)
+    anchors = [
+        (token_time_priors[op.srt_index][0], word_time_centers[op.asr_index])
+        for op in preliminary_ops
+        if op.kind == "match"
+        and op.srt_index is not None
+        and op.asr_index is not None
+        and token_counts[tokens[op.srt_index].normalized] == 1
+        and word_counts[words_norm[op.asr_index]] == 1
+    ]
+    if not anchors:
+        return None
+    if any(
+        left_cue >= right_cue or left_audio > right_audio
+        for (left_cue, left_audio), (right_cue, right_audio) in zip(
+            anchors,
+            anchors[1:],
+        )
+    ):
+        return None
+
+    offset_only = median(audio_time - cue_time for cue_time, audio_time in anchors)
+    chosen_rate = 1.0
+    chosen_offset = offset_only
+    chosen_residual = median(
+        abs((cue_time + offset_only) - audio_time) for cue_time, audio_time in anchors
+    )
+
+    cue_span = anchors[-1][0] - anchors[0][0]
+    if len(anchors) >= 2 and cue_span >= 5.0:
+        sampled = _sample_anchors(anchors, limit=128)
+        minimum_separation = max(1.0, cue_span * 0.1)
+        slopes = [
+            (right_audio - left_audio) / (right_cue - left_cue)
+            for left_index, (left_cue, left_audio) in enumerate(sampled)
+            for right_cue, right_audio in sampled[left_index + 1 :]
+            if right_cue - left_cue >= minimum_separation
+        ]
+        if slopes:
+            candidate_rate = median(slopes)
+            if 0.5 <= candidate_rate <= 2.0 and math.isfinite(candidate_rate):
+                candidate_offset = median(
+                    audio_time - candidate_rate * cue_time
+                    for cue_time, audio_time in anchors
+                )
+                candidate_residual = median(
+                    abs((candidate_rate * cue_time + candidate_offset) - audio_time)
+                    for cue_time, audio_time in anchors
+                )
+                if candidate_residual < chosen_residual:
+                    chosen_rate = candidate_rate
+                    chosen_offset = candidate_offset
+                    chosen_residual = candidate_residual
+
+    audio_span = anchors[-1][1] - anchors[0][1]
+    if chosen_residual > max(2.0, abs(audio_span) * 0.05):
+        return None
+    return chosen_rate, chosen_offset
+
+
+def _sample_anchors(
+    anchors: list[tuple[float, float]],
+    limit: int,
+) -> list[tuple[float, float]]:
+    if len(anchors) <= limit:
+        return anchors
+    last_index = len(anchors) - 1
+    return [anchors[round(position * last_index / (limit - 1))] for position in range(limit)]
+
+
+def _has_repeated_alignment_candidates(tokens: list[SRTToken], words_norm: list[str]) -> bool:
+    token_counts = Counter(token.normalized for token in tokens if token.normalized)
+    word_counts = Counter(word for word in words_norm if word)
+    return any(
+        token_counts[value] > 1 or word_counts[value] > 1
+        for value in token_counts.keys() & word_counts.keys()
+    )
+
+
+def _ordered_usable_intervals(intervals: list[tuple[float, float]]) -> bool:
+    if not intervals:
+        return False
+    if any(
+        not math.isfinite(start) or not math.isfinite(end) or start < 0.0 or end < start
+        for start, end in intervals
+    ):
+        return False
+    return all(left[0] <= right[0] for left, right in zip(intervals, intervals[1:]))
+
+
+def _timing_bonus(
+    token_index: int,
+    word_index: int,
+    token_time_priors: list[tuple[float, float]] | None,
+    word_time_centers: list[float] | None,
+) -> float:
+    if token_time_priors is None or word_time_centers is None:
+        return 0.0
+    expected, radius = token_time_priors[token_index]
+    distance = abs(expected - word_time_centers[word_index])
+    if distance >= radius:
+        return 0.0
+    return TIME_PRIOR_MAX_BONUS * (1.0 - distance / radius)
+
+
+def _align_tokens(
+    tokens: list[SRTToken],
+    words_norm: list[str],
+    band_margin: int = BAND_MARGIN,
+    *,
+    token_time_priors: list[tuple[float, float]] | None = None,
+    word_time_centers: list[float] | None = None,
+) -> list[_Op]:
     n = len(tokens)
     m = len(words_norm)
     gap = -0.75
@@ -70,6 +258,13 @@ def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: in
                 similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
                 match_score = 2.0 * similarity if similarity >= MATCH_THRESHOLD else -0.6
                 candidate = previous[j - 1] + match_score
+                if similarity >= MATCH_THRESHOLD:
+                    candidate += _timing_bonus(
+                        i - 1,
+                        j - 1,
+                        token_time_priors,
+                        word_time_centers,
+                    )
                 if candidate > best_score:
                     best_score = candidate
                     best_op = "match"
@@ -82,7 +277,13 @@ def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: in
     if m not in dp[n]:
         if band_margin >= max(n, m):
             raise RuntimeError("alignment band failed to find a global path")
-        return _align_tokens(tokens, words_norm, band_margin=max(n, m))
+        return _align_tokens(
+            tokens,
+            words_norm,
+            band_margin=max(n, m),
+            token_time_priors=token_time_priors,
+            word_time_centers=word_time_centers,
+        )
 
     ops: list[_Op] = []
     i, j = n, m
@@ -266,7 +467,24 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     if not tokens:
         return AlignmentResult()
 
-    ops = _align_tokens(tokens, words_norm)
+    preliminary_ops = _align_tokens(tokens, words_norm)
+    ops = preliminary_ops
+    if _has_repeated_alignment_candidates(tokens, words_norm):
+        timing_priors = _timing_priors(
+            cues,
+            tokens,
+            words,
+            words_norm,
+            preliminary_ops,
+        )
+        if timing_priors is not None:
+            token_time_priors, word_time_centers = timing_priors
+            ops = _align_tokens(
+                tokens,
+                words_norm,
+                token_time_priors=token_time_priors,
+                word_time_centers=word_time_centers,
+            )
     matches: list[TokenMatch] = []
     cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
 

@@ -89,6 +89,8 @@ describe('shared components', () => {
     rerender(<LegalPage kind="privacy" />)
     expect(screen.getByRole('heading', { name: 'Privacy Policy' })).toBeVisible()
     expect(screen.getByRole('heading', { name: /Service providers/ })).toBeVisible()
+    expect(screen.getByText(/OpenAI for bounded language reasoning/)).toBeVisible()
+    expect(screen.getByText(/Google Gemini remains available only when configured as an alternate/)).toBeVisible()
     rerender(<LegalPage kind="payments" />)
     expect(screen.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
     expect(screen.getByRole('heading', { name: /When a full refund applies/ })).toBeVisible()

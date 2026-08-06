@@ -14,7 +14,7 @@ def test_readme_includes_final_acceptance_report_sections():
         "### Measured Timings And Costs",
         "### Top 3 Risks",
         "Production web `generate` smoke",
-        "445 passed, 5 deselected",
+        "494 passed, 7 deselected",
         "A second paid run was not made",
         "Production dependency audit",
     ):
@@ -33,10 +33,13 @@ def test_production_deployment_requires_job_gate_and_patched_installer():
     blueprint = yaml.safe_load(Path("render.yaml").read_text(encoding="utf-8"))
     env = {item["key"]: item for item in blueprint["services"][0]["envVars"]}
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert env["DUBSYNC_REQUIRE_JOB_ACCESS_CODE"]["value"] == "1"
     assert env["DUBSYNC_JOB_ACCESS_CODE"]["sync"] is False
     assert 'python -m pip install --upgrade "pip>=26.1.2"' in dockerfile
+    assert '"setuptools>=83"' in dockerfile
+    assert "setuptools>=83" in project["build-system"]["requires"]
     assert dockerfile.index('python -m pip install --upgrade "pip>=26.1.2"') < dockerfile.index('python -m pip install ".[cloud,web]"')
 
 
@@ -123,6 +126,14 @@ def test_documented_configuration_uses_gpt_5_6_luna_default():
     assert "model: gpt-5.6-luna" in readme
     assert "**OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`" in plan
     assert "Gemini " + "3.1 Flash-Lite" not in plan
+
+
+def test_commercial_runbook_names_openai_default_and_optional_gemini_secret():
+    commercial_plan = Path("docs/COMMERCIAL_PLAN.md").read_text(encoding="utf-8")
+
+    assert "OpenAI GPT-5.6 Luna language passes" in commercial_plan
+    assert "`OPENAI_API_KEY`" in commercial_plan
+    assert "`GEMINI_API_KEY` is optional" in commercial_plan
 
 
 def test_repository_has_no_legacy_flash_lite_model_references():

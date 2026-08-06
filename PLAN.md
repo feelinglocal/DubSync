@@ -13,13 +13,13 @@ DubSync solves this with a five-stage pipeline:
 
 1. **ASR** the VO-only audio with word-level timestamps + speaker diarization (ElevenLabs Scribe v2 primary; WhisperX local fallback).
 2. **Anchor-align** the SRT text to the ASR word stream with a fuzzy dynamic-programming aligner → every SRT word gets an audio timestamp; divergent spans are isolated as *improvisation candidates*.
-3. **Adjudicate** each divergent span with an LLM (**Gemini 3.5 Flash** default; GPT-5.x / Claude / Gemini Pro pluggable) that sees scene context, both text versions, ASR confidence, and (optionally) the raw audio snippet → decides "SRT is right (ASR error)" vs "actor improvised (use spoken text)" vs "hybrid".
+3. **Adjudicate** each divergent span with an LLM (**OpenAI GPT-5.6 Luna** default; Gemini / Claude pluggable) that sees scene context, both text versions, and ASR confidence → decides "SRT is right (ASR error)" vs "actor improvised (use spoken text)" vs "hybrid". Optional raw-audio snippet verification remains available through the Gemini alternate.
 4. **Re-cue deterministically**: rebuild each cue's start/end from its words' timestamps, snap to the frame grid, enforce house style (max 2 lines, ~25 chars/line, min duration, chaining), preserving the customer's original cue segmentation wherever text is unchanged.
 5. **Verify & report**: optional forced-alignment pass (MMS, 158+ languages) on the *final* text for maximum precision, then emit the synced SRT + a QC report that flags every low-confidence cue, overlap region, and text change for human review.
 
 Timing always comes from acoustic models (ASR word timestamps / forced alignment). LLMs are used **only** for language reasoning (improv adjudication, punctuation, speaker/character attribution) — never as the timing source, because research confirms LLM audio timestamps drift by seconds.
 
-Cost per 45-min episode: **≈ $0.35–0.55** in API calls (ASR ≈ $0.21 + Gemini 3.5 Flash ≈ $0.15–0.30). A fully local free mode (WhisperX + local aligner) is included for sensitive content.
+Cost per 45-min episode: **≈ $0.35–0.55** in API calls (ASR ≈ $0.21 + GPT-5.6 Luna ≈ $0.15–0.25 at the planned token volumes). A fully local free mode (WhisperX + local aligner) is included for sensitive content.
 
 ---
 
@@ -49,7 +49,7 @@ A `style_profile` module will re-derive this table automatically from any sample
 | # | Problem | Strategy |
 |---|---|---|
 | P1 | **Per-cue re-timing** (global offset tools can't) | Word-level anchor alignment SRT-text ↔ ASR-words; cue start = its first matched word's start, cue end = its last matched word's end (+ configurable pad, then frame-snap) |
-| P2 | **Improvised lines** (spoken ≠ SRT text) | Divergence spans from the aligner → LLM adjudication with scene context + ASR confidence + optional audio snippet double-check (Gemini audio-native) |
+| P2 | **Improvised lines** (spoken ≠ SRT text) | Divergence spans from the aligner → GPT-5.6 Luna adjudication with scene context + ASR confidence; optional audio snippet double-check is available by routing adjudication to Gemini audio-native |
 | P3 | **Multiple people speaking together** | Diarization with overlap detection (Scribe speaker IDs; pyannote `community-1` overlap regions as fallback). Overlapping cues get overlapping time ranges or flags per `overlap_policy` |
 | P4 | **Distinguish characters/speakers** | Stable diarization cluster IDs → LLM maps clusters to character names from conversational context (names used in dialogue); optional voice-reference matching (OpenAI `known_speaker_references`, ElevenLabs speaker library) |
 | P5 | **Context-correct punctuation** | Whole-scene LLM pass that re-punctuates the final text with the house conventions (continuation commas across split cues, `?`/`!` from semantics, ellipses for interruptions), constrained to *not* change words |
@@ -70,7 +70,7 @@ A `style_profile` module will re-derive this table automatically from any sample
 | **OpenAI `gpt-4o-transcribe-diarize`** | ❌ (segment-level only) | ✅ + `known_speaker_references[]` (map up to 4 named speakers from 2–10 s voice refs) | 99 | $0.006/min | **Not** a timing source; useful auxiliary for character-name mapping |
 | **Gemini 2.5/3.x audio-native** | ❌ (second-level at best; documented drift of 1–3 s+, worse on long files) | prompt-based only | wide | $1/M audio tokens (~32 tok/s) | **Never for timing.** Reserved for reasoning + audio snippet verification |
 
-Sources: elevenlabs.io/docs + pricing pages, developers.openai.com/api/docs/guides/speech-to-text, assemblyai.com/pricing + docs, ai.google.dev/gemini-api/docs (audio, pricing), github.com/m-bain/whisperX, Google AI dev forum threads on Gemini timestamp drift.
+Sources: elevenlabs.io/docs + pricing pages, developers.openai.com/api/docs/guides/speech-to-text, developers.openai.com/api/docs/models/gpt-5.6-luna, assemblyai.com/pricing + docs, ai.google.dev/gemini-api/docs (audio, pricing), github.com/m-bain/whisperX, Google AI dev forum threads on Gemini timestamp drift.
 
 ### 4.2 Forced alignment (precision re-timing of *known* text)
 
@@ -90,13 +90,14 @@ Sources: elevenlabs.io/docs + pricing pages, developers.openai.com/api/docs/guid
 
 | Model | Price (in/out per M) | Role fit |
 |---|---|---|
-| **Gemini 3.5 Flash** (`gemini-3.5-flash`, GA May 2026) | $1.50 / $9 ($0.15 cached input) | **Default for all LLM passes.** 1M context fits a whole episode + ASR JSON in one call; native audio input for snippet double-checks; structured outputs; thinking on by default (use `low` for punctuation batches, higher for adjudication) |
-| **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`, GA July 2026) | $0.30 / $2.50 | Low-cost option for high-throughput punctuation and speaker-mapping passes; retain each pass's configured thinking level |
+| **OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`) | $1 / $6 ($0.10 cached input) | **Default for all LLM passes.** Responses API structured outputs; `high` reasoning for adjudication and `medium` for punctuation/speaker mapping; text/image input only, so audio snippets stay disabled on this route |
+| **Gemini 3.5 Flash** (`gemini-3.5-flash`, GA May 2026) | $1.50 / $9 ($0.15 cached input) | Alternate adjudicator when native audio snippet verification is required; structured outputs and configurable thinking |
+| **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`, GA July 2026) | $0.30 / $2.50 | Low-cost alternate for high-throughput punctuation and speaker-mapping passes |
 | Gemini 3.1 Pro / 3.5 Pro (when GA) | $2 / $12 | Optional quality upgrade for adjudication on difficult episodes |
 | Claude Opus/Sonnet (Anthropic) | higher | Alternative adjudicator; no audio input → text-only usage |
 | GPT-5.x (OpenAI) | comparable | Same role; structured outputs solid |
 
-Design rule: **provider-agnostic `LLMAdapter`** with structured-output JSON schemas, so the studio can swap by API-key availability. Default: **Gemini 3.5 Flash for both adjudication and punctuation** (one model, one key, audio-capable); config can route each pass to a different model.
+Design rule: **provider-agnostic `LLMAdapter`** with structured-output schemas, so the studio can swap by API-key availability. Default: **OpenAI GPT-5.6 Luna** for adjudication, punctuation, and optional speaker mapping; config can route each pass to Gemini or Anthropic when their capabilities are required.
 
 ### 4.5 Prior art (why we must build)
 
@@ -275,7 +276,7 @@ Build a golden set from past delivered episodes (unsynced SRT + VO audio + final
 |---|---|
 | Scribe v2 ASR + diarization | $0.165 (0.75 h × $0.22) |
 | Keyterm prompting (character names) | +$0.04 |
-| LLM adjudication + punctuation (**Gemini 3.5 Flash**: ~60–100k tok in × $1.50/M + ~15–25k out × $9/M, thinking `low` on punctuation) | $0.15–0.30 (context caching of the episode transcript cuts repeat-pass input to $0.15/M) |
+| LLM adjudication + punctuation (**GPT-5.6 Luna**: ~60–100k tok in × $1/M + ~15–25k out × $6/M; `high` adjudication, `medium` punctuation) | $0.15–0.25 (cached input is $0.10/M when provider caching applies) |
 | Audio-snippet double-checks (~30 × 20 s) | ~$0.02 |
 | Forced-align + pyannote (local) | $0 |
 | **Total** | **≈ $0.35–0.55** (fully-local mode: $0) |
@@ -299,7 +300,7 @@ Build a golden set from past delivered episodes (unsynced SRT + VO audio + final
 ## 14. Defaults chosen (change in config, don't re-litigate in code)
 
 1. Primary ASR **ElevenLabs Scribe v2**; local mode WhisperX. 
-2. Default LLM **Gemini 3.5 Flash** (`gemini-3.5-flash`) for both adjudication and punctuation (thinking `low` for punctuation batches); OpenAI/Anthropic adapters included, Pro-tier escalation configurable per pass. 
+2. Default LLM **OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`) through the Responses API; adjudication uses `reasoning_effort: high`, punctuation and speaker mapping use `reasoning_effort: medium`; Gemini/Anthropic adapters remain configurable alternates.
 3. Frame grid auto-detected, fallback 30 fps (matches the example). 
 4. `overlap_policy: stack`, `drop_policy: keep_flagged`, adjudication confidence gate 0.7. 
 5. Output preserves customer cue segmentation unless text changed. 

@@ -177,14 +177,14 @@ def create_app(
         audio: StarletteUploadFile,
         subtitle: StarletteUploadFile | None,
         style_sample: StarletteUploadFile | None,
-        fps: float,
+        fps: float | None,
         language: str,
         style: str,
     ) -> dict[str, object]:
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
-        _validate_options(fps=fps, language=language)
+        _validate_options(mode=normalized_mode, fps=fps, language=language)
         source_name = _validate_source_filename(audio)
         audio_extension = _validate_audio(audio)
         subtitle_bytes: bytes | None = None
@@ -202,6 +202,7 @@ def create_app(
         resolved_style = "source"
         style_sample_bytes: bytes | None = None
         if normalized_mode == "generate":
+            generation_fps = _require_generation_fps(fps)
             try:
                 style_request = parse_generation_style_request(style)
             except GenerationStyleError as exc:
@@ -225,7 +226,7 @@ def create_app(
             try:
                 resolved_style = resolve_generation_style(
                     style_request,
-                    fps=fps,
+                    fps=generation_fps,
                     sample_cues=sample_cues,
                 ).model_dump_json()
             except GenerationStyleError as exc:
@@ -303,12 +304,13 @@ def create_app(
                 raise HTTPException(status_code=422, detail="Only one original SRT is allowed.")
             if len(style_samples) > 1:
                 raise HTTPException(status_code=422, detail="Only one SRT style example is allowed.")
+            normalized_mode = _validate_mode(_batch_text_field(form, "mode"))
             return await _create_single_job(
-                mode=_batch_text_field(form, "mode"),
+                mode=normalized_mode,
                 audio=audio_uploads[0],
                 subtitle=subtitle_uploads[0] if subtitle_uploads else None,
                 style_sample=style_samples[0] if style_samples else None,
-                fps=_batch_float_field(form, "fps", default=30.0),
+                fps=_batch_fps_field(form, mode=normalized_mode),
                 language=_batch_text_field(form, "language", default="auto"),
                 style=_batch_text_field(form, "style", default="standard"),
             )
@@ -321,10 +323,10 @@ def create_app(
         try:
             _validate_batch_form_shape(form)
             normalized_mode = _validate_mode(_batch_text_field(form, "mode"))
-            fps = _batch_float_field(form, "fps", default=30.0)
+            fps = _batch_fps_field(form, mode=normalized_mode)
             language = _batch_text_field(form, "language", default="auto")
             style = _batch_text_field(form, "style", default="standard")
-            _validate_options(fps=fps, language=language)
+            _validate_options(mode=normalized_mode, fps=fps, language=language)
 
             audio_uploads = _batch_file_field(form, "audio")
             subtitle_uploads = _batch_file_field(form, "subtitle")
@@ -790,12 +792,14 @@ def _batch_text_field(form: FormData, name: str, *, default: str | None = None) 
     return value
 
 
-def _batch_float_field(form: FormData, name: str, *, default: float) -> float:
-    value = _batch_text_field(form, name, default=str(default))
+def _batch_fps_field(form: FormData, *, mode: JobMode) -> float | None:
+    value = _batch_text_field(form, "fps", default="").strip()
+    if not value:
+        return None if mode == "sync" else 30.0
     try:
         return float(value)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid {name} field.") from exc
+        raise HTTPException(status_code=422, detail="Invalid fps field.") from exc
 
 
 def _batch_file_field(form: FormData, name: str) -> list[StarletteUploadFile]:
@@ -828,7 +832,7 @@ async def _resolve_batch_style(
     mode: JobMode,
     *,
     style: str,
-    fps: float,
+    fps: float | None,
     style_sample: StarletteUploadFile | None,
     settings: WebSettings,
 ) -> tuple[str, bytes | None]:
@@ -836,6 +840,8 @@ async def _resolve_batch_style(
         if style_sample is not None:
             raise HTTPException(status_code=422, detail="Sync batches do not accept a style example.")
         return "source", None
+
+    generation_fps = _require_generation_fps(fps)
 
     try:
         style_request = parse_generation_style_request(style)
@@ -866,7 +872,7 @@ async def _resolve_batch_style(
     try:
         resolved_style = resolve_generation_style(
             style_request,
-            fps=fps,
+            fps=generation_fps,
             sample_cues=sample_cues,
         ).model_dump_json()
     except GenerationStyleError as exc:
@@ -889,8 +895,16 @@ def _validate_mode(mode: str) -> JobMode:
     return normalized  # type: ignore[return-value]
 
 
-def _validate_options(*, fps: float, language: str) -> None:
-    if fps not in FPS_VALUES:
+def _require_generation_fps(fps: float | None) -> float:
+    if fps is None:
+        raise HTTPException(status_code=422, detail="A frame rate is required for generate mode.")
+    return fps
+
+
+def _validate_options(*, mode: JobMode, fps: float | None, language: str) -> None:
+    if fps is None and mode != "sync":
+        raise HTTPException(status_code=422, detail="A frame rate is required for generate mode.")
+    if fps is not None and fps not in FPS_VALUES:
         raise HTTPException(status_code=422, detail="Unsupported frame rate.")
     if not LANGUAGE_RE.fullmatch(language.strip()):
         raise HTTPException(status_code=422, detail="Invalid language code.")

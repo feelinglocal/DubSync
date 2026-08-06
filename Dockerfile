@@ -29,7 +29,7 @@ COPY --chown=dubsync:dubsync src/ ./src/
 COPY --chown=dubsync:dubsync provider.yaml style_profile.yaml ./
 COPY --from=frontend --chown=dubsync:dubsync /frontend/dist ./web/dist
 
-RUN python -m pip install --upgrade "pip>=26.1.2" \
+RUN python -m pip install --upgrade "pip>=26.1.2" "setuptools>=83" \
     && python -m pip install ".[cloud,web]"
 
 USER dubsync

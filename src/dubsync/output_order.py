@@ -16,8 +16,10 @@ def finalize_cues_for_output(
     max_cps: float | None = None,
     max_cue_duration_seconds: float | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
+    flags = _source_order_inversion_flags(cues)
     ordered = sorted(cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
-    merged, flags = _merge_duplicate_overlaps(ordered)
+    merged, merge_flags = _merge_duplicate_overlaps(ordered)
+    flags.extend(merge_flags)
     if max_cps is not None:
         merged, readability_flags = _extend_fast_cues_into_following_gap(
             merged,
@@ -39,6 +41,28 @@ def finalize_cues_for_output(
         flags.extend(overlap_flags)
     _assert_monotonic_starts(finalized)
     return finalized, flags
+
+
+def _source_order_inversion_flags(cues: list[Cue]) -> list[QCFlag]:
+    flags: list[QCFlag] = []
+    for left, right in zip(cues, cues[1:]):
+        if right.start_ms >= left.start_ms:
+            continue
+        flags.append(
+            QCFlag(
+                kind="output_order_inversion",
+                cue_ids=[left.index, right.index],
+                message=(
+                    "Source cue order conflicts with chronological timing; final time sorting would "
+                    "reverse this narrative sequence. Acoustic timing review is required."
+                ),
+                severity="error",
+                old_text=f"{left.index}: {left.text}\n{right.index}: {right.text}",
+                start=min(left.start_ms, right.start_ms) / 1000.0,
+                end=max(left.end_ms, right.end_ms) / 1000.0,
+            )
+        )
+    return flags
 
 
 def _extend_fast_cues_into_following_gap(

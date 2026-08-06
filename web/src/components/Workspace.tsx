@@ -33,7 +33,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [mode, setMode] = useState<JobMode>('sync')
   const [audioFiles, setAudioFiles] = useState<File[]>([])
   const [subtitleFiles, setSubtitleFiles] = useState<File[]>([])
-  const [fps, setFps] = useState('30')
+  const [fps, setFps] = useState('auto')
   const [language, setLanguage] = useState('auto')
   const [styleSource, setStyleSource] = useState<'preset' | 'custom' | 'sample'>('preset')
   const [stylePreset, setStylePreset] = useState(config.generation_styles.default_preset)
@@ -201,7 +201,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
     } else {
       audioFiles.forEach((audio) => body.append('audio', audio))
     }
-    body.set('fps', fps)
+    if (fps !== 'auto') body.set('fps', fps)
     body.set('language', language)
     if (mode === 'generate') {
       const style = styleSource === 'preset'
@@ -261,6 +261,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   function selectMode(nextMode: JobMode) {
     if (nextMode === mode) return
     setMode(nextMode)
+    setFps(nextMode === 'sync' ? 'auto' : fps === 'auto' ? '30' : fps)
     setError('')
     if (nextMode === 'generate') setSubtitleFiles([])
   }
@@ -310,7 +311,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
             />
           )}
           <div className={config.access_code_required ? 'workspace-options has-access-code' : 'workspace-options'}>
-            <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
+            <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{mode === 'sync' && <option value="auto">Auto (detect from SRT)</option>}{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
             <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
             {config.access_code_required && config.jobs_available && (
               <label><span className="field-label">Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
