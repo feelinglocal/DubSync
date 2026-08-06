@@ -145,6 +145,24 @@ def test_alignment_retry_margins_progress_without_automatic_full_width():
     assert aligner._retry_margins(64, 500) == [64, 256, 500]
 
 
+def test_alignment_budget_exhaustion_preserves_a_reviewable_whole_span(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 0)
+    cues = [Cue(index=1, start_ms=0, end_ms=1_000, lines=["alpha beta"])]
+    words = [
+        Word(text="alpha", start=0.1, end=0.3),
+        Word(text="beta", start=0.4, end=0.6),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.token_matches == []
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text == "alpha beta"
+    assert result.divergence_spans[0].asr_text == "alpha beta"
+    assert result.diagnostics.band_limited is True
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+
+
 def test_band_windows_keep_distant_priors_disjoint_and_bounded():
     windows = aligner._band_windows(
         row=50,
