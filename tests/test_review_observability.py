@@ -29,12 +29,22 @@ def test_repetitive_adlib_requires_dialogue_envelope_context_for_short_spans():
     assert _generated_adlib_rejection_flag(source, span, "Nein " * 8) is None
 
 
+def test_repetitive_adlib_is_rejected_even_without_span_timing():
+    source = parse_srt_text("1\n00:00:00,000 --> 00:00:10,000\nDialogue.\n\n")
+    span = DivergenceSpan(case_id="case-1", cue_ids=[], srt_text="", asr_text="la " * 18, start=None, end=None)
+
+    flag = _generated_adlib_rejection_flag(source, span, "la " * 18)
+
+    assert flag is not None
+    assert flag.kind == "adlib_rejected_repetitive_content"
+
+
 def test_name_spelling_inconsistency_flags_source_observed_near_match_without_changing_text():
     source = parse_srt_text(
-        "1\n00:00:00,000 --> 00:00:01,000\nDeanna kommt.\n\n"
-        "2\n00:00:02,000 --> 00:00:03,000\nDeanna bleibt.\n\n"
+        "1\n00:00:00,000 --> 00:00:01,000\nIch sehe Deanna.\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nIch kenne Deanna.\n\n"
     )
-    output = parse_srt_text("1\n00:00:00,000 --> 00:00:01,000\nDiana kommt.\n\n")
+    output = parse_srt_text("1\n00:00:00,000 --> 00:00:01,000\nIch sehe Diana.\n\n")
 
     flags = name_spelling_inconsistency_flags(source, output)
 
@@ -43,6 +53,31 @@ def test_name_spelling_inconsistency_flags_source_observed_near_match_without_ch
     assert flags[0].severity == "warning"
     assert "Diana" in flags[0].message
     assert "Deanna" in flags[0].message
+
+
+def test_near_match_to_lowercase_source_word_is_labeled_word_substitution_not_name():
+    source = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nWir gehen nach Hause.\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nSie gehen weiter.\n\n"
+    )
+    output = parse_srt_text("1\n00:00:00,000 --> 00:00:01,000\nWir sehen nach Hause.\n\n")
+
+    flags = name_spelling_inconsistency_flags(source, output)
+
+    assert [flag.kind for flag in flags] == ["unsourced_word_substitution"]
+    assert "word substitution" in flags[0].message
+
+
+def test_sentence_initial_capitalized_common_word_is_not_labeled_name_drift():
+    source = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nFrau Holle kommt.\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nFrau Holle bleibt.\n\n"
+    )
+    output = parse_srt_text("1\n00:00:00,000 --> 00:00:01,000\nFrag Holle kommt.\n\n")
+
+    flags = name_spelling_inconsistency_flags(source, output)
+
+    assert [flag.kind for flag in flags] == ["unsourced_word_substitution"]
 
 
 def test_span_coverage_flag_surfaces_compressed_replacement_without_reconciliation_change():

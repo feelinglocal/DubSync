@@ -18,6 +18,7 @@ from dubsync.providers import (
     ProviderError,
     WhisperXAdapter,
     adapter_from_config,
+    repair_word_stream,
 )
 
 
@@ -265,7 +266,23 @@ def test_cached_asr_boundary_rejects_a_large_malformed_fraction(tmp_path):
         adapter.transcribe(audio)
 
 
-def test_cached_asr_records_cost_when_returned_stream_is_unusable(tmp_path):
+def test_cached_asr_malformed_limit_scales_proportionally_for_long_stream(tmp_path):
+    usable = [
+        Word.model_construct(text=f"word-{index}", start=index * 0.2, end=index * 0.2 + 0.1)
+        for index in range(1_000)
+    ]
+    malformed = [
+        Word.model_construct(text=" ", start=300.0 + index * 0.2, end=300.1 + index * 0.2)
+        for index in range(30)
+    ]
+
+    words, flags = repair_word_stream([*usable, *malformed], source="ASR provider")
+
+    assert len(words) == 1_000
+    assert flags[0].kind == "word_stream_repaired"
+
+
+def test_cached_asr_records_cost_and_caches_raw_unusable_response_before_validation(tmp_path):
     audio = tmp_path / "audio.wav"
     with wave.open(str(audio), "wb") as wav:
         wav.setnchannels(1)
@@ -288,6 +305,11 @@ def test_cached_asr_records_cost_when_returned_stream_is_unusable(tmp_path):
 
     assert len(meter.items) == 1
     assert meter.items[0].kind == "audio"
+
+    with pytest.raises(ProviderError, match="no usable words"):
+        adapter.transcribe(audio)
+
+    assert len(meter.items) == 1
 
 
 def test_cached_asr_boundary_still_rejects_empty_repaired_stream(tmp_path):

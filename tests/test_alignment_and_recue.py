@@ -118,6 +118,40 @@ def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     assert calls < (token_count * token_count) // 2
 
 
+def test_alignment_limits_unique_exact_retry_instead_of_unbounded_full_width(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 10_000)
+    token_count = 1_500
+    cues = [
+        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=[f"token{index}"])
+        for index in range(token_count)
+    ]
+    words = [
+        Word(text=f"token{index}", start=index * 0.2, end=index * 0.2 + 0.1, confidence=0.99)
+        for index in range(token_count)
+    ]
+    words[0] = Word(text="token1499", start=0.0, end=0.1, confidence=0.99)
+    words[-1] = Word(text="token0", start=299.8, end=299.9, confidence=0.99)
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.diagnostics.unbanded_fallback is False
+    assert result.diagnostics.band_limited is True
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+
+
+def test_band_windows_keep_distant_priors_disjoint_and_bounded():
+    windows = aligner._band_windows(
+        row=50,
+        token_count=100,
+        word_count=1_000,
+        margin=5,
+        prior_centers=(100, 900),
+    )
+
+    assert len(windows) == 3
+    assert windows == [(95, 105), (495, 505), (895, 905)]
+
+
 def test_injected_improv_span_is_isolated_to_changed_cue(shifted_srt_text):
     cues = parse_srt_text(shifted_srt_text)
     words = [

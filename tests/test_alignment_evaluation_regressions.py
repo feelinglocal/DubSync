@@ -61,6 +61,45 @@ def test_alignment_does_not_flag_uniform_episode_shift_as_an_outlier():
     assert not any(flag.kind == "alignment_outlier" for flag in result.flags)
 
 
+def test_alignment_flags_scrambled_episode_when_model_fit_is_unavailable():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:03,500\ndelta\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.1, end=0.2),
+        Word(text="beta", start=60.1, end=60.2),
+        Word(text="gamma", start=1.1, end=1.2),
+        Word(text="delta", start=61.1, end=61.2),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert any(flag.kind == "alignment_model_unavailable" for flag in result.flags)
+
+
+def test_alignment_outlier_threshold_scales_down_for_short_form_audio():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,400\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,400\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,400\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:03,400\ndelta\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.05, end=0.15),
+        Word(text="beta", start=1.05, end=1.15),
+        Word(text="gamma", start=2.05, end=2.15),
+        Word(text="delta", start=4.05, end=4.15),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    outliers = [flag for flag in result.flags if flag.kind == "alignment_outlier"]
+    assert [flag.cue_ids for flag in outliers] == [[4]]
+
+
 def test_evaluation_matches_golden_content_after_inserted_predicted_cue():
     predicted = parse_srt_text(
         "1\n00:00:00,000 --> 00:00:00,400\nalpha\n\n"
