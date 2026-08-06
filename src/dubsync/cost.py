@@ -102,6 +102,9 @@ def llm_token_prices(provider: str, model: str, config: dict[str, object]) -> tu
 
     normalized_provider = provider.lower()
     normalized_model = model.lower()
+    if normalized_provider == "openai" or normalized_model.startswith("gpt-"):
+        if normalized_model == "gpt-5.6-luna":
+            return (1.0, 6.0)
     if normalized_provider == "gemini" or normalized_model.startswith("gemini-"):
         if normalized_model == "gemini-3.5-flash":
             return (1.5, 9.0)

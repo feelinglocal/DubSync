@@ -68,7 +68,7 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
           <dl className="privacy-facts">
             <div><dt>{config.retention_hours} hours</dt><dd>Uploads and generated artifacts are scheduled for deletion.</dd></div>
             <div><dt>Secret access</dt><dd>Each job uses a browser-held token for status and downloads.</dd></div>
-            <div><dt>Named providers</dt><dd>Render, ElevenLabs, and Gemini processing is disclosed in the Privacy Policy.</dd></div>
+            <div><dt>Named providers</dt><dd>Render, ElevenLabs, and OpenAI processing is disclosed in the Privacy Policy. Gemini is an optional alternate.</dd></div>
           </dl>
         </div>
       </section>

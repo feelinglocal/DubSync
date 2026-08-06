@@ -67,7 +67,7 @@ flowchart LR
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
     F --> E["ElevenLabs Scribe v2"]
-    W --> G["Gemini language passes"]
+    W --> G["OpenAI GPT-5.6 Luna language passes"]
     W --> C["Deterministic DubSync core"]
     C --> D
     D -->|"token-protected result"| B
@@ -106,7 +106,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
+- Secrets: `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only. `GEMINI_API_KEY` is optional and needed only when a job uses the Gemini alternate.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -189,7 +189,7 @@ Before accepting paid customer media:
 
 - Keep the GitHub repository connected to the Render service.
 - Validate the Blueprint against Render's published schema.
-- Set paid ElevenLabs and Gemini credentials in Render.
+- Set paid ElevenLabs and OpenAI credentials in Render; set Gemini credentials only when enabling the optional alternate.
 - Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
 - Run one short live generate job through the web route for each provider or model change.
 - Keep fixture-backed sync and generate browser tests green on every release.

@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from rapidfuzz import fuzz
+
 from .models import Cue, QCFlag
 from .tokenize import alphanumeric_signature
 
 
 TEXT_CHANGE_FLAG_KINDS = {"text_changed", "adlib_inserted"}
+CUE_MATCH_THRESHOLD = 0.85
+
+
+@dataclass(frozen=True)
+class _CueMatch:
+    predicted: Cue
+    golden: Cue
+    similarity: float
 
 
 def evaluate_against_golden(
@@ -15,17 +27,26 @@ def evaluate_against_golden(
     style_violations: int = 0,
     source: list[Cue] | None = None,
 ) -> dict[str, object]:
-    by_predicted = {cue.index: cue for cue in predicted}
-    by_golden = {cue.index: cue for cue in golden}
-    matched_ids = sorted(set(by_predicted) & set(by_golden))
+    cue_alignment = _match_cues_by_content(predicted, golden)
+    matched_pairs = [
+        match for match in cue_alignment if match.similarity >= CUE_MATCH_THRESHOLD
+    ]
     frame_ms = 1000.0 / fps if fps > 0 else 0.0
-    deltas = [abs(by_predicted[cue_id].start_ms - by_golden[cue_id].start_ms) for cue_id in matched_ids]
+    deltas = [
+        abs(match.predicted.start_ms - match.golden.start_ms) for match in matched_pairs
+    ]
     matched_count = len(deltas)
     start_mae_ms = round(sum(deltas) / matched_count, 3) if matched_count else None
     within_1 = _ratio(sum(1 for delta in deltas if delta <= frame_ms), matched_count)
     within_3 = _ratio(sum(1 for delta in deltas if delta <= frame_ms * 3), matched_count)
     review_burden = _review_burden_ratio(predicted, flags or [])
-    improv_metrics = _improv_detection_metrics(predicted, golden, flags or [], source=source)
+    improv_metrics = _improv_detection_metrics(
+        predicted,
+        golden,
+        flags or [],
+        cue_alignment,
+        source=source,
+    )
 
     return {
         "cue_count_predicted": len(predicted),
@@ -55,6 +76,90 @@ def evaluate_against_golden(
     }
 
 
+def _match_cues_by_content(predicted: list[Cue], golden: list[Cue]) -> list[_CueMatch]:
+    """Globally align cue sequences before comparing their timestamps.
+
+    Cue numbers are export-local and can shift after an insertion or deletion. This
+    text-only alignment keeps timing evaluation monotonic without using timestamps
+    themselves to choose favorable pairs.
+    """
+
+    predicted_count = len(predicted)
+    golden_count = len(golden)
+    if not predicted_count or not golden_count:
+        return []
+
+    gap_score = -0.75
+    scores = [[0.0] * (golden_count + 1) for _ in range(predicted_count + 1)]
+    back = [[""] * (golden_count + 1) for _ in range(predicted_count + 1)]
+    for predicted_index in range(1, predicted_count + 1):
+        scores[predicted_index][0] = scores[predicted_index - 1][0] + gap_score
+        back[predicted_index][0] = "delete"
+    for golden_index in range(1, golden_count + 1):
+        scores[0][golden_index] = scores[0][golden_index - 1] + gap_score
+        back[0][golden_index] = "insert"
+
+    for predicted_index in range(1, predicted_count + 1):
+        for golden_index in range(1, golden_count + 1):
+            match = scores[predicted_index - 1][golden_index - 1] + _cue_match_score(
+                predicted[predicted_index - 1],
+                golden[golden_index - 1],
+            )
+            delete = scores[predicted_index - 1][golden_index] + gap_score
+            insert = scores[predicted_index][golden_index - 1] + gap_score
+            best_score = match
+            best_op = "match"
+            if delete > best_score:
+                best_score = delete
+                best_op = "delete"
+            if insert > best_score:
+                best_score = insert
+                best_op = "insert"
+            scores[predicted_index][golden_index] = best_score
+            back[predicted_index][golden_index] = best_op
+
+    pairs: list[_CueMatch] = []
+    predicted_index = predicted_count
+    golden_index = golden_count
+    while predicted_index > 0 or golden_index > 0:
+        op = back[predicted_index][golden_index]
+        if op == "match":
+            predicted_cue = predicted[predicted_index - 1]
+            golden_cue = golden[golden_index - 1]
+            pairs.append(
+                _CueMatch(
+                    predicted=predicted_cue,
+                    golden=golden_cue,
+                    similarity=_cue_match_similarity(predicted_cue, golden_cue),
+                )
+            )
+            predicted_index -= 1
+            golden_index -= 1
+        elif op == "delete":
+            predicted_index -= 1
+        elif op == "insert":
+            golden_index -= 1
+        else:
+            raise RuntimeError("cue evaluation alignment reached an empty operation")
+    pairs.reverse()
+    return pairs
+
+
+def _cue_match_score(predicted: Cue, golden: Cue) -> float:
+    similarity = _cue_match_similarity(predicted, golden)
+    return 2.0 * similarity if similarity >= CUE_MATCH_THRESHOLD else -0.6
+
+
+def _cue_match_similarity(predicted: Cue, golden: Cue) -> float:
+    predicted_signature = _text_signature(predicted)
+    golden_signature = _text_signature(golden)
+    if predicted_signature and predicted_signature == golden_signature:
+        return 1.0
+    if not predicted_signature or not golden_signature:
+        return 0.0
+    return fuzz.ratio(" ".join(predicted_signature), " ".join(golden_signature)) / 100.0
+
+
 def _review_burden_ratio(cues: list[Cue], flags: list[QCFlag]) -> float:
     if not cues:
         return 0.0
@@ -66,43 +171,57 @@ def _improv_detection_metrics(
     predicted: list[Cue],
     golden: list[Cue],
     flags: list[QCFlag],
+    cue_alignment: list[_CueMatch],
     source: list[Cue] | None = None,
 ) -> dict[str, object]:
     by_predicted = {cue.index: cue for cue in predicted}
-    by_golden = {cue.index: cue for cue in golden}
-    by_source = {cue.index: cue for cue in source or []}
-    matched_ids = set(by_predicted) & set(by_golden)
+    aligned_by_predicted_id = {match.predicted.index: match for match in cue_alignment}
     flagged_change_ids = {
         cue_id
         for flag in flags
         if flag.kind in TEXT_CHANGE_FLAG_KINDS
         for cue_id in flag.cue_ids
-        if cue_id in matched_ids
+        if cue_id in by_predicted
     }
-    if by_source:
-        actual_changed_ids = _source_changed_ids(by_golden, by_source, matched_ids)
+    if source:
+        source_alignment = _match_cues_by_content(source or [], golden)
+        matched_golden_ids = {match.golden.index for match in source_alignment}
+        changed_aligned_ids = {
+            match.golden.index
+            for match in source_alignment
+            if _text_signature(match.predicted) != _text_signature(match.golden)
+        }
+        inserted_golden_ids = {cue.index for cue in golden if cue.index not in matched_golden_ids}
+        actual_changed_ids = changed_aligned_ids | inserted_golden_ids
         true_positive_ids = {
-            cue_id
-            for cue_id in flagged_change_ids
-            if cue_id in actual_changed_ids
-            and _text_signature(by_predicted[cue_id]) == _text_signature(by_golden[cue_id])
+            predicted_id
+            for predicted_id in flagged_change_ids
+            if (match := aligned_by_predicted_id.get(predicted_id)) is not None
+            and match.golden.index in actual_changed_ids
+            and _text_signature(match.predicted) == _text_signature(match.golden)
         }
         true_positives = len(true_positive_ids)
         false_positives = len(flagged_change_ids - true_positive_ids)
-        false_negatives = len(actual_changed_ids - true_positive_ids)
-    else:
-        golden_mismatch_ids = {
-            cue_id
-            for cue_id in matched_ids
-            if _text_signature(by_predicted[cue_id]) != _text_signature(by_golden[cue_id])
+        detected_golden_ids = {
+            aligned_by_predicted_id[predicted_id].golden.index
+            for predicted_id in true_positive_ids
         }
-        true_positives = sum(
-            1
-            for cue_id in flagged_change_ids
-            if _text_signature(by_predicted[cue_id]) == _text_signature(by_golden[cue_id])
-        )
-        false_positives = len(flagged_change_ids) - true_positives
-        false_negatives = len(golden_mismatch_ids - flagged_change_ids)
+        false_negatives = len(actual_changed_ids - detected_golden_ids)
+    else:
+        aligned_mismatch_ids = {
+            match.predicted.index
+            for match in cue_alignment
+            if _text_signature(match.predicted) != _text_signature(match.golden)
+        }
+        true_positive_ids = {
+            predicted_id
+            for predicted_id in flagged_change_ids
+            if (match := aligned_by_predicted_id.get(predicted_id)) is not None
+            and _text_signature(match.predicted) == _text_signature(match.golden)
+        }
+        true_positives = len(true_positive_ids)
+        false_positives = len(flagged_change_ids - true_positive_ids)
+        false_negatives = len(aligned_mismatch_ids - flagged_change_ids)
     precision = _ratio(true_positives, true_positives + false_positives)
     recall = _ratio(true_positives, true_positives + false_negatives)
 
@@ -112,19 +231,6 @@ def _improv_detection_metrics(
         "improv_false_negatives": false_negatives,
         "improv_precision": precision,
         "improv_recall": recall,
-    }
-
-
-def _source_changed_ids(
-    by_golden: dict[int, Cue],
-    by_source: dict[int, Cue],
-    matched_ids: set[int],
-) -> set[int]:
-    source_matched_ids = matched_ids & set(by_source)
-    return {
-        cue_id
-        for cue_id in source_matched_ids
-        if _text_signature(by_source[cue_id]) != _text_signature(by_golden[cue_id])
     }
 
 

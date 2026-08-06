@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Iterable, Protocol
+
+from pydantic import ValidationError
 
 from .cache import CacheKey, JsonDiskCache
 from .cost import CostMeter, audio_seconds
@@ -53,9 +56,9 @@ class CachedASRAdapter:
         key = CacheKey.from_audio(audio_path, self.model, self.params)
         cached = self.cache.read(key)
         if cached is not None:
-            words = cached.get("words", cached) if isinstance(cached, dict) else cached
-            return [Word.model_validate(item) for item in words]
-        words = self.inner.transcribe(audio_path)
+            cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
+            return _validated_word_stream(cached_words, source="ASR cache")
+        words = _validated_word_stream(self.inner.transcribe(audio_path), source="ASR provider")
         if self.cost_meter is not None and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
             self.cost_meter.add_audio(self.cost_provider, audio_seconds(audio_path), self.dollars_per_hour)
         self.cache.write(key, {"words": [word.model_dump() for word in words]})
@@ -180,6 +183,10 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
             speaker_labels=self.speaker_labels,
         )
         transcript = aai.Transcriber().transcribe(str(audio_path), config=config)
+        error_status = _field(_field(aai, "TranscriptStatus", None), "error", "error")
+        transcript_status = _field(transcript, "status", None)
+        if transcript_status == error_status or str(_field(transcript_status, "value", transcript_status)).lower() == "error":
+            raise ProviderError("AssemblyAI transcription failed with a terminal error status.")
         raw_words = _field(transcript, "words", [])
         return [
             Word(
@@ -327,6 +334,32 @@ def _field(item: object, name: str, default: object = None) -> object:
     if isinstance(item, dict):
         return item.get(name, default)
     return getattr(item, name, default)
+
+
+def _validated_word_stream(items: object, *, source: str) -> list[Word]:
+    if isinstance(items, (str, bytes, dict)) or not isinstance(items, Iterable):
+        raise ProviderError(f"{source} returned an invalid word stream.")
+
+    words: list[Word] = []
+    previous_start = -math.inf
+    for index, item in enumerate(items):
+        try:
+            word = Word.model_validate(item)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise ProviderError(f"{source} returned an invalid word at index {index}.") from exc
+
+        if not word.text.strip():
+            raise ProviderError(f"{source} returned blank word text at index {index}.")
+        if not math.isfinite(word.start) or not math.isfinite(word.end):
+            raise ProviderError(f"{source} returned non-finite word timing at index {index}.")
+        if word.start < 0 or word.end <= word.start:
+            raise ProviderError(f"{source} returned invalid word timing at index {index}.")
+        if word.start < previous_start:
+            raise ProviderError(f"{source} returned words out of chronological order at index {index}.")
+
+        words.append(word)
+        previous_start = word.start
+    return words
 
 
 def _asr_keyterms(asr_config: dict[str, object]) -> list[str]:

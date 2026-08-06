@@ -28,6 +28,8 @@ class StaticPunctuationAdapter:
 def validate_punctuation_only(before: str, after: str) -> str:
     if _word_freeze_signature(before) != _word_freeze_signature(after):
         raise PunctuationValidationError("alphanumeric content changed during punctuation pass")
+    if _quotation_mark_signature(before) != _quotation_mark_signature(after):
+        raise PunctuationValidationError("quotation mark signature changed during punctuation pass")
     return after
 
 
@@ -69,7 +71,7 @@ def apply_punctuation_pass(
             )
             continue
 
-        lines = next_text.splitlines() or [next_text]
+        lines = _restore_source_line_breaks(cue.lines, next_text)
         width_exceeded = max_chars_per_line is not None and any(
             display_width(line) > max_chars_per_line for line in lines
         )
@@ -103,3 +105,85 @@ def _word_freeze_signature(text: str) -> list[str]:
         unicodedata.normalize("NFC", token).casefold()
         for token in re.findall(r"[\w]+", text, re.UNICODE)
     ]
+
+
+_ALWAYS_QUOTATION_MARKS = frozenset('"\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a\u201a')
+_CONTEXTUAL_SINGLE_QUOTATION_MARKS = frozenset("'\u2018\u2019")
+
+
+def _quotation_mark_signature(text: str) -> tuple[str, ...]:
+    signature: list[str] = []
+    for index, character in enumerate(text):
+        if character in _ALWAYS_QUOTATION_MARKS:
+            signature.append(character)
+            continue
+        if character not in _CONTEXTUAL_SINGLE_QUOTATION_MARKS:
+            continue
+        previous = text[index - 1] if index > 0 else ""
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if _is_word_character(previous) and _is_word_character(following):
+            continue
+        signature.append(character)
+    return tuple(signature)
+
+
+def _is_word_character(character: str) -> bool:
+    if not character:
+        return False
+    category = unicodedata.category(character)
+    return character == "_" or category[0] in {"L", "M", "N"}
+
+
+def _restore_source_line_breaks(source_lines: list[str], proposed_text: str) -> list[str]:
+    proposed_lines = proposed_text.splitlines() or [proposed_text]
+    source_boundaries = _line_word_boundaries(source_lines)
+    if _line_word_boundaries(proposed_lines) == source_boundaries:
+        return proposed_lines
+
+    flattened = " ".join(proposed_text.split())
+    word_spans = list(re.finditer(r"[\w]+", flattened, re.UNICODE))
+    if not word_spans:
+        return proposed_lines
+
+    split_positions = list(
+        dict.fromkeys(
+            _line_split_position(flattened, word_spans, boundary)
+            for boundary in source_boundaries
+            if 0 < boundary < len(word_spans)
+        )
+    )
+    if not split_positions:
+        return [flattened]
+
+    restored: list[str] = []
+    start = 0
+    for end in split_positions:
+        line = flattened[start:end].strip()
+        if line:
+            restored.append(line)
+        start = end
+    final_line = flattened[start:].strip()
+    if final_line:
+        restored.append(final_line)
+    return restored or proposed_lines
+
+
+def _line_word_boundaries(lines: list[str]) -> list[int]:
+    boundaries: list[int] = []
+    word_count = 0
+    for line in lines[:-1]:
+        word_count += len(re.findall(r"[\w]+", line, re.UNICODE))
+        boundaries.append(word_count)
+    return boundaries
+
+
+def _line_split_position(text: str, word_spans: list[re.Match[str]], boundary: int) -> int:
+    current_word_end = word_spans[boundary - 1].end()
+    next_word_start = word_spans[boundary].start()
+    between_words = text[current_word_end:next_word_start]
+    whitespace_positions = [
+        index for index, character in enumerate(between_words) if character.isspace()
+    ]
+    if whitespace_positions:
+        return current_word_end + whitespace_positions[-1]
+    return next_word_start

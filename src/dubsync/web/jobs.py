@@ -27,6 +27,7 @@ JobStatus = Literal["queued", "processing", "complete", "failed"]
 STALE_JOB_ERROR = "Processing timed out or was interrupted. Please submit the files again."
 STORAGE_RESERVATION_FILENAME = ".storage-reservation"
 STORAGE_RESERVATION_TEMP_FILENAME = ".storage-reservation.tmp"
+AUTO_FPS_DB_SENTINEL = 0.0
 
 
 class OutstandingJobLimitError(RuntimeError):
@@ -50,7 +51,7 @@ class JobRecord:
     directory: Path
     audio_path: Path
     srt_path: Path | None
-    fps: float
+    fps: float | None
     language: str
     style: str
     source_name: str | None = None
@@ -289,7 +290,7 @@ class JobStore:
                         str(job.directory),
                         str(job.audio_path),
                         str(job.srt_path) if job.srt_path else None,
-                        job.fps,
+                        _fps_to_storage(job.fps),
                         job.language,
                         job.style,
                         job.source_name,
@@ -659,6 +660,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             audio_limits=audio_limits,
         )
     else:
+        if job.fps is None:
+            raise ValueError("Generate job is missing its frame rate")
         generate_options: dict[str, object] = {
             "style_path": settings.style_path,
             "providers_path": settings.providers_path,
@@ -730,7 +733,7 @@ def new_job_record(
     directory: Path,
     audio_path: Path,
     srt_path: Path | None,
-    fps: float,
+    fps: float | None,
     language: str,
     style: str,
     retention_hours: int,
@@ -773,7 +776,7 @@ def _record(row: sqlite3.Row) -> JobRecord:
         directory=Path(row["directory"]),
         audio_path=Path(row["audio_path"]),
         srt_path=Path(row["srt_path"]) if row["srt_path"] else None,
-        fps=row["fps"],
+        fps=_fps_from_storage(row["fps"]),
         language=row["language"],
         style=row["style"],
         source_name=row["source_name"],
@@ -795,3 +798,15 @@ def _iso(value: datetime) -> str:
 
 def _datetime(value: str) -> datetime:
     return datetime.fromisoformat(value).astimezone(UTC)
+
+
+def _fps_to_storage(fps: float | None) -> float:
+    if fps is None:
+        return AUTO_FPS_DB_SENTINEL
+    if fps <= AUTO_FPS_DB_SENTINEL:
+        raise ValueError("fps must be positive or None")
+    return fps
+
+
+def _fps_from_storage(value: float) -> float | None:
+    return None if value == AUTO_FPS_DB_SENTINEL else float(value)

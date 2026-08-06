@@ -40,7 +40,7 @@ To deploy:
 
 1. Put this workspace in a real private Git repository and connect that repository to Render.
 2. Create a Blueprint from `render.yaml`.
-3. Enter `ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. Never commit `.env`.
+3. Enter `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. `GEMINI_API_KEY` is only needed for the optional Gemini alternate. Never commit `.env`.
 4. Confirm `/api/health`, `/api/config` reports `jobs_available: true`, and the deployed commit matches the release SHA.
 5. Run one short paid-provider generate job through the web UI. The fixture-backed E2E suite covers sync behavior without provider spend.
 
@@ -128,8 +128,8 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 | ASR fallback | AssemblyAI | Implemented optional adapter | `asr.provider: assemblyai`, `model: universal-3-pro` or `universal-2`, `speaker_labels: true` |
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
-| LLM default | Gemini | Implemented optional adapter | `llm.provider: gemini`, `model: gemini-3.5-flash` |
-| LLM alt | OpenAI | Implemented optional adapter | `llm.provider: openai`, `model: gpt-5.5` |
+| LLM default | OpenAI GPT-5.6 Luna | Implemented optional adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
+| LLM alt | Gemini | Implemented optional adapter with audio-snippet support | `llm.provider: gemini`, `model: gemini-3.5-flash` |
 | LLM alt | Anthropic | Implemented optional adapter | `llm.provider: anthropic` |
 | Test/offline | Fixture decisions | Implemented | `llm.provider: fixture` |
 | Precision verify | Fixture forced alignment | Implemented | `forced_alignment.fixture_path: path/to.forced-align.json` |
@@ -170,27 +170,27 @@ asr:
     - Matthew
 
 llm:
-  provider: gemini
-  model: gemini-3.5-flash
-  # Optional: reuse an existing Gemini explicit cache resource.
-  # cached_content: cachedContents/your-episode-context-cache
+  provider: openai
+  model: gpt-5.6-luna
+  timeout_seconds: 90
+  max_retries: 2
   # Optional per-pass overrides inherit provider/api key unless changed:
   adjudication:
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
+    reasoning_effort: high
     audio_snippet_double_check:
       enabled: false
       pad_seconds: 2.0
       max_duration_seconds: 20.0
   punctuation:
-    model: gemini-3.5-flash-lite
     scene_gap_seconds: 4.0
-    thinking_level: medium
+    reasoning_effort: medium
   speaker_mapping:
-    model: gemini-3.5-flash-lite
+    reasoning_effort: medium
   # Optional for providers/models without built-in defaults:
-  # input_per_million: 2.0
-  # output_per_million: 10.0
+  # input_per_million: 1.0
+  # output_per_million: 6.0
 
 forced_alignment:
   provider: mms
@@ -245,7 +245,7 @@ llm:
 
 ## Cost Model
 
-The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and cached ASR paths record zero API cost. Uncached cloud ASR calls are metered from WAV duration and the configured provider price. Live LLM calls record token costs when the provider response exposes usage metadata and either a built-in Gemini price or explicit `input_per_million` / `output_per_million` pricing is available. `llm.adjudication`, `llm.punctuation`, and `llm.speaker_mapping` can override provider/model/pricing per pass.
+The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and cached ASR paths record zero API cost. Uncached cloud ASR calls are metered from WAV duration and the configured provider price. Live LLM calls record token costs when the provider response exposes usage metadata and a built-in GPT-5.6 Luna/Gemini price or explicit `input_per_million` / `output_per_million` pricing is available. `llm.adjudication`, `llm.punctuation`, and `llm.speaker_mapping` can override provider/model/pricing per pass.
 
 | Item | Planned cost basis |
 |---|---|
@@ -264,13 +264,13 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Invalid style-profile values such as `fps: 0` are rejected with clear CLI errors that name the file and field.
 - Non-mapping provider config sections such as `vad: []`, `forced_alignment: []`, `overlap_detection: []`, and `speaker_mapping: []` are rejected instead of being silently ignored.
 - `sync` and `batch` load `.env` from the current working directory before resolving provider keys, without overwriting already-set environment variables.
-- Fuzzy monotonic, band-limited SRT-token to ASR-word alignment with anchor regions and divergence spans persisted in `align.json`.
+- Fuzzy monotonic, band-limited SRT-token to ASR-word alignment with a bounded cue-time tie-breaker, anchor regions, and divergence spans persisted in `align.json`.
 - Delete-only divergence spans inherit the surrounding matched-word window, so dropped-line/adjudication cases have concrete boundary timestamps when bounded by anchors.
 - Alignment normalization maps common digit strings and English/German number words to the same canonical tokens, avoiding false divergences such as `2` vs `two`.
 - Source cues are sorted chronologically before alignment while preserving original cue ids; moved cues are reported as `source_out_of_order`.
 - Deterministic re-cueing from ASR word timestamps, frame snapping, min duration, and zero-gap chaining.
 - Cue starts floor-snap and cue ends ceil-snap, so fractional model timings cannot truncate the final spoken syllable.
-- Min-duration padding extends only into available same-speaker display gaps; if the next cue starts too soon, the cue remains short and is surfaced by style lint instead of shifting speech timing.
+- Min-duration padding extends only into available display gaps; if the next cue makes the floor unattainable, the cue is held behind an error-level `min_duration_unattainable` QC flag instead of failing silently.
 - Frame-grid ceiling never snaps fractional model timings backward when enforcing minimum duration or forced-alignment ends.
 - Configured cue lead-in is clamped at zero so early speech cannot produce invalid negative SRT timestamps.
 - Fixture-backed ASR/LLM path for offline E2E tests.
@@ -280,13 +280,14 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Browser-held access recovers every child in a submitted batch after refresh, while each child keeps an isolated token and failure state.
 - Downloaded SRT names preserve the validated source stem and append `-dubsync-synced.srt`.
 - ElevenLabs Scribe v2 ASR forwards configured keyterms and character names as `keyterms` while still requesting word timestamps and diarization.
-- Opt-in `--live` pytest smoke tests for Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
+- Opt-in `--live` pytest smoke tests for OpenAI GPT-5.6 Luna, Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
+- OpenAI LLM calls use the Responses API `responses.parse` structured-output path with `store: false`, bounded SDK retries/timeouts, refusal and incomplete-response handling, and explicit `reasoning.effort`. The production default is `gpt-5.6-luna`: adjudication uses `reasoning_effort: high`; punctuation and speaker mapping use `reasoning_effort: medium`.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
 - Gemini thinking-level controls are wired through `thinking_level` (`minimal`, `low`, `medium`, `high`) using `thinking_config.thinking_level`; punctuation defaults to `medium` when using Gemini through `llm.punctuation`.
 - Gemini explicit context-cache reuse is wired through `cached_content`, which may be set at `llm.cached_content` or overridden per pass. DubSync reuses an existing Gemini cache resource but does not create or delete remote caches automatically.
 - Optional adjudication audio-snippet double-checks extract padded WAV snippets from the local audio, persist `audio_snippets.json`, include snippet hashes in the LLM cache key, and send Gemini inline audio parts with `types.Part.from_bytes` when `llm.adjudication.audio_snippet_double_check.enabled: true`.
 - Improv replacement path with QC flags and acoustic timing from spoken ASR words.
-- ASR-only ad-lib spans can be accepted by adjudication, inserted as new acoustically timed cues, and QC-flagged as `adlib_inserted`.
+- ASR-only ad-lib spans can be accepted by adjudication and inserted as acoustically timed cues, while far-tail and highly repetitive music-like candidates are held as error-level QC findings instead of captioned.
 - Exported SRT files are sequentially renumbered in playback order, including ad-lib cues inserted between existing source cues.
 - `keep_srt` adjudication still attaches divergent ASR word indices to timing, so kept source spelling/numbers do not cut off the actor's spoken span.
 - Final output sorting merges duplicate overlapping captions as `duplicate_cue_merged`, resolves residual same/unknown-speaker overlaps when `output.no_overlaps: true`, and asserts monotonic starts before writing SRT.
@@ -294,11 +295,11 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Multi-cue improv timing partitions the accepted spoken word indices across affected cues, so rebuilt changed cues do not all inherit the full span timing.
 - Heuristic adjudication keeps source SRT for punctuation/casing-only differences and tiny ASR spelling noise without spending an LLM call.
 - Adjudication LLM spans carry up to two cue texts before and after the divergent span as structured context.
-- Fixture-backed punctuation pass with a validator that rejects word changes.
+- Fixture-backed punctuation pass with validators that reject word changes and added/removed/restyled quotation delimiters, including German low-high dialogue quotes; word-identical proposals retain customer line-break positions.
 - Punctuation word-freeze validation rejects digit-to-word substitutions such as `2` -> `two`; number normalization remains limited to alignment.
 - LLM adjudication retries invalid structured output once before falling back to `keep_srt` with a QC flag.
 - `adjudicate.json` persists adjudication decisions and adjudication-stage QC flags, so `--resume rebuild` preserves low-confidence or invalid-response warnings instead of silently dropping them.
-- Validated LLM adjudication decisions, speaker mappings, and punctuation outputs are cached in `workdir/<episode>/llm-cache`, keyed by input payload, model, and non-secret request params, so repeat non-resume syncs avoid recomputing the same LLM pass.
+- Validated LLM adjudication decisions, speaker mappings, and punctuation outputs are cached in `workdir/<episode>/llm-cache`, keyed by prompt version, input payload, model, and non-secret request params, so prompt edits cannot serve stale results.
 - QC JSON/HTML report, `changes.diff.srt`, and a verify-stage `verify.json` artifact.
 - `changes.diff.srt` is emitted as a parseable SRT review file with one cue per text-changing flag, preserving the QC timestamp window and old/new text lines.
 - Per-cue verification scores and CPS are written to `qc_report.json` and rendered in `qc_report.html`; scores use forced-alignment confidence when present, otherwise ASR word confidence.
@@ -339,7 +340,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - VAD-backed boundary refinement uses matched cue word timestamps when available; ASR words longer than `timing.max_word_duration` are clamped to the containing speech region and flagged as `asr_word_clamped`.
 - Optional `vad.provider: silero` uses local Silero VAD when available and falls back to the deterministic energy VAD if the model/runtime cannot be loaded.
 - Verify emits `impossible_cps_fast` and `impossible_cps_slow` QC flags using `timing.max_cps` and `timing.min_cps`.
-- `report --synced --golden` computes the PLAN §11 timing/review metrics: cue counts, start MAE, within-1/3-frame ratios, source-aware improv precision/recall, review burden, and target booleans. When `ingest.json` is present, source-vs-golden text defines the actual changed cues; the improv target requires at least 0.9 precision and 0.85 recall.
+- `report --synced --golden` first aligns predicted and golden cues monotonically by text, then computes the PLAN §11 timing/review metrics: cue counts, start MAE, within-1/3-frame ratios, source-aware improv precision/recall, review burden, and target booleans. When `ingest.json` is present, source-vs-golden text defines the actual changed cues; the improv target requires at least 0.9 precision and 0.85 recall.
 - The timing target boolean requires all PLAN §11 timing gates: at least 90% of starts within 1 frame, at least 98% within 3 frames, and start MAE below 50 ms.
 - `report` refuses a parent workdir containing multiple episode reports unless a specific episode workdir is provided, avoiding silent selection of the wrong QC report.
 - `report` rejects malformed `qc_report.json` and malformed comparison SRTs with clear CLI errors instead of raw parser exceptions.
@@ -349,7 +350,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and the approved production ElevenLabs plus Gemini smoke job completed. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
+Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and real GPT-5.6 Luna structured-output smokes pass at the production `medium` punctuation and `high` adjudication reasoning levels. The historical approved production ElevenLabs plus Gemini smoke also completed. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
 
 Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 
@@ -359,8 +360,8 @@ Latest local offline verification in this workspace:
 
 | Command | Result | Runtime / cost evidence |
 |---|---|---|
-| `python -m pytest --cov=dubsync --cov-report=term-missing` | `445 passed, 5 deselected`, coverage `86.01%` | 35.98s on 2026-07-31; paid/live smoke tests deselected |
-| `npm run test:coverage` | `61 passed`; statements `91.02%`, lines `94.13%` | React workflow, sequential batch behavior, recovery, generation style controls, access gate, API client, session, legal, error, and media lifecycle tests |
+| `python -m pytest --cov=dubsync --cov-report=term-missing` | `494 passed, 7 deselected`, coverage `85.88%` | 41.30s on 2026-08-06; paid/live smoke tests deselected |
+| `npm run test:coverage` | `62 passed`; statements `91.05%`, lines `94.15%` | React workflow, sequential batch behavior, recovery, generation style controls, access gate, API client, session, provider disclosure, legal, error, and media lifecycle tests |
 | `npm run test:e2e` | `11 passed` | Two-device shared-code isolation, generate, SRT-derived style, sync, sequential batch naming, token protection, refresh recovery, legal routes, decoded waveform pixels, responsive layout, select-icon inset, and feature-grid alignment |
 | `npm run typecheck` and `npm run build` | PASS | TypeScript and Vite production bundle |
 | Production web `generate` smoke | PASS | 3.444-second WAV, 1 cue, 0 QC flags, `$0.000376` recorded provider cost on Render commit `5c79356` |
@@ -376,7 +377,7 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 
 ### Top 3 Risks
 
-1. Live-provider drift: the ElevenLabs plus Gemini generate path has one production smoke result; OpenAI, Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run.
+1. Live-provider drift: GPT-5.6 Luna medium/high structured calls and one historical ElevenLabs plus Gemini production generate path have live evidence; Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run. Every provider/model rollout still requires a short web-path smoke on its deployed commit.
 2. Real-episode quality: synthetic fixtures prove timing, improv replacement, overlap, dropped-line, and source-error paths, but the PLAN targets need a golden episode set to measure cue-start MAE, improv precision/recall, and review burden on actual delivered material.
 3. Language quality beyond generic handling: CJK/full-width behavior is covered, but production quality for Japanese/Thai/Chinese/Korean and code-switching will benefit from language-specific tokenization and per-language house-style samples.
 
@@ -389,9 +390,9 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 - Deterministic energy VAD is wired; optional Silero VAD is available with energy fallback, but production quality should be validated on a golden set.
 - CJK/Thai/Hangul/Japanese text now uses character-level tokenization and visual-width line checks; language-specific morphological tokenizers remain a future quality upgrade.
 - Live LLM speaker-to-character inference is implemented through the configured LLM adapter, but was not smoke-tested against real provider responses in this workspace.
-- Live Gemini punctuation completed in the production web smoke; OpenAI and Anthropic usage metering remains covered only by deterministic response-shape tests.
+- Live Gemini punctuation completed in the historical production web smoke. Live GPT-5.6 Luna punctuation (`medium`) and adjudication (`high`) structured-output calls completed on 2026-08-06; Anthropic usage metering remains covered only by deterministic response-shape tests.
 - Audio-snippet double-checks are implemented for Gemini inline audio, but were not live-smoke-tested against the real Gemini API in this workspace. Automatic Gemini context-cache creation/deletion remains unimplemented because it creates third-party resources and can incur storage billing; provide `cached_content` to reuse a cache created outside DubSync.
-- OpenAI and Anthropic token prices require explicit config overrides until model-specific billing defaults are confirmed.
+- GPT-5.6 Luna token pricing has a built-in `$1/M` input and `$6/M` output default; Anthropic token prices still require explicit config overrides.
 - The commercial web workspace supports submission, status, and downloads; a browser cue editor remains intentionally out of scope until customer QC behavior proves it is needed.
 
 ## Troubleshooting

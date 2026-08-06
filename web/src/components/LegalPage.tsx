@@ -37,7 +37,7 @@ const privacySections: Section[] = [
   { title: '1. Operator and data controller', paragraphs: ['Reyhan Putra operates DubSync as an individual business based in Indonesia and acts as the controller of personal data processed for the service. Privacy questions and recorded rights requests may be sent to rey@feelslocal.com.'] },
   { title: '2. Data we process', paragraphs: ['DubSync processes audio, subtitle files, generated outputs, QC artifacts, filenames, technical job metadata, approximate request source such as IP address, and messages you send to support. Do not upload personal data that is unnecessary for the job.'] },
   { title: '3. Why we process it', paragraphs: ['We use this data to provide requested subtitle processing, secure and rate-limit the service, diagnose failures, answer support requests, calculate job cost, prevent abuse, and comply with legal obligations.'] },
-  { title: '4. Service providers', paragraphs: ['DubSync runs primarily on Render infrastructure. Cloud processing can send content to ElevenLabs for speech recognition and Google Gemini for bounded language reasoning. Other providers are used only when configured for a specific job. Their processing is governed by their own terms and data practices.', 'DubSync does not promise zero retention by a provider unless that setting is confirmed for the relevant account and job.'] },
+  { title: '4. Service providers', paragraphs: ['DubSync runs primarily on Render infrastructure. Cloud processing can send content to ElevenLabs for speech recognition and OpenAI for bounded language reasoning. Google Gemini remains available only when configured as an alternate for a specific job. Other providers are used only when configured for a specific job. Their processing is governed by their own terms and data practices.', 'DubSync does not promise zero retention by a provider unless that setting is confirmed for the relevant account and job.'] },
   { title: '5. Retention', paragraphs: ['Files, outputs, and job records on DubSync infrastructure are scheduled for deletion 24 hours after upload. Security and platform logs that do not contain uploaded media may be retained longer by infrastructure providers. Third-party AI providers can apply separate retention periods.'] },
   { title: '6. Legal bases and rights', paragraphs: ['Where data-protection law requires a legal basis, processing is based on performing the service you request, legitimate interests in operating and securing it, consent where requested, and legal compliance. Depending on your location, you may have rights to access, correct, delete, restrict, object, or receive a copy of personal data. Send a recorded request by email to exercise a right.'] },
   { title: '7. International transfers', paragraphs: ['The service and its providers may process data in countries other than yours. The relevant provider applies its contractual, organizational, and legal safeguards where required.'] },
@@ -86,7 +86,7 @@ export function LegalPage({ kind }: { kind: LegalKind }) {
         <header className="legal-heading">
           <h1>{document.title}</h1>
           <p>{document.summary}</p>
-          <span>Effective July 16, 2026</span>
+          <span>Effective August 6, 2026</span>
         </header>
         <div className="legal-content">
           {document.sections.map((section) => (

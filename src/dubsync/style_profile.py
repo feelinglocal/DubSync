@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import floor, isclose
+from math import ceil, floor, isclose
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -9,6 +9,9 @@ from .models import Cue
 from .text_metrics import display_width
 
 FPS_CANDIDATES = (23.976, 24.0, 25.0, 29.97, 30.0)
+_ROBUST_PROFILE_MIN_SAMPLE = 20
+_UPPER_STYLE_PERCENTILE = 0.95
+_LOWER_STYLE_TRIM_FRACTION = 0.05
 
 
 class StyleProfile(BaseModel):
@@ -86,10 +89,13 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
         return StyleProfile()
 
     durations = [cue.duration_ms / 1000.0 for cue in cues]
-    max_lines = max(len(cue.lines) for cue in cues)
-    observed_chars = max(display_width(line) for cue in cues for line in cue.lines)
+    line_counts = [len(cue.lines) for cue in cues]
+    line_widths = [display_width(line) for cue in cues for line in cue.lines]
+    max_lines = _robust_upper_limit(line_counts)
+    max_chars = _robust_upper_limit(line_widths)
     allow_zero_gap = any(left.end_ms == right.start_ms for left, right in zip(cues, cues[1:]))
-    min_duration = min(durations)
+    observed_min_duration = min(durations)
+    min_duration = _robust_lower_limit(durations)
 
     notes: list[str] = []
     if any(line != line.rstrip() for cue in cues for line in cue.lines):
@@ -98,11 +104,27 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
     return StyleProfile(
         fps=detect_fps(cues),
         max_lines_per_cue=max(2, max_lines),
-        max_chars_per_line=max(26, observed_chars),
+        max_chars_per_line=max(26, max_chars),
         min_cue_dur=min(round(min_duration, 3), 0.5),
         allow_zero_gap=allow_zero_gap,
         cue_count=len(cues),
-        observed_min_duration=round(min_duration, 3),
+        observed_min_duration=round(observed_min_duration, 3),
         observed_max_duration=round(max(durations), 3),
         notes=notes,
     )
+
+
+def _robust_upper_limit(values: list[int]) -> int:
+    ordered = sorted(values)
+    if len(ordered) < _ROBUST_PROFILE_MIN_SAMPLE:
+        return ordered[-1]
+    rank = max(1, ceil(_UPPER_STYLE_PERCENTILE * len(ordered)))
+    return ordered[rank - 1]
+
+
+def _robust_lower_limit(values: list[float]) -> float:
+    ordered = sorted(values)
+    if len(ordered) < _ROBUST_PROFILE_MIN_SAMPLE:
+        return ordered[0]
+    trimmed_count = floor(_LOWER_STYLE_TRIM_FRACTION * len(ordered))
+    return ordered[min(trimmed_count, len(ordered) - 1)]
