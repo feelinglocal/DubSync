@@ -2140,7 +2140,7 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
     if result.exit_code == 0:
         assert out_path.exists()
     else:
-        assert "WhisperX" in result.output
+        assert "whisperx" in result.output.casefold()
     assert "Traceback" not in result.output
 
 
