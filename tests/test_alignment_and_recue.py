@@ -145,6 +145,15 @@ def test_alignment_retry_margins_progress_without_automatic_full_width():
     assert aligner._retry_margins(64, 500) == [64, 256, 500]
 
 
+def test_small_initial_alignment_is_not_reported_as_an_unbanded_fallback():
+    cues = [Cue(index=1, start_ms=0, end_ms=1_000, lines=["alpha"])]
+    words = [Word(text="alpha", start=0.1, end=0.3)]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.diagnostics.unbanded_fallback is False
+
+
 def test_alignment_budget_exhaustion_preserves_a_reviewable_whole_span(monkeypatch):
     monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 0)
     cues = [Cue(index=1, start_ms=0, end_ms=1_000, lines=["alpha beta"])]
