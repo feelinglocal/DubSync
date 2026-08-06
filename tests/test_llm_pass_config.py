@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from dubsync.llm_providers import (
     GeminiLLMAdapter,
     OpenAILLMAdapter,
@@ -38,6 +40,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert isinstance(speaker_mapping, OpenAILLMAdapter)
     assert speaker_mapping.model == "gpt-5.5"
     assert speaker_mapping.api_key == "openai-key"
+    assert speaker_mapping.reasoning_effort == "medium"
 
 
 def test_gemini_thinking_level_can_be_configured_per_pass():
@@ -82,6 +85,67 @@ def test_gemini_cached_content_can_be_configured_per_pass():
     assert adjudication.cached_content == "cachedContents/base"
     assert isinstance(punctuation, GeminiLLMAdapter)
     assert punctuation.cached_content == "cachedContents/punctuation"
+
+
+def test_openai_reasoning_effort_can_be_configured_per_pass():
+    config = {
+        "llm": {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "api_key": "openai-key",
+            "adjudication": {"reasoning_effort": "high"},
+            "punctuation": {"reasoning_effort": "medium"},
+            "speaker_mapping": {"reasoning_effort": "medium"},
+        }
+    }
+
+    adjudication = llm_adapter_from_config(config, pass_name="adjudication")
+    punctuation = punctuation_adapter_from_config(config)
+    speaker_mapping = llm_adapter_from_config(config, pass_name="speaker_mapping")
+
+    assert isinstance(adjudication, OpenAILLMAdapter)
+    assert adjudication.model == "gpt-5.6-luna"
+    assert adjudication.reasoning_effort == "high"
+    assert isinstance(punctuation, OpenAILLMAdapter)
+    assert punctuation.reasoning_effort == "medium"
+    assert isinstance(speaker_mapping, OpenAILLMAdapter)
+    assert speaker_mapping.reasoning_effort == "medium"
+
+
+def test_openai_adapter_defaults_to_luna_medium_reasoning():
+    adapter = llm_adapter_from_config({"llm": {"provider": "openai", "api_key": "openai-key"}})
+
+    assert isinstance(adapter, OpenAILLMAdapter)
+    assert adapter.model == "gpt-5.6-luna"
+    assert adapter.reasoning_effort == "medium"
+
+
+@pytest.mark.parametrize("reasoning_effort", ["minimal", "turbo", 3])
+def test_openai_adapter_rejects_unsupported_reasoning_effort(reasoning_effort):
+    config = {
+        "llm": {
+            "provider": "openai",
+            "api_key": "openai-key",
+            "reasoning_effort": reasoning_effort,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="reasoning_effort"):
+        llm_adapter_from_config(config)
+
+
+def test_openai_adapter_rejects_audio_snippet_configuration_it_cannot_send():
+    config = {
+        "llm": {
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "api_key": "openai-key",
+            "adjudication": {"audio_snippet_double_check": {"enabled": True}},
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="does not support audio snippets"):
+        llm_adapter_from_config(config, pass_name="adjudication")
 
 
 def test_adjudication_scene_gap_uses_llm_pass_override():

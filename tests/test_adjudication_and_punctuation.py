@@ -273,3 +273,25 @@ def test_punctuation_validator_rejects_digit_word_substitution():
         assert "alphanumeric content changed" in str(exc)
     else:
         raise AssertionError("digit-to-word substitution should fail word-freeze validation")
+
+
+def test_punctuation_validator_rejects_added_german_quotes():
+    try:
+        validate_punctuation_only("Alessia, hör auf", "„Alessia, hör auf")
+    except PunctuationValidationError as exc:
+        assert "quotation mark signature changed" in str(exc)
+    else:
+        raise AssertionError("punctuation pass should not add German quote marks")
+
+
+def test_punctuation_validator_preserves_existing_quotes():
+    assert validate_punctuation_only('"Alessia"', '"Alessia."') == '"Alessia."'
+
+
+def test_punctuation_validator_rejects_restyling_existing_quotes():
+    try:
+        validate_punctuation_only('"Alessia"', "„Alessia“")
+    except PunctuationValidationError as exc:
+        assert "quotation mark signature changed" in str(exc)
+    else:
+        raise AssertionError("punctuation pass should preserve the source quote convention")

@@ -294,3 +294,69 @@ def test_terminal_punctuation_insertion_requires_narrow_confirmed_continuation(
     )
 
     assert [cue.plain_text for cue in transformed] == ["Hallo!", "Ja"]
+
+
+def test_generated_adlib_far_beyond_source_span_is_rejected_with_qc_flag() -> None:
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1800, lines=["Wir gehen jetzt."]),
+        Cue(index=2, start_ms=3200, end_ms=5000, lines=["Kommst du mit?"]),
+    ]
+    span = DivergenceSpan(
+        case_id="far-tail-adlib",
+        cue_ids=[],
+        srt_text="",
+        asr_text="Warte auf mich",
+        start=20.0,
+        end=21.2,
+        confidence=0.98,
+        speaker_ids=["A"],
+        asr_word_indices=[8, 9, 10],
+    )
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="use_audio",
+        final_text="Warte auf mich!",
+        confidence=0.98,
+        speaker="A",
+        reason="ASR-only tail content",
+    )
+
+    adlib_ids, flags = _adlib_cue_ids_by_case(cues, [span], [decision], [])
+
+    assert adlib_ids == {}
+    assert [flag.kind for flag in flags] == ["adlib_rejected_outside_source_span"]
+    assert flags[0].new_text == "Warte auf mich!"
+    assert flags[0].start == 20.0
+    assert flags[0].end == 21.2
+
+
+def test_highly_repetitive_song_like_adlib_is_rejected_with_qc_flag() -> None:
+    cues = [Cue(index=1, start_ms=0, end_ms=120_000, lines=["Episode dialogue"])]
+    lyrics = "Go, let it all go, let it all go. Go, let it all go, let it all go."
+    span = DivergenceSpan(
+        case_id="repetitive-adlib",
+        cue_ids=[],
+        srt_text="",
+        asr_text=lyrics,
+        start=50.0,
+        end=54.0,
+        confidence=0.99,
+        speaker_ids=["A"],
+        asr_word_indices=list(range(16)),
+    )
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="use_audio",
+        final_text=lyrics,
+        confidence=0.99,
+        speaker="A",
+        reason="ASR-only repeated content",
+    )
+
+    adlib_ids, flags = _adlib_cue_ids_by_case(cues, [span], [decision], [])
+
+    assert adlib_ids == {}
+    assert [flag.kind for flag in flags] == ["adlib_rejected_repetitive_content"]
+    assert flags[0].new_text == lyrics
+    assert flags[0].start == 50.0
+    assert flags[0].end == 54.0

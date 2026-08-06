@@ -250,6 +250,87 @@ def test_generate_job_requires_a_valid_srt_for_sample_style(tmp_path):
     assert malformed.json()["detail"].startswith("Could not read the SRT style example:")
 
 
+@pytest.mark.parametrize(
+    ("mode", "fps_field", "expected_fps"),
+    [
+        ("sync", None, None),
+        ("sync", "", None),
+        ("sync", "24", 24.0),
+        ("generate", None, 30.0),
+        ("generate", "", 30.0),
+        ("generate", "25", 25.0),
+    ],
+)
+def test_single_job_uses_auto_fps_only_for_sync_without_an_explicit_override(
+    tmp_path,
+    mode: str,
+    fps_field: str | None,
+    expected_fps: float | None,
+):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    data = {"mode": mode}
+    if fps_field is not None:
+        data["fps"] = fps_field
+    files = {"audio": ("dialogue.wav", b"fixture audio", "audio/wav")}
+    if mode == "sync":
+        files["subtitle"] = (
+            "dialogue.srt",
+            b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n",
+            "application/x-subrip",
+        )
+
+    with TestClient(app) as client:
+        response = client.post("/api/jobs", data=data, files=files)
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    assert captured[0].fps == expected_fps
+
+
+@pytest.mark.parametrize(
+    ("fps_field", "expected_detail"),
+    [
+        ("not-a-frame-rate", "Invalid fps field."),
+        ("26", "Unsupported frame rate."),
+    ],
+)
+def test_single_job_rejects_an_invalid_explicit_fps_without_queueing(
+    tmp_path,
+    fps_field: str,
+    expected_detail: str,
+):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "sync", "fps": fps_field},
+            files={
+                "audio": ("dialogue.wav", b"fixture audio", "audio/wav"),
+                "subtitle": (
+                    "dialogue.srt",
+                    b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n",
+                    "application/x-subrip",
+                ),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": expected_detail}
+    assert captured == []
+
+
 def test_sync_mode_requires_srt_and_rejects_unsupported_or_oversized_audio(tmp_path):
     app = create_app(settings=_settings(tmp_path, max_upload_bytes=16), processor=_fake_processor)
     with TestClient(app) as client:

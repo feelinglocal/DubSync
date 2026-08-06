@@ -9,7 +9,8 @@ from typer.testing import CliRunner
 
 from dubsync.cli import app
 from dubsync.models import AudioSnippet, Cue
-from dubsync.pipeline import _punctuation_cache_key
+import dubsync.pipeline as pipeline_module
+from dubsync.pipeline import _punctuation_cache_key, _speaker_mapping_cache_key
 from dubsync.srt_io import parse_srt_text
 
 
@@ -30,6 +31,88 @@ def test_punctuation_cache_key_includes_line_constraints():
     wider_style = _punctuation_cache_key(cues, config, max_chars_per_line=42, max_lines_per_cue=2)
 
     assert house_style.digest != wider_style.digest
+
+
+def test_cli_sync_flags_explicit_fps_that_disagrees_with_source_grid(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    providers_path = tmp_path / "providers.yaml"
+    output_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n00:00:05,250 --> 00:00:06,625\nalpha\n\n"
+        "2\n00:00:06,833 --> 00:00:09,083\nbeta\n\n"
+        "3\n00:00:09,416 --> 00:00:11,291\ngamma\n\n"
+        "4\n00:00:11,625 --> 00:00:13,000\ndelta\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "alpha", "start": 5.25, "end": 6.625},
+                    {"text": "beta", "start": 6.833, "end": 9.083},
+                    {"text": "gamma", "start": 9.416, "end": 11.291},
+                    {"text": "delta", "start": 11.625, "end": 13.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "--providers",
+            str(providers_path),
+            "--fps",
+            "30",
+            "--no-llm",
+            "--output",
+            str(output_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    mismatch = [flag for flag in report["flags"] if flag["kind"] == "fps_override_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["severity"] == "warning"
+    assert "24" in mismatch[0]["message"]
+    assert "30" in mismatch[0]["message"]
+
+
+def test_punctuation_cache_key_changes_with_prompt_version(monkeypatch):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello there"])]
+    config = {"llm": {"provider": "fixture", "model": "fixture-punctuation", "punctuation": {}}}
+    monkeypatch.setattr(pipeline_module, "_PUNCTUATION_PROMPT_VERSION", "punctuation-a", raising=False)
+    first = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
+    monkeypatch.setattr(pipeline_module, "_PUNCTUATION_PROMPT_VERSION", "punctuation-b", raising=False)
+    second = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
+
+    assert first.digest != second.digest
+
+
+def test_speaker_mapping_cache_key_changes_with_prompt_version(monkeypatch):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello"], speaker_id="A")]
+    config = {"llm": {"provider": "fixture", "model": "fixture-speakers"}}
+    monkeypatch.setattr(pipeline_module, "_SPEAKER_MAPPING_PROMPT_VERSION", "speakers-a", raising=False)
+    first = _speaker_mapping_cache_key(cues, config)
+    monkeypatch.setattr(pipeline_module, "_SPEAKER_MAPPING_PROMPT_VERSION", "speakers-b", raising=False)
+    second = _speaker_mapping_cache_key(cues, config)
+
+    assert first.digest != second.digest
 
 
 def test_cli_profile_rejects_malformed_sample_with_clear_message(tmp_path):

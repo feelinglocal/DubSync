@@ -146,6 +146,7 @@ def test_llm_token_prices_use_plan_defaults_and_config_overrides():
     legacy_flash_lite = "gemini-" + "3.1-flash-lite"
     assert llm_token_prices("gemini", legacy_flash_lite, {}) == (0.25, 1.5)
     assert llm_token_prices("openai", "gpt-5.5", {}) is None
+    assert llm_token_prices("openai", "gpt-5.6-luna", {}) == (1.0, 6.0)
     assert llm_token_prices("openai", "gpt-5.5", {"input_per_million": 2, "output_per_million": 12}) == (
         2.0,
         12.0,
