@@ -85,6 +85,8 @@ BATCH_ARCHIVE_SPOOL_BYTES = 8 * 1024 * 1024
 ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
 MAX_SINGLE_PARSER_FIELDS = 4
+MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
+FPS_RESULT_SOURCES = frozenset({"detected", "fallback", "explicit"})
 
 
 def create_app(
@@ -948,12 +950,48 @@ def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object
     if token is not None:
         payload["token"] = token
     if job.status == "complete":
-        payload["result"] = {"cue_count": job.cue_count, "cost_usd": job.cost_usd}
+        payload["result"] = {
+            "cue_count": job.cue_count,
+            "cost_usd": job.cost_usd,
+            **_qc_result_metadata(job.qc_json),
+        }
         downloads = ["srt", "qc-json", "qc-html"]
         if job.changes_srt is not None:
             downloads.append("changes")
         payload["downloads"] = downloads
     return payload
+
+
+def _qc_result_metadata(qc_json: Path | None) -> dict[str, object]:
+    if qc_json is None:
+        return {}
+    try:
+        if qc_json.stat().st_size > MAX_QC_RESULT_METADATA_BYTES:
+            return {}
+        payload = json.loads(qc_json.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("summary"), dict):
+        return {}
+
+    summary = payload["summary"]
+    raw_fps = summary.get("fps")
+    raw_source = summary.get("fps_source")
+    raw_confidence = summary.get("fps_detection_confident")
+    if (
+        isinstance(raw_fps, bool)
+        or not isinstance(raw_fps, int | float)
+        or not 0 < float(raw_fps) <= 240
+        or not isinstance(raw_source, str)
+        or raw_source not in FPS_RESULT_SOURCES
+        or not isinstance(raw_confidence, bool)
+    ):
+        return {}
+    return {
+        "fps": float(raw_fps),
+        "fps_source": raw_source,
+        "fps_detection_confident": raw_confidence,
+    }
 
 
 def _download_artifact(job: JobRecord, kind: str) -> tuple[Path | None, str, str]:

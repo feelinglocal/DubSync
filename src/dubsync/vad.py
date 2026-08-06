@@ -74,8 +74,10 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
         )
         self.sampling_rate = sampling_rate
         self.min_region_ms = min_region_ms
+        self.fallback_used = False
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
+        self.fallback_used = False
         try:
             import torch
 
@@ -95,6 +97,7 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
                 return_seconds=True,
             )
         except Exception:
+            self.fallback_used = True
             return self.fallback.detect(audio_path)
         return [
             SpeechRegion(

@@ -10,6 +10,7 @@ from .tokenize import alphanumeric_signature
 
 TEXT_CHANGE_FLAG_KINDS = {"text_changed", "adlib_inserted"}
 CUE_MATCH_THRESHOLD = 0.85
+EVALUATION_BAND_MARGIN = 32
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class _CueMatch:
     predicted: Cue
     golden: Cue
     similarity: float
+    is_exact: bool
 
 
 def evaluate_against_golden(
@@ -27,7 +29,14 @@ def evaluate_against_golden(
     style_violations: int = 0,
     source: list[Cue] | None = None,
 ) -> dict[str, object]:
-    cue_alignment = _match_cues_by_content(predicted, golden)
+    predicted_signatures = [_text_signature(cue) for cue in predicted]
+    golden_signatures = [_text_signature(cue) for cue in golden]
+    cue_alignment = _match_cues_by_content(
+        predicted,
+        golden,
+        predicted_signatures=predicted_signatures,
+        golden_signatures=golden_signatures,
+    )
     matched_pairs = [
         match for match in cue_alignment if match.similarity >= CUE_MATCH_THRESHOLD
     ]
@@ -45,6 +54,7 @@ def evaluate_against_golden(
         golden,
         flags or [],
         cue_alignment,
+        golden_signatures,
         source=source,
     )
 
@@ -76,7 +86,13 @@ def evaluate_against_golden(
     }
 
 
-def _match_cues_by_content(predicted: list[Cue], golden: list[Cue]) -> list[_CueMatch]:
+def _match_cues_by_content(
+    predicted: list[Cue],
+    golden: list[Cue],
+    *,
+    predicted_signatures: list[tuple[str, ...]] | None = None,
+    golden_signatures: list[tuple[str, ...]] | None = None,
+) -> list[_CueMatch]:
     """Globally align cue sequences before comparing their timestamps.
 
     Cue numbers are export-local and can shift after an insertion or deletion. This
@@ -90,21 +106,150 @@ def _match_cues_by_content(predicted: list[Cue], golden: list[Cue]) -> list[_Cue
         return []
 
     gap_score = -0.75
+    if predicted_signatures is None:
+        predicted_signatures = [_text_signature(cue) for cue in predicted]
+    if golden_signatures is None:
+        golden_signatures = [_text_signature(cue) for cue in golden]
+    if len(predicted_signatures) != predicted_count or len(golden_signatures) != golden_count:
+        raise ValueError("cue signature counts must match cue counts")
+    reachability = _evaluation_reachability_centers(
+        predicted_signatures,
+        golden_signatures,
+    )
+    similarities: dict[tuple[int, int], float] = {}
+    scores: list[dict[int, float]] = [{0: 0.0}]
+    back: list[dict[int, str]] = [{0: ""}]
+    _, first_end = _evaluation_band_window(
+        0,
+        predicted_count,
+        golden_count,
+        reachability.get(0, ()),
+    )
+    for golden_index in range(1, first_end + 1):
+        scores[0][golden_index] = scores[0][golden_index - 1] + gap_score
+        back[0][golden_index] = "insert"
+
+    for predicted_index in range(1, predicted_count + 1):
+        previous = scores[predicted_index - 1]
+        row: dict[int, float] = {}
+        row_back: dict[int, str] = {}
+        start, end = _evaluation_band_window(
+            predicted_index,
+            predicted_count,
+            golden_count,
+            reachability.get(predicted_index, ()),
+        )
+        for golden_index in range(start, end + 1):
+            best_score = float("-inf")
+            best_op = ""
+            if golden_index in previous:
+                best_score = previous[golden_index] + gap_score
+                best_op = "delete"
+            if golden_index > 0 and (golden_index - 1) in row:
+                insert = row[golden_index - 1] + gap_score
+                if insert > best_score:
+                    best_score = insert
+                    best_op = "insert"
+            if golden_index > 0 and (golden_index - 1) in previous:
+                similarity = _signature_similarity(
+                    predicted_signatures[predicted_index - 1],
+                    golden_signatures[golden_index - 1],
+                )
+                similarities[(predicted_index - 1, golden_index - 1)] = similarity
+                match = previous[golden_index - 1] + _cue_match_score_from_similarity(similarity)
+                if match > best_score:
+                    best_score = match
+                    best_op = "match"
+            if best_op:
+                row[golden_index] = best_score
+                row_back[golden_index] = best_op
+        scores.append(row)
+        back.append(row_back)
+
+    if golden_count not in scores[predicted_count]:
+        return _match_cues_by_content_unbanded(
+            predicted,
+            golden,
+            predicted_signatures,
+            golden_signatures,
+        )
+
+    pairs: list[_CueMatch] = []
+    predicted_index = predicted_count
+    golden_index = golden_count
+    while predicted_index > 0 or golden_index > 0:
+        op = back[predicted_index][golden_index]
+        if op == "match":
+            predicted_cue = predicted[predicted_index - 1]
+            golden_cue = golden[golden_index - 1]
+            pairs.append(
+                _CueMatch(
+                    predicted=predicted_cue,
+                    golden=golden_cue,
+                    similarity=similarities.get(
+                        (predicted_index - 1, golden_index - 1),
+                        _signature_similarity(
+                            predicted_signatures[predicted_index - 1],
+                            golden_signatures[golden_index - 1],
+                        ),
+                    ),
+                    is_exact=(
+                        predicted_signatures[predicted_index - 1]
+                        == golden_signatures[golden_index - 1]
+                    ),
+                )
+            )
+            predicted_index -= 1
+            golden_index -= 1
+        elif op == "delete":
+            predicted_index -= 1
+        elif op == "insert":
+            golden_index -= 1
+        else:
+            raise RuntimeError("cue evaluation alignment reached an empty operation")
+    pairs.reverse()
+    if _misses_unique_evaluation_pair(
+        pairs,
+        predicted,
+        golden,
+        predicted_signatures,
+        golden_signatures,
+    ):
+        return _match_cues_by_content_unbanded(
+            predicted,
+            golden,
+            predicted_signatures,
+            golden_signatures,
+        )
+    return pairs
+
+
+def _match_cues_by_content_unbanded(
+    predicted: list[Cue],
+    golden: list[Cue],
+    predicted_signatures: list[tuple[str, ...]],
+    golden_signatures: list[tuple[str, ...]],
+) -> list[_CueMatch]:
+    gap_score = -0.75
+    predicted_count = len(predicted)
+    golden_count = len(golden)
     scores = [[0.0] * (golden_count + 1) for _ in range(predicted_count + 1)]
     back = [[""] * (golden_count + 1) for _ in range(predicted_count + 1)]
+    similarities: dict[tuple[int, int], float] = {}
     for predicted_index in range(1, predicted_count + 1):
         scores[predicted_index][0] = scores[predicted_index - 1][0] + gap_score
         back[predicted_index][0] = "delete"
     for golden_index in range(1, golden_count + 1):
         scores[0][golden_index] = scores[0][golden_index - 1] + gap_score
         back[0][golden_index] = "insert"
-
     for predicted_index in range(1, predicted_count + 1):
         for golden_index in range(1, golden_count + 1):
-            match = scores[predicted_index - 1][golden_index - 1] + _cue_match_score(
-                predicted[predicted_index - 1],
-                golden[golden_index - 1],
+            similarity = _signature_similarity(
+                predicted_signatures[predicted_index - 1],
+                golden_signatures[golden_index - 1],
             )
+            similarities[(predicted_index - 1, golden_index - 1)] = similarity
+            match = scores[predicted_index - 1][golden_index - 1] + _cue_match_score_from_similarity(similarity)
             delete = scores[predicted_index - 1][golden_index] + gap_score
             insert = scores[predicted_index][golden_index - 1] + gap_score
             best_score = match
@@ -124,13 +269,15 @@ def _match_cues_by_content(predicted: list[Cue], golden: list[Cue]) -> list[_Cue
     while predicted_index > 0 or golden_index > 0:
         op = back[predicted_index][golden_index]
         if op == "match":
-            predicted_cue = predicted[predicted_index - 1]
-            golden_cue = golden[golden_index - 1]
             pairs.append(
                 _CueMatch(
-                    predicted=predicted_cue,
-                    golden=golden_cue,
-                    similarity=_cue_match_similarity(predicted_cue, golden_cue),
+                    predicted=predicted[predicted_index - 1],
+                    golden=golden[golden_index - 1],
+                    similarity=similarities[(predicted_index - 1, golden_index - 1)],
+                    is_exact=(
+                        predicted_signatures[predicted_index - 1]
+                        == golden_signatures[golden_index - 1]
+                    ),
                 )
             )
             predicted_index -= 1
@@ -145,14 +292,97 @@ def _match_cues_by_content(predicted: list[Cue], golden: list[Cue]) -> list[_Cue
     return pairs
 
 
+def _evaluation_band_window(
+    row: int,
+    predicted_count: int,
+    golden_count: int,
+    prior_centers: tuple[int, ...] = (),
+) -> tuple[int, int]:
+    if predicted_count <= 0:
+        return 0, golden_count
+    center = round(row * golden_count / predicted_count)
+    start = max(0, center - EVALUATION_BAND_MARGIN)
+    end = min(golden_count, center + EVALUATION_BAND_MARGIN)
+    if row == 0:
+        start = 0
+    if row == predicted_count:
+        end = golden_count
+    for prior_center in prior_centers:
+        start = min(start, max(0, prior_center - EVALUATION_BAND_MARGIN))
+        end = max(end, min(golden_count, prior_center + EVALUATION_BAND_MARGIN))
+    return start, end
+
+
+def _evaluation_unique_exact_pairs(
+    predicted_signatures: list[tuple[str, ...]],
+    golden_signatures: list[tuple[str, ...]],
+) -> list[tuple[int, int]]:
+    predicted_positions: dict[tuple[str, ...], list[int]] = {}
+    golden_positions: dict[tuple[str, ...], list[int]] = {}
+    for index, signature in enumerate(predicted_signatures):
+        if signature:
+            predicted_positions.setdefault(signature, []).append(index)
+    for index, signature in enumerate(golden_signatures):
+        if signature:
+            golden_positions.setdefault(signature, []).append(index)
+    pairs = sorted(
+        (predicted_indices[0], golden_positions[signature][0])
+        for signature, predicted_indices in predicted_positions.items()
+        if len(predicted_indices) == 1
+        and signature in golden_positions
+        and len(golden_positions[signature]) == 1
+    )
+    if any(left_golden >= right_golden for (_, left_golden), (_, right_golden) in zip(pairs, pairs[1:])):
+        return []
+    return pairs
+
+
+def _evaluation_reachability_centers(
+    predicted_signatures: list[tuple[str, ...]],
+    golden_signatures: list[tuple[str, ...]],
+) -> dict[int, tuple[int, ...]]:
+    centers: dict[int, set[int]] = {}
+    for predicted_index, golden_index in _evaluation_unique_exact_pairs(
+        predicted_signatures,
+        golden_signatures,
+    ):
+        centers.setdefault(predicted_index, set()).add(golden_index)
+        centers.setdefault(predicted_index + 1, set()).add(golden_index + 1)
+    return {row: tuple(sorted(values)) for row, values in centers.items()}
+
+
+def _misses_unique_evaluation_pair(
+    matches: list[_CueMatch],
+    predicted: list[Cue],
+    golden: list[Cue],
+    predicted_signatures: list[tuple[str, ...]],
+    golden_signatures: list[tuple[str, ...]],
+) -> bool:
+    expected = {
+        (predicted[predicted_index].index, golden[golden_index].index)
+        for predicted_index, golden_index in _evaluation_unique_exact_pairs(
+            predicted_signatures,
+            golden_signatures,
+        )
+    }
+    matched = {(match.predicted.index, match.golden.index) for match in matches if match.is_exact}
+    return not expected.issubset(matched)
+
+
 def _cue_match_score(predicted: Cue, golden: Cue) -> float:
     similarity = _cue_match_similarity(predicted, golden)
+    return _cue_match_score_from_similarity(similarity)
+
+
+def _cue_match_score_from_similarity(similarity: float) -> float:
     return 2.0 * similarity if similarity >= CUE_MATCH_THRESHOLD else -0.6
 
 
 def _cue_match_similarity(predicted: Cue, golden: Cue) -> float:
-    predicted_signature = _text_signature(predicted)
-    golden_signature = _text_signature(golden)
+    return _signature_similarity(_text_signature(predicted), _text_signature(golden))
+
+
+def _signature_similarity(predicted_signature: tuple[str, ...], golden_signature: tuple[str, ...]) -> float:
     if predicted_signature and predicted_signature == golden_signature:
         return 1.0
     if not predicted_signature or not golden_signature:
@@ -172,6 +402,7 @@ def _improv_detection_metrics(
     golden: list[Cue],
     flags: list[QCFlag],
     cue_alignment: list[_CueMatch],
+    golden_signatures: list[tuple[str, ...]],
     source: list[Cue] | None = None,
 ) -> dict[str, object]:
     by_predicted = {cue.index: cue for cue in predicted}
@@ -184,12 +415,18 @@ def _improv_detection_metrics(
         if cue_id in by_predicted
     }
     if source:
-        source_alignment = _match_cues_by_content(source or [], golden)
+        source_signatures = [_text_signature(cue) for cue in source]
+        source_alignment = _match_cues_by_content(
+            source,
+            golden,
+            predicted_signatures=source_signatures,
+            golden_signatures=golden_signatures,
+        )
         matched_golden_ids = {match.golden.index for match in source_alignment}
         changed_aligned_ids = {
             match.golden.index
             for match in source_alignment
-            if _text_signature(match.predicted) != _text_signature(match.golden)
+            if not match.is_exact
         }
         inserted_golden_ids = {cue.index for cue in golden if cue.index not in matched_golden_ids}
         actual_changed_ids = changed_aligned_ids | inserted_golden_ids
@@ -198,7 +435,7 @@ def _improv_detection_metrics(
             for predicted_id in flagged_change_ids
             if (match := aligned_by_predicted_id.get(predicted_id)) is not None
             and match.golden.index in actual_changed_ids
-            and _text_signature(match.predicted) == _text_signature(match.golden)
+            and match.is_exact
         }
         true_positives = len(true_positive_ids)
         false_positives = len(flagged_change_ids - true_positive_ids)
@@ -211,13 +448,13 @@ def _improv_detection_metrics(
         aligned_mismatch_ids = {
             match.predicted.index
             for match in cue_alignment
-            if _text_signature(match.predicted) != _text_signature(match.golden)
+            if not match.is_exact
         }
         true_positive_ids = {
             predicted_id
             for predicted_id in flagged_change_ids
             if (match := aligned_by_predicted_id.get(predicted_id)) is not None
-            and _text_signature(match.predicted) == _text_signature(match.golden)
+            and match.is_exact
         }
         true_positives = len(true_positive_ids)
         false_positives = len(flagged_change_ids - true_positive_ids)

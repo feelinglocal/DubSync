@@ -97,7 +97,19 @@ def generate_srt_from_audio(
         dollars_per_hour=asr_dollars_per_hour(provider, asr_config),
     )
     words = adapter.transcribe(audio_for_asr)
-    _write_json(episode_workdir / "asr.json", {"words": [word.model_dump() for word in words]})
+    flags: list[QCFlag] = list(adapter.last_repair_flags)
+    asr_metadata = {
+        "provider": provider,
+        "model": model,
+        "repair_flags": [flag.model_dump() for flag in adapter.last_repair_flags],
+    }
+    _write_json(
+        episode_workdir / "asr.json",
+        {
+            "words": [word.model_dump() for word in words],
+            "metadata": asr_metadata,
+        },
+    )
 
     generation_config = provider_config.get("generation", {})
     if not isinstance(generation_config, dict):
@@ -114,13 +126,13 @@ def generate_srt_from_audio(
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
     )
 
-    flags: list[QCFlag] = []
     if not no_llm:
         punctuation_adapter = punctuation_adapter_from_config(provider_config)
         if punctuation_adapter is not None:
             cues, punctuation_flags = apply_punctuation_pass(
                 cues,
                 punctuation_adapter,
+                source_cues=[],
                 scene_gap_seconds=_punctuation_scene_gap(provider_config),
                 max_chars_per_line=profile.max_chars_per_line,
                 max_lines_per_cue=profile.max_lines_per_cue,
@@ -156,6 +168,7 @@ def generate_srt_from_audio(
             "cues": [cue.model_dump() for cue in cues],
             "profile": profile.model_dump(),
             "constraints": constraints.model_dump(),
+            "asr": asr_metadata,
         },
     )
     report = write_qc_report(
@@ -165,6 +178,14 @@ def generate_srt_from_audio(
         flags,
         style_issues,
         cue_scores=cue_scores,
+        summary_metadata={
+            "fps": profile.fps,
+            "fps_source": "explicit" if fps is not None else "fallback",
+            "fps_detection_confident": fps is not None,
+            "asr_provider": provider,
+            "asr_model": model,
+            "asr_repair_count": len(adapter.last_repair_flags),
+        },
     )
     (episode_workdir / "cost.json").write_text(cost_meter.to_json(), encoding="utf-8")
     return TranscriptionResult(output_path, episode_workdir, cost_meter, report)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from .models import Cue, CueScore, QCFlag, StyleIssue
@@ -15,16 +16,27 @@ def write_qc_report(
     flags: list[QCFlag],
     style_issues: list[StyleIssue],
     cue_scores: list[CueScore] | None = None,
+    summary_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    ordered_flags = _sorted_flags(flags)
+    ordered_issues = _sorted_style_issues(style_issues)
+    all_findings = [*ordered_flags, *ordered_issues]
+    summary: dict[str, object] = {
+        **dict(summary_metadata or {}),
+        "cue_count": len(cues),
+        "flags": len(ordered_flags),
+        "style_violations": len(ordered_issues),
+        "flags_by_severity": _severity_counts(ordered_flags),
+        "style_issues_by_severity": _severity_counts(ordered_issues),
+        "error_count": sum(1 for item in all_findings if item.severity == "error"),
+        "warning_count": sum(1 for item in all_findings if item.severity == "warning"),
+        "info_count": sum(1 for item in all_findings if item.severity == "info"),
+    }
     payload: dict[str, object] = {
-        "summary": {
-            "cue_count": len(cues),
-            "flags": len(flags),
-            "style_violations": len(style_issues),
-        },
+        "summary": summary,
         "cue_scores": [score.model_dump() for score in cue_scores or []],
-        "flags": [flag.model_dump() for flag in flags],
-        "style_issues": [issue.model_dump() for issue in style_issues],
+        "flags": [flag.model_dump() for flag in ordered_flags],
+        "style_issues": [issue.model_dump() for issue in ordered_issues],
     }
     report_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     report_html_path.write_text(_render_html(payload), encoding="utf-8")
@@ -71,6 +83,7 @@ def _render_html(payload: dict[str, object]) -> str:
     for item in flags if isinstance(flags, list) else []:
         rows.append(
             "<tr>"
+            f"<td>{html.escape(str(item.get('severity', '')))}</td>"
             f"<td>{html.escape(str(item.get('kind', '')))}</td>"
             f"<td>{html.escape(str(item.get('cue_ids', '')))}</td>"
             f"<td>{_format_seconds(item.get('start'))}</td>"
@@ -85,6 +98,7 @@ def _render_html(payload: dict[str, object]) -> str:
     for item in issues if isinstance(issues, list) else []:
         issue_rows.append(
             "<tr>"
+            f"<td>{html.escape(str(item.get('severity', '')))}</td>"
             f"<td>{html.escape(str(item.get('kind', '')))}</td>"
             f"<td>{html.escape(str(item.get('cue_id', '')))}</td>"
             f"<td>{html.escape(str(item.get('message', '')))}</td>"
@@ -101,13 +115,31 @@ def _render_html(payload: dict[str, object]) -> str:
         "<h2>Cue Scores</h2><table><tr><th>Cue</th><th>CPS</th><th>Score</th><th>Source</th></tr>"
         + "".join(score_rows)
         + "</table>"
-        "<h2>Flags</h2><table><tr><th>Kind</th><th>Cues</th><th>Start</th><th>End</th>"
+        "<h2>Flags</h2><table><tr><th>Severity</th><th>Kind</th><th>Cues</th><th>Start</th><th>End</th>"
         "<th>Message</th><th>Confidence</th><th>Old Text</th><th>New Text</th></tr>"
         + "".join(rows)
-        + "</table><h2>Style Issues</h2><table><tr><th>Kind</th><th>Cue</th><th>Message</th></tr>"
+        + "</table><h2>Style Issues</h2><table><tr><th>Severity</th><th>Kind</th><th>Cue</th><th>Message</th></tr>"
         + "".join(issue_rows)
         + "</table></body></html>"
     )
+
+
+_SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+
+
+def _sorted_flags(flags: list[QCFlag]) -> list[QCFlag]:
+    return sorted(flags, key=lambda flag: _SEVERITY_RANK.get(flag.severity, 9))
+
+
+def _sorted_style_issues(issues: list[StyleIssue]) -> list[StyleIssue]:
+    return sorted(issues, key=lambda issue: _SEVERITY_RANK.get(issue.severity, 9))
+
+
+def _severity_counts(items: list[QCFlag] | list[StyleIssue]) -> dict[str, int]:
+    return {
+        severity: sum(1 for item in items if item.severity == severity)
+        for severity in ("error", "warning", "info")
+    }
 
 
 def _format_seconds(value: object) -> str:

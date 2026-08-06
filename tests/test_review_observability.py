@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 from dubsync.models import AdjudicationDecision, Cue, DivergenceSpan
 from dubsync.observability import name_spelling_inconsistency_flags, span_coverage_flags
 from dubsync.pipeline import (
     _generated_adlib_rejection_flag,
     _is_repetitive_generated_text,
+    _load_asr_artifact_with_repair,
 )
 from dubsync.srt_io import parse_srt_text
 
@@ -63,3 +66,37 @@ def test_span_coverage_flag_surfaces_compressed_replacement_without_reconciliati
     assert [flag.kind for flag in flags] == ["span_coverage_low"]
     assert flags[0].severity == "error"
     assert "35%" in flags[0].message
+
+
+def test_resume_asr_artifact_repairs_words_and_merges_persisted_flags(tmp_path):
+    artifact_path = tmp_path / "asr.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "", "start": 0.0, "end": 0.1},
+                    {"text": "beta", "start": 2.0, "end": 2.0},
+                    {"text": "alpha", "start": 1.0, "end": 1.5},
+                ],
+                "repair_flags": [
+                    {
+                        "kind": "word_stream_repaired",
+                        "cue_ids": [],
+                        "message": "Persisted provider repair.",
+                        "severity": "warning",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    words, flags = _load_asr_artifact_with_repair(artifact_path)
+
+    assert [word.text for word in words] == ["alpha", "beta"]
+    assert words[1].end > words[1].start
+    assert [flag.message for flag in flags] == [
+        "Persisted provider repair.",
+        "ASR resume artifact word stream was repaired before alignment: "
+        "1 blank dropped, 0 invalid dropped, 1 timing clamped, 2 reordered; 2 usable words remain.",
+    ]

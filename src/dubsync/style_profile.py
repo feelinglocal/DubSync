@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from math import ceil, floor, isclose
+from dataclasses import dataclass
+from math import ceil, floor
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -12,6 +13,22 @@ FPS_CANDIDATES = (23.976, 24.0, 25.0, 29.97, 30.0)
 _ROBUST_PROFILE_MIN_SAMPLE = 20
 _UPPER_STYLE_PERCENTILE = 0.95
 _LOWER_STYLE_TRIM_FRACTION = 0.05
+_FPS_CONFIDENT_MAX_ERROR_MS = 2.0
+_FPS_CONFIDENT_MIN_ADVANTAGE_MS = 0.25
+
+
+@dataclass(frozen=True)
+class FPSDetection:
+    fps: float
+    confident: bool
+    best_error_ms: float
+    runner_up_error_ms: float | None = None
+    detected_fps: float | None = None
+    fallback_fps: float | None = None
+
+    @property
+    def used_fallback(self) -> bool:
+        return not self.confident
 
 
 class StyleProfile(BaseModel):
@@ -71,17 +88,53 @@ def _candidate_error(timestamps: list[int], fps: float) -> float:
     errors = []
     for timestamp in timestamps:
         frame = round(timestamp / frame_ms)
-        floored = int(frame * frame_ms)
-        errors.append(abs(timestamp - floored))
+        snapped = round(frame * frame_ms)
+        errors.append(abs(timestamp - snapped))
     return sum(errors) / max(len(errors), 1)
 
 
 def detect_fps(cues: list[Cue]) -> float:
+    return detect_fps_with_confidence(cues).fps
+
+
+def detect_fps_with_confidence(cues: list[Cue], default: float = 30.0) -> FPSDetection:
+    if default <= 0:
+        raise ValueError("default FPS must be positive")
     timestamps = [time for cue in cues for time in (cue.start_ms, cue.end_ms)]
     if not timestamps:
-        return 30.0
-    best = min(FPS_CANDIDATES, key=lambda fps: _candidate_error(timestamps, fps))
-    return 30.0 if isclose(best, 29.97) and _candidate_error(timestamps, 30.0) <= 2 else float(best)
+        return FPSDetection(
+            fps=float(default),
+            confident=False,
+            best_error_ms=0.0,
+            runner_up_error_ms=None,
+            detected_fps=None,
+            fallback_fps=float(default),
+        )
+    scored = sorted(((_candidate_error(timestamps, fps), fps) for fps in FPS_CANDIDATES), key=lambda item: item[0])
+    best_error, best = scored[0]
+    runner_up_error = scored[1][0] if len(scored) > 1 else None
+    confident = (
+        best_error <= _FPS_CONFIDENT_MAX_ERROR_MS
+        and runner_up_error is not None
+        and runner_up_error - best_error >= _FPS_CONFIDENT_MIN_ADVANTAGE_MS
+    )
+    if not confident:
+        return FPSDetection(
+            fps=float(default),
+            confident=False,
+            best_error_ms=round(best_error, 3),
+            runner_up_error_ms=round(runner_up_error, 3) if runner_up_error is not None else None,
+            detected_fps=float(best),
+            fallback_fps=float(default),
+        )
+    return FPSDetection(
+        fps=float(best),
+        confident=True,
+        best_error_ms=round(best_error, 3),
+        runner_up_error_ms=round(runner_up_error, 3) if runner_up_error is not None else None,
+        detected_fps=float(best),
+        fallback_fps=None,
+    )
 
 
 def derive_style_profile(cues: list[Cue]) -> StyleProfile:

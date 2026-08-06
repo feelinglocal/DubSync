@@ -114,6 +114,16 @@ def test_punctuation_pass_keeps_restored_source_breaks_for_unchanged_cue_even_wh
     assert updated[0].lines == ["Drachen-Evolutionssystem", "besitze ich längst."]
 
 
+def test_punctuation_pass_allows_generation_without_source_cues():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hallo welt"])]
+    adapter = StaticPunctuationAdapter({1: "Hallo Welt."})
+
+    updated, flags = apply_punctuation_pass(cues, adapter, source_cues=[])
+
+    assert flags == []
+    assert updated[0].text == "Hallo Welt."
+
+
 def test_cli_sync_applies_fixture_punctuation_pass(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"

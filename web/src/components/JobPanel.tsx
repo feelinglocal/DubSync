@@ -14,6 +14,7 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
   const titleId = useId()
   const complete = job.status === 'complete'
   const failed = job.status === 'failed'
+  const fpsStatus = complete ? formatFpsStatus(job.result) : null
   return (
     <section className="job-panel" aria-live="polite" aria-labelledby={titleId}>
       <div className="job-summary">
@@ -25,6 +26,7 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
           {sourceName && <span className="job-source-name" id={titleId}>{sourceName}</span>}
           <strong>{complete ? `${job.result?.cue_count ?? 0} cues ready` : failed ? 'Job failed' : job.status === 'processing' ? 'Processing dialogue' : 'Waiting to start'}</strong>
           <span>{job.error || (complete ? 'Your result and QC files are ready.' : 'You can keep this page open while DubSync works.')}</span>
+          {fpsStatus && <span>{fpsStatus}</span>}
         </div>
         <span className="job-progress">{job.progress}%</span>
       </div>
@@ -48,4 +50,13 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
       )}
     </section>
   )
+}
+
+function formatFpsStatus(result: JobResponse['result']): string | null {
+  if (!result || typeof result.fps !== 'number' || !Number.isFinite(result.fps) || result.fps <= 0) return null
+  const fps = Number.isInteger(result.fps) ? result.fps.toString() : result.fps.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')
+  if (result.fps_source === 'explicit') return `${fps} fps selected`
+  if (result.fps_source === 'fallback' || result.fps_detection_confident === false) return `${fps} fps fallback`
+  if (result.fps_source === 'detected') return `${fps} fps detected`
+  return `${fps} fps`
 }

@@ -40,7 +40,7 @@ To deploy:
 
 1. Put this workspace in a real private Git repository and connect that repository to Render.
 2. Create a Blueprint from `render.yaml`.
-3. Enter `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. `GEMINI_API_KEY` is only needed for the optional Gemini alternate. Never commit `.env`.
+3. Enter `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. Never commit `.env`.
 4. Confirm `/api/health`, `/api/config` reports `jobs_available: true`, and the deployed commit matches the release SHA.
 5. Run one short paid-provider generate job through the web UI. The fixture-backed E2E suite covers sync behavior without provider spend.
 
@@ -128,8 +128,8 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 | ASR fallback | AssemblyAI | Implemented optional adapter | `asr.provider: assemblyai`, `model: universal-3-pro` or `universal-2`, `speaker_labels: true` |
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
-| LLM default | OpenAI GPT-5.6 Luna | Implemented optional adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
-| LLM alt | Gemini | Implemented optional adapter with audio-snippet support | `llm.provider: gemini`, `model: gemini-3.5-flash` |
+| LLM text default | OpenAI GPT-5.6 Luna | Implemented adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
+| LLM adjudication default | Gemini 3.5 Flash-Lite | Implemented adapter with audio-snippet support | `llm.adjudication.provider: gemini`, `model: gemini-3.5-flash-lite`, `thinking_level: high` |
 | LLM alt | Anthropic | Implemented optional adapter | `llm.provider: anthropic` |
 | Test/offline | Fixture decisions | Implemented | `llm.provider: fixture` |
 | Precision verify | Fixture forced alignment | Implemented | `forced_alignment.fixture_path: path/to.forced-align.json` |
@@ -174,13 +174,15 @@ llm:
   model: gpt-5.6-luna
   timeout_seconds: 90
   max_retries: 2
-  # Optional per-pass overrides inherit provider/api key unless changed:
+  # Per-pass overrides inherit the base settings unless provider/model changes:
   adjudication:
+    provider: gemini
+    model: gemini-3.5-flash-lite
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
-    reasoning_effort: high
+    thinking_level: high
     audio_snippet_double_check:
-      enabled: false
+      enabled: true
       pad_seconds: 2.0
       max_duration_seconds: 20.0
   punctuation:
@@ -281,11 +283,11 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Downloaded SRT names preserve the validated source stem and append `-dubsync-synced.srt`.
 - ElevenLabs Scribe v2 ASR forwards configured keyterms and character names as `keyterms` while still requesting word timestamps and diarization.
 - Opt-in `--live` pytest smoke tests for OpenAI GPT-5.6 Luna, Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
-- OpenAI LLM calls use the Responses API `responses.parse` structured-output path with `store: false`, bounded SDK retries/timeouts, refusal and incomplete-response handling, and explicit `reasoning.effort`. The production default is `gpt-5.6-luna`: adjudication uses `reasoning_effort: high`; punctuation and speaker mapping use `reasoning_effort: medium`.
+- OpenAI LLM calls use the Responses API `responses.parse` structured-output path with `store: false`, bounded SDK retries/timeouts, refusal and incomplete-response handling, and explicit `reasoning.effort`. The production text-only default is `gpt-5.6-luna`: punctuation and speaker mapping use `reasoning_effort: medium`.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
 - Gemini thinking-level controls are wired through `thinking_level` (`minimal`, `low`, `medium`, `high`) using `thinking_config.thinking_level`; punctuation defaults to `medium` when using Gemini through `llm.punctuation`.
 - Gemini explicit context-cache reuse is wired through `cached_content`, which may be set at `llm.cached_content` or overridden per pass. DubSync reuses an existing Gemini cache resource but does not create or delete remote caches automatically.
-- Optional adjudication audio-snippet double-checks extract padded WAV snippets from the local audio, persist `audio_snippets.json`, include snippet hashes in the LLM cache key, and send Gemini inline audio parts with `types.Part.from_bytes` when `llm.adjudication.audio_snippet_double_check.enabled: true`.
+- Default adjudication audio-snippet checks extract padded WAV snippets from the local audio, persist `audio_snippets.json`, include snippet hashes in the LLM cache key, and send Gemini inline audio parts with `types.Part.from_bytes` when `llm.adjudication.audio_snippet_double_check.enabled: true`.
 - Improv replacement path with QC flags and acoustic timing from spoken ASR words.
 - ASR-only ad-lib spans can be accepted by adjudication and inserted as acoustically timed cues, while far-tail and highly repetitive music-like candidates are held as error-level QC findings instead of captioned.
 - Exported SRT files are sequentially renumbered in playback order, including ad-lib cues inserted between existing source cues.
@@ -350,7 +352,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and real GPT-5.6 Luna structured-output smokes pass at the production `medium` punctuation and `high` adjudication reasoning levels. The historical approved production ElevenLabs plus Gemini smoke also completed. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
+Current status: the CLI and commercial web MVP are implemented, the default Render domain is healthy, fixture-backed automated tests cover both customer workflows, and real GPT-5.6 Luna structured-output smokes pass for text-only language passes. The historical approved production ElevenLabs plus Gemini smoke also completed. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks.
 
 Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 
@@ -377,7 +379,7 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 
 ### Top 3 Risks
 
-1. Live-provider drift: GPT-5.6 Luna medium/high structured calls and one historical ElevenLabs plus Gemini production generate path have live evidence; Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run. Every provider/model rollout still requires a short web-path smoke on its deployed commit.
+1. Live-provider drift: GPT-5.6 Luna `medium` text-only structured calls and one historical ElevenLabs plus Gemini production generate path have live evidence. The restored Gemini 3.5 Flash-Lite `high` audio-adjudication route, Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run. Every provider/model rollout still requires a short web-path smoke on its deployed commit.
 2. Real-episode quality: synthetic fixtures prove timing, improv replacement, overlap, dropped-line, and source-error paths, but the PLAN targets need a golden episode set to measure cue-start MAE, improv precision/recall, and review burden on actual delivered material.
 3. Language quality beyond generic handling: CJK/full-width behavior is covered, but production quality for Japanese/Thai/Chinese/Korean and code-switching will benefit from language-specific tokenization and per-language house-style samples.
 
@@ -390,8 +392,8 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 - Deterministic energy VAD is wired; optional Silero VAD is available with energy fallback, but production quality should be validated on a golden set.
 - CJK/Thai/Hangul/Japanese text now uses character-level tokenization and visual-width line checks; language-specific morphological tokenizers remain a future quality upgrade.
 - Live LLM speaker-to-character inference is implemented through the configured LLM adapter, but was not smoke-tested against real provider responses in this workspace.
-- Live Gemini punctuation completed in the historical production web smoke. Live GPT-5.6 Luna punctuation (`medium`) and adjudication (`high`) structured-output calls completed on 2026-08-06; Anthropic usage metering remains covered only by deterministic response-shape tests.
-- Audio-snippet double-checks are implemented for Gemini inline audio, but were not live-smoke-tested against the real Gemini API in this workspace. Automatic Gemini context-cache creation/deletion remains unimplemented because it creates third-party resources and can incur storage billing; provide `cached_content` to reuse a cache created outside DubSync.
+- Live Gemini punctuation completed in the historical production web smoke. Live GPT-5.6 Luna punctuation (`medium`) and text-only adjudication (`high`) structured-output calls completed on 2026-08-06 before adjudication was restored to Gemini for audio understanding; Anthropic usage metering remains covered only by deterministic response-shape tests.
+- Audio-snippet double-checks are implemented for Gemini inline audio, but the restored Gemini 3.5 Flash-Lite `high` audio-adjudication route has not been paid-live-smoke-tested in this workspace. Automatic Gemini context-cache creation/deletion remains unimplemented because it creates third-party resources and can incur storage billing; provide `cached_content` to reuse a cache created outside DubSync.
 - GPT-5.6 Luna token pricing has a built-in `$1/M` input and `$6/M` output default; Anthropic token prices still require explicit config overrides.
 - The commercial web workspace supports submission, status, and downloads; a browser cue editor remains intentionally out of scope until customer QC behavior proves it is needed.
 

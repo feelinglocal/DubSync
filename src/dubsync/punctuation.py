@@ -39,9 +39,19 @@ def apply_punctuation_pass(
     scene_gap_seconds: float = 4.0,
     max_chars_per_line: int | None = None,
     max_lines_per_cue: int | None = None,
+    source_cues: list[Cue] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
+    source_by_id = {
+        cue.index: cue for cue in (cues if source_cues is None else source_cues)
+    }
+    prompt_cues = [
+        cue.with_lines(source_by_id[cue.index].lines)
+        if _source_words_unchanged(cue, source_by_id.get(cue.index))
+        else cue
+        for cue in cues
+    ]
     proposed: dict[int, str] = {}
-    for batch in _scene_batches(cues, scene_gap_seconds):
+    for batch in _scene_batches(prompt_cues, scene_gap_seconds):
         proposed.update(adapter.punctuate(batch))
     if not proposed:
         return cues, []
@@ -50,7 +60,7 @@ def apply_punctuation_pass(
     flags: list[QCFlag] = []
     for cue in cues:
         next_text = proposed.get(cue.index)
-        if next_text is None or next_text == cue.text:
+        if next_text is None:
             updated.append(cue)
             continue
         try:
@@ -71,18 +81,35 @@ def apply_punctuation_pass(
             )
             continue
 
-        lines = _restore_source_line_breaks(cue.lines, next_text)
+        source_cue = source_by_id.get(cue.index)
+        source_words_unchanged = _source_words_unchanged(cue, source_cue)
+        lines = (
+            _restore_source_line_breaks(source_cue.lines, next_text)
+            if source_words_unchanged
+            else (next_text.splitlines() or [next_text])
+        )
         width_exceeded = max_chars_per_line is not None and any(
             display_width(line) > max_chars_per_line for line in lines
         )
         line_count_exceeded = max_lines_per_cue is not None and len(lines) > max_lines_per_cue
-        if width_exceeded or line_count_exceeded:
+        restored_matches_source_structure = source_words_unchanged and (
+            _line_word_boundaries(lines) == _line_word_boundaries(source_cue.lines)
+        )
+        preserve_source_breaks = restored_matches_source_structure and not line_count_exceeded
+        if (width_exceeded or line_count_exceeded) and not preserve_source_breaks:
             plain_text = next_text.replace("\n", " ")
             lines = [plain_text]
             if max_chars_per_line is not None:
                 lines = wrap_visual_width(plain_text, max_chars_per_line) or [plain_text]
         updated.append(cue.with_lines(lines))
     return updated, flags
+
+
+def _source_words_unchanged(cue: Cue, source_cue: Cue | None) -> bool:
+    return source_cue is not None and (
+        _word_freeze_signature(source_cue.plain_text)
+        == _word_freeze_signature(cue.plain_text)
+    )
 
 
 def _scene_batches(cues: list[Cue], scene_gap_seconds: float) -> list[list[Cue]]:

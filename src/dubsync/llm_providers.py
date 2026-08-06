@@ -57,7 +57,7 @@ _LLM_PASS_CONFIG_KEYS = {
 
 _GEMINI_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-_ADJUDICATION_PROMPT_VERSION = "adjudication-v3-luna-evidence-boundary"
+_ADJUDICATION_PROMPT_VERSION = "adjudication-v4-audio-evidence-boundary"
 _PUNCTUATION_PROMPT_VERSION = "punctuation-v2-preserve-editorial-structure"
 _SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v2-context-only"
 

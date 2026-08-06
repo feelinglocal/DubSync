@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
 
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 
 from .cache import CacheKey, JsonDiskCache
 from .cost import CostMeter, audio_seconds
-from .models import Word
+from .models import QCFlag, Word
 
 
 class ProviderError(RuntimeError):
@@ -51,17 +52,33 @@ class CachedASRAdapter:
         self.cost_meter = cost_meter
         self.cost_provider = cost_provider or model
         self.dollars_per_hour = dollars_per_hour
+        self.last_repair_flags: list[QCFlag] = []
 
     def transcribe(self, audio_path: Path) -> list[Word]:
+        self.last_repair_flags = []
         key = CacheKey.from_audio(audio_path, self.model, self.params)
         cached = self.cache.read(key)
         if cached is not None:
             cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
-            return _validated_word_stream(cached_words, source="ASR cache")
-        words = _validated_word_stream(self.inner.transcribe(audio_path), source="ASR provider")
+            words, cache_repair_flags = _repair_word_stream(cached_words, source="ASR cache")
+            persisted_flags = _cached_repair_flags(cached)
+            self.last_repair_flags = [*persisted_flags, *cache_repair_flags]
+            return words
+
+        provider_words = self.inner.transcribe(audio_path)
         if self.cost_meter is not None and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
             self.cost_meter.add_audio(self.cost_provider, audio_seconds(audio_path), self.dollars_per_hour)
-        self.cache.write(key, {"words": [word.model_dump() for word in words]})
+        words, repair_flags = _repair_word_stream(provider_words, source="ASR provider")
+        self.last_repair_flags = repair_flags
+        self.cache.write(
+            key,
+            {
+                "words": [word.model_dump() for word in words],
+                "metadata": {
+                    "repair_flags": [flag.model_dump() for flag in repair_flags],
+                },
+            },
+        )
         return words
 
 
@@ -336,30 +353,121 @@ def _field(item: object, name: str, default: object = None) -> object:
     return getattr(item, name, default)
 
 
+@dataclass(frozen=True)
+class _RepairCounts:
+    blank_dropped: int = 0
+    invalid_dropped: int = 0
+    timing_clamped: int = 0
+    reordered: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.blank_dropped + self.invalid_dropped + self.timing_clamped + self.reordered
+
+
 def _validated_word_stream(items: object, *, source: str) -> list[Word]:
-    if isinstance(items, (str, bytes, dict)) or not isinstance(items, Iterable):
+    words, _flags = _repair_word_stream(items, source=source)
+    return words
+
+
+def _cached_repair_flags(cached: object) -> list[QCFlag]:
+    if not isinstance(cached, dict):
+        return []
+    metadata = cached.get("metadata", {})
+    raw_flags = metadata.get("repair_flags", []) if isinstance(metadata, dict) else []
+    if not isinstance(raw_flags, list):
+        raw_flags = []
+    if not raw_flags:
+        raw_flags = cached.get("repair_flags", [])
+    if not isinstance(raw_flags, list):
+        return []
+    flags: list[QCFlag] = []
+    for item in raw_flags:
+        try:
+            flags.append(QCFlag.model_validate(item))
+        except (TypeError, ValueError, ValidationError):
+            continue
+    return flags
+
+
+def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
+    if isinstance(items, (str, bytes, dict, Word)) or not isinstance(items, Iterable):
         raise ProviderError(f"{source} returned an invalid word stream.")
 
-    words: list[Word] = []
-    previous_start = -math.inf
+    repaired: list[tuple[int, Word]] = []
+    blank_dropped = 0
+    invalid_dropped = 0
+    timing_clamped = 0
+    total_items = 0
     for index, item in enumerate(items):
+        total_items += 1
         try:
             word = Word.model_validate(item)
-        except (TypeError, ValueError, ValidationError) as exc:
-            raise ProviderError(f"{source} returned an invalid word at index {index}.") from exc
+        except (TypeError, ValueError, ValidationError):
+            invalid_dropped += 1
+            continue
 
         if not word.text.strip():
-            raise ProviderError(f"{source} returned blank word text at index {index}.")
+            blank_dropped += 1
+            continue
         if not math.isfinite(word.start) or not math.isfinite(word.end):
-            raise ProviderError(f"{source} returned non-finite word timing at index {index}.")
-        if word.start < 0 or word.end <= word.start:
-            raise ProviderError(f"{source} returned invalid word timing at index {index}.")
-        if word.start < previous_start:
-            raise ProviderError(f"{source} returned words out of chronological order at index {index}.")
+            invalid_dropped += 1
+            continue
 
-        words.append(word)
-        previous_start = word.start
-    return words
+        start = max(0.0, float(word.start))
+        end = float(word.end)
+        if end <= start:
+            end = start + 0.001
+            timing_clamped += 1
+        elif start != word.start:
+            timing_clamped += 1
+        next_word = word.model_copy(update={"text": word.text.strip(), "start": start, "end": end})
+        repaired.append((index, next_word))
+
+    if not repaired:
+        raise ProviderError(f"{source} returned no usable words after validation.")
+
+    malformed_dropped = blank_dropped + invalid_dropped
+    malformed_limit = min(25, max(1, math.ceil(total_items * 0.05)))
+    if malformed_dropped > malformed_limit:
+        raise ProviderError(
+            f"{source} returned a malformed fraction too large to repair "
+            f"({malformed_dropped}/{total_items} words; maximum {malformed_limit})."
+        )
+
+    sorted_repaired = sorted(repaired, key=lambda item: (item[1].start, item[0]))
+    original_order = [original_index for original_index, _word in repaired]
+    sorted_order = [original_index for original_index, _word in sorted_repaired]
+    reordered = sum(1 for before, after in zip(original_order, sorted_order, strict=True) if before != after)
+    words = [word for _index, word in sorted_repaired]
+    counts = _RepairCounts(
+        blank_dropped=blank_dropped,
+        invalid_dropped=invalid_dropped,
+        timing_clamped=timing_clamped,
+        reordered=reordered,
+    )
+    flags = _word_stream_repair_flags(source, counts, len(words))
+    return words, flags
+
+
+def _word_stream_repair_flags(source: str, counts: _RepairCounts, usable_words: int) -> list[QCFlag]:
+    if counts.total == 0:
+        return []
+    parts = [
+        f"{counts.blank_dropped} blank dropped",
+        f"{counts.invalid_dropped} invalid dropped",
+        f"{counts.timing_clamped} timing clamped",
+        f"{counts.reordered} reordered",
+    ]
+    return [
+        QCFlag(
+            kind="word_stream_repaired",
+            cue_ids=[],
+            message=f"{source} word stream was repaired before alignment: {', '.join(parts)}; {usable_words} usable words remain.",
+            severity="warning",
+            confidence=None,
+        )
+    ]
 
 
 def _asr_keyterms(asr_config: dict[str, object]) -> list[str]:

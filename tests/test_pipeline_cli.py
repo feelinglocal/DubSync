@@ -1626,6 +1626,74 @@ def test_cli_sync_resume_align_reuses_asr_artifact(tmp_path, shifted_srt_text, s
     assert parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))[0].start_ms == 1000
 
 
+def test_cli_sync_resume_align_repairs_legacy_asr_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    broken_providers_path = tmp_path / "broken-providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    resumed_out_path = tmp_path / "episode.resumed.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(shifted_srt_text, encoding="utf-8")
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(json.dumps({"words": shifted_wordstream}), encoding="utf-8")
+    providers_path.write_text(yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}), encoding="utf-8")
+    broken_providers_path.write_text(yaml.safe_dump({"asr": {"provider": "not-real"}}), encoding="utf-8")
+
+    first = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--no-llm",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+
+    asr_path = workdir / "episode" / "asr.json"
+    legacy_words = [
+        {"text": "hello", "start": 1.00, "end": 1.20, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "general", "start": 2.00, "end": 2.33, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "there", "start": 1.23, "end": 1.23, "confidence": 0.97, "speaker_id": "A"},
+        {"text": "kenobi", "start": 2.36, "end": 2.80, "confidence": 0.99, "speaker_id": "A"},
+    ]
+    asr_path.write_text(json.dumps({"words": legacy_words}), encoding="utf-8")
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(resumed_out_path),
+            "--providers",
+            str(broken_providers_path),
+            "--workdir",
+            str(workdir),
+            "--resume",
+            "align",
+            "--no-llm",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    repair_flags = [flag for flag in report["flags"] if flag["kind"] == "word_stream_repaired"]
+    assert repair_flags
+    assert "ASR resume artifact" in repair_flags[0]["message"]
+    assert parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))[0].start_ms == 1000
+
+
 def test_cli_sync_resume_asr_uses_ingest_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"

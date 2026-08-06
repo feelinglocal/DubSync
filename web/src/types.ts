@@ -56,6 +56,9 @@ export interface PublicConfig {
 export interface JobResult {
   cue_count: number
   cost_usd: number
+  fps?: number
+  fps_source?: 'detected' | 'fallback' | 'explicit'
+  fps_detection_confident?: boolean
 }
 
 export interface JobResponse {

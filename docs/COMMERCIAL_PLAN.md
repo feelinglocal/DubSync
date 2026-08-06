@@ -67,7 +67,8 @@ flowchart LR
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
     F --> E["ElevenLabs Scribe v2"]
-    W --> G["OpenAI GPT-5.6 Luna language passes"]
+    W --> G["OpenAI GPT-5.6 Luna punctuation and speaker-mapping passes"]
+    W --> H["Gemini 3.5 Flash-Lite adjudication with audio snippets"]
     W --> C["Deterministic DubSync core"]
     C --> D
     D -->|"token-protected result"| B
@@ -106,7 +107,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only. `GEMINI_API_KEY` is optional and needed only when a job uses the Gemini alternate.
+- Secrets: `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -136,7 +137,7 @@ For a single-file or multi-file order, quote `max(total source-audio minutes × 
 Current provider price anchors:
 
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
-- Gemini 3.5 Flash paid tier: $1.50 per million input tokens and $9 per million output tokens.
+- Gemini 3.5 Flash-Lite paid tier: $0.30 per million input tokens and $2.50 per million output tokens.
 - Every job already writes measured provider cost to `cost.json`; this is the source of truth for repricing.
 
 Margin rule:
@@ -189,7 +190,7 @@ Before accepting paid customer media:
 
 - Keep the GitHub repository connected to the Render service.
 - Validate the Blueprint against Render's published schema.
-- Set paid ElevenLabs and OpenAI credentials in Render; set Gemini credentials only when enabling the optional alternate.
+- Set paid ElevenLabs, OpenAI, and Gemini credentials in Render.
 - Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
 - Run one short live generate job through the web route for each provider or model change.
 - Keep fixture-backed sync and generate browser tests green on every release.
@@ -226,5 +227,8 @@ Do not log transcript text, API keys, job tokens, uploaded filenames, or raw pro
 - Render persistent disks: https://render.com/docs/disks
 - Render Blueprint specification: https://render.com/docs/blueprint-spec
 - ElevenLabs API pricing: https://elevenlabs.io/pricing/api
+- Gemini 3.5 Flash-Lite capabilities and stable model ID: https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
+- Gemini thinking levels: https://ai.google.dev/gemini-api/docs/generate-content/thinking
+- Gemini audio understanding and inline audio input: https://ai.google.dev/gemini-api/docs/generate-content/audio
 - Gemini API pricing: https://ai.google.dev/gemini-api/docs/pricing
 - Gemini data retention: https://ai.google.dev/gemini-api/docs/zdr

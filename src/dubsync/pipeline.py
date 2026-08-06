@@ -28,10 +28,11 @@ from .llm_providers import (
     punctuation_adapter_from_config,
 )
 from .models import AdjudicationDecision, AlignmentResult, AudioSnippet, Cue, CueContext, DivergenceSpan, ForcedAlignmentCue, QCFlag, Word
+from .observability import name_spelling_inconsistency_flags, span_coverage_flags
 from .output_order import finalize_cues_for_output
 from .overlap import apply_overlap_policy
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
-from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
+from .providers import CachedASRAdapter, _repair_word_stream, adapter_from_config, apply_asr_language
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .recue import rebuild_cues
@@ -41,7 +42,7 @@ from .silence import silence_flags_for_cues
 from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
-from .style_profile import StyleProfile, derive_style_profile, detect_fps
+from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
 from .timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 from .tokenize import alphanumeric_signature
 from .vad import (
@@ -70,6 +71,7 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "overlap_detected",
         "speaker_transition_gap_inserted",
         "timing_refined",
+        "vad_provider_fallback",
     }
 )
 
@@ -102,11 +104,26 @@ def sync_episode(
     cost_meter = CostMeter()
     cues = _source_cues_for_run(srt_path, episode_workdir, resume_stage)
     cues, source_order_flags = sort_cues_chronologically(cues)
-    fps_override_flags = _fps_override_mismatch_flags(cues, fps)
+    fps_detection = detect_fps_with_confidence(cues)
+    fps_override_flags = _fps_override_mismatch_flags(cues, fps, fps_detection)
+    fps_detection_flags = (
+        []
+        if style_path is not None
+        else _fps_detection_flags(cues, fps, fps_detection)
+    )
     style_artifact_path = episode_workdir / "style_profile.json"
-    profile = load_style_profile(style_path) or _load_style_profile_for_resume(style_artifact_path, resume_stage) or derive_style_profile(cues)
+    profile = (
+        load_style_profile(style_path)
+        or _load_style_profile_for_resume(style_artifact_path, resume_stage)
+        or derive_style_profile(cues)
+    )
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
+    fps_summary_metadata = _fps_summary_metadata(
+        profile,
+        fps_detection,
+        explicitly_configured=fps is not None or style_path is not None,
+    )
     if _should_write_ingest_artifacts(resume_stage, episode_workdir, style_path, fps):
         _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues]})
         _write_json(style_artifact_path, profile.model_dump())
@@ -116,7 +133,8 @@ def sync_episode(
         no_llm = True
     audio_for_asr = audio_path
     if _should_load_asr_artifact(resume_stage):
-        words = _load_asr_artifact(episode_workdir / "asr.json")
+        asr_artifact_path = episode_workdir / "asr.json"
+        words, asr_repair_flags = _load_asr_artifact_with_repair(asr_artifact_path)
         audio_for_asr = _resume_audio_for_verify(audio_path, episode_workdir)
     else:
         asr_config = provider_config.get("asr", {}) if isinstance(provider_config, dict) else {}
@@ -145,7 +163,14 @@ def sync_episode(
             dollars_per_hour=dollars_per_hour,
         )
         words = adapter.transcribe(audio_for_asr)
-        _write_json(episode_workdir / "asr.json", {"words": [word.model_dump() for word in words]})
+        asr_repair_flags = list(adapter.last_repair_flags)
+        _write_json(
+            episode_workdir / "asr.json",
+            {
+                "words": [word.model_dump() for word in words],
+                "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
+            },
+        )
 
     if resume_stage == "verify":
         rebuilt = _load_rebuild_artifact(episode_workdir / "rebuild.json")
@@ -160,9 +185,18 @@ def sync_episode(
             rebuilt=rebuilt,
             words=words,
             alignment=_load_alignment_artifact(episode_workdir / "align.json"),
-            flags=_load_report_flags(episode_workdir / "qc_report.json"),
+            flags=[
+                *_load_report_flags(episode_workdir / "qc_report.json"),
+                *source_order_flags,
+                *fps_override_flags,
+                *fps_detection_flags,
+                *asr_repair_flags,
+                *detect_source_errors(cues),
+            ],
             cost_meter=cost_meter,
             include_dropped_line_flags=False,
+            decisions=_load_adjudication_artifact(episode_workdir / "adjudicate.json")[0],
+            fps_summary_metadata=fps_summary_metadata,
         )
 
     if resume_stage in {"adjudicate", "rebuild"}:
@@ -172,7 +206,14 @@ def sync_episode(
         alignment = _alignment_with_adjudication_context(alignment, cues)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
 
-    flags: list[QCFlag] = [*source_order_flags, *fps_override_flags, *detect_source_errors(cues)]
+    flags: list[QCFlag] = [
+        *source_order_flags,
+        *fps_override_flags,
+        *fps_detection_flags,
+        *asr_repair_flags,
+        *alignment.flags,
+        *detect_source_errors(cues),
+    ]
     decisions: list[AdjudicationDecision] = []
     if resume_stage == "rebuild":
         decisions, adjudication_flags = _load_adjudication_artifact(episode_workdir / "adjudicate.json")
@@ -296,6 +337,7 @@ def sync_episode(
                 provider_config,
                 max_chars_per_line=profile.max_chars_per_line,
                 max_lines_per_cue=profile.max_lines_per_cue,
+                source_cues=cues,
             )
             if cached_punctuation is None:
                 rebuilt, punctuation_flags = apply_punctuation_pass(
@@ -304,6 +346,7 @@ def sync_episode(
                     scene_gap_seconds=_punctuation_scene_gap_seconds(provider_config),
                     max_chars_per_line=profile.max_chars_per_line,
                     max_lines_per_cue=profile.max_lines_per_cue,
+                    source_cues=cues,
                 )
                 _write_cached_punctuation(
                     episode_workdir,
@@ -313,6 +356,7 @@ def sync_episode(
                     punctuation_flags,
                     max_chars_per_line=profile.max_chars_per_line,
                     max_lines_per_cue=profile.max_lines_per_cue,
+                    source_cues=cues,
                 )
                 _record_llm_usage_events(cost_meter, punctuation_adapter, provider_config, pass_name="punctuation")
             else:
@@ -332,6 +376,8 @@ def sync_episode(
         flags=flags,
         cost_meter=cost_meter,
         include_dropped_line_flags=True,
+        decisions=decisions,
+        fps_summary_metadata=fps_summary_metadata,
     )
 
 
@@ -389,10 +435,17 @@ def _should_write_ingest_artifacts(
     return not (episode_workdir / "ingest.json").exists()
 
 
-def _fps_override_mismatch_flags(cues: list[Cue], fps: float | None) -> list[QCFlag]:
+def _fps_override_mismatch_flags(
+    cues: list[Cue],
+    fps: float | None,
+    detection: FPSDetection | None = None,
+) -> list[QCFlag]:
     if fps is None or not cues:
         return []
-    detected = detect_fps(cues)
+    detection = detection or detect_fps_with_confidence(cues)
+    if not detection.confident:
+        return []
+    detected = detection.fps
     # Treat the broadcast-equivalent pairs 23.976/24 and 29.97/30 as the same grid.
     if abs(float(fps) - detected) <= 0.05:
         return []
@@ -411,6 +464,45 @@ def _fps_override_mismatch_flags(cues: list[Cue], fps: float | None) -> list[QCF
     ]
 
 
+def _fps_detection_flags(
+    cues: list[Cue],
+    fps: float | None,
+    detection: FPSDetection | None = None,
+) -> list[QCFlag]:
+    if fps is not None or not cues:
+        return []
+    detection = detection or detect_fps_with_confidence(cues)
+    if detection.confident:
+        return []
+    return [
+        QCFlag(
+            kind="fps_detection_low_confidence",
+            cue_ids=[],
+            message=(
+                f"Source SRT timestamps are not confidently frame-snapped; defaulting to {detection.fps:g} fps "
+                f"(best mean snap error {detection.best_error_ms:g} ms)."
+            ),
+            severity="warning",
+            start=cues[0].start_ms / 1000.0,
+            end=cues[-1].end_ms / 1000.0,
+        )
+    ]
+
+
+def _fps_summary_metadata(
+    profile: StyleProfile,
+    detection: FPSDetection,
+    *,
+    explicitly_configured: bool,
+) -> dict[str, object]:
+    source = "explicit" if explicitly_configured else ("detected" if detection.confident else "fallback")
+    return {
+        "fps": float(profile.fps),
+        "fps_source": source,
+        "fps_detection_confident": bool(detection.confident),
+    }
+
+
 def _load_style_profile_for_resume(path: Path, resume_stage: str | None) -> StyleProfile | None:
     if not _should_load_ingest_artifact(resume_stage):
         return None
@@ -423,10 +515,34 @@ def _load_ingest_artifact(path: Path) -> list[Cue]:
 
 
 def _load_asr_artifact(path: Path) -> list[Word]:
+    words, _flags = _load_asr_artifact_with_repair(path)
+    return words
+
+
+def _load_asr_artifact_with_repair(path: Path) -> tuple[list[Word], list[QCFlag]]:
     if not path.exists():
         raise FileNotFoundError(f"Cannot resume without ASR artifact: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return [Word.model_validate(item) for item in payload.get("words", [])]
+    raw_words = payload.get("words", []) if isinstance(payload, dict) else payload
+    words, repair_flags = _repair_word_stream(raw_words, source="ASR resume artifact")
+    return words, [*_load_asr_repair_flags_from_payload(payload, path), *repair_flags]
+
+
+def _load_asr_repair_flags(path: Path) -> list[QCFlag]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return _load_asr_repair_flags_from_payload(payload, path)
+
+
+def _load_asr_repair_flags_from_payload(payload: object, path: Path) -> list[QCFlag]:
+    if not isinstance(payload, dict):
+        return []
+    raw_flags = payload.get("repair_flags")
+    if raw_flags is None:
+        metadata = payload.get("metadata", {})
+        raw_flags = metadata.get("repair_flags", []) if isinstance(metadata, dict) else []
+    if not isinstance(raw_flags, list):
+        raise ValueError(f"Invalid ASR repair flags artifact: {path}")
+    return [QCFlag.model_validate(item) for item in raw_flags]
 
 
 def _load_alignment_artifact(path: Path) -> AlignmentResult:
@@ -506,6 +622,7 @@ def _load_cached_punctuation(
     *,
     max_chars_per_line: int,
     max_lines_per_cue: int,
+    source_cues: list[Cue] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]] | None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     payload = cache.read(
@@ -514,6 +631,7 @@ def _load_cached_punctuation(
             provider_config,
             max_chars_per_line=max_chars_per_line,
             max_lines_per_cue=max_lines_per_cue,
+            source_cues=source_cues,
         )
     )
     if payload is None:
@@ -535,6 +653,7 @@ def _write_cached_punctuation(
     *,
     max_chars_per_line: int,
     max_lines_per_cue: int,
+    source_cues: list[Cue] | None = None,
 ) -> None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     cache.write(
@@ -543,6 +662,7 @@ def _write_cached_punctuation(
             provider_config,
             max_chars_per_line=max_chars_per_line,
             max_lines_per_cue=max_lines_per_cue,
+            source_cues=source_cues,
         ),
         {
             "cues": [cue.model_dump() for cue in output_cues],
@@ -601,6 +721,7 @@ def _punctuation_cache_key(
     *,
     max_chars_per_line: int,
     max_lines_per_cue: int,
+    source_cues: list[Cue] | None = None,
 ) -> CacheKey:
     llm_config = llm_config_for_pass(provider_config, "punctuation")
     provider = str(llm_config.get("provider", "gemini")).lower()
@@ -614,6 +735,11 @@ def _punctuation_cache_key(
             "max_lines_per_cue": max_lines_per_cue,
         },
         "cues": [cue.model_dump(mode="json") for cue in cues],
+        "source_break_cues": (
+            [cue.model_dump(mode="json") for cue in source_cues]
+            if source_cues is not None
+            else None
+        ),
     }
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))
 
@@ -822,7 +948,10 @@ def _run_verify_stage(
     flags: list[QCFlag],
     cost_meter: CostMeter,
     include_dropped_line_flags: bool,
+    decisions: list[AdjudicationDecision] | None = None,
+    fps_summary_metadata: dict[str, object] | None = None,
 ) -> PipelineResult:
+    decisions = list(decisions or [])
     flags = _without_stale_verify_flags(flags)
     forced_alignments: list[ForcedAlignmentCue] = []
     effective_words = words
@@ -843,6 +972,15 @@ def _run_verify_stage(
     speech_activity_adapter = speech_activity_adapter_from_config(provider_config)
     if speech_activity_adapter is not None:
         speech_regions = speech_activity_adapter.detect(audio_for_asr)
+        if getattr(speech_activity_adapter, "fallback_used", False):
+            flags.append(
+                QCFlag(
+                    kind="vad_provider_fallback",
+                    cue_ids=[],
+                    message="Configured VAD provider fell back to energy-based speech activity detection.",
+                    severity="warning",
+                )
+            )
         _write_json(episode_workdir / "vad.json", {"regions": [region.model_dump() for region in speech_regions]})
         effective_words, word_clamp_flags = clamp_asr_word_durations(
             words,
@@ -904,6 +1042,8 @@ def _run_verify_stage(
 
     rebuilt, profanity_flags = apply_german_profanity_censorship(rebuilt, source_cues)
     flags.extend(profanity_flags)
+    flags.extend(span_coverage_flags(source_cues, rebuilt, alignment.divergence_spans, decisions))
+    flags.extend(name_spelling_inconsistency_flags(source_cues, rebuilt))
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(flags)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -917,6 +1057,7 @@ def _run_verify_stage(
         flags,
         style_issues,
         cue_scores,
+        summary_metadata=fps_summary_metadata,
     )
     _write_json(
         episode_workdir / "verify.json",
@@ -1179,6 +1320,13 @@ def _generated_adlib_rejection_flag(
     final_text: str,
     source_margin_seconds: float = 5.0,
 ) -> QCFlag | None:
+    if not source_cues or (span.start is None and span.end is None):
+        return None
+    source_start = min(cue.start_ms for cue in source_cues) / 1000.0
+    source_end = max(cue.end_ms for cue in source_cues) / 1000.0
+    span_start = span.start if span.start is not None else span.end
+    span_end = span.end if span.end is not None else span.start
+    assert span_start is not None and span_end is not None
     if _is_repetitive_generated_text(final_text):
         return QCFlag(
             kind="adlib_rejected_repetitive_content",
@@ -1189,13 +1337,6 @@ def _generated_adlib_rejection_flag(
             start=span.start,
             end=span.end,
         )
-    if not source_cues or (span.start is None and span.end is None):
-        return None
-    source_start = min(cue.start_ms for cue in source_cues) / 1000.0
-    source_end = max(cue.end_ms for cue in source_cues) / 1000.0
-    span_start = span.start if span.start is not None else span.end
-    span_end = span.end if span.end is not None else span.start
-    assert span_start is not None and span_end is not None
     if span_end >= source_start - source_margin_seconds and span_start <= source_end + source_margin_seconds:
         return None
     return QCFlag(
@@ -1211,7 +1352,7 @@ def _generated_adlib_rejection_flag(
 
 def _is_repetitive_generated_text(text: str) -> bool:
     tokens = alphanumeric_signature(text)
-    if len(tokens) < 8 or len(set(tokens)) / len(tokens) > 0.6:
+    if len(tokens) < 12 or len(set(tokens)) / len(tokens) > 0.35:
         return False
     trigrams = [tuple(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
     return len(set(trigrams)) < len(trigrams)
