@@ -334,7 +334,7 @@ def _align_tokens_detailed(
     last_run: _AlignmentRun | None = None
     band_limited = False
     remaining_cells = ALIGNMENT_CELL_BUDGET
-    for margin in _retry_margins(band_margin, max(n, m)):
+    for attempt_index, margin in enumerate(_retry_margins(band_margin, max(n, m))):
         cell_count = _band_cell_count(n, m, margin, reachability)
         if cell_count > remaining_cells:
             band_limited = True
@@ -353,7 +353,7 @@ def _align_tokens_detailed(
             continue
         run = _AlignmentRun(
             ops=ops,
-            unbanded_fallback=margin >= max(n, m) and margin != band_margin,
+            unbanded_fallback=attempt_index > 0 and margin >= max(n, m),
         )
         last_run = run
         if margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
