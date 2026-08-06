@@ -178,6 +178,9 @@ describe('DubSync workspace', () => {
     const user = userEvent.setup()
     render(<App />)
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    const fpsSelect = screen.getByLabelText('Frame rate')
+    expect(fpsSelect).toHaveValue('auto')
+    expect(within(fpsSelect).getByRole('option', { name: 'Auto (detect from SRT)' })).toBeInTheDocument()
     const firstAudio = new File(['audio-1'], '001.wav', { type: 'audio/wav' })
     const secondAudio = new File(['audio-2'], '002.wav', { type: 'audio/wav' })
     const firstSubtitle = new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' })
@@ -194,10 +197,35 @@ describe('DubSync workspace', () => {
     expect(options?.method).toBe('POST')
     expect((body.getAll('audio') as File[]).map((file) => file.name)).toEqual(['001.wav', '002.wav'])
     expect((body.getAll('subtitle') as File[]).map((file) => file.name)).toEqual(['001.srt', '002.srt'])
+    expect(body.get('fps')).toBeNull()
     expect(await screen.findByText('001')).toBeVisible()
     expect(screen.getByText('3 cues ready')).toBeVisible()
     expect(screen.getByText('002')).toBeVisible()
     expect(screen.getByText('4 cues ready')).toBeVisible()
+  })
+
+  it('sends a sync FPS only when the user explicitly selects an override', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.selectOptions(screen.getByLabelText('Frame rate'), '24')
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [, options] = fetchMock.mock.calls[1]
+    expect((options?.body as FormData).get('fps')).toBe('24')
   })
 
   it('uses the selected child token when downloading a batch result', async () => {
@@ -496,6 +524,7 @@ describe('DubSync workspace', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     const [, options] = fetchMock.mock.calls[1]
     expect((options?.body as FormData).get('mode')).toBe('generate')
+    expect((options?.body as FormData).get('fps')).toBe('30')
     expect((options?.body as FormData).get('subtitle')).toBeNull()
     expect(JSON.parse(String((options?.body as FormData).get('style')))).toEqual({ source: 'preset', preset: 'standard' })
     expect(await screen.findByText('12 cues ready')).toBeVisible()

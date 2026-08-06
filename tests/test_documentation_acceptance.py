@@ -96,31 +96,32 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     config = yaml.safe_load(Path("providers.example.yaml").read_text(encoding="utf-8"))
     example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
 
+    assert config["llm"]["provider"] == "openai"
+    assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
+    assert config["llm"]["adjudication"]["reasoning_effort"] == "high"
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is False
-    assert config["llm"]["punctuation"]["model"] == "gemini-3.5-flash-lite"
-    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
-    assert config["llm"]["speaker_mapping"]["model"] == "gemini-3.5-flash-lite"
-    assert "thinking_level" not in config["llm"]["speaker_mapping"]
-    assert "cached_content: cachedContents/your-episode-context-cache" in example_text
+    assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
+    assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
+    assert "OPENAI_API_KEY" in example_text
 
 
-def test_production_flash_lite_passes_use_3_5_and_preserve_thinking_levels():
+def test_production_luna_passes_use_requested_reasoning_efforts():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
-    assert config["llm"]["adjudication"]["thinking_level"] == "high"
-    assert config["llm"]["punctuation"]["model"] == "gemini-3.5-flash-lite"
-    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
-    assert config["llm"]["speaker_mapping"]["model"] == "gemini-3.5-flash-lite"
-    assert "thinking_level" not in config["llm"]["speaker_mapping"]
+    assert config["llm"]["provider"] == "openai"
+    assert config["llm"]["model"] == "gpt-5.6-luna"
+    assert config["llm"]["adjudication"]["reasoning_effort"] == "high"
+    assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
+    assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
 
 
-def test_documented_configuration_uses_3_5_flash_lite():
+def test_documented_configuration_uses_gpt_5_6_luna_default():
     readme = Path("README.md").read_text(encoding="utf-8")
     plan = Path("PLAN.md").read_text(encoding="utf-8")
 
-    assert readme.count("model: gemini-3.5-flash-lite") == 2
-    assert "**Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`" in plan
+    assert "model: gpt-5.6-luna" in readme
+    assert "**OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`" in plan
     assert "Gemini " + "3.1 Flash-Lite" not in plan
 
 
@@ -149,13 +150,14 @@ def test_readme_names_remaining_unimplemented_plan_provider_controls():
         assert expected in readme
 
 
-def test_readme_documents_gemini_thinking_level_controls():
+def test_readme_documents_luna_reasoning_effort_controls():
     readme = Path("README.md").read_text(encoding="utf-8")
 
     for expected in (
-        "Gemini thinking-level controls",
-        "thinking_config.thinking_level",
-        "punctuation defaults to `medium`",
+        "OpenAI LLM calls use",
+        "reasoning.effort",
+        "gpt-5.6-luna",
+        "punctuation and speaker mapping use `reasoning_effort: medium`",
     ):
         assert expected in readme
 
@@ -197,3 +199,4 @@ def test_cloud_dependencies_require_medium_thinking_compatible_google_genai():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert "google-genai>=1.56,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
+    assert "openai>=2.44,<3" in pyproject["project"]["optional-dependencies"]["cloud"]

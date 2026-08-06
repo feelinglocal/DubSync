@@ -45,6 +45,28 @@ def test_punctuation_pass_preserves_valid_proposed_line_breaks():
     assert updated[0].lines == ["Hello,", "there."]
 
 
+def test_punctuation_pass_restores_source_line_breaks_when_model_flattens_them():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Alessia hör auf", "mit dem Quatsch"])]
+    adapter = StaticPunctuationAdapter({1: "Alessia, hör auf mit dem Quatsch!"})
+
+    updated, flags = apply_punctuation_pass(cues, adapter)
+
+    assert flags == []
+    assert updated[0].lines == ["Alessia, hör auf", "mit dem Quatsch!"]
+
+
+def test_punctuation_pass_rejects_model_added_german_dialogue_quotes():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Wer bist du?"])]
+    adapter = StaticPunctuationAdapter({1: "„Wer bist du?“"})
+
+    updated, flags = apply_punctuation_pass(cues, adapter)
+
+    assert updated == cues
+    assert [flag.kind for flag in flags] == ["invalid_punctuation_change"]
+    assert flags[0].severity == "error"
+    assert "quotation mark signature changed" in flags[0].message
+
+
 def test_punctuation_pass_reflows_an_overlong_model_line():
     cues = [Cue(index=1, start_ms=0, end_ms=2700, lines=["Hello this is the Dubsync", "Cloud test"])]
     adapter = StaticPunctuationAdapter({1: "Hello, this is the Dubsync Cloud test."})

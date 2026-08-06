@@ -10,7 +10,13 @@ import pytest
 from dubsync.audio import AudioNormalizeError, normalize_audio, probe_audio_duration
 from dubsync.cache import JsonDiskCache
 from dubsync.models import Word
-from dubsync.providers import CachedASRAdapter, WhisperXAdapter, adapter_from_config
+from dubsync.providers import (
+    AssemblyAIAdapter,
+    CachedASRAdapter,
+    ProviderError,
+    WhisperXAdapter,
+    adapter_from_config,
+)
 
 
 class CountingAdapter:
@@ -20,6 +26,15 @@ class CountingAdapter:
     def transcribe(self, audio_path):
         self.calls += 1
         return [Word(text="cached", start=0.0, end=0.2, confidence=0.9, speaker_id="A")]
+
+
+class StaticWordAdapter:
+    def __init__(self, words: list[Word]):
+        self.words = words
+
+    def transcribe(self, audio_path):
+        del audio_path
+        return list(self.words)
 
 
 def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
@@ -190,6 +205,71 @@ def test_cached_asr_adapter_avoids_second_provider_call(tmp_path):
     assert [word.text for word in first] == ["cached"]
     assert [word.text for word in second] == ["cached"]
     assert inner.calls == 1
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        [Word.model_construct(text="   ", start=0.0, end=0.2)],
+        [Word.model_construct(text="negative", start=-0.1, end=0.2)],
+        [Word.model_construct(text="zero", start=0.4, end=0.4)],
+        [
+            Word.model_construct(text="later", start=0.8, end=1.0),
+            Word.model_construct(text="earlier", start=0.2, end=0.4),
+        ],
+    ],
+    ids=["empty-text", "negative-start", "non-positive-duration", "out-of-order"],
+)
+def test_cached_asr_boundary_rejects_invalid_provider_word_streams(tmp_path, words):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    cache_dir = tmp_path / "cache"
+    adapter = CachedASRAdapter(
+        StaticWordAdapter(words),
+        JsonDiskCache(cache_dir),
+        model="fixture",
+        params={},
+    )
+
+    with pytest.raises(ProviderError):
+        adapter.transcribe(audio)
+
+    assert list(cache_dir.glob("*.json")) == []
+
+
+def test_assemblyai_adapter_raises_for_terminal_error_status(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+
+    transcript = SimpleNamespace(
+        status="error",
+        error="provider rejected the transcription",
+        words=[
+            SimpleNamespace(
+                text="must-not-be-returned",
+                start=0,
+                end=100,
+                confidence=0.99,
+                speaker="A",
+            )
+        ],
+    )
+
+    class FakeTranscriber:
+        def transcribe(self, path, config):
+            del path, config
+            return transcript
+
+    fake_assemblyai = SimpleNamespace(
+        settings=SimpleNamespace(api_key=None),
+        TranscriptStatus=SimpleNamespace(error="error"),
+        TranscriptionConfig=lambda **kwargs: kwargs,
+        Transcriber=FakeTranscriber,
+    )
+    monkeypatch.setitem(sys.modules, "assemblyai", fake_assemblyai)
+
+    with pytest.raises(ProviderError):
+        AssemblyAIAdapter(api_key="test-key").transcribe(audio)
 
 
 def test_elevenlabs_adapter_passes_configured_keyterms_to_scribe_v2(tmp_path, monkeypatch):

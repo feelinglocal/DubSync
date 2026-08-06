@@ -35,6 +35,24 @@ def test_profile_derivation_matches_plan_house_style(sample_srt_path):
     assert profile.cue_count == 68
 
 
+def test_profile_derivation_uses_robust_limits_instead_of_single_outliers():
+    cues = [
+        Cue(
+            index=index + 1,
+            start_ms=index * 1000,
+            end_ms=index * 1000 + (100 if index == 0 else 500),
+            lines=["x" * (48 if index == 0 else 26)],
+        )
+        for index in range(20)
+    ]
+
+    profile = derive_style_profile(cues)
+
+    assert 26 <= profile.max_chars_per_line < 48
+    assert 0.1 < profile.min_cue_dur <= 0.5
+    assert profile.observed_min_duration == 0.1
+
+
 def test_snap_ceil_never_returns_before_fractional_millisecond_input():
     profile = StyleProfile(fps=30.0)
 

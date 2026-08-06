@@ -104,3 +104,40 @@ def test_refine_cues_to_speech_activity_does_not_undo_next_cue_cap_for_min_durat
     assert refined[0].end_ms <= refined[1].start_ms
     assert refined[0].end_ms == 1100
     assert flags[0].kind == "timing_refined"
+
+
+def test_refine_cues_to_speech_activity_does_not_silently_emit_a_subminimum_cue():
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5)
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=500, lines=["previous speech"]),
+        Cue(index=2, start_ms=1000, end_ms=1050, lines=["short"]),
+        Cue(index=3, start_ms=1100, end_ms=1600, lines=["next speech"]),
+    ]
+
+    refined, flags = refine_cues_to_speech_activity(
+        cues,
+        [
+            SpeechRegion(start=0.0, end=0.5),
+            SpeechRegion(start=1.0, end=1.05),
+            SpeechRegion(start=1.1, end=1.6),
+        ],
+        profile,
+        BoundaryRefinementConfig(max_end_extension_ms=300),
+    )
+
+    target = next(cue for cue in refined if cue.index == 2)
+    previous = next(cue for cue in refined if cue.index == 1)
+    following = next(cue for cue in refined if cue.index == 3)
+    attained_floor_without_clipping_neighbors = (
+        target.duration_ms >= int(profile.min_cue_dur * 1000)
+        and target.start_ms >= previous.end_ms
+        and target.end_ms <= following.start_ms
+    )
+    explicit_failure = any(
+        flag.kind == "min_duration_unattainable"
+        and flag.severity == "error"
+        and target.index in flag.cue_ids
+        for flag in flags
+    )
+
+    assert attained_floor_without_clipping_neighbors or explicit_failure

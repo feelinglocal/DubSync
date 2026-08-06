@@ -78,18 +78,20 @@ def _post_batch(
     subtitle_files: list[tuple[str, bytes]],
     *,
     mode: str = "sync",
-    fps: float = 30,
+    fps: float | str | None = 30,
     language: str = "auto",
     style: str = "standard",
 ):
+    data = {
+        "mode": mode,
+        "language": language,
+        "style": style,
+    }
+    if fps is not None:
+        data["fps"] = str(fps)
     return client.post(
         "/api/batches",
-        data={
-            "mode": mode,
-            "fps": str(fps),
-            "language": language,
-            "style": style,
-        },
+        data=data,
         files=_multipart(audio_files, subtitle_files),
     )
 
@@ -382,6 +384,85 @@ def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selecti
     assert all(job.fps == 25 for job in captured)
     assert all(job.language == "id" for job in captured)
     assert len({job.style for job in captured}) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "fps_field", "expected_fps"),
+    [
+        ("sync", None, None),
+        ("sync", "", None),
+        ("sync", 24, 24.0),
+        ("generate", None, 30.0),
+        ("generate", "", 30.0),
+        ("generate", 25, 25.0),
+    ],
+)
+def test_batch_jobs_use_auto_fps_only_for_sync_without_an_explicit_override(
+    tmp_path,
+    mode: str,
+    fps_field: float | str | None,
+    expected_fps: float | None,
+):
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path), processor=processor)
+    audio_files = [("one.wav", b"one"), ("two.wav", b"two")]
+    subtitle_files = (
+        [("one.srt", SRT_BYTES), ("two.srt", SRT_BYTES)]
+        if mode == "sync"
+        else []
+    )
+
+    with TestClient(app) as client:
+        response = _post_batch(
+            client,
+            audio_files,
+            subtitle_files,
+            mode=mode,
+            fps=fps_field,
+        )
+
+    assert response.status_code == 202
+    assert len(captured) == 2
+    assert [job.fps for job in captured] == [expected_fps, expected_fps]
+
+
+@pytest.mark.parametrize(
+    ("fps_field", "expected_detail"),
+    [
+        ("not-a-frame-rate", "Invalid fps field."),
+        ("26", "Unsupported frame rate."),
+    ],
+)
+def test_batch_rejects_an_invalid_explicit_fps_without_queueing(
+    tmp_path,
+    fps_field: str,
+    expected_detail: str,
+):
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path), processor=processor)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            data={"mode": "sync", "fps": fps_field},
+            files=_multipart(
+                [("one.wav", b"one"), ("two.wav", b"two")],
+                [("one.srt", SRT_BYTES), ("two.srt", SRT_BYTES)],
+            ),
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": expected_detail}
+    assert captured == []
 
 
 def test_generate_batch_accepts_one_shared_sample_style_srt(tmp_path):

@@ -266,6 +266,11 @@ def test_punctuation_prompt_includes_speaker_and_character_labels():
 
     assert prompt["cues"][0]["speaker_id"] == "SPEAKER_00"
     assert prompt["cues"][0]["character"] == "Luna"
+    assert prompt["prompt_version"].startswith("punctuation-")
+    instructions = "\n".join(prompt["instructions"])
+    assert "Preserve every cue ID" in instructions
+    assert "Preserve the source line-break positions" in instructions
+    assert "Do not add, remove, or restyle quotation marks" in instructions
 
 
 def test_gemini_adjudication_prompt_uses_configured_confidence_gate(monkeypatch):
