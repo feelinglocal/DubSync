@@ -40,6 +40,33 @@ class StaticWordAdapter:
         return list(self.words)
 
 
+class GeneratorWordAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, audio_path):
+        del audio_path
+        self.calls += 1
+        return (
+            word
+            for word in [
+                Word(text="generated", start=0.0, end=0.2, confidence=0.9, speaker_id="A")
+            ]
+        )
+
+
+class InvalidThenValidAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def transcribe(self, audio_path):
+        del audio_path
+        self.calls += 1
+        if self.calls == 1:
+            return "not-a-word-stream"
+        return [Word(text="valid", start=0.0, end=0.2, confidence=0.9)]
+
+
 def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
     source = tmp_path / "in.mp3"
     dest = tmp_path / "out.wav"
@@ -310,6 +337,45 @@ def test_cached_asr_records_cost_and_caches_raw_unusable_response_before_validat
         adapter.transcribe(audio)
 
     assert len(meter.items) == 1
+
+
+def test_cached_asr_raw_cache_does_not_consume_generator_provider_stream(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    inner = GeneratorWordAdapter()
+    adapter = CachedASRAdapter(
+        inner,
+        JsonDiskCache(tmp_path / "cache"),
+        model="fixture",
+        params={},
+    )
+
+    first = adapter.transcribe(audio)
+    second = adapter.transcribe(audio)
+
+    assert [word.text for word in first] == ["generated"]
+    assert [word.text for word in second] == ["generated"]
+    assert inner.calls == 1
+
+
+def test_cached_asr_invalid_stream_type_does_not_poison_cache(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    inner = InvalidThenValidAdapter()
+    adapter = CachedASRAdapter(
+        inner,
+        JsonDiskCache(tmp_path / "cache"),
+        model="fixture",
+        params={},
+    )
+
+    with pytest.raises(ProviderError, match="invalid word stream"):
+        adapter.transcribe(audio)
+
+    words = adapter.transcribe(audio)
+
+    assert [word.text for word in words] == ["valid"]
+    assert inner.calls == 2
 
 
 def test_cached_asr_boundary_still_rejects_empty_repaired_stream(tmp_path):

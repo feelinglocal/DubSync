@@ -32,7 +32,12 @@ from .observability import name_spelling_inconsistency_flags, span_coverage_flag
 from .output_order import finalize_cues_for_output
 from .overlap import apply_overlap_policy
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
-from .providers import CachedASRAdapter, _repair_word_stream, adapter_from_config, apply_asr_language
+from .providers import (
+    CachedASRAdapter,
+    adapter_from_config,
+    apply_asr_language,
+    repair_word_stream,
+)
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .recue import rebuild_cues
@@ -524,7 +529,7 @@ def _load_asr_artifact_with_repair(path: Path) -> tuple[list[Word], list[QCFlag]
         raise FileNotFoundError(f"Cannot resume without ASR artifact: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     raw_words = payload.get("words", []) if isinstance(payload, dict) else payload
-    words, repair_flags = _repair_word_stream(raw_words, source="ASR resume artifact")
+    words, repair_flags = repair_word_stream(raw_words, source="ASR resume artifact")
     return words, [*_load_asr_repair_flags_from_payload(payload, path), *repair_flags]
 
 
@@ -1320,13 +1325,6 @@ def _generated_adlib_rejection_flag(
     final_text: str,
     source_margin_seconds: float = 5.0,
 ) -> QCFlag | None:
-    if not source_cues or (span.start is None and span.end is None):
-        return None
-    source_start = min(cue.start_ms for cue in source_cues) / 1000.0
-    source_end = max(cue.end_ms for cue in source_cues) / 1000.0
-    span_start = span.start if span.start is not None else span.end
-    span_end = span.end if span.end is not None else span.start
-    assert span_start is not None and span_end is not None
     if _is_repetitive_generated_text(final_text):
         return QCFlag(
             kind="adlib_rejected_repetitive_content",
@@ -1337,6 +1335,13 @@ def _generated_adlib_rejection_flag(
             start=span.start,
             end=span.end,
         )
+    if not source_cues or (span.start is None and span.end is None):
+        return None
+    source_start = min(cue.start_ms for cue in source_cues) / 1000.0
+    source_end = max(cue.end_ms for cue in source_cues) / 1000.0
+    span_start = span.start if span.start is not None else span.end
+    span_end = span.end if span.end is not None else span.start
+    assert span_start is not None and span_end is not None
     if span_end >= source_start - source_margin_seconds and span_start <= source_end + source_margin_seconds:
         return None
     return QCFlag(

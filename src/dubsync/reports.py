@@ -18,7 +18,7 @@ def write_qc_report(
     cue_scores: list[CueScore] | None = None,
     summary_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    ordered_flags = _sorted_flags(flags)
+    ordered_flags = _sorted_flags(flags, cues)
     ordered_issues = _sorted_style_issues(style_issues)
     all_findings = [*ordered_flags, *ordered_issues]
     summary: dict[str, object] = {
@@ -127,8 +127,29 @@ def _render_html(payload: dict[str, object]) -> str:
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 
 
-def _sorted_flags(flags: list[QCFlag]) -> list[QCFlag]:
-    return sorted(flags, key=lambda flag: _SEVERITY_RANK.get(flag.severity, 9))
+def _sorted_flags(flags: list[QCFlag], cues: list[Cue]) -> list[QCFlag]:
+    cue_starts = {cue.index: cue.start_ms / 1000.0 for cue in cues}
+    return [
+        flag
+        for _original_index, flag in sorted(
+            enumerate(flags),
+            key=lambda item: _flag_sort_key(item[0], item[1], cue_starts),
+        )
+    ]
+
+
+def _flag_sort_key(
+    original_index: int,
+    flag: QCFlag,
+    cue_starts: dict[int, float],
+) -> tuple[int, float, int, int]:
+    cue_id = min(flag.cue_ids) if flag.cue_ids else 1_000_000_000
+    cue_position = min(
+        (cue_starts[flag_cue_id] for flag_cue_id in flag.cue_ids if flag_cue_id in cue_starts),
+        default=float("inf"),
+    )
+    position = flag.start if flag.start is not None else cue_position
+    return _SEVERITY_RANK.get(flag.severity, 9), position, cue_id, original_index
 
 
 def _sorted_style_issues(issues: list[StyleIssue]) -> list[StyleIssue]:

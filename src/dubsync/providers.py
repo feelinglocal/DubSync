@@ -60,25 +60,36 @@ class CachedASRAdapter:
         cached = self.cache.read(key)
         if cached is not None:
             cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
-            words, cache_repair_flags = _repair_word_stream(cached_words, source="ASR cache")
+            words, cache_repair_flags = repair_word_stream(cached_words, source="ASR cache")
             persisted_flags = _cached_repair_flags(cached)
             self.last_repair_flags = [*persisted_flags, *cache_repair_flags]
+            if _is_raw_provider_cache(cached):
+                self.cache.write(key, _validated_word_cache_payload(words, self.last_repair_flags))
             return words
 
         provider_words = self.inner.transcribe(audio_path)
-        if self.cost_meter is not None and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
+        if (
+            self.cost_meter is not None
+            and self.dollars_per_hour is not None
+            and self.dollars_per_hour > 0
+        ):
             self.cost_meter.add_audio(self.cost_provider, audio_seconds(audio_path), self.dollars_per_hour)
-        words, repair_flags = _repair_word_stream(provider_words, source="ASR provider")
-        self.last_repair_flags = repair_flags
+        cacheable_words = _cacheable_word_items(provider_words)
+        if cacheable_words is None:
+            words, repair_flags = repair_word_stream(provider_words, source="ASR provider")
+            self.last_repair_flags = repair_flags
+            self.cache.write(key, _validated_word_cache_payload(words, repair_flags))
+            return words
         self.cache.write(
             key,
             {
-                "words": [word.model_dump() for word in words],
-                "metadata": {
-                    "repair_flags": [flag.model_dump() for flag in repair_flags],
-                },
+                "words": cacheable_words,
+                "metadata": {"raw_provider_response": True},
             },
         )
+        words, repair_flags = repair_word_stream(cacheable_words, source="ASR provider")
+        self.last_repair_flags = repair_flags
+        self.cache.write(key, _validated_word_cache_payload(words, repair_flags))
         return words
 
 
@@ -366,7 +377,7 @@ class _RepairCounts:
 
 
 def _validated_word_stream(items: object, *, source: str) -> list[Word]:
-    words, _flags = _repair_word_stream(items, source=source)
+    words, _flags = repair_word_stream(items, source=source)
     return words
 
 
@@ -390,7 +401,7 @@ def _cached_repair_flags(cached: object) -> list[QCFlag]:
     return flags
 
 
-def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
+def repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
     if isinstance(items, (str, bytes, dict, Word)) or not isinstance(items, Iterable):
         raise ProviderError(f"{source} returned an invalid word stream.")
 
@@ -428,7 +439,7 @@ def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list
         raise ProviderError(f"{source} returned no usable words after validation.")
 
     malformed_dropped = blank_dropped + invalid_dropped
-    malformed_limit = min(25, max(1, math.ceil(total_items * 0.05)))
+    malformed_limit = max(1, math.ceil(total_items * 0.05))
     if malformed_dropped > malformed_limit:
         raise ProviderError(
             f"{source} returned a malformed fraction too large to repair "
@@ -448,6 +459,40 @@ def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list
     )
     flags = _word_stream_repair_flags(source, counts, len(words))
     return words, flags
+
+
+def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
+    """Compatibility alias for callers outside the package that used the old private name."""
+
+    return repair_word_stream(items, source=source)
+
+
+def _cacheable_word_items(items: object) -> list[dict[str, object] | None] | None:
+    if isinstance(items, (str, bytes, dict, Word)) or not isinstance(items, Iterable):
+        return None
+    cached: list[dict[str, object] | None] = []
+    for item in items:
+        try:
+            cached.append(Word.model_validate(item).model_dump())
+        except (TypeError, ValueError, ValidationError):
+            cached.append(None)
+    return cached
+
+
+def _is_raw_provider_cache(cached: object) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    metadata = cached.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("raw_provider_response") is True
+
+
+def _validated_word_cache_payload(words: list[Word], flags: list[QCFlag]) -> dict[str, object]:
+    return {
+        "words": [word.model_dump() for word in words],
+        "metadata": {
+            "repair_flags": [flag.model_dump() for flag in flags],
+        },
+    }
 
 
 def _word_stream_repair_flags(source: str, counts: _RepairCounts, usable_words: int) -> list[QCFlag]:

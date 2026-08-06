@@ -55,6 +55,20 @@ def test_name_spelling_inconsistency_flags_source_observed_near_match_without_ch
     assert "Deanna" in flags[0].message
 
 
+def test_name_spelling_inconsistency_preserves_sentence_state_across_cue_boundaries():
+    source = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nIch sehe\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nDeanna.\n\n"
+        "3\n00:00:02,000 --> 00:00:03,000\nIch kenne\n\n"
+        "4\n00:00:03,000 --> 00:00:04,000\nDeanna.\n\n"
+    )
+    output = parse_srt_text("1\n00:00:00,000 --> 00:00:01,000\nIch sehe Diana.\n\n")
+
+    flags = name_spelling_inconsistency_flags(source, output)
+
+    assert [flag.kind for flag in flags] == ["name_spelling_inconsistency"]
+
+
 def test_near_match_to_lowercase_source_word_is_labeled_word_substitution_not_name():
     source = parse_srt_text(
         "1\n00:00:00,000 --> 00:00:01,000\nWir gehen nach Hause.\n\n"

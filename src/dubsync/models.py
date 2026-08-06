@@ -130,6 +130,7 @@ class AlignmentDiagnostics(BaseModel):
     transform_offset_seconds: float | None = None
     transform_anchor_count: int = Field(default=0, ge=0)
     unbanded_fallback: bool = False
+    band_limited: bool = False
 
 
 class AlignmentResult(BaseModel):

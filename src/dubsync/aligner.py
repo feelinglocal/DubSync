@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from statistics import median
 
@@ -23,10 +24,16 @@ from .tokenize import SRTToken, normalized_words, tokenize_cues
 MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
+ALIGNMENT_RETRY_MARGINS = (64, 256, 1024)
+ALIGNMENT_CELL_BUDGET = 2_000_000
 NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
+_BACK_NONE = 0
+_BACK_MATCH = 1
+_BACK_DELETE = 2
+_BACK_INSERT = 3
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,7 @@ class _TimingPriors:
 class _AlignmentRun:
     ops: list[_Op]
     unbanded_fallback: bool = False
+    band_limited: bool = False
 
 
 def _similarity(left: str, right: str) -> float:
@@ -63,26 +71,38 @@ def _similarity(left: str, right: str) -> float:
     return fuzz.ratio(left, right) / 100.0
 
 
-def _band_window(
+def _band_windows(
     row: int,
     token_count: int,
     word_count: int,
     margin: int,
     prior_centers: tuple[int, ...] = (),
-) -> tuple[int, int]:
+) -> list[tuple[int, int]]:
     if token_count <= 0:
-        return 0, word_count
+        return [(0, word_count)]
     center = round(row * word_count / token_count)
-    start = max(0, center - margin)
-    end = min(word_count, center + margin)
+    intervals = [(max(0, center - margin), min(word_count, center + margin))]
     if row == 0:
-        start = 0
+        intervals.append((0, min(word_count, margin)))
     if row == token_count:
-        end = word_count
+        intervals.append((max(0, word_count - margin), word_count))
     for prior_center in prior_centers:
-        start = min(start, max(0, prior_center - margin))
-        end = max(end, min(word_count, prior_center + margin))
-    return start, end
+        intervals.append((max(0, prior_center - margin), min(word_count, prior_center + margin)))
+    return _merge_intervals(intervals)
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    cleaned = sorted((start, end) for start, end in intervals if end >= start)
+    if not cleaned:
+        return []
+    merged = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end + 1:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _timing_priors(
@@ -305,51 +325,150 @@ def _align_tokens_detailed(
 ) -> _AlignmentRun:
     n = len(tokens)
     m = len(words_norm)
-    gap = -0.75
-    dp: list[dict[int, float]] = [{0: 0.0}]
-    back: list[dict[int, str]] = [{0: ""}]
     reachability = _reachability_centers(
         tokens,
         words_norm,
         token_time_priors,
         word_time_centers,
     )
-
-    _, first_row_end = _band_window(
-        0,
-        n,
-        m,
-        band_margin,
-        reachability.get(0, ()),
+    last_run: _AlignmentRun | None = None
+    band_limited = False
+    remaining_cells = ALIGNMENT_CELL_BUDGET
+    for margin in _retry_margins(band_margin, max(n, m)):
+        cell_count = _band_cell_count(n, m, margin, reachability)
+        if cell_count > remaining_cells:
+            band_limited = True
+            continue
+        remaining_cells -= cell_count
+        ops = _align_tokens_once(
+            tokens,
+            words_norm,
+            margin,
+            reachability,
+            token_time_priors=token_time_priors,
+            word_time_centers=word_time_centers,
+        )
+        if ops is None:
+            band_limited = band_limited or margin >= ALIGNMENT_RETRY_MARGINS[-1]
+            continue
+        run = _AlignmentRun(
+            ops=ops,
+            unbanded_fallback=margin >= max(n, m) and margin != band_margin,
+        )
+        last_run = run
+        if margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
+            continue
+        return run
+    if last_run is not None:
+        return _AlignmentRun(
+            ops=last_run.ops,
+            unbanded_fallback=last_run.unbanded_fallback,
+            band_limited=True,
+        )
+    return _AlignmentRun(
+        ops=_fully_divergent_ops(n, m),
+        band_limited=True,
     )
-    for j in range(1, first_row_end + 1):
-        dp[0][j] = dp[0][j - 1] + gap
-        back[0][j] = "insert"
+
+
+def _retry_margins(initial_margin: int, full_width: int) -> list[int]:
+    bounded_initial = max(0, initial_margin)
+    candidates = [
+        bounded_initial,
+        *(candidate for candidate in ALIGNMENT_RETRY_MARGINS if candidate > bounded_initial),
+    ]
+    margins: list[int] = []
+    for candidate in candidates:
+        margin = min(candidate, full_width)
+        if margin not in margins:
+            margins.append(margin)
+    return margins
+
+
+def _fully_divergent_ops(token_count: int, word_count: int) -> list[_Op]:
+    return [
+        *(_Op("delete", token_index, None, 0.0) for token_index in range(token_count)),
+        *(_Op("insert", None, word_index, 0.0) for word_index in range(word_count)),
+    ]
+
+
+def _band_cell_count(
+    token_count: int,
+    word_count: int,
+    margin: int,
+    reachability: dict[int, tuple[int, ...]],
+) -> int:
+    return sum(
+        sum(
+            end - start + 1
+            for start, end in _band_windows(
+                row,
+                token_count,
+                word_count,
+                margin,
+                reachability.get(row, ()),
+            )
+        )
+        for row in range(token_count + 1)
+    )
+
+
+def _align_tokens_once(
+    tokens: list[SRTToken],
+    words_norm: list[str],
+    band_margin: int,
+    reachability: dict[int, tuple[int, ...]],
+    *,
+    token_time_priors: list[tuple[float, float]] | None = None,
+    word_time_centers: list[float] | None = None,
+) -> list[_Op] | None:
+    n = len(tokens)
+    m = len(words_norm)
+    gap = -0.75
+    first_intervals = _band_windows(0, n, m, band_margin, reachability.get(0, ()))
+    previous_scores = [NEG_INF] * _interval_cell_count(first_intervals)
+    first_back = bytearray(len(previous_scores))
+    zero_offset = _row_offset(first_intervals, 0)
+    if zero_offset is None:
+        return None
+    previous_scores[zero_offset] = 0.0
+    for offset, j in _iter_interval_cells(first_intervals):
+        if j == 0:
+            continue
+        previous_offset = _row_offset(first_intervals, j - 1)
+        if previous_offset is None:
+            continue
+        previous_score = previous_scores[previous_offset]
+        if previous_score <= NEG_INF / 2:
+            continue
+        previous_scores[offset] = previous_score + gap
+        first_back[offset] = _BACK_INSERT
+    previous_intervals = first_intervals
+    back_rows: list[tuple[list[tuple[int, int]], bytearray]] = [(first_intervals, first_back)]
 
     for i in range(1, n + 1):
-        previous = dp[i - 1]
-        row: dict[int, float] = {}
-        row_back: dict[int, str] = {}
-        start, end = _band_window(
-            i,
-            n,
-            m,
-            band_margin,
-            reachability.get(i, ()),
-        )
-        for j in range(start, end + 1):
+        current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()))
+        current_scores = [NEG_INF] * _interval_cell_count(current_intervals)
+        current_back = bytearray(len(current_scores))
+        for offset, j in _iter_interval_cells(current_intervals):
             best_score = NEG_INF
-            best_op = ""
-            if j in previous:
-                best_score = previous[j] + gap
-                best_op = "delete"
-            if j > 0 and (j - 1) in row and row[j - 1] + gap > best_score:
-                best_score = row[j - 1] + gap
-                best_op = "insert"
-            if j > 0 and (j - 1) in previous:
+            best_op = _BACK_NONE
+            previous_offset = _row_offset(previous_intervals, j)
+            if previous_offset is not None:
+                best_score = previous_scores[previous_offset] + gap
+                best_op = _BACK_DELETE
+            current_previous_offset = _row_offset(current_intervals, j - 1) if j > 0 else None
+            if (
+                current_previous_offset is not None
+                and current_scores[current_previous_offset] + gap > best_score
+            ):
+                best_score = current_scores[current_previous_offset] + gap
+                best_op = _BACK_INSERT
+            previous_diagonal_offset = _row_offset(previous_intervals, j - 1) if j > 0 else None
+            if previous_diagonal_offset is not None:
                 similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
                 match_score = 2.0 * similarity if similarity >= MATCH_THRESHOLD else -0.6
-                candidate = previous[j - 1] + match_score
+                candidate = previous_scores[previous_diagonal_offset] + match_score
                 if similarity >= MATCH_THRESHOLD:
                     candidate += _timing_bonus(
                         i - 1,
@@ -359,54 +478,61 @@ def _align_tokens_detailed(
                     )
                 if candidate > best_score:
                     best_score = candidate
-                    best_op = "match"
+                    best_op = _BACK_MATCH
             if best_op:
-                row[j] = best_score
-                row_back[j] = best_op
-        dp.append(row)
-        back.append(row_back)
+                current_scores[offset] = best_score
+                current_back[offset] = best_op
+        previous_intervals = current_intervals
+        previous_scores = current_scores
+        back_rows.append((current_intervals, current_back))
 
-    if m not in dp[n]:
-        if band_margin >= max(n, m):
-            raise RuntimeError("alignment band failed to find a global path")
-        retry = _align_tokens_detailed(
-            tokens,
-            words_norm,
-            band_margin=max(n, m),
-            token_time_priors=token_time_priors,
-            word_time_centers=word_time_centers,
-        )
-        return _AlignmentRun(ops=retry.ops, unbanded_fallback=True)
+    final_offset = _row_offset(previous_intervals, m)
+    if final_offset is None or previous_scores[final_offset] <= NEG_INF / 2:
+        return None
 
     ops: list[_Op] = []
     i, j = n, m
     while i > 0 or j > 0:
-        op = back[i].get(j, "")
-        if op == "match":
+        intervals, row_back = back_rows[i]
+        offset = _row_offset(intervals, j)
+        op = _BACK_NONE if offset is None else row_back[offset]
+        if op == _BACK_MATCH:
             score = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
             kind = "match" if tokens[i - 1].normalized == words_norm[j - 1] else "replace"
             ops.append(_Op(kind, i - 1, j - 1, score))
             i -= 1
             j -= 1
-        elif op == "delete":
+        elif op == _BACK_DELETE:
             ops.append(_Op("delete", i - 1, None, 0.0))
             i -= 1
-        elif op == "insert":
+        elif op == _BACK_INSERT:
             ops.append(_Op("insert", None, j - 1, 0.0))
             j -= 1
         else:
-            raise RuntimeError("alignment backtrack reached an empty operation")
+            return None
     ops.reverse()
-    if band_margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
-        retry = _align_tokens_detailed(
-            tokens,
-            words_norm,
-            band_margin=max(n, m),
-            token_time_priors=token_time_priors,
-            word_time_centers=word_time_centers,
-        )
-        return _AlignmentRun(ops=retry.ops, unbanded_fallback=True)
-    return _AlignmentRun(ops=ops)
+    return ops
+
+
+def _interval_cell_count(intervals: list[tuple[int, int]]) -> int:
+    return sum(end - start + 1 for start, end in intervals)
+
+
+def _iter_interval_cells(intervals: list[tuple[int, int]]) -> Iterator[tuple[int, int]]:
+    offset = 0
+    for start, end in intervals:
+        for value in range(start, end + 1):
+            yield offset, value
+            offset += 1
+
+
+def _row_offset(intervals: list[tuple[int, int]], column: int) -> int | None:
+    offset = 0
+    for start, end in intervals:
+        if start <= column <= end:
+            return offset + column - start
+        offset += end - start + 1
+    return None
 
 
 def _misses_unique_exact_pair(
@@ -588,6 +714,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     preliminary_run = _align_tokens_detailed(tokens, words_norm)
     ops = preliminary_run.ops
     unbanded_fallback = preliminary_run.unbanded_fallback
+    band_limited = preliminary_run.band_limited
     prior_attempted = _has_repeated_alignment_candidates(tokens, words_norm)
     prior_used = False
     transform: _TimeTransform | None = None
@@ -610,6 +737,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             )
             ops = prior_run.ops
             unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
+            band_limited = band_limited or prior_run.band_limited
     matches: list[TokenMatch] = []
     cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
 
@@ -632,6 +760,23 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     unmatched_cue_ids = [cue.index for cue in cues if not cue_word_indices.get(cue.index)]
     anchor_coverage = len(matches) / len(tokens)
     flags = _alignment_outlier_flags(matches, cues, tokens, words)
+    if band_limited:
+        episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
+        episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
+        flags.append(
+            QCFlag(
+                kind="alignment_band_limited",
+                cue_ids=[],
+                message=(
+                    "Alignment retry reached its bounded margin or cell budget before every "
+                    "unique exact anchor could be proven; review this artifact instead of "
+                    "running an unbounded alignment."
+                ),
+                severity="warning",
+                start=episode_start,
+                end=episode_end,
+            )
+        )
 
     return AlignmentResult(
         token_matches=matches,
@@ -651,6 +796,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             ),
             transform_anchor_count=transform.anchor_count if transform is not None else 0,
             unbanded_fallback=unbanded_fallback,
+            band_limited=band_limited,
         ),
     )
 
@@ -731,18 +877,34 @@ def _alignment_outlier_flags(
         observations.append((match, cue, word, cue_center, word_center))
     if len(observations) < 3:
         return []
+    observations = sorted(observations, key=lambda item: item[3])
 
     transform = _fit_time_transform(
         [(cue_center, word_center) for _, _, _, cue_center, word_center in observations]
     )
     if transform is None:
-        return []
+        episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
+        episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
+        return [
+            QCFlag(
+                kind="alignment_model_unavailable",
+                cue_ids=sorted({match.cue_id for match, *_rest in observations}),
+                message=(
+                    "Matched anchors could not produce a stable episode timing model; "
+                    "review alignment order and timing before accepting this artifact."
+                ),
+                severity="warning",
+                start=episode_start,
+                end=episode_end,
+            )
+        ]
 
+    threshold_seconds = _alignment_outlier_threshold_seconds(cues)
     outlier_by_cue: dict[int, tuple[float, TokenMatch, Cue, Word]] = {}
     for match, cue, word, cue_center, word_center in observations:
         expected_word_center = transform.rate * cue_center + transform.offset_seconds
         residual = word_center - expected_word_center
-        if abs(residual) <= ALIGNMENT_OUTLIER_SECONDS:
+        if abs(residual) <= threshold_seconds:
             continue
         current = outlier_by_cue.get(match.cue_id)
         if current is None or abs(residual) > abs(current[0]):
@@ -769,3 +931,14 @@ def _alignment_outlier_flags(
             )
         )
     return flags
+
+
+def _alignment_outlier_threshold_seconds(cues: list[Cue]) -> float:
+    starts = [cue.start_ms for cue in cues]
+    ends = [cue.end_ms for cue in cues]
+    if not starts or not ends:
+        return ALIGNMENT_OUTLIER_SECONDS
+    duration_seconds = max(0.0, (max(ends) - min(starts)) / 1000.0)
+    if duration_seconds <= 0.0:
+        return ALIGNMENT_OUTLIER_SECONDS
+    return min(ALIGNMENT_OUTLIER_SECONDS, duration_seconds * 0.1)
