@@ -38,7 +38,21 @@ def _fake_processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifact
     output = job.directory / ("generated.srt" if job.mode == "generate" else "synced.srt")
     output.write_text("1\n00:00:00,000 --> 00:00:00,500\nReady.\n", encoding="utf-8")
     qc_json = job.directory / "qc_report.json"
-    qc_json.write_text(json.dumps({"summary": {"cue_count": 1, "flags": 0, "style_violations": 0}}), encoding="utf-8")
+    qc_json.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "cue_count": 1,
+                    "flags": 0,
+                    "style_violations": 0,
+                    "fps": 30.0,
+                    "fps_source": "explicit",
+                    "fps_detection_confident": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     qc_html = job.directory / "qc_report.html"
     qc_html.write_text("<h1>QC</h1>", encoding="utf-8")
     return ProcessedArtifacts(output_srt=output, qc_json=qc_json, qc_html=qc_html, cost_usd=0.01, cue_count=1)
@@ -60,6 +74,9 @@ def test_create_generate_job_processes_and_protects_status_and_download(tmp_path
         assert created["progress"] == 100
         assert created["result"]["cue_count"] == 1
         assert created["result"]["cost_usd"] == 0.01
+        assert created["result"]["fps"] == 30.0
+        assert created["result"]["fps_source"] == "explicit"
+        assert created["result"]["fps_detection_confident"] is True
         assert created["token"]
 
         assert client.get(f"/api/jobs/{created['id']}").status_code == 404
