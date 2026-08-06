@@ -73,7 +73,10 @@ def test_generate_srt_from_audio_with_fixture_provider_writes_downloadable_artif
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
     assert [cue.plain_text for cue in cues] == ["Ready now."]
     assert result.output_srt == output_path
-    assert result.report["summary"] == {"cue_count": 1, "flags": 0, "style_violations": 0}
+    assert result.report["summary"]["cue_count"] == 1
+    assert result.report["summary"]["flags"] == 0
+    assert result.report["summary"]["style_violations"] == 0
+    assert result.report["summary"]["flags_by_severity"] == {"error": 0, "warning": 0, "info": 0}
     assert (result.episode_workdir / "asr.json").exists()
     assert (result.episode_workdir / "generate.json").exists()
     assert (result.episode_workdir / "qc_report.json").exists()

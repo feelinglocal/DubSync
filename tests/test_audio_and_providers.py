@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 
 from dubsync.audio import AudioNormalizeError, normalize_audio, probe_audio_duration
 from dubsync.cache import JsonDiskCache
+from dubsync.cost import CostMeter
 from dubsync.models import Word
 from dubsync.providers import (
     AssemblyAIAdapter,
@@ -207,34 +209,99 @@ def test_cached_asr_adapter_avoids_second_provider_call(tmp_path):
     assert inner.calls == 1
 
 
-@pytest.mark.parametrize(
-    "words",
-    [
-        [Word.model_construct(text="   ", start=0.0, end=0.2)],
-        [Word.model_construct(text="negative", start=-0.1, end=0.2)],
-        [Word.model_construct(text="zero", start=0.4, end=0.4)],
-        [
-            Word.model_construct(text="later", start=0.8, end=1.0),
-            Word.model_construct(text="earlier", start=0.2, end=0.4),
-        ],
-    ],
-    ids=["empty-text", "negative-start", "non-positive-duration", "out-of-order"],
-)
-def test_cached_asr_boundary_rejects_invalid_provider_word_streams(tmp_path, words):
+def test_cached_asr_boundary_repairs_provider_word_stream_quirks(tmp_path):
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"audio")
     cache_dir = tmp_path / "cache"
     adapter = CachedASRAdapter(
-        StaticWordAdapter(words),
+        StaticWordAdapter(
+            [
+                Word.model_construct(text="   ", start=0.0, end=0.2),
+                Word.model_construct(text="later", start=0.8, end=0.8),
+                Word.model_construct(text="earlier", start=0.2, end=0.4),
+            ]
+        ),
         JsonDiskCache(cache_dir),
         model="fixture",
         params={},
     )
 
-    with pytest.raises(ProviderError):
+    words = adapter.transcribe(audio)
+
+    assert [word.text for word in words] == ["earlier", "later"]
+    assert words[1].end == pytest.approx(0.801)
+    assert adapter.last_repair_flags
+    assert adapter.last_repair_flags[0].kind == "word_stream_repaired"
+    assert adapter.last_repair_flags[0].severity == "warning"
+    assert list(cache_dir.glob("*.json"))
+
+    cached_words = adapter.transcribe(audio)
+
+    assert [word.text for word in cached_words] == ["earlier", "later"]
+    assert [flag.kind for flag in adapter.last_repair_flags] == ["word_stream_repaired"]
+
+
+def test_cached_asr_boundary_rejects_a_large_malformed_fraction(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    mostly_usable = [
+        Word.model_construct(text=f"word-{index}", start=index * 0.2, end=index * 0.2 + 0.1)
+        for index in range(18)
+    ]
+    mostly_usable.extend(
+        [
+            Word.model_construct(text=" ", start=4.0, end=4.1),
+            Word.model_construct(text=" ", start=4.2, end=4.3),
+        ]
+    )
+    adapter = CachedASRAdapter(
+        StaticWordAdapter(mostly_usable),
+        JsonDiskCache(tmp_path / "cache"),
+        model="fixture",
+        params={},
+    )
+
+    with pytest.raises(ProviderError, match="malformed fraction"):
         adapter.transcribe(audio)
 
-    assert list(cache_dir.glob("*.json")) == []
+
+def test_cached_asr_records_cost_when_returned_stream_is_unusable(tmp_path):
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    meter = CostMeter()
+    adapter = CachedASRAdapter(
+        StaticWordAdapter([Word.model_construct(text=" ", start=0.0, end=0.0)]),
+        JsonDiskCache(tmp_path / "cache"),
+        model="scribe_v2",
+        params={},
+        cost_meter=meter,
+        cost_provider="scribe_v2",
+        dollars_per_hour=0.22,
+    )
+
+    with pytest.raises(ProviderError, match="no usable words"):
+        adapter.transcribe(audio)
+
+    assert len(meter.items) == 1
+    assert meter.items[0].kind == "audio"
+
+
+def test_cached_asr_boundary_still_rejects_empty_repaired_stream(tmp_path):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    adapter = CachedASRAdapter(
+        StaticWordAdapter([Word.model_construct(text="   ", start=0.0, end=0.2)]),
+        JsonDiskCache(tmp_path / "cache"),
+        model="fixture",
+        params={},
+    )
+
+    with pytest.raises(ProviderError, match="no usable words"):
+        adapter.transcribe(audio)
 
 
 def test_assemblyai_adapter_raises_for_terminal_error_status(tmp_path, monkeypatch):

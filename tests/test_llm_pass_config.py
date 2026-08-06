@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from dubsync.llm_providers import (
     GeminiLLMAdapter,
@@ -40,6 +43,27 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert isinstance(speaker_mapping, OpenAILLMAdapter)
     assert speaker_mapping.model == "gpt-5.5"
     assert speaker_mapping.api_key == "openai-key"
+    assert speaker_mapping.reasoning_effort == "medium"
+
+
+def test_production_config_routes_only_audio_adjudication_back_to_gemini(monkeypatch):
+    config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+
+    adjudication = llm_adapter_from_config(config, pass_name="adjudication")
+    punctuation = punctuation_adapter_from_config(config)
+    speaker_mapping = llm_adapter_from_config(config, pass_name="speaker_mapping")
+
+    assert isinstance(adjudication, GeminiLLMAdapter)
+    assert adjudication.model == "gemini-3.5-flash-lite"
+    assert adjudication.thinking_level == "high"
+    assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
+    assert isinstance(punctuation, OpenAILLMAdapter)
+    assert punctuation.model == "gpt-5.6-luna"
+    assert punctuation.reasoning_effort == "medium"
+    assert isinstance(speaker_mapping, OpenAILLMAdapter)
+    assert speaker_mapping.model == "gpt-5.6-luna"
     assert speaker_mapping.reasoning_effort == "medium"
 
 

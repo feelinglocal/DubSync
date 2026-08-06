@@ -97,6 +97,23 @@ def test_punctuation_pass_reflows_excess_model_lines():
     assert updated[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
 
 
+def test_punctuation_pass_keeps_restored_source_breaks_for_unchanged_cue_even_when_profile_is_narrow():
+    source_cues = [Cue(index=1, start_ms=0, end_ms=2700, lines=["Drachen-Evolutionssystem", "besitze ich längst"])]
+    rebuilt_cues = [Cue(index=1, start_ms=40, end_ms=2680, lines=["Drachen-Evolutionssystem besitze", "ich längst"])]
+    adapter = StaticPunctuationAdapter({1: "Drachen-Evolutionssystem besitze ich längst."})
+
+    updated, flags = apply_punctuation_pass(
+        rebuilt_cues,
+        adapter,
+        max_chars_per_line=22,
+        max_lines_per_cue=2,
+        source_cues=source_cues,
+    )
+
+    assert flags == []
+    assert updated[0].lines == ["Drachen-Evolutionssystem", "besitze ich längst."]
+
+
 def test_cli_sync_applies_fixture_punctuation_pass(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"

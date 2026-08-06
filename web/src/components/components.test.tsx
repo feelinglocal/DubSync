@@ -117,8 +117,9 @@ describe('shared components', () => {
     expect(screen.getByText('Provider unavailable.')).toBeVisible()
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
 
-    rerender(<JobPanel job={job({ status: 'complete', progress: 100, result: { cue_count: 18, cost_usd: 0.03 }, downloads: ['srt', 'qc-json', 'qc-html'] })} onDownload={onDownload} downloading={null} />)
+    rerender(<JobPanel job={job({ status: 'complete', progress: 100, result: { cue_count: 18, cost_usd: 0.03, fps: 24, fps_source: 'detected', fps_detection_confident: true }, downloads: ['srt', 'qc-json', 'qc-html'] })} onDownload={onDownload} downloading={null} />)
     expect(screen.getByText('18 cues ready')).toBeVisible()
+    expect(screen.getByText('24 fps detected')).toBeVisible()
     await userEvent.click(screen.getByRole('button', { name: 'QC JSON' }))
     await userEvent.click(screen.getByRole('button', { name: 'QC report' }))
     await userEvent.click(screen.getByRole('button', { name: 'Download SRT' }))

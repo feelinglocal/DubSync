@@ -4,7 +4,7 @@ import pytest
 
 from dubsync.models import Cue
 from dubsync.srt_io import parse_srt_text, write_srt
-from dubsync.style_profile import StyleProfile, derive_style_profile
+from dubsync.style_profile import StyleProfile, derive_style_profile, detect_fps_with_confidence
 
 
 def test_example_srt_round_trips_with_only_trailing_space_normalization(sample_srt_path):
@@ -51,6 +51,33 @@ def test_profile_derivation_uses_robust_limits_instead_of_single_outliers():
     assert 26 <= profile.max_chars_per_line < 48
     assert 0.1 < profile.min_cue_dur <= 0.5
     assert profile.observed_min_duration == 0.1
+
+
+def test_detect_fps_low_confidence_unsnapped_file_falls_back_to_default():
+    cues = [
+        Cue(index=1, start_ms=101, end_ms=923, lines=["alpha"]),
+        Cue(index=2, start_ms=1277, end_ms=2089, lines=["beta"]),
+        Cue(index=3, start_ms=2603, end_ms=3491, lines=["gamma"]),
+    ]
+
+    detection = detect_fps_with_confidence(cues)
+
+    assert detection.fps == 30.0
+    assert detection.confident is False
+    assert detection.best_error_ms > 2.0
+
+
+def test_detect_fps_reports_low_error_for_a_frame_snapped_grid():
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1000, lines=["alpha"]),
+        Cue(index=2, start_ms=2000, end_ms=3000, lines=["beta"]),
+        Cue(index=3, start_ms=4000, end_ms=5000, lines=["gamma"]),
+    ]
+
+    detection = detect_fps_with_confidence(cues, default=25.0)
+
+    assert detection.fps in {24.0, 25.0, 30.0}
+    assert detection.best_error_ms <= 2.0
 
 
 def test_snap_ceil_never_returns_before_fractional_millisecond_input():

@@ -102,11 +102,14 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
-    assert config["llm"]["adjudication"]["reasoning_effort"] == "high"
-    assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is False
+    assert config["llm"]["adjudication"]["provider"] == "gemini"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
     assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
     assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
     assert "OPENAI_API_KEY" in example_text
+    assert "GEMINI_API_KEY" in example_text
 
 
 def test_production_luna_passes_use_requested_reasoning_efforts():
@@ -114,7 +117,10 @@ def test_production_luna_passes_use_requested_reasoning_efforts():
 
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
-    assert config["llm"]["adjudication"]["reasoning_effort"] == "high"
+    assert config["llm"]["adjudication"]["provider"] == "gemini"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
     assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
     assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
 
@@ -131,9 +137,10 @@ def test_documented_configuration_uses_gpt_5_6_luna_default():
 def test_commercial_runbook_names_openai_default_and_optional_gemini_secret():
     commercial_plan = Path("docs/COMMERCIAL_PLAN.md").read_text(encoding="utf-8")
 
-    assert "OpenAI GPT-5.6 Luna language passes" in commercial_plan
+    assert "OpenAI GPT-5.6 Luna punctuation and speaker-mapping passes" in commercial_plan
+    assert "Gemini 3.5 Flash-Lite adjudication with audio snippets" in commercial_plan
     assert "`OPENAI_API_KEY`" in commercial_plan
-    assert "`GEMINI_API_KEY` is optional" in commercial_plan
+    assert "`GEMINI_API_KEY`" in commercial_plan
 
 
 def test_repository_has_no_legacy_flash_lite_model_references():

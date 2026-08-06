@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import wave
 
 import pytest
@@ -75,6 +76,21 @@ def test_silero_vad_provider_config_is_optional_adapter():
     adapter = speech_activity_adapter_from_config({"vad": {"provider": "silero"}})
 
     assert isinstance(adapter, SileroSpeechActivityAdapter)
+
+
+def test_silero_vad_records_when_it_falls_back_to_energy(tmp_path, monkeypatch):
+    audio = tmp_path / "speech.wav"
+    with wave.open(str(audio), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    adapter = SileroSpeechActivityAdapter()
+    monkeypatch.setitem(sys.modules, "torch", None)
+
+    adapter.detect(audio)
+
+    assert adapter.fallback_used is True
 
 
 def test_cli_sync_writes_vad_fixture_artifact_and_qc_flag(tmp_path):

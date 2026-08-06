@@ -91,7 +91,7 @@ describe('DubSync workspace', () => {
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
     expect(await screen.findByText('Files are deleted after 24 hours')).toBeVisible()
     expect(await screen.findByText(/Manual quote and invoice before paid processing/i)).toBeVisible()
-    expect(await screen.findByText(/Render, ElevenLabs, and OpenAI processing/)).toBeVisible()
+    expect(await screen.findByText(/Render, ElevenLabs, OpenAI, and Gemini processing/)).toBeVisible()
     expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
     expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
     expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
