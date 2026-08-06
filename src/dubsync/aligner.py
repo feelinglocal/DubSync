@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import math
-from bisect import bisect_left
 from collections import Counter
-from collections.abc import Iterator
 from dataclasses import dataclass
 from statistics import median
 
 from rapidfuzz import fuzz
 
+from .alignment_windows import (
+    RETRY_MARGINS as ALIGNMENT_RETRY_MARGINS,
+    band_cell_count as _band_cell_count,
+    band_windows as _band_windows,
+    interval_cell_count as _interval_cell_count,
+    iter_interval_cells as _iter_interval_cells,
+    reachability_centers as _reachability_centers,
+    retry_margins as _retry_margins,
+    row_offset as _row_offset,
+    unique_exact_pairs as _unique_exact_pairs,
+)
 from .models import (
     AlignmentDiagnostics,
     AlignmentResult,
@@ -24,17 +33,12 @@ from .tokenize import SRTToken, normalized_words, tokenize_cues
 MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
-ALIGNMENT_RETRY_MARGINS = (64, 256, 1024)
 ALIGNMENT_CELL_BUDGET = 2_000_000
 NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-_BACK_NONE = 0
-_BACK_MATCH = 1
-_BACK_DELETE = 2
-_BACK_INSERT = 3
-
+_BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 
 @dataclass(frozen=True)
 class _Op:
@@ -69,40 +73,6 @@ def _similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
     return fuzz.ratio(left, right) / 100.0
-
-
-def _band_windows(
-    row: int,
-    token_count: int,
-    word_count: int,
-    margin: int,
-    prior_centers: tuple[int, ...] = (),
-) -> list[tuple[int, int]]:
-    if token_count <= 0:
-        return [(0, word_count)]
-    center = round(row * word_count / token_count)
-    intervals = [(max(0, center - margin), min(word_count, center + margin))]
-    if row == 0:
-        intervals.append((0, min(word_count, margin)))
-    if row == token_count:
-        intervals.append((max(0, word_count - margin), word_count))
-    for prior_center in prior_centers:
-        intervals.append((max(0, prior_center - margin), min(word_count, prior_center + margin)))
-    return _merge_intervals(intervals)
-
-
-def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    cleaned = sorted((start, end) for start, end in intervals if end >= start)
-    if not cleaned:
-        return []
-    merged = [cleaned[0]]
-    for start, end in cleaned[1:]:
-        previous_start, previous_end = merged[-1]
-        if start <= previous_end + 1:
-            merged[-1] = (previous_start, max(previous_end, end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
 def _timing_priors(
@@ -371,46 +341,11 @@ def _align_tokens_detailed(
     )
 
 
-def _retry_margins(initial_margin: int, full_width: int) -> list[int]:
-    bounded_initial = max(0, initial_margin)
-    candidates = [
-        bounded_initial,
-        *(candidate for candidate in ALIGNMENT_RETRY_MARGINS if candidate > bounded_initial),
-    ]
-    margins: list[int] = []
-    for candidate in candidates:
-        margin = min(candidate, full_width)
-        if margin not in margins:
-            margins.append(margin)
-    return margins
-
-
 def _fully_divergent_ops(token_count: int, word_count: int) -> list[_Op]:
     return [
         *(_Op("delete", token_index, None, 0.0) for token_index in range(token_count)),
         *(_Op("insert", None, word_index, 0.0) for word_index in range(word_count)),
     ]
-
-
-def _band_cell_count(
-    token_count: int,
-    word_count: int,
-    margin: int,
-    reachability: dict[int, tuple[int, ...]],
-) -> int:
-    return sum(
-        sum(
-            end - start + 1
-            for start, end in _band_windows(
-                row,
-                token_count,
-                word_count,
-                margin,
-                reachability.get(row, ()),
-            )
-        )
-        for row in range(token_count + 1)
-    )
 
 
 def _align_tokens_once(
@@ -512,27 +447,6 @@ def _align_tokens_once(
             return None
     ops.reverse()
     return ops
-
-
-def _interval_cell_count(intervals: list[tuple[int, int]]) -> int:
-    return sum(end - start + 1 for start, end in intervals)
-
-
-def _iter_interval_cells(intervals: list[tuple[int, int]]) -> Iterator[tuple[int, int]]:
-    offset = 0
-    for start, end in intervals:
-        for value in range(start, end + 1):
-            yield offset, value
-            offset += 1
-
-
-def _row_offset(intervals: list[tuple[int, int]], column: int) -> int | None:
-    offset = 0
-    for start, end in intervals:
-        if start <= column <= end:
-            return offset + column - start
-        offset += end - start + 1
-    return None
 
 
 def _misses_unique_exact_pair(
@@ -798,64 +712,6 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             unbanded_fallback=unbanded_fallback,
             band_limited=band_limited,
         ),
-    )
-
-
-def _unique_exact_pairs(
-    tokens: list[SRTToken],
-    words_norm: list[str],
-) -> list[tuple[int, int]]:
-    token_positions: dict[str, list[int]] = {}
-    word_positions: dict[str, list[int]] = {}
-    for token_index, token in enumerate(tokens):
-        if token.normalized:
-            token_positions.setdefault(token.normalized, []).append(token_index)
-    for word_index, word in enumerate(words_norm):
-        if word:
-            word_positions.setdefault(word, []).append(word_index)
-    pairs = sorted(
-        (token_indices[0], word_positions[value][0])
-        for value, token_indices in token_positions.items()
-        if len(token_indices) == 1
-        and value in word_positions
-        and len(word_positions[value]) == 1
-    )
-    if any(left_word >= right_word for (_, left_word), (_, right_word) in zip(pairs, pairs[1:])):
-        return []
-    return pairs
-
-
-def _reachability_centers(
-    tokens: list[SRTToken],
-    words_norm: list[str],
-    token_time_priors: list[tuple[float, float]] | None,
-    word_time_centers: list[float] | None,
-) -> dict[int, tuple[int, ...]]:
-    centers: dict[int, set[int]] = {}
-    for token_index, word_index in _unique_exact_pairs(tokens, words_norm):
-        centers.setdefault(token_index, set()).add(word_index)
-        centers.setdefault(token_index + 1, set()).add(word_index + 1)
-
-    if token_time_priors is not None and word_time_centers:
-        for token_index, (expected, _) in enumerate(token_time_priors):
-            word_index = _closest_word_index(word_time_centers, expected)
-            centers.setdefault(token_index, set()).add(word_index)
-            centers.setdefault(token_index + 1, set()).add(word_index + 1)
-    return {row: tuple(sorted(row_centers)) for row, row_centers in centers.items()}
-
-
-def _closest_word_index(word_time_centers: list[float], expected: float) -> int:
-    insertion = bisect_left(word_time_centers, expected)
-    if insertion <= 0:
-        return 0
-    if insertion >= len(word_time_centers):
-        return len(word_time_centers) - 1
-    before = insertion - 1
-    return (
-        before
-        if abs(word_time_centers[before] - expected)
-        <= abs(word_time_centers[insertion] - expected)
-        else insertion
     )
 
 
