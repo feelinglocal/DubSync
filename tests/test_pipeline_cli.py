@@ -532,6 +532,8 @@ def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
             str(providers_path),
             "--workdir",
             str(workdir),
+            "--fps",
+            "24",
         ],
     )
 
@@ -620,6 +622,8 @@ def test_cli_sync_keeps_german_profanity_mask_without_llm_rewrite(tmp_path):
             str(providers_path),
             "--workdir",
             str(workdir),
+            "--fps",
+            "24",
         ],
     )
 
