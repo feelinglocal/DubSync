@@ -12,6 +12,8 @@ from dubsync.models import AudioSnippet, Cue
 import dubsync.pipeline as pipeline_module
 from dubsync.pipeline import _punctuation_cache_key, _speaker_mapping_cache_key
 from dubsync.srt_io import parse_srt_text
+from dubsync.text_metrics import display_width
+from dubsync.tokenize import alphanumeric_signature
 
 
 def test_cli_profile_writes_style_profile(tmp_path, sample_srt_path):
@@ -1376,6 +1378,107 @@ def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     assert adlib_flag["old_text"] is None
     assert adlib_flag["new_text"] == "surprise line"
     assert adlib_flag["confidence"] == 0.88
+
+
+def test_cli_sync_splits_long_asr_only_tail_into_readable_cues(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    tail_text = (
+        "Verraten von Feinden. Unser Ziel ist ein abgelegenes Versteck. "
+        "Damian packte alle Vorräte, Waffen und das Bargeld auf die Packpferde hinter uns. "
+        "Hätte ich gewusst, worauf diese verzweifelte Flucht zu Pferd hinausläuft, "
+        "wäre ich lieber gestorben, als mitzukommen."
+    )
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "in die Familie.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    words = [
+        {"text": "in", "start": 0.10, "end": 0.22, "confidence": 0.99, "speaker_id": "A"},
+        {"text": "die", "start": 0.25, "end": 0.37, "confidence": 0.99, "speaker_id": "A"},
+        {"text": "Familie.", "start": 0.40, "end": 0.70, "confidence": 0.99, "speaker_id": "A"},
+    ]
+    cursor = 1.05
+    for token in tail_text.split():
+        words.append(
+            {
+                "text": token,
+                "start": round(cursor, 3),
+                "end": round(cursor + 0.22, 3),
+                "confidence": 0.98,
+                "speaker_id": "A",
+            }
+        )
+        cursor += 0.30
+        if token.endswith((".", "?", "!")):
+            cursor += 0.85
+    wordstream_path.write_text(json.dumps({"words": words}), encoding="utf-8")
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": tail_text,
+                            "confidence": 0.99,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "the source subtitle ends while spoken narration continues",
+                        }
+                    },
+                },
+                "generation": {
+                    "max_gap_seconds": 0.8,
+                    "max_cue_duration_seconds": 5.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    tail_cues = synced[1:]
+    assert len(tail_cues) > 1
+    assert alphanumeric_signature(" ".join(cue.plain_text for cue in tail_cues)) == alphanumeric_signature(tail_text)
+    assert all(cue.duration_ms <= 5_000 for cue in tail_cues)
+    assert all(len(cue.lines) <= 2 for cue in tail_cues)
+    assert all(display_width(line) <= 26 for cue in tail_cues for line in cue.lines)
+    assert all(left.end_ms <= right.start_ms for left, right in zip(tail_cues, tail_cues[1:]))
+
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    adlib_flag = next(flag for flag in report["flags"] if flag["kind"] == "adlib_inserted")
+    assert len(adlib_flag["cue_ids"]) == len(tail_cues)
 
 
 def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp_path):
