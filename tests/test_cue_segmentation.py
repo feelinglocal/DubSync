@@ -143,3 +143,28 @@ def test_generated_adlib_does_not_guess_between_repeated_exact_word_windows():
         "generated_adlib_segmented",
     ]
     assert len(cues) == 2
+
+
+def test_generated_adlib_accepts_full_span_timing_for_equal_length_word_corrections():
+    words = [
+        Word(text="wrong", start=1.00, end=1.20, speaker_id="A"),
+        Word(text="audio", start=1.25, end=1.45, speaker_id="A"),
+        Word(text="wording.", start=1.50, end=1.80, speaker_id="A"),
+    ]
+    source = Cue(index=4, start_ms=1_000, end_ms=1_800, lines=["correct editorial wording."])
+    alignment = AlignmentResult(cue_word_indices={4: [0, 1, 2]})
+
+    cues, updated, flags, expansions = segment_generated_adlib_cues(
+        [source],
+        words,
+        alignment,
+        {4},
+        _profile(),
+        max_gap_seconds=0.8,
+        max_cue_duration_seconds=5.0,
+    )
+
+    assert cues == [source]
+    assert updated.cue_word_indices[4] == [0, 1, 2]
+    assert flags == []
+    assert expansions == {}

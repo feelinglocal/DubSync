@@ -5,6 +5,7 @@ from collections import Counter
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .style_profile import StyleProfile
 from .text_metrics import contains_character_level_script, wrap_visual_width
+from .tokenize import alphanumeric_signature
 
 
 def group_words_for_cues(
@@ -32,17 +33,7 @@ def group_word_indices_for_cues(
     max_gap_seconds: float,
     max_cue_duration_seconds: float,
 ) -> list[list[int]]:
-    ordered = sorted(
-        {
-            index
-            for index in word_indices
-            if 0 <= index < len(words)
-            and words[index].text.strip()
-            and words[index].end >= words[index].start
-            and words[index].start >= 0
-        },
-        key=lambda index: (words[index].start, words[index].end, index),
-    )
+    ordered = _ordered_valid_word_indices(words, word_indices)
     groups: list[list[int]] = []
     current: list[int] = []
     for word_index in ordered:
@@ -93,9 +84,23 @@ def segment_generated_adlib_cues(
             segmented.append(cue)
             continue
 
+        candidate_word_indices = cue_word_indices.get(cue.index, [])
+        retained_word_indices, mapping_status = _retained_word_window(
+            cue.plain_text,
+            words,
+            candidate_word_indices,
+        )
+        cue_word_indices[cue.index] = retained_word_indices
+        mapping_flag = _word_mapping_flag(
+            cue,
+            words,
+            candidate_word_indices,
+            retained_word_indices,
+            mapping_status,
+        )
         word_groups = group_word_indices_for_cues(
             words,
-            cue_word_indices.get(cue.index, []),
+            retained_word_indices,
             profile,
             max_gap_seconds=max_gap_seconds,
             max_cue_duration_seconds=max_cue_duration_seconds,
@@ -107,6 +112,8 @@ def segment_generated_adlib_cues(
         )
         if len(word_groups) <= 1 or len(text_chunks) <= 1:
             segmented.append(cue)
+            if mapping_flag is not None:
+                flags.append(mapping_flag)
             continue
 
         replacement_cues: list[Cue] = []
@@ -132,6 +139,8 @@ def segment_generated_adlib_cues(
 
         segmented.extend(replacement_cues)
         expansions[cue.index] = replacement_ids
+        if mapping_flag is not None:
+            flags.append(mapping_flag.model_copy(update={"cue_ids": replacement_ids}))
         flags.append(
             QCFlag(
                 kind="generated_adlib_segmented",
@@ -153,6 +162,141 @@ def segment_generated_adlib_cues(
         alignment.model_copy(update={"cue_word_indices": cue_word_indices}),
         flags,
         expansions,
+    )
+
+
+def _retained_word_window(
+    text: str,
+    words: list[Word],
+    word_indices: list[int],
+) -> tuple[list[int], str]:
+    ordered = _ordered_valid_word_indices(words, word_indices)
+    target_tokens = alphanumeric_signature(text)
+    if not ordered or not target_tokens:
+        return ordered, "full"
+
+    candidate_tokens: list[str] = []
+    token_word_positions: list[int] = []
+    for word_position, word_index in enumerate(ordered):
+        for token in alphanumeric_signature(words[word_index].text):
+            candidate_tokens.append(token)
+            token_word_positions.append(word_position)
+
+    if not candidate_tokens:
+        return ordered, "full"
+
+    matching_windows = _exact_token_windows(
+        candidate_tokens,
+        target_tokens,
+        token_word_positions,
+        limit=2,
+    )
+
+    if len(matching_windows) != 1:
+        status = "unavailable" if len(candidate_tokens) > len(target_tokens) else "full"
+        return ordered, status
+
+    word_start, word_end = next(iter(matching_windows))
+    retained = ordered[word_start:word_end]
+    return retained, "full" if retained == ordered else "refined"
+
+
+def _exact_token_windows(
+    candidate_tokens: list[str],
+    target_tokens: list[str],
+    token_word_positions: list[int],
+    *,
+    limit: int,
+) -> set[tuple[int, int]]:
+    if not target_tokens or len(target_tokens) > len(candidate_tokens):
+        return set()
+    prefix_lengths = _kmp_prefix_lengths(target_tokens)
+    matched = 0
+    windows: set[tuple[int, int]] = set()
+    for token_position, token in enumerate(candidate_tokens):
+        while matched and token != target_tokens[matched]:
+            matched = prefix_lengths[matched - 1]
+        if token == target_tokens[matched]:
+            matched += 1
+        if matched != len(target_tokens):
+            continue
+        token_start = token_position - len(target_tokens) + 1
+        windows.add(
+            (
+                token_word_positions[token_start],
+                token_word_positions[token_position] + 1,
+            )
+        )
+        if len(windows) >= limit:
+            return windows
+        matched = prefix_lengths[matched - 1]
+    return windows
+
+
+def _kmp_prefix_lengths(tokens: list[str]) -> list[int]:
+    lengths = [0] * len(tokens)
+    matched = 0
+    for index in range(1, len(tokens)):
+        while matched and tokens[index] != tokens[matched]:
+            matched = lengths[matched - 1]
+        if tokens[index] == tokens[matched]:
+            matched += 1
+            lengths[index] = matched
+    return lengths
+
+
+def _ordered_valid_word_indices(words: list[Word], word_indices: list[int]) -> list[int]:
+    return sorted(
+        {
+            index
+            for index in word_indices
+            if 0 <= index < len(words)
+            and words[index].text.strip()
+            and words[index].end >= words[index].start
+            and words[index].start >= 0
+        },
+        key=lambda index: (words[index].start, words[index].end, index),
+    )
+
+
+def _word_mapping_flag(
+    cue: Cue,
+    words: list[Word],
+    candidate_word_indices: list[int],
+    retained_word_indices: list[int],
+    mapping_status: str,
+) -> QCFlag | None:
+    if mapping_status == "full":
+        return None
+
+    valid_candidates = _ordered_valid_word_indices(words, candidate_word_indices)
+    start = words[valid_candidates[0]].start if valid_candidates else cue.start_ms / 1000.0
+    end = words[valid_candidates[-1]].end if valid_candidates else cue.end_ms / 1000.0
+    if mapping_status == "refined":
+        return QCFlag(
+            kind="generated_adlib_word_window_refined",
+            cue_ids=[cue.index],
+            message=(
+                "Generated dialogue matched one unique contiguous ASR word window; "
+                f"{len(valid_candidates) - len(retained_word_indices)} candidate words outside "
+                "the retained text were excluded from cue timing and remain unrepresented."
+            ),
+            severity="warning",
+            new_text=cue.text,
+            start=start,
+            end=end,
+        )
+    return QCFlag(
+        kind="generated_adlib_word_mapping_unavailable",
+        cue_ids=[cue.index],
+        message=(
+            "Generated dialogue could not be mapped to one unique contiguous ASR word window; "
+            "the full candidate timing was retained for review."
+        ),
+        severity="warning",
+        new_text=cue.text,
+        start=start,
+        end=end,
     )
 
 
