@@ -53,6 +53,8 @@ timing:
 generation:
   max_gap_seconds: 0.8
   max_cue_duration_seconds: 5.0
+  # Fail closed when an ASR-only span looks like a missing section of the source SRT.
+  max_generated_adlib_duration_seconds: 20.0
 
 output:
   no_overlaps: true

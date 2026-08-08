@@ -168,3 +168,55 @@ def test_generated_adlib_accepts_full_span_timing_for_equal_length_word_correcti
     assert updated.cue_word_indices[4] == [0, 1, 2]
     assert flags == []
     assert expansions == {}
+
+
+def test_generated_adlib_flags_text_expansion_beyond_available_asr_words():
+    words = [
+        Word(text="kurzer", start=1.00, end=1.20, speaker_id="A"),
+        Word(text="Satz.", start=1.25, end=1.55, speaker_id="A"),
+    ]
+    source = Cue(
+        index=4,
+        start_ms=1_000,
+        end_ms=1_550,
+        lines=["Dieser erheblich längere Text hat keine akustische Wortabdeckung."],
+    )
+    alignment = AlignmentResult(cue_word_indices={4: [0, 1]})
+
+    _cues, updated, flags, expansions = segment_generated_adlib_cues(
+        [source],
+        words,
+        alignment,
+        {4},
+        _profile(),
+        max_gap_seconds=0.8,
+        max_cue_duration_seconds=5.0,
+    )
+
+    assert [
+        word_index
+        for cue_id in expansions[4]
+        for word_index in updated.cue_word_indices[cue_id]
+    ] == [0, 1]
+    assert flags[0].kind == "generated_adlib_word_mapping_unavailable"
+
+
+def test_generated_adlib_flags_when_candidate_indices_have_no_valid_word_timing():
+    words = [Word(text="invalid", start=-1.0, end=-0.5, speaker_id="A")]
+    source = Cue(index=4, start_ms=1_000, end_ms=1_500, lines=["generated dialogue"])
+    alignment = AlignmentResult(cue_word_indices={4: [0, -1, 99]})
+
+    cues, updated, flags, expansions = segment_generated_adlib_cues(
+        [source],
+        words,
+        alignment,
+        {4},
+        _profile(),
+        max_gap_seconds=0.8,
+        max_cue_duration_seconds=5.0,
+    )
+
+    assert cues == [source]
+    assert updated.cue_word_indices[4] == []
+    assert [flag.kind for flag in flags] == ["generated_adlib_word_mapping_unavailable"]
+    assert expansions == {}

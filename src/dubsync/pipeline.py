@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,24 @@ def sync_episode(
         )
 
     if resume_stage == "verify":
+        resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
+        resume_decisions = _load_adjudication_artifact(
+            episode_workdir / "adjudicate.json"
+        )[0]
         rebuilt = _load_rebuild_artifact(episode_workdir / "rebuild.json")
+        unsafe_cases = _unsafe_incomplete_source_resume_case_ids(
+            resume_alignment.divergence_spans,
+            provider_config,
+            resume_decisions,
+            rebuilt,
+            cues,
+        )
+        if unsafe_cases:
+            raise RuntimeError(
+                "Cannot resume verify from stale incomplete-source adjudication cases "
+                f"({', '.join(unsafe_cases)}); resume from rebuild so source-authority "
+                "safety checks can be applied."
+            )
         return _run_verify_stage(
             episode_workdir=episode_workdir,
             output_path=output_path,
@@ -190,7 +208,7 @@ def sync_episode(
             source_cues=cues,
             rebuilt=rebuilt,
             words=words,
-            alignment=_load_alignment_artifact(episode_workdir / "align.json"),
+            alignment=resume_alignment,
             flags=[
                 *_load_report_flags(episode_workdir / "qc_report.json"),
                 *source_order_flags,
@@ -201,7 +219,7 @@ def sync_episode(
             ],
             cost_meter=cost_meter,
             include_dropped_line_flags=False,
-            decisions=_load_adjudication_artifact(episode_workdir / "adjudicate.json")[0],
+            decisions=resume_decisions,
             fps_summary_metadata=fps_summary_metadata,
         )
 
@@ -223,52 +241,88 @@ def sync_episode(
     decisions: list[AdjudicationDecision] = []
     if resume_stage == "rebuild":
         decisions, adjudication_flags = _load_adjudication_artifact(episode_workdir / "adjudicate.json")
+        decisions, adjudication_flags = _apply_incomplete_source_holds_to_decisions(
+            alignment.divergence_spans,
+            provider_config,
+            decisions,
+            adjudication_flags,
+        )
         flags.extend(adjudication_flags)
+        _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
     elif alignment.divergence_spans:
-        adjudication_flags: list[QCFlag]
-        audio_snippets = (
-            {}
-            if no_llm
-            else _adjudication_audio_snippets(
-                audio_for_asr,
-                episode_workdir,
+        provider_spans, held_decisions, incomplete_source_flags = (
+            _hold_incomplete_source_insertions(
                 alignment.divergence_spans,
                 provider_config,
             )
         )
-        cached_adjudication = (
-            None
-            if no_llm
-            else _load_cached_adjudication(
-                episode_workdir,
-                alignment.divergence_spans,
-                provider_config,
-                audio_snippets=audio_snippets,
-            )
-        )
-        if cached_adjudication is None:
-            llm_adapter = KeepSRTAdapter() if no_llm else llm_adapter_from_config(provider_config, pass_name="adjudication")
-            engine = AdjudicationEngine(
-                llm_adapter,
-                confidence_gate=_adjudication_confidence_gate(provider_config),
-                scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
-                audio_snippets=audio_snippets,
-            )
-            decisions, adjudication_flags = engine.adjudicate(alignment.divergence_spans)
-            if not no_llm:
-                _write_cached_adjudication(
+        provider_decisions: list[AdjudicationDecision] = []
+        provider_flags: list[QCFlag] = []
+        if provider_spans:
+            audio_snippets = (
+                {}
+                if no_llm
+                else _adjudication_audio_snippets(
+                    audio_for_asr,
                     episode_workdir,
-                    alignment.divergence_spans,
+                    provider_spans,
                     provider_config,
-                    decisions,
-                    adjudication_flags,
+                )
+            )
+            cached_adjudication = (
+                None
+                if no_llm
+                else _load_cached_adjudication(
+                    episode_workdir,
+                    provider_spans,
+                    provider_config,
                     audio_snippets=audio_snippets,
                 )
-            _record_llm_usage_events(cost_meter, llm_adapter, provider_config, pass_name="adjudication")
+            )
+            if cached_adjudication is None:
+                llm_adapter = (
+                    KeepSRTAdapter()
+                    if no_llm
+                    else llm_adapter_from_config(provider_config, pass_name="adjudication")
+                )
+                engine = AdjudicationEngine(
+                    llm_adapter,
+                    confidence_gate=_adjudication_confidence_gate(provider_config),
+                    scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
+                    audio_snippets=audio_snippets,
+                )
+                provider_decisions, provider_flags = engine.adjudicate(provider_spans)
+                if not no_llm:
+                    _write_cached_adjudication(
+                        episode_workdir,
+                        provider_spans,
+                        provider_config,
+                        provider_decisions,
+                        provider_flags,
+                        audio_snippets=audio_snippets,
+                    )
+                _record_llm_usage_events(
+                    cost_meter,
+                    llm_adapter,
+                    provider_config,
+                    pass_name="adjudication",
+                )
+            else:
+                provider_decisions, provider_flags = cached_adjudication
         else:
-            decisions, adjudication_flags = cached_adjudication
+            _write_json(episode_workdir / "audio_snippets.json", {"snippets": []})
+        decisions_by_case = {
+            decision.case_id: decision
+            for decision in [*held_decisions, *provider_decisions]
+        }
+        decisions = [
+            decisions_by_case[span.case_id]
+            for span in alignment.divergence_spans
+            if span.case_id in decisions_by_case
+        ]
+        adjudication_flags = [*incomplete_source_flags, *provider_flags]
         if no_llm:
-            for span in alignment.divergence_spans:
+            for span in provider_spans:
                 adjudication_flags.append(
                     QCFlag(
                         kind="divergence_unresolved",
@@ -863,8 +917,8 @@ def _generation_float_config(provider_config: dict[str, object], key: str, defau
     if not isinstance(generation_config, dict):
         return default
     value = _float_config(generation_config, key, default, f"generation.{key}")
-    if value <= 0:
-        raise ValueError(f"generation.{key} must be positive")
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"generation.{key} must be finite and positive")
     return value
 
 
@@ -1318,6 +1372,155 @@ def _expanded_adlib_cue_flags(
         else flag
         for flag in flags
     ]
+
+
+def _hold_incomplete_source_insertions(
+    spans: list[DivergenceSpan],
+    provider_config: dict[str, object],
+) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
+    max_duration = _generation_float_config(
+        provider_config,
+        "max_generated_adlib_duration_seconds",
+        20.0,
+    )
+    provider_spans: list[DivergenceSpan] = []
+    held_decisions: list[AdjudicationDecision] = []
+    flags: list[QCFlag] = []
+    for span in spans:
+        hold = _incomplete_source_hold(span, max_duration)
+        if hold is None:
+            provider_spans.append(span)
+            continue
+        decision, flag = hold
+        held_decisions.append(decision)
+        flags.append(flag)
+    return provider_spans, held_decisions, flags
+
+
+def _incomplete_source_hold(
+    span: DivergenceSpan,
+    max_duration: float,
+) -> tuple[AdjudicationDecision, QCFlag] | None:
+    if span.cue_ids or span.srt_token_indices:
+        return None
+    if not span.asr_word_indices and not span.asr_text.strip():
+        return None
+    duration = (
+        span.end - span.start
+        if span.start is not None
+        and span.end is not None
+        and isfinite(span.start)
+        and isfinite(span.end)
+        and span.start >= 0
+        and span.end > span.start
+        else None
+    )
+    if duration is not None and duration <= max_duration:
+        return None
+    timing_reason = (
+        f"lasted {duration:.1f}s, above the {max_duration:g}s automatic ad-lib limit"
+        if duration is not None
+        else "had no valid timing for bounded automatic ad-lib generation"
+    )
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="keep_srt",
+        final_text=span.srt_text,
+        confidence=0.0,
+        speaker=span.speaker_ids[0] if len(span.speaker_ids) == 1 else None,
+        character="unknown",
+        reason=(
+            "ASR-only dialogue exceeded a safe automatic ad-lib bound; the source "
+            "subtitles may be incomplete, so no text was generated."
+        ),
+    )
+    flag = QCFlag(
+        kind="generated_adlib_rejected_incomplete_source",
+        cue_ids=[],
+        message=(
+            f"An ASR-only span {timing_reason}. The source SRT may be incomplete; "
+            "supply the full customer subtitles instead of auto-generating an episode section."
+        ),
+        severity="error",
+        old_text=span.srt_text,
+        new_text=span.asr_text,
+        start=span.start,
+        end=span.end,
+    )
+    return decision, flag
+
+
+def _apply_incomplete_source_holds_to_decisions(
+    spans: list[DivergenceSpan],
+    provider_config: dict[str, object],
+    decisions: list[AdjudicationDecision],
+    adjudication_flags: list[QCFlag],
+) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
+    _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
+        spans,
+        provider_config,
+    )
+    if not held_decisions:
+        return decisions, adjudication_flags
+
+    held_by_case = {decision.case_id: decision for decision in held_decisions}
+    decisions_by_case = {decision.case_id: decision for decision in decisions}
+    decisions_by_case.update(held_by_case)
+    ordered_decisions = [
+        decisions_by_case[span.case_id]
+        for span in spans
+        if span.case_id in decisions_by_case
+    ]
+    retained_flags = [
+        flag
+        for flag in adjudication_flags
+        if flag.kind != "generated_adlib_rejected_incomplete_source"
+    ]
+    return ordered_decisions, [*retained_flags, *incomplete_source_flags]
+
+
+def _unsafe_incomplete_source_resume_case_ids(
+    spans: list[DivergenceSpan],
+    provider_config: dict[str, object],
+    decisions: list[AdjudicationDecision],
+    rebuilt: list[Cue],
+    source_cues: list[Cue],
+) -> list[str]:
+    _, held_decisions, _ = _hold_incomplete_source_insertions(spans, provider_config)
+    decisions_by_case = {decision.case_id: decision for decision in decisions}
+    spans_by_case = {span.case_id: span for span in spans}
+    source_ids = {cue.index for cue in source_cues}
+    unsafe_cases: list[str] = []
+    for held in held_decisions:
+        decision = decisions_by_case.get(held.case_id)
+        span = spans_by_case.get(held.case_id)
+        stale_decision = (
+            decision is None
+            or decision.verdict != "keep_srt"
+        )
+        stale_rebuild = (
+            span is not None
+            and _rebuilt_contains_generated_span(rebuilt, source_ids, span)
+        )
+        if stale_decision or stale_rebuild:
+            unsafe_cases.append(held.case_id)
+    return unsafe_cases
+
+
+def _rebuilt_contains_generated_span(
+    rebuilt: list[Cue],
+    source_ids: set[int],
+    span: DivergenceSpan,
+) -> bool:
+    generated = [cue for cue in rebuilt if cue.index not in source_ids]
+    if span.start is None or span.end is None or span.end <= span.start:
+        return bool(generated)
+    span_start_ms = round(span.start * 1000)
+    span_end_ms = round(span.end * 1000)
+    return any(
+        cue.end_ms > span_start_ms and cue.start_ms < span_end_ms
+        for cue in generated
+    )
 
 
 def _adlib_cue_ids_by_case(

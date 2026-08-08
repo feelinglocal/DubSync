@@ -4,11 +4,12 @@ import json
 import os
 import wave
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
 from dubsync.cli import app
-from dubsync.models import AudioSnippet, Cue
+from dubsync.models import AudioSnippet, Cue, DivergenceSpan
 import dubsync.pipeline as pipeline_module
 from dubsync.pipeline import _punctuation_cache_key, _speaker_mapping_cache_key
 from dubsync.srt_io import parse_srt_text
@@ -33,6 +34,115 @@ def test_punctuation_cache_key_includes_line_constraints():
     wider_style = _punctuation_cache_key(cues, config, max_chars_per_line=42, max_lines_per_cue=2)
 
     assert house_style.digest != wider_style.digest
+
+
+def test_incomplete_source_guard_leaves_source_backed_and_short_adlib_spans_unchanged():
+    source_backed = DivergenceSpan(
+        case_id="case-source",
+        cue_ids=[1],
+        srt_text="customer subtitle text",
+        asr_text="spoken replacement text",
+        start=10.0,
+        end=70.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1, 2],
+    )
+    short_adlib = DivergenceSpan(
+        case_id="case-adlib",
+        cue_ids=[],
+        srt_text="",
+        asr_text="short spoken aside",
+        start=71.0,
+        end=74.0,
+        asr_word_indices=[3, 4, 5],
+    )
+    source_free_without_asr_words = DivergenceSpan(
+        case_id="case-empty",
+        cue_ids=[],
+        srt_text="",
+        asr_text="",
+        start=None,
+        end=None,
+        asr_word_indices=[],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [source_backed, short_adlib, source_free_without_asr_words],
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+    )
+
+    assert provider_spans == [source_backed, short_adlib, source_free_without_asr_words]
+    assert held_decisions == []
+    assert flags == []
+
+
+def test_incomplete_source_guard_holds_source_free_spans_with_invalid_timing():
+    missing_start = DivergenceSpan(
+        case_id="case-missing-start",
+        cue_ids=[],
+        srt_text="",
+        asr_text="unbounded spoken section",
+        start=None,
+        end=70.0,
+        asr_word_indices=[0, 1, 2],
+    )
+    reversed_timing = DivergenceSpan(
+        case_id="case-reversed",
+        cue_ids=[],
+        srt_text="",
+        asr_text="invalid spoken section",
+        start=70.0,
+        end=10.0,
+        asr_word_indices=[3, 4, 5],
+    )
+    negative_timing = DivergenceSpan(
+        case_id="case-negative",
+        cue_ids=[],
+        srt_text="",
+        asr_text="negative spoken section",
+        start=-70.0,
+        end=-10.0,
+        asr_word_indices=[6, 7, 8],
+    )
+    missing_word_indices = DivergenceSpan(
+        case_id="case-missing-indices",
+        cue_ids=[],
+        srt_text="",
+        asr_text="long ASR evidence without recoverable word indices",
+        start=10.0,
+        end=70.0,
+        asr_word_indices=[],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [missing_start, reversed_timing, negative_timing, missing_word_indices],
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+    )
+
+    assert provider_spans == []
+    assert [decision.case_id for decision in held_decisions] == [
+        "case-missing-start",
+        "case-reversed",
+        "case-negative",
+        "case-missing-indices",
+    ]
+    assert [flag.kind for flag in flags] == [
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+    ]
+    assert all("valid timing" in flag.message for flag in flags[:3])
+    assert "above the 20s" in flags[3].message
+
+
+@pytest.mark.parametrize("invalid_limit", [float("inf"), float("nan"), 0.0, -1.0])
+def test_incomplete_source_guard_rejects_invalid_safety_limits(invalid_limit):
+    with pytest.raises(ValueError, match="max_generated_adlib_duration_seconds"):
+        pipeline_module._hold_incomplete_source_insertions(
+            [],
+            {"generation": {"max_generated_adlib_duration_seconds": invalid_limit}},
+        )
 
 
 def test_cli_sync_flags_explicit_fps_that_disagrees_with_source_grid(tmp_path):
@@ -1380,11 +1490,14 @@ def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     assert adlib_flag["confidence"] == 0.88
 
 
-def test_cli_sync_splits_long_asr_only_tail_into_readable_cues(tmp_path):
+def test_cli_sync_holds_episode_length_asr_tail_when_source_is_incomplete(tmp_path, monkeypatch):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
     out_path = tmp_path / "episode.synced.srt"
+    resumed_out_path = tmp_path / "episode.resumed.srt"
+    verify_out_path = tmp_path / "episode.verify.srt"
+    partial_verify_out_path = tmp_path / "episode.partial-verify.srt"
     workdir = tmp_path / "work"
     wordstream_path = tmp_path / "episode.wordstream.json"
     tail_text = (
@@ -1443,10 +1556,17 @@ def test_cli_sync_splits_long_asr_only_tail_into_readable_cues(tmp_path):
                 "generation": {
                     "max_gap_seconds": 0.8,
                     "max_cue_duration_seconds": 5.0,
+                    "max_generated_adlib_duration_seconds": 8.0,
                 },
             }
         ),
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "dubsync.pipeline.llm_adapter_from_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an incomplete-source tail must be held before provider work")
+        ),
     )
 
     result = CliRunner().invoke(
@@ -1468,17 +1588,135 @@ def test_cli_sync_splits_long_asr_only_tail_into_readable_cues(tmp_path):
 
     assert result.exit_code == 0, result.output
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
-    tail_cues = synced[1:]
-    assert len(tail_cues) > 1
-    assert alphanumeric_signature(" ".join(cue.plain_text for cue in tail_cues)) == alphanumeric_signature(tail_text)
-    assert all(cue.duration_ms <= 5_000 for cue in tail_cues)
-    assert all(len(cue.lines) <= 2 for cue in tail_cues)
-    assert all(display_width(line) <= 26 for cue in tail_cues for line in cue.lines)
-    assert all(left.end_ms <= right.start_ms for left, right in zip(tail_cues, tail_cues[1:]))
+    assert [cue.plain_text for cue in synced] == ["in die Familie."]
 
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
-    adlib_flag = next(flag for flag in report["flags"] if flag["kind"] == "adlib_inserted")
-    assert len(adlib_flag["cue_ids"]) == len(tail_cues)
+    incomplete_source_flag = next(
+        flag
+        for flag in report["flags"]
+        if flag["kind"] == "generated_adlib_rejected_incomplete_source"
+    )
+    assert incomplete_source_flag["severity"] == "error"
+    assert incomplete_source_flag["new_text"] == tail_text
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+    adjudication = json.loads((workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8"))
+    assert adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert adjudication["decisions"][0]["final_text"] == ""
+
+    stale_decision = {
+        **adjudication["decisions"][0],
+        "verdict": "use_audio",
+        "final_text": tail_text,
+        "confidence": 0.99,
+        "reason": "stale pre-guard adjudication generated the missing episode section",
+    }
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": [stale_decision], "flags": []}),
+        encoding="utf-8",
+    )
+    stale_tail = Cue(
+        index=2,
+        start_ms=1_033,
+        end_ms=round(cursor * 1000),
+        lines=[tail_text],
+    )
+    (workdir / "episode" / "rebuild.json").write_text(
+        json.dumps({"cues": [synced[0].model_dump(), stale_tail.model_dump()]}),
+        encoding="utf-8",
+    )
+
+    verify = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(verify_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "verify",
+            "--no-llm",
+        ],
+    )
+
+    assert verify.exit_code != 0
+    assert "resume from rebuild" in verify.output.lower()
+    assert not verify_out_path.exists()
+
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": adjudication["decisions"], "flags": adjudication["flags"]}),
+        encoding="utf-8",
+    )
+    partial_stale_tail = stale_tail.model_copy(update={"lines": ["Verraten von Feinden."]})
+    (workdir / "episode" / "rebuild.json").write_text(
+        json.dumps({"cues": [synced[0].model_dump(), partial_stale_tail.model_dump()]}),
+        encoding="utf-8",
+    )
+    partial_verify = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(partial_verify_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "verify",
+            "--no-llm",
+        ],
+    )
+
+    assert partial_verify.exit_code != 0
+    assert "resume from rebuild" in partial_verify.output.lower()
+    assert not partial_verify_out_path.exists()
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": [stale_decision], "flags": []}),
+        encoding="utf-8",
+    )
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(resumed_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "rebuild",
+            "--no-llm",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    resumed_cues = parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in resumed_cues] == ["in die Familie."]
+    resumed_adjudication = json.loads(
+        (workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8")
+    )
+    assert resumed_adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert any(
+        flag["kind"] == "generated_adlib_rejected_incomplete_source"
+        for flag in resumed_adjudication["flags"]
+    )
 
 
 def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp_path):

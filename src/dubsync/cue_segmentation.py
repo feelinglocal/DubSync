@@ -172,8 +172,10 @@ def _retained_word_window(
 ) -> tuple[list[int], str]:
     ordered = _ordered_valid_word_indices(words, word_indices)
     target_tokens = alphanumeric_signature(text)
-    if not ordered or not target_tokens:
+    if not target_tokens:
         return ordered, "full"
+    if not ordered:
+        return ordered, "unavailable"
 
     candidate_tokens: list[str] = []
     token_word_positions: list[int] = []
@@ -183,7 +185,7 @@ def _retained_word_window(
             token_word_positions.append(word_position)
 
     if not candidate_tokens:
-        return ordered, "full"
+        return ordered, "unavailable"
 
     matching_windows = _exact_token_windows(
         candidate_tokens,
@@ -193,7 +195,7 @@ def _retained_word_window(
     )
 
     if len(matching_windows) != 1:
-        status = "unavailable" if len(candidate_tokens) > len(target_tokens) else "full"
+        status = "unavailable" if len(candidate_tokens) != len(target_tokens) else "full"
         return ordered, status
 
     word_start, word_end = next(iter(matching_windows))
