@@ -7,6 +7,7 @@ from .audio import AudioNormalizationLimits, normalize_audio
 from .cache import JsonDiskCache
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
+from .cue_segmentation import group_words_for_cues
 from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_adapter_from_config
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
@@ -39,7 +40,7 @@ def build_cues_from_words(
         (word for word in words if word.text.strip() and word.end >= word.start and word.start >= 0),
         key=lambda word: (word.start, word.end),
     )
-    groups = _word_groups(
+    groups = group_words_for_cues(
         ordered,
         profile,
         max_gap_seconds=max_gap_seconds,
@@ -191,53 +192,6 @@ def generate_srt_from_audio(
     return TranscriptionResult(output_path, episode_workdir, cost_meter, report)
 
 
-def _word_groups(
-    words: list[Word],
-    profile: StyleProfile,
-    *,
-    max_gap_seconds: float,
-    max_cue_duration_seconds: float,
-) -> list[list[Word]]:
-    groups: list[list[Word]] = []
-    current: list[Word] = []
-    for word in words:
-        if current and _starts_new_cue(
-            current,
-            word,
-            profile,
-            max_gap_seconds=max_gap_seconds,
-            max_cue_duration_seconds=max_cue_duration_seconds,
-        ):
-            groups.append(current)
-            current = []
-        current.append(word)
-        if _ends_sentence(word.text) and word.end - current[0].start >= profile.min_cue_dur:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _starts_new_cue(
-    current: list[Word],
-    word: Word,
-    profile: StyleProfile,
-    *,
-    max_gap_seconds: float,
-    max_cue_duration_seconds: float,
-) -> bool:
-    previous = current[-1]
-    if word.start - previous.end > max_gap_seconds:
-        return True
-    if previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id:
-        return True
-    if word.end - current[0].start > max_cue_duration_seconds:
-        return True
-    candidate = " ".join(item.text.strip() for item in [*current, word])
-    return len(wrap_visual_width(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
-
-
 def _cue_from_group(index: int, group: list[Word], profile: StyleProfile) -> Cue:
     text = " ".join(word.text.strip() for word in group)
     lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
@@ -334,10 +288,6 @@ def _nonnegative_float(source: dict[str, object], key: str, default: float) -> f
     if value < 0:
         raise ValueError(f"{key} must be zero or greater")
     return value
-
-
-def _ends_sentence(text: str) -> bool:
-    return text.rstrip().endswith((".", "?", "!", "...", "\u2026"))
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

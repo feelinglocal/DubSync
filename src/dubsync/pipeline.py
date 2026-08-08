@@ -17,6 +17,7 @@ from .cache import CacheKey, JsonDiskCache
 from .changes import apply_adjudication_decisions
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
+from .cue_segmentation import segment_generated_adlib_cues
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
@@ -291,6 +292,12 @@ def sync_episode(
         alignment.unmatched_cue_ids,
     )
     flags.extend(adlib_reconciliation_flags)
+    source_cue_ids = {cue.index for cue in cues}
+    generated_adlib_cue_ids = {
+        cue_id
+        for cue_id in adlib_cue_ids_by_case.values()
+        if cue_id not in source_cue_ids
+    }
     alignment = _alignment_with_decision_words(
         alignment,
         decisions,
@@ -304,7 +311,22 @@ def sync_episode(
         profile,
         adlib_cue_ids_by_case=adlib_cue_ids_by_case,
     )
+    adjudicated_cues, alignment, segmentation_flags, cue_id_expansions = segment_generated_adlib_cues(
+        adjudicated_cues,
+        words,
+        alignment,
+        generated_adlib_cue_ids,
+        profile,
+        max_gap_seconds=_generation_float_config(provider_config, "max_gap_seconds", 0.8),
+        max_cue_duration_seconds=_generation_float_config(
+            provider_config,
+            "max_cue_duration_seconds",
+            5.0,
+        ),
+    )
+    change_flags = _expanded_adlib_cue_flags(change_flags, cue_id_expansions)
     flags.extend(change_flags)
+    flags.extend(segmentation_flags)
     rebuilt, recue_flags = rebuild_cues(
         adjudicated_cues,
         words,
@@ -836,6 +858,16 @@ def _timing_float_config(provider_config: dict[str, object], key: str, default: 
     return value
 
 
+def _generation_float_config(provider_config: dict[str, object], key: str, default: float) -> float:
+    generation_config = provider_config.get("generation", {}) if isinstance(provider_config, dict) else {}
+    if not isinstance(generation_config, dict):
+        return default
+    value = _float_config(generation_config, key, default, f"generation.{key}")
+    if value <= 0:
+        raise ValueError(f"generation.{key} must be positive")
+    return value
+
+
 def _output_no_overlaps(provider_config: dict[str, object]) -> bool:
     output_config = provider_config.get("output", {}) if isinstance(provider_config, dict) else {}
     if not isinstance(output_config, dict):
@@ -1263,6 +1295,28 @@ def _cues_with_speaker_characters(cues: list[Cue], speaker_map: dict[str, str]) 
         if cue.speaker_id in speaker_map
         else cue
         for cue in cues
+    ]
+
+
+def _expanded_adlib_cue_flags(
+    flags: list[QCFlag],
+    cue_id_expansions: dict[int, list[int]],
+) -> list[QCFlag]:
+    if not cue_id_expansions:
+        return list(flags)
+    return [
+        flag.model_copy(
+            update={
+                "cue_ids": [
+                    expanded_id
+                    for cue_id in flag.cue_ids
+                    for expanded_id in cue_id_expansions.get(cue_id, [cue_id])
+                ]
+            }
+        )
+        if flag.kind == "adlib_inserted"
+        else flag
+        for flag in flags
     ]
 
 
