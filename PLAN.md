@@ -277,10 +277,10 @@ Build a golden set from past delivered episodes (unsynced SRT + VO audio + final
 |---|---|
 | Scribe v2 ASR + diarization | $0.165 (0.75 h × $0.22) |
 | Keyterm prompting (character names) | +$0.04 |
-| LLM adjudication + punctuation (Gemini 3.7 Flash `high` adjudication with audio snippets + Gemini 3.7 Flash `medium` punctuation) | $0.15–0.25 target range depending on divergence count and snippet volume |
+| LLM adjudication + punctuation (Gemini 3.7 Flash `high` adjudication with audio snippets + Gemini 3.7 Flash `medium` punctuation) | Long-form target must be re-benchmarked after complete episode context was added; the paid 258.9-second `testing 4` replay measured $0.20228 for these LLM passes |
 | Audio-snippet double-checks (~30 × 20 s) | ~$0.02 |
 | Forced-align + pyannote (local) | $0 |
-| **Total** | **≈ $0.35–0.55** (fully-local mode: $0) |
+| **Total** | **Not yet established for a 45-minute episode after the complete-context upgrade** (fully-local mode: $0) |
 
 ---
 

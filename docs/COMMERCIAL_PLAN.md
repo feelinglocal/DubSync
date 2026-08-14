@@ -138,6 +138,7 @@ Current provider price anchors:
 
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
 - Gemini 3.7 Flash Standard paid tier through December 31, 2026: $0.75 per million input tokens and $3.75 per million output tokens, including thinking tokens. Starting January 1, 2027, the Standard paid tier is $1.50 per million input tokens and $7.50 per million output tokens.
+- The 2026-08-14 paid `testing 4` replay measured $0.20228 for Gemini adjudication plus punctuation over 258.9 seconds of source audio with complete ordered episode context. Re-benchmark representative long-form jobs before quoting from older per-episode LLM assumptions.
 - Every job already writes measured provider cost to `cost.json`; this is the source of truth for repricing.
 
 Margin rule:
