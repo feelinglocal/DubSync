@@ -56,9 +56,10 @@ _LLM_PASS_CONFIG_KEYS = {
 }
 
 _GEMINI_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
+_GEMINI_37_THINKING_LEVELS = {"low", "medium", "high"}
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-_ADJUDICATION_PROMPT_VERSION = "adjudication-v4-audio-evidence-boundary"
-_PUNCTUATION_PROMPT_VERSION = "punctuation-v2-preserve-editorial-structure"
+_ADJUDICATION_PROMPT_VERSION = "adjudication-v6-gemini37-complete-context-boundary"
+_PUNCTUATION_PROMPT_VERSION = "punctuation-v4-gemini37-complete-context-freeze"
 _SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v2-context-only"
 
 
@@ -74,9 +75,13 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model = model
         self.confidence_gate = confidence_gate
-        self.thinking_level = thinking_level
+        self.thinking_level = _normalize_gemini_thinking_level(thinking_level, model)
         self.cached_content = cached_content
         self.usage_events: list[object] = []
+        self.episode_context: list[Cue] = []
+
+    def set_episode_context(self, cues: list[Cue]) -> None:
+        self.episode_context = [cue.model_copy(deep=True) for cue in cues]
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> list[dict[str, object]]:
         if not self.api_key:
@@ -84,7 +89,11 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
         response = _gemini_generate_json(
             api_key=self.api_key,
             model=self.model,
-            prompt=_adjudication_prompt(spans, confidence_gate=self.confidence_gate),
+            prompt=_adjudication_prompt(
+                spans,
+                confidence_gate=self.confidence_gate,
+                episode_context=self.episode_context,
+            ),
             response_schema=AdjudicationBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
@@ -106,6 +115,7 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
                 spans,
                 confidence_gate=self.confidence_gate,
                 audio_snippets=audio_snippets,
+                episode_context=self.episode_context,
             ),
             response_schema=AdjudicationBatch,
             thinking_level=self.thinking_level,
@@ -121,7 +131,7 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
         response = _gemini_generate_json(
             api_key=self.api_key,
             model=self.model,
-            prompt=_punctuation_prompt(cues),
+            prompt=_punctuation_prompt(cues, episode_context=self.episode_context),
             response_schema=PunctuationBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
@@ -351,7 +361,7 @@ def llm_adapter_from_config(config: dict[str, Any], pass_name: str | None = None
             api_key=api_key,
             model=str(model or "gemini-3.5-flash"),
             confidence_gate=confidence_gate,
-            thinking_level=_gemini_thinking_level_from_config(llm_config, pass_name),
+            thinking_level=_gemini_thinking_level_from_config(llm_config, pass_name, str(model or "gemini-3.5-flash")),
             cached_content=_gemini_cached_content_from_config(llm_config),
         )
     if provider == "openai":
@@ -422,10 +432,14 @@ def _confidence_gate_from_config(llm_config: dict[str, Any]) -> float:
     return confidence_gate
 
 
-def _gemini_thinking_level_from_config(llm_config: dict[str, Any], pass_name: str | None) -> str | None:
+def _gemini_thinking_level_from_config(llm_config: dict[str, Any], pass_name: str | None, model: str) -> str | None:
     value = llm_config.get("thinking_level")
     if value is None and pass_name == "punctuation":
-        return "medium"
+        value = "medium"
+    return _normalize_gemini_thinking_level(value, model)
+
+
+def _normalize_gemini_thinking_level(value: object, model: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
@@ -433,6 +447,9 @@ def _gemini_thinking_level_from_config(llm_config: dict[str, Any], pass_name: st
     thinking_level = value.strip().lower()
     if thinking_level not in _GEMINI_THINKING_LEVELS:
         raise ProviderError("llm.thinking_level must be one of: minimal, low, medium, high")
+    normalized_model = model.strip().lower().removeprefix("models/")
+    if normalized_model == "gemini-3.7-flash" and thinking_level not in _GEMINI_37_THINKING_LEVELS:
+        raise ProviderError("gemini-3.7-flash thinking_level must be one of: low, medium, high")
     return thinking_level
 
 
@@ -492,14 +509,22 @@ def _adjudication_prompt(
     spans: list[DivergenceSpan],
     confidence_gate: float = 0.7,
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    episode_context: list[Cue] | None = None,
 ) -> str:
     instructions = [
         "Listen to each attached audio snippet when one is provided; use it only to determine the literal words spoken in that case.",
-        "Weigh the original SRT span, ASR hypothesis, and neighboring cue context. Audio or ASR word timing is acoustic evidence; matched neighboring SRT text is editorial context.",
+        "Weigh the original SRT span, ASR hypothesis, neighboring cue context, speaker IDs, and character labels. Audio and ASR word timing are acoustic evidence; matched neighboring SRT text is editorial context.",
+        "Treat context_before, context_after, anchor cue IDs, anchor times, speaker IDs, and character labels as read-only context. Never copy neighboring text into final_text.",
+        "Context can disambiguate meaning, spelling, speaker continuity, and sentence boundaries. Context cannot prove unheard words. Do not change the source solely because an ASR hypothesis is different or more fluent.",
+        "Prefer the source SRT when the audio is ambiguous, noisy, overlapped, musical, or when ASR appears to mistranscribe a plausible source word.",
+        "Treat divergence start/end times, source cue times, and audio snippet boundaries as a strict locality check. If a partial audio window would compress, omit, or absorb dialogue outside its evidence, choose keep_srt or report below-gate confidence; never rewrite a whole cue from partial audio.",
         "final_text is the replacement for only the divergent span. Never include timestamps, neighboring cue text, explanations in final_text, or a full-cue rewrite.",
         "Do not drop matched cue words outside the divergent span. Example: for divergent 'Drachen Evolutionssystem' within 'Drachen- / Evolutionssystem besitze.', return 'Drachenevolutionssystem'; downstream text remains 'Drachenevolutionssystem besitze.'.",
+        "Preserve source line breaks and quotation marks exactly. Never add decorative dialogue quotes; alter a mark only when it is inside the divergent span and the evidence makes that bounded change necessary.",
         "Preserve source spellings of character and proper names unless acoustic evidence clearly supports a different spoken name; lower confidence for a near-homophone.",
         "For German compounds and rank labels, use subtitle-readable spelling supported by the evidence, for example 'SSS-Rangklasse' rather than 'SSS-Rang-Klasse'.",
+        "Keep German grammar, case, and punctuation style consistent with the source unless the divergent span itself requires a spoken-word correction.",
+        "If the ASR text contains repeated filler, music-like loops, or text not grounded in the supplied source context, choose keep_srt or low-confidence use_audio only when the snippet clearly contains dialogue.",
         "Choose keep_srt for punctuation, casing, line-break, or likely ASR spelling-only differences; use_audio for a clear spoken-word difference; hybrid only when both sources contribute necessary words.",
         f"Return the best bounded answer for every case. If confidence is below {confidence_gate:.2f}, report that lower confidence so QC can hold it for review.",
     ]
@@ -510,6 +535,8 @@ def _adjudication_prompt(
         "allowed_verdicts": ["keep_srt", "use_audio", "hybrid"],
         "confidence_gate": confidence_gate,
         "spans": [span.model_dump() for span in spans],
+        "episode_context_role": "read_only ordered source subtitle context; never copy unrelated text into final_text",
+        "episode_context": _episode_context_payload(episode_context or []),
         "audio_snippets": [
             {
                 "case_id": snippet.case_id,
@@ -522,29 +549,58 @@ def _adjudication_prompt(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _punctuation_prompt(cues: list[Cue]) -> str:
+def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = None) -> str:
     payload = {
         "task": "Apply subtitle punctuation and casing while preserving the supplied editorial structure.",
         "prompt_version": _PUNCTUATION_PROMPT_VERSION,
+        "modality": "text_only",
         "instructions": [
             "Preserve every cue ID and cue boundary, and return exactly one result for every supplied cue.",
+            "The episode_context is read-only. Return results only for editable_cue_ids; never copy text from a context-only cue.",
             "Do not add, remove, reorder, translate, or respell any alphanumeric word; never return timestamps.",
-            "Preserve the source line-break positions. Do not flatten, add, or move line breaks.",
-            "Do not add, remove, or restyle quotation marks. In particular, do not wrap ordinary German dialogue in new low-high quotes when the source has none.",
+            "Preserve the source line-break positions represented by source_lines. Do not flatten, add, move, or remove line breaks.",
+            "Do not add, remove, or restyle quotation marks, including German „ “, English “ ”, guillemets « », single guillemets ‹ ›, or straight quotes. Never wrap ordinary dialogue in quotes when the source has none.",
+            "Use the full ordered batch, including previous and next cues, speakers, characters, and timing metadata, as sentence context; change only punctuation, casing, and spacing inside each returned cue.",
+            "For German, apply natural sentence punctuation without decorative dialogue quotes; preserve existing ellipses, dashes, censorship masks, names, numbers, and compounds.",
+            "Leave a cue unchanged when punctuation would require guessing speaker intent, adding missing words, or changing subtitle line structure.",
             "Use speaker and character labels only as context for sentence punctuation; never copy labels into subtitle text.",
+            "Timing metadata is read-only context. Do not infer, move, merge, split, or output cue times.",
+            "Before returning each cue, verify that its alphanumeric token sequence, line-break positions, and quotation-mark sequence match the input exactly; if any differ, return that cue unchanged.",
             "Return only the structured cue results; no commentary.",
         ],
+        "editable_cue_ids": [cue.index for cue in cues],
+        "episode_context": _episode_context_payload(episode_context or cues),
         "cues": [
             {
                 "cue_id": cue.index,
+                "sequence_position": position,
+                "start_ms": cue.start_ms,
+                "end_ms": cue.end_ms,
+                "duration_ms": cue.duration_ms,
+                "source_lines": list(cue.lines),
                 "text": cue.text,
                 "speaker_id": cue.speaker_id,
                 "character": cue.character,
             }
-            for cue in cues
+            for position, cue in enumerate(cues, start=1)
         ],
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _episode_context_payload(cues: list[Cue]) -> list[dict[str, object]]:
+    return [
+        {
+            "cue_id": cue.index,
+            "sequence_position": position,
+            "start_ms": cue.start_ms,
+            "end_ms": cue.end_ms,
+            "source_lines": list(cue.lines),
+            "speaker_id": cue.speaker_id,
+            "character": cue.character,
+        }
+        for position, cue in enumerate(cues, start=1)
+    ]
 
 
 def _speaker_mapping_prompt(cues: list[Cue]) -> str:

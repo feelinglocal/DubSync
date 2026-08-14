@@ -35,6 +35,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [subtitleFiles, setSubtitleFiles] = useState<File[]>([])
   const [fps, setFps] = useState('auto')
   const [language, setLanguage] = useState('auto')
+  const [syncMaxLines, setSyncMaxLines] = useState('source')
   const [styleSource, setStyleSource] = useState<'preset' | 'custom' | 'sample'>('preset')
   const [stylePreset, setStylePreset] = useState(config.generation_styles.default_preset)
   const [customStyle, setCustomStyle] = useState<GenerationStyleDraft>(DEFAULT_STYLE_DRAFT)
@@ -213,6 +214,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
       if (styleSource === 'sample' && styleSample) body.set('style_sample', styleSample)
     } else {
       body.set('style', 'source')
+      if (syncMaxLines !== 'source') body.set('sync_max_lines_per_cue', syncMaxLines)
     }
     const requestAccessCode = config.access_code_required ? accessCode.trim() : ''
     try {
@@ -312,6 +314,9 @@ export function Workspace({ config }: { config: PublicConfig }) {
           )}
           <div className={config.access_code_required ? 'workspace-options has-access-code' : 'workspace-options'}>
             <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{mode === 'sync' && <option value="auto">Auto (detect from SRT)</option>}{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
+            {mode === 'sync' && (
+              <label><span className="field-label">Maximum lines per cue</span><span className="select-control"><select value={syncMaxLines} onChange={(event) => setSyncMaxLines(event.target.value)}><option value="source">Keep source style (default)</option>{syncLineOptions(config).map((value) => <option key={value} value={value}>{value} {value === 1 ? 'line' : 'lines'}</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
+            )}
             <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
             {config.access_code_required && config.jobs_available && (
               <label><span className="field-label">Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
@@ -423,6 +428,15 @@ function refreshFailureMessage(jobId: string, jobs: readonly JobResponse[]) {
 
 function messageFrom(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong.'
+}
+
+function syncLineOptions(config: PublicConfig): number[] {
+  const limit = config.sync_style_limits.max_lines_per_cue
+  const values: number[] = []
+  for (let value = limit.min; value <= limit.max; value += limit.step) {
+    values.push(value)
+  }
+  return values
 }
 
 const DEFAULT_STYLE_DRAFT: GenerationStyleDraft = {

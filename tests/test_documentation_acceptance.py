@@ -103,25 +103,29 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.7-flash"
     assert config["llm"]["adjudication"]["thinking_level"] == "high"
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
-    assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
+    assert config["llm"]["punctuation"]["provider"] == "gemini"
+    assert config["llm"]["punctuation"]["model"] == "gemini-3.7-flash"
+    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
     assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
     assert "OPENAI_API_KEY" in example_text
     assert "GEMINI_API_KEY" in example_text
 
 
-def test_production_luna_passes_use_requested_reasoning_efforts():
+def test_production_llm_passes_use_requested_models_and_thinking_levels():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.7-flash"
     assert config["llm"]["adjudication"]["thinking_level"] == "high"
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
-    assert config["llm"]["punctuation"]["reasoning_effort"] == "medium"
+    assert config["llm"]["punctuation"]["provider"] == "gemini"
+    assert config["llm"]["punctuation"]["model"] == "gemini-3.7-flash"
+    assert config["llm"]["punctuation"]["thinking_level"] == "medium"
     assert config["llm"]["speaker_mapping"]["reasoning_effort"] == "medium"
 
 
@@ -137,8 +141,8 @@ def test_documented_configuration_uses_gpt_5_6_luna_default():
 def test_commercial_runbook_names_openai_default_and_optional_gemini_secret():
     commercial_plan = Path("docs/COMMERCIAL_PLAN.md").read_text(encoding="utf-8")
 
-    assert "OpenAI GPT-5.6 Luna punctuation and speaker-mapping passes" in commercial_plan
-    assert "Gemini 3.5 Flash-Lite adjudication with audio snippets" in commercial_plan
+    assert "Gemini 3.7 Flash adjudication and punctuation passes" in commercial_plan
+    assert "OpenAI GPT-5.6 Luna speaker-mapping pass" in commercial_plan
     assert "`OPENAI_API_KEY`" in commercial_plan
     assert "`GEMINI_API_KEY`" in commercial_plan
 
@@ -175,7 +179,8 @@ def test_readme_documents_luna_reasoning_effort_controls():
         "OpenAI LLM calls use",
         "reasoning.effort",
         "gpt-5.6-luna",
-        "punctuation and speaker mapping use `reasoning_effort: medium`",
+        "speaker mapping uses `reasoning_effort: medium`",
+        "Gemini 3.7 Flash punctuation uses `thinking_level: medium`",
     ):
         assert expected in readme
 

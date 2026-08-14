@@ -114,6 +114,28 @@ def test_punctuation_pass_keeps_restored_source_breaks_for_unchanged_cue_even_wh
     assert updated[0].lines == ["Drachen-Evolutionssystem", "besitze ich längst."]
 
 
+def test_punctuation_pass_does_not_text_reflow_source_cue_that_exceeds_line_limit():
+    source = Cue(
+        index=1,
+        start_ms=0,
+        end_ms=2_700,
+        lines=["Alpha beta", "gamma delta", "epsilon zeta."],
+    )
+    adapter = StaticPunctuationAdapter({1: "Alpha beta, gamma delta, epsilon zeta."})
+
+    updated, flags = apply_punctuation_pass(
+        [source],
+        adapter,
+        max_chars_per_line=80,
+        max_lines_per_cue=2,
+        source_cues=[source],
+    )
+
+    assert updated[0].lines == ["Alpha beta,", "gamma delta,", "epsilon zeta."]
+    assert [flag.kind for flag in flags] == ["punctuation_source_structure_preserved"]
+    assert flags[0].severity == "warning"
+
+
 def test_punctuation_pass_allows_generation_without_source_cues():
     cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hallo welt"])]
     adapter = StaticPunctuationAdapter({1: "Hallo Welt."})

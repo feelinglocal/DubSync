@@ -46,7 +46,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert speaker_mapping.reasoning_effort == "medium"
 
 
-def test_production_config_routes_only_audio_adjudication_back_to_gemini(monkeypatch):
+def test_production_config_routes_audio_adjudication_and_punctuation_to_gemini_37(monkeypatch):
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -56,12 +56,12 @@ def test_production_config_routes_only_audio_adjudication_back_to_gemini(monkeyp
     speaker_mapping = llm_adapter_from_config(config, pass_name="speaker_mapping")
 
     assert isinstance(adjudication, GeminiLLMAdapter)
-    assert adjudication.model == "gemini-3.5-flash-lite"
+    assert adjudication.model == "gemini-3.7-flash"
     assert adjudication.thinking_level == "high"
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
-    assert isinstance(punctuation, OpenAILLMAdapter)
-    assert punctuation.model == "gpt-5.6-luna"
-    assert punctuation.reasoning_effort == "medium"
+    assert isinstance(punctuation, GeminiLLMAdapter)
+    assert punctuation.model == "gemini-3.7-flash"
+    assert punctuation.thinking_level == "medium"
     assert isinstance(speaker_mapping, OpenAILLMAdapter)
     assert speaker_mapping.model == "gpt-5.6-luna"
     assert speaker_mapping.reasoning_effort == "medium"
@@ -89,6 +89,20 @@ def test_gemini_thinking_level_can_be_configured_per_pass():
     assert punctuation.thinking_level == "low"
     assert isinstance(speaker_mapping, GeminiLLMAdapter)
     assert speaker_mapping.thinking_level == "minimal"
+
+
+def test_gemini_37_flash_rejects_minimal_thinking_level():
+    config = {
+        "llm": {
+            "provider": "gemini",
+            "model": "gemini-3.7-flash",
+            "api_key": "gemini-key",
+            "punctuation": {"thinking_level": "minimal"},
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="gemini-3.7-flash thinking_level"):
+        punctuation_adapter_from_config(config)
 
 
 def test_gemini_cached_content_can_be_configured_per_pass():

@@ -95,7 +95,24 @@ def apply_punctuation_pass(
         restored_matches_source_structure = source_words_unchanged and (
             _line_word_boundaries(lines) == _line_word_boundaries(source_cue.lines)
         )
-        preserve_source_breaks = restored_matches_source_structure and not line_count_exceeded
+        preserve_source_breaks = restored_matches_source_structure
+        if line_count_exceeded and preserve_source_breaks:
+            flags.append(
+                QCFlag(
+                    kind="punctuation_source_structure_preserved",
+                    cue_ids=[cue.index],
+                    message=(
+                        "The source cue exceeds the active line limit, but its original line "
+                        "structure was preserved because punctuation is not authorized to "
+                        "reflow or split it without acoustic timing evidence."
+                    ),
+                    severity="warning",
+                    old_text=cue.text,
+                    new_text="\n".join(lines),
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
         if (width_exceeded or line_count_exceeded) and not preserve_source_breaks:
             plain_text = next_text.replace("\n", " ")
             lines = [plain_text]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import wave
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 
 
 _LEGACY_FLASH_LITE_VERSION = "3.1"
+_GEMINI_37_STANDARD_PRICE_CHANGE = date(2027, 1, 1)
 
 
 class CostItem(BaseModel):
@@ -84,13 +86,33 @@ def token_usage_from_response(response: object) -> TokenUsage | None:
             continue
         input_tokens = _int_field(
             usage,
-            ("input_tokens", "prompt_tokens", "input_token_count", "prompt_token_count"),
+            ("input_tokens", "prompt_tokens", "input_token_count", "prompt_token_count", "total_input_tokens"),
         )
         output_tokens = _int_field(
             usage,
-            ("output_tokens", "completion_tokens", "output_token_count", "completion_token_count", "candidates_token_count"),
+            (
+                "output_tokens",
+                "completion_tokens",
+                "output_token_count",
+                "completion_token_count",
+                "candidates_token_count",
+                "response_token_count",
+                "total_output_tokens",
+            ),
         )
         if input_tokens is not None and output_tokens is not None:
+            thought_tokens = _int_field(
+                usage,
+                (
+                    "thoughts_token_count",
+                    "thought_token_count",
+                    "thinking_tokens",
+                    "thought_tokens",
+                    "total_thought_tokens",
+                ),
+            )
+            if thought_tokens is not None:
+                output_tokens += thought_tokens
             return TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
     return None
 
@@ -101,11 +123,15 @@ def llm_token_prices(provider: str, model: str, config: dict[str, object]) -> tu
         return configured
 
     normalized_provider = provider.lower()
-    normalized_model = model.lower()
+    normalized_model = model.lower().removeprefix("models/")
     if normalized_provider == "openai" or normalized_model.startswith("gpt-"):
         if normalized_model == "gpt-5.6-luna":
             return (1.0, 6.0)
     if normalized_provider == "gemini" or normalized_model.startswith("gemini-"):
+        if normalized_model == "gemini-3.7-flash":
+            # https://ai.google.dev/gemini-api/docs/pricing
+            # Official standard paid-tier pricing changes on 2027-01-01.
+            return (1.5, 7.5) if _utc_today() >= _GEMINI_37_STANDARD_PRICE_CHANGE else (0.75, 3.75)
         if normalized_model == "gemini-3.5-flash":
             return (1.5, 9.0)
         if normalized_model == "gemini-3.5-flash-lite":
@@ -113,6 +139,10 @@ def llm_token_prices(provider: str, model: str, config: dict[str, object]) -> tu
         if normalized_model == f"gemini-{_LEGACY_FLASH_LITE_VERSION}-flash-lite":
             return (0.25, 1.5)
     return None
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 def record_llm_usage(

@@ -67,8 +67,8 @@ flowchart LR
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
     F --> E["ElevenLabs Scribe v2"]
-    W --> G["OpenAI GPT-5.6 Luna punctuation and speaker-mapping passes"]
-    W --> H["Gemini 3.5 Flash-Lite adjudication with audio snippets"]
+    W --> G["Gemini 3.7 Flash adjudication and punctuation passes"]
+    W --> H["OpenAI GPT-5.6 Luna speaker-mapping pass"]
     W --> C["Deterministic DubSync core"]
     C --> D
     D -->|"token-protected result"| B
@@ -137,7 +137,7 @@ For a single-file or multi-file order, quote `max(total source-audio minutes × 
 Current provider price anchors:
 
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
-- Gemini 3.5 Flash-Lite paid tier: $0.30 per million input tokens and $2.50 per million output tokens.
+- Gemini 3.7 Flash Standard paid tier through December 31, 2026: $0.75 per million input tokens and $3.75 per million output tokens, including thinking tokens. Starting January 1, 2027, the Standard paid tier is $1.50 per million input tokens and $7.50 per million output tokens.
 - Every job already writes measured provider cost to `cost.json`; this is the source of truth for repricing.
 
 Margin rule:
@@ -227,8 +227,8 @@ Do not log transcript text, API keys, job tokens, uploaded filenames, or raw pro
 - Render persistent disks: https://render.com/docs/disks
 - Render Blueprint specification: https://render.com/docs/blueprint-spec
 - ElevenLabs API pricing: https://elevenlabs.io/pricing/api
-- Gemini 3.5 Flash-Lite capabilities and stable model ID: https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
-- Gemini thinking levels: https://ai.google.dev/gemini-api/docs/generate-content/thinking
+- Gemini 3.7 Flash capabilities and stable model ID: https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+- Gemini thinking levels: https://ai.google.dev/gemini-api/docs/thinking
 - Gemini audio understanding and inline audio input: https://ai.google.dev/gemini-api/docs/generate-content/audio
 - Gemini API pricing: https://ai.google.dev/gemini-api/docs/pricing
 - Gemini data retention: https://ai.google.dev/gemini-api/docs/zdr

@@ -386,6 +386,65 @@ def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selecti
     assert len({job.style for job in captured}) == 1
 
 
+def test_sync_batch_applies_one_max_lines_option_to_every_child(tmp_path):
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path), processor=processor)
+    with TestClient(app) as client:
+        response = _post_batch(
+            client,
+            [("one.wav", b"one"), ("two.wav", b"two")],
+            [("one.srt", SRT_BYTES), ("two.srt", SRT_BYTES)],
+            mode="sync",
+            fps=None,
+            style="source",
+        )
+
+    assert response.status_code == 202
+    assert {job.style for job in captured} == {"source"}
+
+    captured.clear()
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            data={"mode": "sync", "sync_max_lines_per_cue": "2"},
+            files=_multipart(
+                [("three.wav", b"three"), ("four.wav", b"four")],
+                [("three.srt", SRT_BYTES), ("four.srt", SRT_BYTES)],
+            ),
+        )
+
+    assert response.status_code == 202
+    assert {json.loads(job.style)["max_lines_per_cue"] for job in captured} == {2}
+
+
+def test_sync_batch_rejects_max_lines_above_customer_limit_without_queueing(tmp_path):
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    app = create_app(settings=_settings(tmp_path), processor=processor)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches",
+            data={"mode": "sync", "sync_max_lines_per_cue": "3"},
+            files=_multipart(
+                [("one.wav", b"one"), ("two.wav", b"two")],
+                [("one.srt", SRT_BYTES), ("two.srt", SRT_BYTES)],
+            ),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Sync maximum lines per cue must be 1 or 2."
+    assert captured == []
+
+
 @pytest.mark.parametrize(
     ("mode", "fps_field", "expected_fps"),
     [

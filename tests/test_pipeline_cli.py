@@ -145,6 +145,24 @@ def test_incomplete_source_guard_rejects_invalid_safety_limits(invalid_limit):
         )
 
 
+def test_adapter_episode_context_hook_receives_complete_ordered_cues():
+    seen: list[list[Cue]] = []
+
+    class ContextAdapter:
+        def set_episode_context(self, cues: list[Cue]) -> None:
+            seen.append(list(cues))
+
+    episode = [
+        Cue(index=4, start_ms=0, end_ms=700, lines=["Vorher."]),
+        Cue(index=5, start_ms=800, end_ms=1_500, lines=["Bleib hier."]),
+        Cue(index=6, start_ms=1_600, end_ms=2_300, lines=["Nachher."]),
+    ]
+
+    pipeline_module._set_adapter_episode_context(ContextAdapter(), episode)
+
+    assert seen == [episode]
+
+
 def test_cli_sync_flags_explicit_fps_that_disagrees_with_source_grid(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
@@ -214,6 +232,74 @@ def test_punctuation_cache_key_changes_with_prompt_version(monkeypatch):
     second = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
 
     assert first.digest != second.digest
+
+
+def test_cli_sync_splits_overlong_source_cue_when_style_limits_lines(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    providers_path = tmp_path / "providers.yaml"
+    style_path = tmp_path / "style.yaml"
+    output_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n"
+        "00:00:01,000 --> 00:00:03,000\n"
+        "Team Falcon hat eigenmächtig die Position verraten.\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Team", "start": 1.00, "end": 1.18, "speaker_id": "A"},
+                    {"text": "Falcon", "start": 1.20, "end": 1.48, "speaker_id": "A"},
+                    {"text": "hat", "start": 1.50, "end": 1.62, "speaker_id": "A"},
+                    {"text": "eigenmächtig", "start": 1.64, "end": 2.05, "speaker_id": "A"},
+                    {"text": "die", "start": 2.07, "end": 2.20, "speaker_id": "A"},
+                    {"text": "Position", "start": 2.22, "end": 2.55, "speaker_id": "A"},
+                    {"text": "verraten.", "start": 2.57, "end": 2.95, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}),
+        encoding="utf-8",
+    )
+    style_path.write_text(
+        "fps: 30\nmax_lines_per_cue: 2\nmax_chars_per_line: 18\nmin_cue_dur: 0.4\ntail_ms: 0\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "--providers",
+            str(providers_path),
+            "--style",
+            str(style_path),
+            "--no-llm",
+            "--output",
+            str(output_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(output_path.read_text(encoding="utf-8"))
+    assert len(synced) == 2
+    assert " ".join(cue.plain_text for cue in synced) == "Team Falcon hat eigenmächtig die Position verraten."
+    assert all(len(cue.lines) <= 2 for cue in synced)
+    assert synced[0].end_ms <= synced[1].start_ms
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "sync_cue_line_limit_split" for flag in report["flags"])
 
 
 def test_speaker_mapping_cache_key_changes_with_prompt_version(monkeypatch):

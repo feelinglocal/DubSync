@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 from .models import AlignmentResult, Cue, QCFlag, Word
@@ -165,13 +166,309 @@ def segment_generated_adlib_cues(
     )
 
 
+def split_overlong_existing_cues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    source_cue_ids: set[int] | None = None,
+    max_gap_seconds: float,
+    max_cue_duration_seconds: float,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], dict[int, list[int]]]:
+    """Split source-backed cues that cannot satisfy the active line limit.
+
+    This is deliberately timing-gated: when a cue cannot be mapped to valid ASR
+    word timing, it is kept and flagged instead of being split by text alone.
+    """
+
+    next_cue_id = max((cue.index for cue in cues), default=0) + 1
+    cue_word_indices = {
+        cue_id: list(indices)
+        for cue_id, indices in alignment.cue_word_indices.items()
+    }
+    split_cues: list[Cue] = []
+    flags: list[QCFlag] = []
+    expansions: dict[int, list[int]] = {}
+
+    for cue in cues:
+        if source_cue_ids is not None and cue.index not in source_cue_ids:
+            split_cues.append(cue)
+            continue
+        exceeds_explicit_lines = len(cue.lines) > profile.max_lines_per_cue
+        exceeds_wrapped_lines = len(wrap_visual_width(cue.plain_text, profile.max_chars_per_line)) > profile.max_lines_per_cue
+        if not exceeds_explicit_lines and not exceeds_wrapped_lines:
+            split_cues.append(cue)
+            continue
+        has_markup = _has_inline_subtitle_markup(cue.text)
+        markup_can_follow_source_lines = (
+            exceeds_explicit_lines and _source_lines_have_self_contained_markup(cue.lines)
+        )
+        if has_markup and not markup_can_follow_source_lines:
+            split_cues.append(cue)
+            flags.append(
+                QCFlag(
+                    kind="sync_cue_line_limit_markup_unsupported",
+                    cue_ids=[cue.index],
+                    message=(
+                        "Cue exceeds the requested maximum line count, but it contains inline "
+                        "subtitle styling markup. It was kept for review instead of risking "
+                        "unbalanced tags during an automatic split."
+                    ),
+                    severity="warning",
+                    old_text=cue.text,
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
+            continue
+
+        candidate_word_indices = cue_word_indices.get(cue.index, [])
+        retained_word_indices, mapping_status = _retained_word_window(
+            cue.plain_text,
+            words,
+            candidate_word_indices,
+        )
+        cue_word_indices[cue.index] = retained_word_indices
+        valid_retained = _ordered_valid_word_indices(words, retained_word_indices)
+        if (
+            mapping_status == "unavailable"
+            or not valid_retained
+            or not _has_unique_exact_text_window(cue.plain_text, words, valid_retained)
+        ):
+            split_cues.append(cue)
+            flags.append(
+                QCFlag(
+                    kind="sync_cue_line_limit_timing_unavailable",
+                    cue_ids=[cue.index],
+                    message=(
+                        "Cue exceeds the requested maximum line count, but no unique valid ASR "
+                        "word timing window was available, so it was kept for review instead of "
+                        "being text-split without acoustic evidence."
+                    ),
+                    severity="warning",
+                    old_text=cue.text,
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
+            continue
+
+        if exceeds_explicit_lines:
+            word_groups, text_chunks = _source_line_chunks_for_limit(
+                cue,
+                valid_retained,
+                words,
+                profile,
+                max_gap_seconds=max_gap_seconds,
+                max_cue_duration_seconds=max_cue_duration_seconds,
+            )
+        else:
+            word_groups = group_word_indices_for_cues(
+                words,
+                valid_retained,
+                profile,
+                max_gap_seconds=max_gap_seconds,
+                max_cue_duration_seconds=max_cue_duration_seconds,
+            )
+            word_groups, text_chunks = _text_chunks_for_word_groups(cue.plain_text, word_groups, profile)
+        if len(word_groups) <= 1 or len(text_chunks) <= 1:
+            split_cues.append(cue)
+            flags.append(
+                QCFlag(
+                    kind="sync_cue_line_limit_timing_unavailable",
+                    cue_ids=[cue.index],
+                    message=(
+                        "Cue exceeds the requested maximum line count, but the aligned words "
+                        "did not yield a safe acoustic split point."
+                    ),
+                    severity="warning",
+                    old_text=cue.text,
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
+            continue
+
+        replacement_cues: list[Cue] = []
+        replacement_ids: list[int] = []
+        for position, (word_group, text_chunk) in enumerate(zip(word_groups, text_chunks, strict=True)):
+            cue_id = cue.index if position == 0 else next_cue_id
+            if position > 0:
+                next_cue_id += 1
+            replacement_ids.append(cue_id)
+            cue_word_indices[cue_id] = list(word_group)
+            replacement_cues.append(
+                _cue_from_generated_group(
+                    cue_id,
+                    cue,
+                    text_chunk,
+                    word_group,
+                    words,
+                    profile,
+                )
+            )
+
+        split_cues.extend(replacement_cues)
+        expansions[cue.index] = replacement_ids
+        flags.append(
+            QCFlag(
+                kind="sync_cue_line_limit_split",
+                cue_ids=replacement_ids,
+                message=(
+                    "A source SRT cue exceeded the requested maximum line count and was "
+                    "split using aligned ASR word timing, speaker, sentence, duration, and "
+                    "house-style boundaries."
+                ),
+                severity="info",
+                old_text=cue.text,
+                new_text="\n\n".join(item.text for item in replacement_cues),
+                start=replacement_cues[0].start_ms / 1000.0,
+                end=replacement_cues[-1].end_ms / 1000.0,
+            )
+        )
+
+    return split_cues, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, expansions
+
+
+def _source_line_chunks_for_limit(
+    cue: Cue,
+    valid_word_indices: list[int],
+    words: list[Word],
+    profile: StyleProfile,
+    *,
+    max_gap_seconds: float,
+    max_cue_duration_seconds: float,
+) -> tuple[list[list[int]], list[str]]:
+    line_word_groups = _word_groups_for_source_lines(cue.lines, valid_word_indices, words)
+    if line_word_groups is None:
+        return [valid_word_indices], [cue.text]
+
+    cue_word_groups: list[list[int]] = []
+    cue_line_groups: list[list[str]] = []
+    current_words: list[int] = []
+    current_lines: list[str] = []
+    for line, line_words in zip(cue.lines, line_word_groups, strict=True):
+        if current_words and _starts_new_source_line_cue(
+            current_lines,
+            current_words,
+            line_words,
+            words,
+            profile,
+            max_gap_seconds=max_gap_seconds,
+            max_cue_duration_seconds=max_cue_duration_seconds,
+        ):
+            cue_word_groups.append(current_words)
+            cue_line_groups.append(current_lines)
+            current_words = []
+            current_lines = []
+        current_words.extend(line_words)
+        current_lines.append(line)
+    if current_words:
+        cue_word_groups.append(current_words)
+        cue_line_groups.append(current_lines)
+    return cue_word_groups, ["\n".join(group) for group in cue_line_groups]
+
+
+def _word_groups_for_source_lines(
+    lines: list[str],
+    word_indices: list[int],
+    words: list[Word],
+) -> list[list[int]] | None:
+    groups: list[list[int]] = []
+    word_position = 0
+    for line in lines:
+        target_token_count = len(alphanumeric_signature(_text_without_subtitle_markup(line)))
+        if target_token_count <= 0:
+            return None
+        group: list[int] = []
+        observed_token_count = 0
+        while word_position < len(word_indices) and observed_token_count < target_token_count:
+            word_index = word_indices[word_position]
+            word_token_count = len(alphanumeric_signature(words[word_index].text))
+            if word_token_count <= 0:
+                return None
+            group.append(word_index)
+            observed_token_count += word_token_count
+            word_position += 1
+        if observed_token_count != target_token_count or not group:
+            return None
+        groups.append(group)
+    if word_position != len(word_indices):
+        return None
+    return groups
+
+
+def _starts_new_source_line_cue(
+    current_lines: list[str],
+    current_words: list[int],
+    next_words: list[int],
+    words: list[Word],
+    profile: StyleProfile,
+    *,
+    max_gap_seconds: float,
+    max_cue_duration_seconds: float,
+) -> bool:
+    if len(current_lines) >= profile.max_lines_per_cue:
+        return True
+    previous = words[current_words[-1]]
+    nxt = words[next_words[0]]
+    if nxt.start - previous.end > max_gap_seconds:
+        return True
+    if previous.speaker_id and nxt.speaker_id and previous.speaker_id != nxt.speaker_id:
+        return True
+    if _ends_sentence(_text_without_subtitle_markup(current_lines[-1])):
+        return True
+    return (
+        _snapped_duration_ms(words[current_words[0]], words[next_words[-1]], profile)
+        > max_cue_duration_seconds * 1000
+    )
+
+
+_INLINE_SUBTITLE_MARKUP_RE = re.compile(r"</?[^>\n]+>|{\\[^}\n]+}")
+_HTML_SUBTITLE_TAG_RE = re.compile(
+    r"<\s*(?P<closing>/)?\s*(?P<name>[A-Za-z][\w:.-]*)\b[^>]*?(?P<self_closing>/)?\s*>"
+)
+_VOID_HTML_TAGS = frozenset({"br", "hr"})
+
+
+def _has_inline_subtitle_markup(text: str) -> bool:
+    return bool(_INLINE_SUBTITLE_MARKUP_RE.search(text))
+
+
+def _source_lines_have_self_contained_markup(lines: list[str]) -> bool:
+    """Return whether every source line can move without opening/closing tags elsewhere."""
+
+    for line in lines:
+        stack: list[str] = []
+        for markup in _INLINE_SUBTITLE_MARKUP_RE.findall(line):
+            if markup.startswith("{\\"):
+                continue
+            tag = _HTML_SUBTITLE_TAG_RE.fullmatch(markup)
+            if tag is None:
+                return False
+            name = tag.group("name").casefold()
+            if tag.group("closing"):
+                if not stack or stack.pop() != name:
+                    return False
+            elif not tag.group("self_closing") and name not in _VOID_HTML_TAGS:
+                stack.append(name)
+        if stack:
+            return False
+    return True
+
+
+def _text_without_subtitle_markup(text: str) -> str:
+    return _INLINE_SUBTITLE_MARKUP_RE.sub(" ", text)
+
+
 def _retained_word_window(
     text: str,
     words: list[Word],
     word_indices: list[int],
 ) -> tuple[list[int], str]:
     ordered = _ordered_valid_word_indices(words, word_indices)
-    target_tokens = alphanumeric_signature(text)
+    target_tokens = alphanumeric_signature(_text_without_subtitle_markup(text))
     if not target_tokens:
         return ordered, "full"
     if not ordered:
@@ -201,6 +498,27 @@ def _retained_word_window(
     word_start, word_end = next(iter(matching_windows))
     retained = ordered[word_start:word_end]
     return retained, "full" if retained == ordered else "refined"
+
+
+def _has_unique_exact_text_window(text: str, words: list[Word], word_indices: list[int]) -> bool:
+    target_tokens = alphanumeric_signature(_text_without_subtitle_markup(text))
+    if not target_tokens:
+        return True
+    candidate_tokens: list[str] = []
+    token_word_positions: list[int] = []
+    for word_position, word_index in enumerate(word_indices):
+        for token in alphanumeric_signature(words[word_index].text):
+            candidate_tokens.append(token)
+            token_word_positions.append(word_position)
+    if not candidate_tokens:
+        return False
+    windows = _exact_token_windows(
+        candidate_tokens,
+        target_tokens,
+        token_word_positions,
+        limit=2,
+    )
+    return windows == {(0, len(word_indices))}
 
 
 def _exact_token_windows(
@@ -481,7 +799,7 @@ def _cue_from_generated_group(
     profile: StyleProfile,
 ) -> Cue:
     group_words = [words[index] for index in word_indices]
-    lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
+    lines = [line for line in text.splitlines() if line.strip()] if "\n" in text else wrap_visual_width(text, profile.max_chars_per_line) or [text]
     start_ms = profile.snap_floor(max(0, group_words[0].start * 1000 - profile.lead_in_ms))
     spoken_end_ms = profile.snap_ceil(group_words[-1].end * 1000 + profile.tail_ms)
     minimum_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)

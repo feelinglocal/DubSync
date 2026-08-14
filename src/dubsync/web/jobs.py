@@ -14,9 +14,12 @@ from typing import Callable, Literal
 
 from dubsync.audio import AudioNormalizationLimits, tree_size_bytes
 from dubsync.pipeline import sync_episode
+from dubsync.srt_io import parse_srt_text
+from dubsync.source_order import sort_cues_chronologically
+from dubsync.style_profile import derive_style_profile
 from dubsync.transcription import generate_srt_from_audio
 
-from .generation_styles import ResolvedGenerationStyle
+from .generation_styles import ResolvedGenerationStyle, parse_sync_style_request
 from .process_lock import ProcessLock
 from .settings import WebSettings
 
@@ -648,16 +651,30 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     if job.mode == "sync":
         if job.srt_path is None:
             raise ValueError("Sync job is missing its SRT input")
+        sync_options: dict[str, object] = {
+            "style_path": None,
+            "providers_path": settings.providers_path,
+            "fps": job.fps,
+            "language": language,
+            "audio_limits": audio_limits,
+        }
+        sync_style = parse_sync_style_request(job.style)
+        if sync_style.source == "source_max_lines":
+            max_lines_per_cue = sync_style.max_lines_per_cue
+            if max_lines_per_cue is None:  # Defensive for manually persisted job records.
+                raise ValueError("Sync maximum lines per cue is required")
+            source_cues = parse_srt_text(job.srt_path.read_text(encoding="utf-8-sig"))
+            source_cues, _ = sort_cues_chronologically(source_cues)
+            profile = derive_style_profile(source_cues).model_copy(
+                update={"max_lines_per_cue": max_lines_per_cue}
+            )
+            sync_options["style_profile"] = profile
         result = sync_episode(
             job.srt_path,
             job.audio_path,
             output_path,
             workdir,
-            style_path=None,
-            providers_path=settings.providers_path,
-            fps=job.fps,
-            language=language,
-            audio_limits=audio_limits,
+            **sync_options,
         )
     else:
         if job.fps is None:

@@ -34,9 +34,13 @@ from .batch_uploads import (
 )
 from .generation_styles import (
     GenerationStyleError,
+    SYNC_MAX_LINES_MAX,
+    SYNC_MAX_LINES_MIN,
     parse_generation_style_request,
     public_generation_styles,
+    public_sync_style_limits,
     resolve_generation_style,
+    sync_style_from_max_lines,
 )
 from .jobs import (
     JobMode,
@@ -84,7 +88,7 @@ MAX_BATCH_DOWNLOAD_BODY_BYTES = 16 * 1024
 BATCH_ARCHIVE_SPOOL_BYTES = 8 * 1024 * 1024
 ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
-MAX_SINGLE_PARSER_FIELDS = 4
+MAX_SINGLE_PARSER_FIELDS = 5
 MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
 FPS_RESULT_SOURCES = frozenset({"detected", "fallback", "explicit"})
 
@@ -171,6 +175,7 @@ def create_app(
             "access_code_required": access_code_required,
             "jobs_available": jobs_available,
             "generation_styles": public_generation_styles(),
+            "sync_style_limits": public_sync_style_limits(),
         }
 
     async def _create_single_job(
@@ -182,11 +187,13 @@ def create_app(
         fps: float | None,
         language: str,
         style: str,
+        sync_max_lines_per_cue: int | None,
     ) -> dict[str, object]:
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
         _validate_options(mode=normalized_mode, fps=fps, language=language)
+        resolved_sync_style = _sync_style_for_mode(normalized_mode, sync_max_lines_per_cue)
         source_name = _validate_source_filename(audio)
         audio_extension = _validate_audio(audio)
         subtitle_bytes: bytes | None = None
@@ -235,6 +242,8 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
         elif style_sample is not None:
             await style_sample.close()
+        if normalized_mode == "sync":
+            resolved_style = resolved_sync_style
 
         service.store.delete_expired()
         job_id = uuid.uuid4().hex
@@ -315,6 +324,7 @@ def create_app(
                 fps=_batch_fps_field(form, mode=normalized_mode),
                 language=_batch_text_field(form, "language", default="auto"),
                 style=_batch_text_field(form, "style", default="standard"),
+                sync_max_lines_per_cue=_batch_sync_max_lines_field(form),
             )
         finally:
             await form.close()
@@ -328,7 +338,9 @@ def create_app(
             fps = _batch_fps_field(form, mode=normalized_mode)
             language = _batch_text_field(form, "language", default="auto")
             style = _batch_text_field(form, "style", default="standard")
+            sync_max_lines_per_cue = _batch_sync_max_lines_field(form)
             _validate_options(mode=normalized_mode, fps=fps, language=language)
+            resolved_sync_style = _sync_style_for_mode(normalized_mode, sync_max_lines_per_cue)
 
             audio_uploads = _batch_file_field(form, "audio")
             subtitle_uploads = _batch_file_field(form, "subtitle")
@@ -416,7 +428,7 @@ def create_app(
                             srt_path=subtitle_path,
                             fps=fps,
                             language=language.lower(),
-                            style=resolved_style,
+                            style=resolved_sync_style if normalized_mode == "sync" else resolved_style,
                             retention_hours=resolved_settings.retention_hours,
                             source_name=source_name,
                             batch_id=batch_id,
@@ -750,7 +762,7 @@ async def _parse_single_form(request: Request) -> FormData:
 
 
 def _validate_single_form_shape(form: FormData) -> None:
-    allowed_fields = {"mode", "fps", "language", "style"}
+    allowed_fields = {"mode", "fps", "language", "style", "sync_max_lines_per_cue"}
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
         allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
@@ -772,7 +784,7 @@ async def _parse_batch_form(request: Request) -> FormData:
 
 
 def _validate_batch_form_shape(form: FormData) -> None:
-    allowed_fields = {"mode", "fps", "language", "style"}
+    allowed_fields = {"mode", "fps", "language", "style", "sync_max_lines_per_cue"}
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
         allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
@@ -802,6 +814,27 @@ def _batch_fps_field(form: FormData, *, mode: JobMode) -> float | None:
         return float(value)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid fps field.") from exc
+
+
+def _batch_sync_max_lines_field(form: FormData) -> int | None:
+    value = _batch_text_field(form, "sync_max_lines_per_cue", default="").strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid sync maximum lines field.") from exc
+    if str(parsed) != value or not SYNC_MAX_LINES_MIN <= parsed <= SYNC_MAX_LINES_MAX:
+        raise HTTPException(status_code=422, detail="Sync maximum lines per cue must be 1 or 2.")
+    return parsed
+
+
+def _sync_style_for_mode(mode: JobMode, max_lines_per_cue: int | None) -> str:
+    if mode == "generate":
+        if max_lines_per_cue is not None:
+            raise HTTPException(status_code=422, detail="Sync maximum lines only applies to sync mode.")
+        return "standard"
+    return sync_style_from_max_lines(max_lines_per_cue)
 
 
 def _batch_file_field(form: FormData, name: str) -> list[StarletteUploadFile]:

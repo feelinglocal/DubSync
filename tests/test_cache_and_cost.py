@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import wave
+from datetime import date
 from pathlib import Path
 
+import dubsync.cost as cost_module
 from dubsync.cache import CacheKey, JsonDiskCache
 from dubsync.cost import (
     CostMeter,
@@ -140,6 +142,28 @@ def test_token_usage_from_common_provider_response_shapes():
     assert token_usage_from_response({"usage": {"input_tokens": 1}}) is None
 
 
+def test_token_usage_bills_gemini_thinking_tokens_as_output_tokens():
+    generate_content = {
+        "usage_metadata": {
+            "prompt_token_count": 120,
+            "response_token_count": 30,
+            "thoughts_token_count": 70,
+        }
+    }
+    interactions = {
+        "usage": {
+            "total_input_tokens": 80,
+            "total_output_tokens": 20,
+            "total_thought_tokens": 40,
+        }
+    }
+
+    assert token_usage_from_response(generate_content).input_tokens == 120
+    assert token_usage_from_response(generate_content).output_tokens == 100
+    assert token_usage_from_response(interactions).input_tokens == 80
+    assert token_usage_from_response(interactions).output_tokens == 60
+
+
 def test_llm_token_prices_use_plan_defaults_and_config_overrides():
     assert llm_token_prices("gemini", "gemini-3.5-flash", {}) == (1.5, 9.0)
     assert llm_token_prices("gemini", "gemini-3.5-flash-lite", {}) == (0.3, 2.5)
@@ -151,6 +175,15 @@ def test_llm_token_prices_use_plan_defaults_and_config_overrides():
         2.0,
         12.0,
     )
+
+
+def test_gemini_37_flash_prices_follow_the_official_2027_transition(monkeypatch):
+    monkeypatch.setattr(cost_module, "_utc_today", lambda: date(2026, 12, 31))
+    assert llm_token_prices("gemini", "gemini-3.7-flash", {}) == (0.75, 3.75)
+    assert llm_token_prices("gemini", "models/gemini-3.7-flash", {}) == (0.75, 3.75)
+
+    monkeypatch.setattr(cost_module, "_utc_today", lambda: date(2027, 1, 1))
+    assert llm_token_prices("gemini", "gemini-3.7-flash", {}) == (1.5, 7.5)
 
 
 def test_record_llm_usage_adds_cost_only_when_usage_and_price_are_available():

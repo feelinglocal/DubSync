@@ -52,6 +52,9 @@ const configResponse = {
       tail_ms: { min: 0, max: 1000, step: 10 },
     },
   },
+  sync_style_limits: {
+    max_lines_per_cue: { min: 1, max: 2, step: 1 },
+  },
 }
 
 const completedBatchResponse = {
@@ -199,6 +202,7 @@ describe('DubSync workspace', () => {
     expect((body.getAll('audio') as File[]).map((file) => file.name)).toEqual(['001.wav', '002.wav'])
     expect((body.getAll('subtitle') as File[]).map((file) => file.name)).toEqual(['001.srt', '002.srt'])
     expect(body.get('fps')).toBeNull()
+    expect(body.get('sync_max_lines_per_cue')).toBeNull()
     expect(await screen.findByText('001')).toBeVisible()
     expect(screen.getByText('3 cues ready')).toBeVisible()
     expect(screen.getByText('002')).toBeVisible()
@@ -227,6 +231,40 @@ describe('DubSync workspace', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     const [, options] = fetchMock.mock.calls[1]
     expect((options?.body as FormData).get('fps')).toBe('24')
+  })
+
+  it('submits the sync maximum line limit when selected', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'line-limit-job',
+      token: 'line-limit-token',
+      mode: 'sync',
+      status: 'complete',
+      progress: 100,
+      result: { cue_count: 5, cost_usd: 0.01 },
+      downloads: ['srt'],
+      expires_at: '2026-07-12T00:00:00Z',
+      error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const maxLines = screen.getByLabelText('Maximum lines per cue')
+    expect(maxLines).toHaveValue('source')
+    expect(within(maxLines).getByRole('option', { name: 'Keep source style (default)' })).toBeInTheDocument()
+    expect(within(maxLines).getByRole('option', { name: '1 line' })).toBeInTheDocument()
+    expect(within(maxLines).getByRole('option', { name: '2 lines' })).toBeInTheDocument()
+    expect(within(maxLines).queryByRole('option', { name: '3 lines' })).not.toBeInTheDocument()
+    await user.selectOptions(maxLines, '2')
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], '001.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], '001.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [, options] = fetchMock.mock.calls[1]
+    expect((options?.body as FormData).get('sync_max_lines_per_cue')).toBe('2')
   })
 
   it('uses the selected child token when downloading a batch result', async () => {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -38,6 +39,7 @@ class MeteredPunctuationAdapter:
 
 
 def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypatch):
+    monkeypatch.setattr("dubsync.cost._utc_today", lambda: date(2026, 8, 14))
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
@@ -77,8 +79,9 @@ def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypat
                 "asr": {"fixture_path": str(wordstream_path)},
                 "llm": {
                     "provider": "gemini",
-                    "model": "gemini-3.5-flash",
-                    "punctuation": {"model": "gemini-3.5-flash-lite"},
+                    "model": "gemini-3.7-flash",
+                    "adjudication": {"thinking_level": "high"},
+                    "punctuation": {"model": "gemini-3.7-flash", "thinking_level": "medium"},
                 },
             }
         ),
@@ -91,19 +94,19 @@ def test_pipeline_records_live_llm_usage_events_in_cost_json(tmp_path, monkeypat
 
     result = sync_episode(srt_path, audio_path, out_path, workdir, providers_path=providers_path)
 
-    assert result.cost_meter.total_usd == 0.01234
+    assert result.cost_meter.total_usd == 0.00585
     cost_data = json.loads((workdir / "episode" / "cost.json").read_text(encoding="utf-8"))
     assert [item for item in cost_data["items"] if item["kind"] == "tokens"] == [
         {
-            "provider": "gemini-3.5-flash",
+            "provider": "gemini-3.7-flash",
             "kind": "tokens",
             "units": {"input_tokens": 2000.0, "output_tokens": 1000.0},
-            "usd": 0.012,
+            "usd": 0.00525,
         },
         {
-            "provider": "gemini-3.5-flash-lite",
+            "provider": "gemini-3.7-flash",
             "kind": "tokens",
             "units": {"input_tokens": 300.0, "output_tokens": 100.0},
-            "usd": 0.00034,
+            "usd": 0.0006,
         },
     ]

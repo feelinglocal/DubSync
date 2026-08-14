@@ -7,7 +7,7 @@ import types
 import pytest
 
 from dubsync.llm_providers import GeminiLLMAdapter, _adjudication_prompt, _punctuation_prompt, llm_adapter_from_config
-from dubsync.models import AudioSnippet, Cue, DivergenceSpan
+from dubsync.models import AudioSnippet, Cue, CueContext, DivergenceSpan
 
 
 def test_google_genai_sdk_supports_medium_thinking_level():
@@ -109,6 +109,15 @@ def test_gemini_adapter_passes_thinking_level_to_generate_content(monkeypatch):
     adapter.punctuate([Cue(index=1, start_ms=0, end_ms=500, lines=["hello there"])])
 
     assert calls[0]["config"]["thinking_config"] == {"thinking_level": "low"}
+
+
+def test_direct_gemini_37_adapter_rejects_unsupported_minimal_thinking():
+    with pytest.raises(RuntimeError, match="gemini-3.7-flash thinking_level"):
+        GeminiLLMAdapter(
+            api_key="test-key",
+            model="gemini-3.7-flash",
+            thinking_level="minimal",
+        )
 
 
 def test_gemini_adapter_passes_cached_content_to_generate_content(monkeypatch):
@@ -248,6 +257,46 @@ def test_adjudication_prompt_instructs_audio_literal_check_and_no_word_drops(tmp
     assert prompt["audio_snippets"][0]["duration_seconds"] == 5.0
 
 
+def test_adjudication_prompt_marks_neighbor_context_read_only_and_preserves_editorial_marks():
+    span = DivergenceSpan(
+        case_id="case-context",
+        cue_ids=[11],
+        srt_text="Verdammt, „bleib hier“.",
+        asr_text="Verdammt bleib hier",
+        context_before=[CueContext(cue_id=10, text="Komm zurück!", start=4.0, end=5.0)],
+        context_after=[CueContext(cue_id=12, text="Ich gehe nicht.", start=7.0, end=8.0)],
+    )
+
+    prompt = json.loads(_adjudication_prompt([span]))
+    instructions = "\n".join(prompt["instructions"])
+
+    assert prompt["spans"][0]["context_before"][0]["text"] == "Komm zurück!"
+    assert prompt["spans"][0]["context_after"][0]["text"] == "Ich gehe nicht."
+    assert "read-only context" in instructions
+    assert "cannot prove unheard words" in instructions
+    assert "partial audio window" in instructions
+    assert "compress, omit, or absorb dialogue" in instructions
+    assert "line breaks" in instructions
+    assert "quotation marks" in instructions
+
+
+def test_adjudication_prompt_includes_complete_ordered_episode_context():
+    span = DivergenceSpan(case_id="case-2", cue_ids=[2], srt_text="Bleib.", asr_text="bleib")
+    episode = [
+        Cue(index=1, start_ms=0, end_ms=800, lines=["Vorher."]),
+        Cue(index=2, start_ms=900, end_ms=1_600, lines=["Bleib."], speaker_id="S1"),
+        Cue(index=3, start_ms=1_700, end_ms=2_400, lines=["Nachher."], character="Mara"),
+    ]
+
+    prompt = json.loads(_adjudication_prompt([span], episode_context=episode))
+
+    assert [item["cue_id"] for item in prompt["episode_context"]] == [1, 2, 3]
+    assert prompt["episode_context"][1]["source_lines"] == ["Bleib."]
+    assert prompt["episode_context"][1]["speaker_id"] == "S1"
+    assert prompt["episode_context"][2]["character"] == "Mara"
+    assert "read_only" in prompt["episode_context_role"]
+
+
 def test_punctuation_prompt_includes_speaker_and_character_labels():
     prompt = json.loads(
         _punctuation_prompt(
@@ -271,6 +320,58 @@ def test_punctuation_prompt_includes_speaker_and_character_labels():
     assert "Preserve every cue ID" in instructions
     assert "Preserve the source line-break positions" in instructions
     assert "Do not add, remove, or restyle quotation marks" in instructions
+
+
+def test_punctuation_prompt_supplies_full_ordered_text_context_without_audio_or_reflow_authority():
+    prompt = json.loads(
+        _punctuation_prompt(
+            [
+                Cue(
+                    index=7,
+                    start_ms=1200,
+                    end_ms=2400,
+                    lines=["Er sagte", "„Bleib hier.“"],
+                    speaker_id="SPEAKER_00",
+                    character="Luna",
+                ),
+                Cue(index=8, start_ms=2500, end_ms=3100, lines=["Ich bleibe"]),
+            ]
+        )
+    )
+    instructions = "\n".join(prompt["instructions"])
+
+    assert prompt["modality"] == "text_only"
+    assert prompt["cues"][0] == {
+        "cue_id": 7,
+        "sequence_position": 1,
+        "start_ms": 1200,
+        "end_ms": 2400,
+        "duration_ms": 1200,
+        "source_lines": ["Er sagte", "„Bleib hier.“"],
+        "text": "Er sagte\n„Bleib hier.“",
+        "speaker_id": "SPEAKER_00",
+        "character": "Luna",
+    }
+    assert prompt["cues"][1]["sequence_position"] == 2
+    assert "full ordered batch" in instructions
+    assert "„ “" in instructions
+    assert "source_lines" in instructions
+    assert "alphanumeric token sequence" in instructions
+    assert "quotation-mark sequence" in instructions
+
+
+def test_punctuation_prompt_separates_editable_batch_from_complete_episode_context():
+    episode = [
+        Cue(index=1, start_ms=0, end_ms=800, lines=["Vorher."]),
+        Cue(index=2, start_ms=900, end_ms=1_600, lines=["bleib hier"]),
+        Cue(index=3, start_ms=1_700, end_ms=2_400, lines=["Nachher."]),
+    ]
+
+    prompt = json.loads(_punctuation_prompt([episode[1]], episode_context=episode))
+
+    assert prompt["editable_cue_ids"] == [2]
+    assert [item["cue_id"] for item in prompt["episode_context"]] == [1, 2, 3]
+    assert prompt["cues"][0]["cue_id"] == 2
 
 
 def test_gemini_adjudication_prompt_uses_configured_confidence_gate(monkeypatch):

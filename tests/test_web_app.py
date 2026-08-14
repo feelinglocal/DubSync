@@ -14,6 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import dubsync.web.app as web_app_module
+from dubsync.srt_io import parse_srt_text
+from dubsync.style_profile import derive_style_profile
 from dubsync.web.app import create_app
 from dubsync.web.jobs import JobRecord, JobService, ProcessedArtifacts, default_processor, new_job_record
 from dubsync.web.security import hash_job_token
@@ -122,6 +124,7 @@ def test_public_config_exposes_generation_style_presets_and_custom_limits(tmp_pa
         "tail_ms": 40,
     }
     assert styles["custom_limits"]["max_chars_per_line"] == {"min": 10, "max": 80, "step": 1}
+    assert payload["sync_style_limits"]["max_lines_per_cue"] == {"min": 1, "max": 2, "step": 1}
 
 
 def test_public_config_exposes_agreed_order_pricing(tmp_path):
@@ -310,6 +313,61 @@ def test_single_job_uses_auto_fps_only_for_sync_without_an_explicit_override(
     assert captured[0].fps == expected_fps
 
 
+def test_sync_job_accepts_an_explicit_max_lines_option(tmp_path):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "sync", "sync_max_lines_per_cue": "2"},
+            files={
+                "audio": ("dialogue.wav", b"fixture audio", "audio/wav"),
+                "subtitle": (
+                    "dialogue.srt",
+                    b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n",
+                    "application/x-subrip",
+                ),
+            },
+        )
+
+    assert response.status_code == 202
+    assert json.loads(captured[0].style) == {
+        "source": "source_max_lines",
+        "max_lines_per_cue": 2,
+    }
+
+
+def test_sync_job_preserves_source_style_when_max_lines_is_not_selected(tmp_path):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "sync"},
+            files={
+                "audio": ("dialogue.wav", b"fixture audio", "audio/wav"),
+                "subtitle": (
+                    "dialogue.srt",
+                    b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n",
+                    "application/x-subrip",
+                ),
+            },
+        )
+
+    assert response.status_code == 202
+    assert captured[0].style == "source"
+
+
 @pytest.mark.parametrize(
     ("fps_field", "expected_detail"),
     [
@@ -345,6 +403,68 @@ def test_single_job_rejects_an_invalid_explicit_fps_without_queueing(
 
     assert response.status_code == 422
     assert response.json() == {"detail": expected_detail}
+    assert captured == []
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_detail"),
+    [
+        ("0", "Sync maximum lines per cue must be 1 or 2."),
+        ("3", "Sync maximum lines per cue must be 1 or 2."),
+        ("01", "Sync maximum lines per cue must be 1 or 2."),
+        ("+1", "Sync maximum lines per cue must be 1 or 2."),
+        ("1.0", "Invalid sync maximum lines field."),
+        ("two", "Invalid sync maximum lines field."),
+    ],
+)
+def test_sync_job_rejects_invalid_max_lines_without_queueing(
+    tmp_path,
+    value: str,
+    expected_detail: str,
+):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "sync", "sync_max_lines_per_cue": value},
+            files={
+                "audio": ("dialogue.wav", b"fixture audio", "audio/wav"),
+                "subtitle": (
+                    "dialogue.srt",
+                    b"1\n00:00:00,000 --> 00:00:00,500\nReady.\n",
+                    "application/x-subrip",
+                ),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == expected_detail
+    assert captured == []
+
+
+def test_generate_job_rejects_sync_max_lines_without_queueing(tmp_path):
+    captured: list[JobRecord] = []
+
+    def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _fake_processor(job, settings)
+
+    app = create_app(settings=_settings(tmp_path), processor=capture)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "generate", "sync_max_lines_per_cue": "2"},
+            files={"audio": ("dialogue.wav", b"fixture audio", "audio/wav")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Sync maximum lines only applies to sync mode."
     assert captured == []
 
 
@@ -888,6 +1008,57 @@ def test_default_processor_derives_sync_style_from_the_uploaded_srt(tmp_path, mo
 
     assert calls["style_path"] is None
     assert calls["fps"] == 25
+
+
+def test_default_processor_applies_sync_max_lines_override(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-sync-max-lines"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    source = directory / "original.srt"
+    source.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nOne\nTwo\nThree\n\n",
+        encoding="utf-8",
+    )
+    job = new_job_record(
+        job_id="sync-max-lines",
+        token_hash=hash_job_token("token"),
+        mode="sync",
+        directory=directory,
+        audio_path=audio,
+        srt_path=source,
+        fps=25,
+        language="auto",
+        style=json.dumps({"source": "source_max_lines", "max_lines_per_cue": 2}),
+        retention_hours=24,
+    )
+    calls = {}
+
+    def fake_sync(_srt, _audio, output, _workdir, **kwargs):
+        calls.update(kwargs)
+        output.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output,
+            episode_workdir=artifacts,
+            report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.01),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.sync_episode", fake_sync)
+
+    default_processor(job, settings)
+
+    expected_profile = derive_style_profile(parse_srt_text(source.read_text(encoding="utf-8-sig")))
+    expected_profile = expected_profile.model_copy(update={"max_lines_per_cue": 2})
+    assert calls["style_profile"] == expected_profile
+    assert calls["fps"] == 25
+    assert calls["style_path"] is None
 
 
 def test_web_settings_loads_dotenv_from_current_working_directory(tmp_path, monkeypatch):

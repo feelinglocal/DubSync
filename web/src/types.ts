@@ -51,6 +51,7 @@ export interface PublicConfig {
   access_code_required: boolean
   jobs_available: boolean
   generation_styles: GenerationStylesConfig
+  sync_style_limits: Pick<Record<GenerationStyleValueKey, GenerationStyleLimit>, 'max_lines_per_cue'>
 }
 
 export interface JobResult {
@@ -170,5 +171,8 @@ export const defaultConfig: PublicConfig = {
       lead_in_ms: { min: 0, max: 1000, step: 10 },
       tail_ms: { min: 0, max: 1000, step: 10 },
     },
+  },
+  sync_style_limits: {
+    max_lines_per_cue: { min: 1, max: 2, step: 1 },
   },
 }

@@ -18,7 +18,7 @@ from .cache import CacheKey, JsonDiskCache
 from .changes import apply_adjudication_decisions
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
-from .cue_segmentation import segment_generated_adlib_cues
+from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
@@ -104,6 +104,7 @@ def sync_episode(
     local: bool = False,
     language: str | None = None,
     audio_limits: AudioNormalizationLimits | None = None,
+    style_profile: StyleProfile | None = None,
 ) -> PipelineResult:
     resume_stage = _normalize_resume_stage(resume)
     episode_workdir = workdir / srt_path.stem
@@ -113,16 +114,20 @@ def sync_episode(
     cues, source_order_flags = sort_cues_chronologically(cues)
     fps_detection = detect_fps_with_confidence(cues)
     fps_override_flags = _fps_override_mismatch_flags(cues, fps, fps_detection)
+    explicit_style_override = style_profile is not None or style_path is not None
     fps_detection_flags = (
         []
         if style_path is not None
         else _fps_detection_flags(cues, fps, fps_detection)
     )
     style_artifact_path = episode_workdir / "style_profile.json"
+    source_profile = derive_style_profile(cues)
     profile = (
-        load_style_profile(style_path)
+        style_profile.model_copy(deep=True)
+        if style_profile is not None
+        else load_style_profile(style_path)
         or _load_style_profile_for_resume(style_artifact_path, resume_stage)
-        or derive_style_profile(cues)
+        or source_profile
     )
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
@@ -131,7 +136,7 @@ def sync_episode(
         fps_detection,
         explicitly_configured=fps is not None or style_path is not None,
     )
-    if _should_write_ingest_artifacts(resume_stage, episode_workdir, style_path, fps):
+    if _should_write_ingest_artifacts(resume_stage, episode_workdir, explicit_style_override, fps):
         _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues]})
         _write_json(style_artifact_path, profile.model_dump())
 
@@ -277,6 +282,7 @@ def sync_episode(
                     provider_spans,
                     provider_config,
                     audio_snippets=audio_snippets,
+                    source_cues=cues,
                 )
             )
             if cached_adjudication is None:
@@ -285,6 +291,7 @@ def sync_episode(
                     if no_llm
                     else llm_adapter_from_config(provider_config, pass_name="adjudication")
                 )
+                _set_adapter_episode_context(llm_adapter, cues)
                 engine = AdjudicationEngine(
                     llm_adapter,
                     confidence_gate=_adjudication_confidence_gate(provider_config),
@@ -300,6 +307,7 @@ def sync_episode(
                         provider_decisions,
                         provider_flags,
                         audio_snippets=audio_snippets,
+                        source_cues=cues,
                     )
                 _record_llm_usage_events(
                     cost_meter,
@@ -381,6 +389,25 @@ def sync_episode(
     change_flags = _expanded_adlib_cue_flags(change_flags, cue_id_expansions)
     flags.extend(change_flags)
     flags.extend(segmentation_flags)
+    enforce_existing_line_limit = explicit_style_override or (
+        profile.max_lines_per_cue < source_profile.max_lines_per_cue
+        or profile.max_chars_per_line < source_profile.max_chars_per_line
+    )
+    if enforce_existing_line_limit:
+        adjudicated_cues, alignment, sync_line_flags, _ = split_overlong_existing_cues(
+            adjudicated_cues,
+            words,
+            alignment,
+            profile,
+            source_cue_ids={cue.index for cue in cues},
+            max_gap_seconds=_generation_float_config(provider_config, "max_gap_seconds", 0.8),
+            max_cue_duration_seconds=_generation_float_config(
+                provider_config,
+                "max_cue_duration_seconds",
+                5.0,
+            ),
+        )
+        flags.extend(sync_line_flags)
     rebuilt, recue_flags = rebuild_cues(
         adjudicated_cues,
         words,
@@ -412,6 +439,7 @@ def sync_episode(
         punctuation_adapter = punctuation_adapter_from_config(provider_config)
         if punctuation_adapter is not None:
             punctuation_input = rebuilt
+            _set_adapter_episode_context(punctuation_adapter, punctuation_input)
             cached_punctuation = _load_cached_punctuation(
                 episode_workdir,
                 punctuation_input,
@@ -506,12 +534,12 @@ def _source_cues_for_run(srt_path: Path, episode_workdir: Path, resume_stage: st
 def _should_write_ingest_artifacts(
     resume_stage: str | None,
     episode_workdir: Path,
-    style_path: Path | None,
+    explicit_style_override: bool,
     fps: float | None,
 ) -> bool:
     if not _should_load_ingest_artifact(resume_stage):
         return True
-    if style_path is not None or fps is not None:
+    if explicit_style_override or fps is not None:
         return True
     return not (episode_workdir / "ingest.json").exists()
 
@@ -665,9 +693,17 @@ def _load_cached_adjudication(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    source_cues: list[Cue] | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]] | None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
-    payload = cache.read(_adjudication_cache_key(spans, provider_config, audio_snippets=audio_snippets))
+    payload = cache.read(
+        _adjudication_cache_key(
+            spans,
+            provider_config,
+            audio_snippets=audio_snippets,
+            source_cues=source_cues,
+        )
+    )
     if payload is None:
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("decisions"), list) or not isinstance(payload.get("flags"), list):
@@ -685,10 +721,16 @@ def _write_cached_adjudication(
     decisions: list[AdjudicationDecision],
     flags: list[QCFlag],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    source_cues: list[Cue] | None = None,
 ) -> None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     cache.write(
-        _adjudication_cache_key(spans, provider_config, audio_snippets=audio_snippets),
+        _adjudication_cache_key(
+            spans,
+            provider_config,
+            audio_snippets=audio_snippets,
+            source_cues=source_cues,
+        ),
         {
             "decisions": [decision.model_dump() for decision in decisions],
             "flags": [flag.model_dump() for flag in flags],
@@ -781,6 +823,7 @@ def _adjudication_cache_key(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    source_cues: list[Cue] | None = None,
 ) -> CacheKey:
     llm_config = llm_config_for_pass(provider_config, "adjudication")
     provider = str(llm_config.get("provider", "gemini")).lower()
@@ -791,6 +834,11 @@ def _adjudication_cache_key(
         "confidence_gate": _adjudication_confidence_gate(provider_config),
         "scene_gap_seconds": _adjudication_scene_gap_seconds(provider_config),
         "spans": [span.model_dump(mode="json") for span in spans],
+        "episode_context": (
+            [cue.model_dump(mode="json") for cue in source_cues]
+            if source_cues is not None
+            else None
+        ),
         "audio_snippets": _audio_snippet_cache_payload(audio_snippets or {}),
     }
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))
@@ -1395,6 +1443,12 @@ def _hold_incomplete_source_insertions(
         held_decisions.append(decision)
         flags.append(flag)
     return provider_spans, held_decisions, flags
+
+
+def _set_adapter_episode_context(adapter: object, cues: list[Cue]) -> None:
+    setter = getattr(adapter, "set_episode_context", None)
+    if callable(setter):
+        setter(cues)
 
 
 def _incomplete_source_hold(
