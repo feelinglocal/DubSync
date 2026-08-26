@@ -242,6 +242,7 @@ def test_drain_usage_events_returns_and_clears_adapter_events():
 def test_default_asr_prices_match_plan_cost_table():
     assert asr_dollars_per_hour("elevenlabs", {}) == 0.22
     assert asr_dollars_per_hour("openai", {}) == 0.36
+    assert asr_dollars_per_hour("whisper-1", {}) == 0.36
     assert asr_dollars_per_hour("assemblyai", {}) == 0.23
     assert asr_dollars_per_hour("gemini", {}) == 0.3
     assert asr_dollars_per_hour("gemini_transcribe", {}) == 0.3

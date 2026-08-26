@@ -1,67 +1,76 @@
-# Gemini Transcribe Local Option TDD Evidence
+# Gemini 3.5 Transcribe Local Pilot Evidence
 
-## Source
+## Scope and sources
 
-Journeys were derived from the local-only Gemini 3.5 Transcribe test request. API behavior was checked against:
+This pilot adds Gemini 3.5 Transcribe as an opt-in local comparison provider. It does not replace the ElevenLabs Scribe v2 default and does not change any Render or web deployment configuration.
+
+The request and response contract was checked against Google's official documentation:
 
 - https://ai.google.dev/gemini-api/docs/models/gemini-3.5-transcribe
 - https://ai.google.dev/gemini-api/docs/transcribe
 - https://ai.google.dev/gemini-api/docs/interactions-overview
 - https://ai.google.dev/gemini-api/docs/pricing
 
-## User Journeys
+## TDD evidence
 
-1. As an operator, I can test Gemini 3.5 Transcribe locally without changing the production ElevenLabs ASR default.
-2. As an engineer, I can compare ASR timing streams because Gemini word annotations map into DubSync `Word` objects.
-3. As an operator, I get clear failures for unsupported long timestamp/diarization requests or missing word annotations.
+The RED checkpoint is commit `7303850` (`test: define local Gemini transcription contract`). Before implementation, the contract tests failed on missing SDK annotation unwrapping, uploaded-file cleanup, request-limit validation, unknown-confidence handling, and unsafe `word_timestamps` / `store` overrides.
 
-## RED Evidence
+Additional RED hardening checks caught and drove fixes for:
 
-- `python -m pytest tests/test_audio_and_providers.py::test_gemini_transcribe_adapter_maps_word_info_annotations tests/test_audio_and_providers.py::test_gemini_transcribe_requires_local_mode -q` failed before the adapter existed.
-- `python -m pytest tests/test_audio_and_providers.py::test_gemini_transcribe_unwraps_sdk_unknown_annotations_and_deletes_upload tests/test_audio_and_providers.py::test_gemini_transcribe_deletes_upload_when_interaction_fails tests/test_audio_and_providers.py::test_gemini_transcribe_factory_accepts_deduplicated_custom_vocabulary tests/test_audio_and_providers.py::test_gemini_transcribe_rejects_invalid_request_limit tests/test_alignment_and_recue.py::test_divergence_with_unknown_asr_confidence_remains_unscored -q` failed 4 of 5 before SDK annotation unwrapping, upload cleanup, request-limit validation, and unknown-confidence scoring were implemented.
-- `python -m pytest tests/test_audio_and_providers.py::test_gemini_transcribe_rejects_unsafe_local_contract_overrides -q` failed before `word_timestamps: false` and `store: true` were rejected.
-- `python -m pytest tests/test_audio_and_providers.py::test_google_genai_version_supports_transcription_interaction_fields -q` failed with `google-genai` 2.10.0, which lacked the typed Transcribe interaction fields needed for this adapter.
+- `google-genai` 2.10.0 silently omitting the new transcription fields; the cloud dependency now requires `google-genai>=2.20,<3`.
+- API keys appearing in provider error text and chained tracebacks.
+- Audio with an unverifiable duration reaching the paid API.
+- A model substitution instead of the requested `gemini-3.5-transcribe` model.
+- Gemini provider aliases bypassing cost metering.
+- A cost-normalization regression for the existing `whisper-1` alias.
 
-## GREEN Evidence
+## Verification
 
-- `python -m pytest tests/test_audio_and_providers.py -k "gemini_transcribe" tests/test_alignment_and_recue.py::test_divergence_with_unknown_asr_confidence_remains_unscored tests/test_verify_scores.py::test_score_cues_marks_unknown_asr_confidence_as_unscored tests/test_cache_and_cost.py::test_default_asr_prices_match_plan_cost_table tests/test_documentation_acceptance.py::test_cloud_dependencies_require_medium_thinking_compatible_google_genai -q` passed.
-- `python -m pytest tests/test_audio_and_providers.py tests/test_alignment_and_recue.py tests/test_verify_scores.py tests/test_transcription.py tests/test_cache_and_cost.py tests/test_documentation_acceptance.py -q` passed.
-- `python -m pytest tests/test_audio_and_providers.py tests/test_alignment_and_recue.py tests/test_verify_scores.py tests/test_transcription.py tests/test_pipeline_cli.py tests/test_cache_and_cost.py tests/test_documentation_acceptance.py -q` passed.
-- `python -m pytest --cov=dubsync --cov-report=term-missing` passed with 603 passed, 8 deselected, and 84.23% total coverage.
-- `python -m pytest --live tests/test_live_smoke.py::test_live_gemini_transcribe_smoke -q` passed with `DUBSYNC_LIVE_TRANSCRIBE_AUDIO=work/gemini-transcribe-smoke-032-30s.wav`.
-- `python -m dubsync sync "testing 3\original srt\032.srt" "testing 3\audio\032.wav" -o "work\gemini-transcribe-compare\032.gemini.synced.srt" --providers providers.gemini-transcribe.local.example.yaml --workdir "work\gemini-transcribe-compare" --local --no-llm` passed and wrote ignored comparison artifacts.
+- Focused Gemini adapter, local routing, CLI integration, artifact, confidence, cost, and documentation tests passed.
+- `python -m pytest --cov=dubsync --cov-report=term-missing` passed: 605 passed, 8 deselected, 86.10% total coverage.
+- `python -m pip check` passed. `pip-audit` separately reported 29 advisories across 9 packages already installed in the broader local ML/development environment; `google-genai` and its declared direct dependencies were not among the reported packages.
+- The opt-in live smoke passed with a real 30-second German WAV and non-empty word annotations.
+- A full 49.4-second local episode 032 sync passed with 125 Gemini words, 2 speakers, and a metered cost of `$0.004117`.
+- The final live adapter deletes the uploaded Google file in `finally`, rejects `store: true`, redacts the configured key from provider errors, and suppresses an unredacted chained exception.
 
-## Implementation Guarantees
+## Fresh 30-second comparison
+
+Both providers processed the same normalized first 30 seconds of episode 032, with `--no-llm`, fresh caches, and separate work directories.
+
+| Measurement | Gemini 3.5 Transcribe | ElevenLabs Scribe v2 |
+|---|---:|---:|
+| Words | 78 | 78 |
+| Detected speakers | 2 | 2 |
+| Contiguous speaker turns | 4 | 4 |
+| Normalized token edits versus source SRT | 3 / 78 (3.85%) | 3 / 78 (3.85%) |
+| Unknown word-confidence values | 78 | 0 |
+| Metered ASR cost | `$0.002500` | `$0.001833` |
+| Fresh wall time on this machine | 9.796 s | 3.965 s |
+
+The two ASR streams matched exactly on 75 of 78 aligned tokens. Among those matching tokens, their timestamps differed by 74 ms at word starts and 65 ms at word ends on average; median differences were 79 ms and 39 ms respectively. The source SRT is editorial guidance rather than an acoustic ground-truth transcript, so its token edit distance is useful for this pilot but is not a definitive WER score.
+
+Artifacts are ignored local files under:
+
+- `work/asr-compare-20260827/gemini/`
+- `work/asr-compare-20260827/scribe/`
+
+## Implementation guarantees
 
 | Behavior | Guarantee |
 |---|---|
-| Production default | `provider.yaml` and normal sync/generate runs remain on ElevenLabs Scribe v2 unless the operator explicitly passes `--local` with a Gemini local override. |
-| Local-only enforcement | `adapter_from_config(..., local_mode=False)` rejects `gemini_transcribe`. |
-| Interactions request shape | Uploaded audio is sent to `client.interactions.create` with `model`, audio `input`, `generation_config.transcription_config`, verbatim mode, word timestamps, optional speaker diarization, and `store=False`. |
-| Data retention | The adapter rejects `store: true` and best-effort deletes uploaded files in a `finally` block. |
-| Word timings | `word_info` annotations are converted into DubSync `Word` text/start/end/speaker fields; missing provider confidence is represented as `None` and downstream scoring marks that source as unscored. |
-| Cost metering | Uncached Gemini Transcribe ASR calls meter at `$0.30/hr`, matching Google's `$0.005/min` Transcribe price basis. |
+| Default provider | `provider.yaml` remains ElevenLabs Scribe v2. |
+| Local-only enforcement | Gemini ASR is rejected unless the caller explicitly uses `--local`. |
+| Exact model | The adapter rejects any model other than `gemini-3.5-transcribe`. |
+| API mode | Requests use the Interactions API, uploaded audio, verbatim mode, word timestamps, optional speaker diarization, and `store=False`. |
+| Timing contract | Native `word_info` annotations map into DubSync word text, start, end, and speaker fields. |
+| Unknown confidence | Missing Gemini confidence remains `None`; downstream scoring marks fully unknown confidence as unscored instead of inventing certainty. |
+| Duration safety | Timestamp/diarization requests fail closed when duration is unknown and fail before upload above 1,800 seconds. |
+| Cost | Gemini ASR aliases meter at `$0.30/hour`, matching the documented `$0.005/minute` basis. |
 
-## Live Comparison Artifact
+## Known gaps
 
-The local Gemini run for episode 032 produced:
-
-- ASR metadata: `provider=gemini_transcribe`, `model=gemini-3.5-transcribe`
-- Word annotations: 125
-- Speakers: 2
-- Confidence values: 125 null values, expected because Gemini Transcribe word annotations do not currently provide per-word confidence in the tested response
-- Cost meter: 49.4 seconds, `$0.004117`
-
-SRT timing summary for the same episode:
-
-| File | Cues | Start ms | End ms | Text chars |
-|---|---:|---:|---:|---:|
-| Original source SRT | 30 | 0 | 47000 | 715 |
-| Existing synced SRT | 30 | 100 | 47066 | 732 |
-| Gemini local output | 30 | 0 | 47066 | 715 |
-
-## Known Gaps
-
-- This is a local comparison path, not a production provider migration.
-- Automatic chunking for audio longer than 30 minutes is intentionally not enabled yet. Correct chunking needs timestamp rebasing, overlap dedupe, speaker stitching, cache keys, and cost accounting.
-- A fresh Scribe-vs-Gemini live comparison was not run in this pass because `ELEVENLABS_API_KEY` was not present in the shell environment. The current comparison uses Gemini output against the repo's existing episode 032 synced artifact.
+- This is one pilot sample, not evidence that Gemini is already a production upgrade.
+- Correct automatic chunking above 30 minutes is intentionally absent. It requires timestamp rebasing, overlap deduplication, speaker stitching, cache design, and cost attribution.
+- Gemini's tested word annotations did not include per-word confidence.
+- The broader local environment's dependency-audit findings remain outside this scoped provider pilot and should be triaged separately before treating that environment as production-ready.
+- Promotion requires a broader, manually reviewed German corpus with acoustic ground truth, especially names, compounds, overlaps, whispers, noise, and multi-speaker scenes.
