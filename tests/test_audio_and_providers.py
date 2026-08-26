@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import wave
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,6 +68,15 @@ class InvalidThenValidAdapter:
         if self.calls == 1:
             return "not-a-word-stream"
         return [Word(text="valid", start=0.0, end=0.2, confidence=0.9)]
+
+
+def _write_valid_wav(path: Path, *, duration_seconds: float = 1.0) -> None:
+    sample_rate = 16_000
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * int(sample_rate * duration_seconds))
 
 
 def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
@@ -484,7 +494,7 @@ def test_elevenlabs_adapter_passes_configured_keyterms_to_scribe_v2(tmp_path, mo
 
 def test_gemini_transcribe_adapter_maps_word_info_annotations(tmp_path, monkeypatch):
     audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"audio")
+    _write_valid_wav(audio)
     calls: dict[str, object] = {}
 
     class FakeFiles:
@@ -565,9 +575,16 @@ def test_gemini_transcribe_adapter_maps_word_info_annotations(tmp_path, monkeypa
     }
 
 
+def test_google_genai_version_supports_transcription_interaction_fields():
+    pytest.importorskip("google.genai")
+    version = tuple(int(part) for part in metadata.version("google-genai").split(".")[:2])
+
+    assert version >= (2, 20)
+
+
 def test_gemini_transcribe_unwraps_sdk_unknown_annotations_and_deletes_upload(tmp_path, monkeypatch):
     audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"audio")
+    _write_valid_wav(audio)
     calls: dict[str, object] = {}
 
     class FakeFiles:
@@ -623,7 +640,7 @@ def test_gemini_transcribe_unwraps_sdk_unknown_annotations_and_deletes_upload(tm
 
 def test_gemini_transcribe_deletes_upload_when_interaction_fails(tmp_path, monkeypatch):
     audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"audio")
+    _write_valid_wav(audio)
     calls: dict[str, object] = {}
 
     class FakeFiles:
@@ -651,6 +668,39 @@ def test_gemini_transcribe_deletes_upload_when_interaction_fails(tmp_path, monke
     assert calls["delete"] == "files/audio-1"
 
 
+def test_gemini_transcribe_redacts_api_key_from_provider_errors(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    _write_valid_wav(audio)
+
+    class FakeFiles:
+        def upload(self, file):
+            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
+
+        def delete(self, *, name):
+            del name
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            del kwargs
+            raise RuntimeError("provider rejected secret test-key")
+
+    class FakeClient:
+        def __init__(self, api_key):
+            del api_key
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=SimpleNamespace(Client=FakeClient)))
+
+    with pytest.raises(ProviderError) as exc_info:
+        GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
+
+    assert "test-key" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
 def test_gemini_transcribe_factory_accepts_deduplicated_custom_vocabulary():
     adapter = adapter_from_config(
         {
@@ -676,6 +726,32 @@ def test_gemini_transcribe_rejects_invalid_request_limit():
                     "provider": "gemini_transcribe",
                     "api_key": "test-key",
                     "max_audio_seconds": 1800.1,
+                }
+            },
+            local_mode=True,
+        )
+
+
+def test_gemini_transcribe_rejects_a_different_model():
+    with pytest.raises(ProviderError, match="gemini-3.5-transcribe"):
+        GeminiTranscribeAdapter(api_key="test-key", model="gemini-2.5-flash")
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"word_timestamps": False}, "word_timestamps"),
+        ({"store": True}, "store"),
+    ],
+)
+def test_gemini_transcribe_rejects_unsafe_local_contract_overrides(config, message):
+    with pytest.raises(ProviderError, match=message):
+        adapter_from_config(
+            {
+                "asr": {
+                    "provider": "gemini_transcribe",
+                    "api_key": "test-key",
+                    **config,
                 }
             },
             local_mode=True,
@@ -723,7 +799,7 @@ def test_local_mode_uses_nested_gemini_transcribe_override():
 
 def test_gemini_transcribe_fails_clearly_without_word_annotations(tmp_path, monkeypatch):
     audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"audio")
+    _write_valid_wav(audio)
 
     class FakeClient:
         def __init__(self, api_key):
@@ -746,6 +822,14 @@ def test_gemini_transcribe_rejects_overlong_timestamp_request(tmp_path):
         wav.writeframes(b"\x00\x00" * 1801)
 
     with pytest.raises(ProviderError, match="30 minutes"):
+        GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
+
+
+def test_gemini_transcribe_rejects_audio_with_unknown_duration(tmp_path):
+    audio = tmp_path / "invalid.wav"
+    audio.write_bytes(b"not-a-valid-wave-file")
+
+    with pytest.raises(ProviderError, match="duration"):
         GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
 
 

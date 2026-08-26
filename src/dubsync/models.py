@@ -46,7 +46,7 @@ class Word(BaseModel):
     text: str
     start: float
     end: float
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    confidence: float | None = Field(default=1.0, ge=0.0, le=1.0)
     speaker_id: str | None = None
 
 

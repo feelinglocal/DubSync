@@ -58,8 +58,13 @@ def score_cues(
             for index in alignment.cue_word_indices.get(cue.index, [])
             if 0 <= index < len(words)
         ]
-        if cue_words:
-            score = sum(word.confidence for word in cue_words) / len(cue_words)
+        confidences = [
+            word.confidence
+            for word in cue_words
+            if word.confidence is not None
+        ]
+        if confidences:
+            score = sum(confidences) / len(confidences)
             source = "asr_confidence"
         else:
             score = 0.0

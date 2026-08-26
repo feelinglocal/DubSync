@@ -501,7 +501,11 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         if not srt_indices and not asr_indices:
             return
         cue_ids = sorted({tokens[index].cue_id for index in srt_indices})
-        confidences = [words[index].confidence for index in asr_indices]
+        confidences = [
+            words[index].confidence
+            for index in asr_indices
+            if words[index].confidence is not None
+        ]
         speaker_ids = sorted({words[index].speaker_id for index in asr_indices if words[index].speaker_id})
         start = boundary_start(next_match)
         end = boundary_end(next_match)

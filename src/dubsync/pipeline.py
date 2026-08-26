@@ -38,6 +38,7 @@ from .providers import (
     CachedASRAdapter,
     adapter_from_config,
     apply_asr_language,
+    apply_local_asr_config,
     repair_word_stream,
 )
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
@@ -156,7 +157,7 @@ def sync_episode(
                 episode_workdir / "audio.16k.wav",
                 limits=audio_limits,
             )
-        raw_adapter = adapter_from_config(provider_config)
+        raw_adapter = adapter_from_config(provider_config, local_mode=local)
         if isinstance(asr_config, dict):
             asr_provider = str(asr_config.get("provider", "fixture"))
             model_name = str(asr_config.get("model_id", asr_config.get("model", asr_provider)))
@@ -181,6 +182,11 @@ def sync_episode(
             {
                 "words": [word.model_dump() for word in words],
                 "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
+                "metadata": {
+                    "provider": asr_provider,
+                    "model": model_name,
+                    "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
+                },
             },
         )
 
@@ -505,15 +511,7 @@ def _normalize_resume_stage(resume: str | None) -> str | None:
 
 
 def _apply_local_mode(config: dict[str, object], local: bool) -> dict[str, object]:
-    if not local:
-        return config
-    next_config = dict(config)
-    existing_asr = next_config.get("asr", {})
-    asr_config = dict(existing_asr) if isinstance(existing_asr, dict) else {}
-    asr_config["provider"] = "whisperx"
-    asr_config.pop("fixture_path", None)
-    next_config["asr"] = asr_config
-    return next_config
+    return apply_local_asr_config(config, local)
 
 
 def _should_load_asr_artifact(resume_stage: str | None) -> bool:

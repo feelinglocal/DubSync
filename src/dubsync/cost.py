@@ -66,7 +66,7 @@ def asr_dollars_per_hour(provider: str, config: dict[str, object]) -> float | No
     if override is not None:
         return float(override)
 
-    normalized = provider.lower()
+    normalized = provider.lower().replace("-", "_")
     if normalized in {"elevenlabs", "scribe_v2"}:
         surcharge = 0.05 if _has_keyterm_prompting(config) else 0.0
         return round(0.22 + surcharge, 6)
@@ -74,6 +74,13 @@ def asr_dollars_per_hour(provider: str, config: dict[str, object]) -> float | No
         return 0.36
     if normalized == "assemblyai":
         return _assemblyai_dollars_per_hour(config)
+    if normalized in {
+        "gemini",
+        "gemini_transcribe",
+        "gemini_3.5_transcribe",
+        "gemini_3_5_transcribe",
+    }:
+        return 0.3
     if normalized in {"whisperx", "fixture"}:
         return 0.0
     return None

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
+import wave
+from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from dubsync.cli import app
@@ -82,6 +86,97 @@ def test_generate_srt_from_audio_with_fixture_provider_writes_downloadable_artif
     assert (result.episode_workdir / "qc_report.json").exists()
     assert (result.episode_workdir / "qc_report.html").exists()
     assert (result.episode_workdir / "cost.json").exists()
+
+
+def test_generate_srt_local_gemini_option_writes_comparable_asr_and_cost_artifacts(tmp_path, monkeypatch):
+    audio_path = tmp_path / "dialogue.wav"
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(
+        "\n".join(
+            [
+                "asr:",
+                "  provider: elevenlabs",
+                "  model_id: scribe_v2",
+                "  local:",
+                "    provider: gemini_transcribe",
+                "    model: gemini-3.5-transcribe",
+                "    api_key: test-key",
+                "    language_codes: [de-DE]",
+                "    diarize: true",
+                "    word_timestamps: true",
+                "    store: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls: dict[str, object] = {}
+
+    class FakeFiles:
+        def upload(self, file):
+            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
+
+        def delete(self, *, name):
+            calls["deleted"] = name
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            calls["request"] = kwargs
+            return SimpleNamespace(
+                steps=[
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(
+                                annotations=[
+                                    {
+                                        "type": "word_info",
+                                        "text": "Hallo.",
+                                        "speaker": "spk_1",
+                                        "start_offset": "0.100s",
+                                        "end_offset": "0.700s",
+                                    }
+                                ]
+                            )
+                        ]
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self, api_key):
+            assert api_key == "test-key"
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "google",
+        SimpleNamespace(genai=SimpleNamespace(Client=FakeClient)),
+    )
+    monkeypatch.setattr("dubsync.transcription.normalize_audio", lambda source, _dest, **_kwargs: source)
+    output_path = tmp_path / "dialogue.gemini.srt"
+
+    result = generate_srt_from_audio(
+        audio_path=audio_path,
+        output_path=output_path,
+        workdir=tmp_path / "gemini-work",
+        providers_path=providers_path,
+        local=True,
+    )
+
+    asr_payload = json.loads((result.episode_workdir / "asr.json").read_text(encoding="utf-8"))
+    cost_payload = json.loads((result.episode_workdir / "cost.json").read_text(encoding="utf-8"))
+    assert asr_payload["metadata"]["provider"] == "gemini_transcribe"
+    assert asr_payload["metadata"]["model"] == "gemini-3.5-transcribe"
+    assert asr_payload["words"][0]["confidence"] is None
+    assert calls["deleted"] == "files/audio-1"
+    assert cost_payload["items"][0]["provider"] == "gemini-3.5-transcribe"
+    assert cost_payload["items"][0]["usd"] == pytest.approx(0.3 / 3600, abs=5e-7)
+    assert parse_srt_text(output_path.read_text(encoding="utf-8"))[0].plain_text == "Hallo."
 
 
 def test_generate_srt_reflows_punctuation_to_the_style_width(tmp_path):

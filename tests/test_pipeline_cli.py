@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import wave
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -2637,6 +2639,120 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
     else:
         assert "whisperx" in result.output.casefold()
     assert "Traceback" not in result.output
+
+
+def test_cli_sync_local_mode_uses_nested_gemini_transcribe_override(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.gemini.synced.srt"
+    workdir = tmp_path / "work"
+    calls: dict[str, object] = {}
+
+    srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo Welt\n\n", encoding="utf-8")
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {
+                    "provider": "elevenlabs",
+                    "model_id": "scribe_v2",
+                    "local": {
+                        "provider": "gemini_transcribe",
+                        "model": "gemini-3.5-transcribe",
+                        "api_key": "test-key",
+                        "language_codes": ["de-DE"],
+                        "word_timestamps": True,
+                        "diarize": True,
+                        "store": False,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeFiles:
+        def upload(self, file):
+            calls["upload"] = file
+            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
+
+        def delete(self, *, name):
+            calls["delete"] = name
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            calls["create"] = kwargs
+            return SimpleNamespace(
+                steps=[
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(
+                                annotations=[
+                                    {
+                                        "type": "word_info",
+                                        "text": "Hallo",
+                                        "speaker": "spk_1",
+                                        "start_offset": "0.100s",
+                                        "end_offset": "0.450s",
+                                    },
+                                    {
+                                        "type": "word_info",
+                                        "text": "Welt",
+                                        "speaker": "spk_1",
+                                        "start_offset": "0.500s",
+                                        "end_offset": "0.850s",
+                                    },
+                                ]
+                            )
+                        ]
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self, api_key):
+            calls["api_key"] = api_key
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=SimpleNamespace(Client=FakeClient)))
+    monkeypatch.setattr("dubsync.pipeline.normalize_audio", lambda source, _dest, **_kwargs: source)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--local",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    asr_payload = json.loads((workdir / "episode" / "asr.json").read_text(encoding="utf-8"))
+    cost_payload = json.loads((workdir / "episode" / "cost.json").read_text(encoding="utf-8"))
+    assert asr_payload["metadata"]["provider"] == "gemini_transcribe"
+    assert asr_payload["metadata"]["model"] == "gemini-3.5-transcribe"
+    assert calls["api_key"] == "test-key"
+    assert calls["delete"] == "files/audio-1"
+    assert calls["create"]["generation_config"]["transcription_config"]["mode"] == {
+        "type": "verbatim",
+        "diarization_mode": "speaker",
+        "timestamp_granularities": ["word"],
+    }
+    assert cost_payload["items"][0]["provider"] == "gemini-3.5-transcribe"
+    assert parse_srt_text(out_path.read_text(encoding="utf-8"))[0].plain_text == "Hallo Welt"
 
 
 def test_cli_batch_accepts_fps_flag(tmp_path, shifted_srt_text, shifted_wordstream):

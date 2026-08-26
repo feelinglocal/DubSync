@@ -81,6 +81,19 @@ Live provider smoke tests are opt-in because they can spend API credits:
 python -m pytest --live tests/test_live_smoke.py
 ```
 
+Gemini 3.5 Transcribe is available only for local comparison runs, not the default web/production provider. Install the cloud extra, set `GEMINI_API_KEY`, and pass both `--local` and the dedicated local example config:
+
+```powershell
+python -m dubsync sync episode.srt episode.wav `
+  -o episode.gemini-transcribe.synced.srt `
+  --providers providers.gemini-transcribe.local.example.yaml `
+  --workdir workdir-gemini-transcribe `
+  --local `
+  --no-llm
+```
+
+The adapter uses `gemini-3.5-transcribe` through Google's Interactions API with uploaded audio, verbatim mode, word timestamps, optional speaker diarization, `store: false`, optional `language_code` / `language_codes`, and `keyterms` / `character_names` as custom vocabulary. Google documents a 30-minute limit when timestamps or diarization are enabled; split longer series audio into episode-sized or sub-episode files before using this test path.
+
 Create `.env` as needed:
 
 ```text
@@ -117,7 +130,7 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 
 `--resume asr` reloads persisted ingest/style artifacts before rerunning ASR. `--resume align` and later stages reuse `workdir/<episode>/asr.json` instead of calling ASR again. `--resume adjudicate` reloads persisted ingest and alignment artifacts before rerunning adjudication. `--resume rebuild` reloads persisted ingest, alignment, and adjudication artifacts before re-cueing. `--resume verify` reloads `align.json` and `rebuild.json`, so verification/report generation starts from the persisted rebuilt subtitle artifact instead of recomputing earlier stages from the source SRT.
 
-`--local` forces the ASR provider to WhisperX and disables LLM calls. If `dubsync[local]` is not installed, it fails with a clear WhisperX optional-extra error rather than requesting cloud credentials.
+`--local` disables LLM calls and selects a local-test ASR path. By default it uses WhisperX; to test Gemini 3.5 Transcribe locally, put a nested `asr.local` block in your providers YAML and run with `--local --providers <that-file>`. Gemini Transcribe is intentionally blocked outside `--local` so production/default runs keep the configured primary ASR.
 
 ## Provider Matrix
 
@@ -126,6 +139,7 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 | ASR primary | ElevenLabs Scribe v2 | Implemented optional adapter | `asr.provider: elevenlabs`, `model_id: scribe_v2`, `diarize: true`, optional `keyterms` / `character_names` |
 | ASR fallback | OpenAI Whisper | Implemented optional adapter, no diarization | `asr.provider: openai`, `model: whisper-1` |
 | ASR fallback | AssemblyAI | Implemented optional adapter | `asr.provider: assemblyai`, `model: universal-3-pro` or `universal-2`, `speaker_labels: true` |
+| ASR local comparison | Gemini 3.5 Transcribe | Implemented optional adapter; blocked outside `--local`; requires `dubsync[cloud]` and `GEMINI_API_KEY`; limited to 30-minute timestamp/diarization requests | `asr.local.provider: gemini_transcribe`, `model: gemini-3.5-transcribe`, `language_codes: ["de-DE"]`, `diarize: true`, `word_timestamps: true` |
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
 | LLM text default | OpenAI GPT-5.6 Luna | Implemented adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
@@ -168,6 +182,16 @@ asr:
   character_names:
     - Luna
     - Matthew
+  # Used only with --local. Keep this in a private local providers file for tests.
+  local:
+    provider: gemini_transcribe
+    model: gemini-3.5-transcribe
+    language_codes: ["de-DE"]
+    diarize: true
+    word_timestamps: true
+    store: false
+    custom_vocabulary:
+      - Drachen-Evolutionssystem
 
 llm:
   provider: openai
@@ -254,6 +278,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 | Item | Planned cost basis |
 |---|---|
 | Scribe v2 ASR | audio seconds x provider hourly price (`$0.22/hr`, or `$0.27/hr` when `keyterms` or `character_names` enable keyterm prompting) |
+| Gemini 3.5 Transcribe local comparison ASR | audio seconds x provider price (`$0.30/hr`, from Google's `$0.005/min` file-transcription rate) |
 | AssemblyAI ASR | audio seconds x provider/model hourly price (`$0.21/hr` for `universal-3-pro`, `$0.15/hr` for `universal-2`, plus `$0.02/hr` when `speaker_labels` is enabled; enabled by default) |
 | LLM adjudication/punctuation | input/output tokens x model price |
 | Audio snippet double-checks | inline snippet audio duration is included in Gemini input usage when provider metadata is available |

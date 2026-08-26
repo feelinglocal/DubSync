@@ -114,6 +114,31 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     assert "GEMINI_API_KEY" in example_text
 
 
+def test_readme_and_provider_example_document_local_gemini_transcribe():
+    readme = Path("README.md").read_text(encoding="utf-8")
+    example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
+    local_example = yaml.safe_load(Path("providers.gemini-transcribe.local.example.yaml").read_text(encoding="utf-8"))
+
+    for expected in (
+        "Gemini 3.5 Transcribe",
+        "asr.local",
+        "blocked outside `--local`",
+        "$0.005/min",
+    ):
+        assert expected in readme
+    for expected in (
+        "local:",
+        "provider: gemini_transcribe",
+        "model: gemini-3.5-transcribe",
+        "word_timestamps: true",
+        "store: false",
+    ):
+        assert expected in example_text
+    assert local_example["asr"]["provider"] == "elevenlabs"
+    assert local_example["asr"]["local"]["provider"] == "gemini_transcribe"
+    assert local_example["asr"]["local"]["model"] == "gemini-3.5-transcribe"
+
+
 def test_production_llm_passes_use_requested_models_and_thinking_levels():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
@@ -221,5 +246,5 @@ def test_readme_mentions_improv_precision_recall_metrics():
 def test_cloud_dependencies_require_medium_thinking_compatible_google_genai():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "google-genai>=1.56,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
+    assert "google-genai>=2.20,<3" in pyproject["project"]["optional-dependencies"]["cloud"]
     assert "openai>=2.44,<3" in pyproject["project"]["optional-dependencies"]["cloud"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import mimetypes
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -12,6 +15,10 @@ from pydantic import ValidationError
 from .cache import CacheKey, JsonDiskCache
 from .cost import CostMeter, audio_seconds
 from .models import QCFlag, Word
+
+
+logger = logging.getLogger(__name__)
+GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS = 30 * 60.0
 
 
 class ProviderError(RuntimeError):
@@ -229,6 +236,124 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
         ]
 
 
+class GeminiTranscribeAdapter:  # pragma: no cover - live provider path
+    """Optional Gemini 3.5 Transcribe ASR adapter for local comparison runs."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gemini-3.5-transcribe",
+        language_codes: list[str] | None = None,
+        custom_vocabulary: list[str] | None = None,
+        diarize: bool = True,
+        word_timestamps: bool = True,
+        store: bool = False,
+        max_audio_seconds: object = GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
+    ):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        self.model = model.strip()
+        self.language_codes = list(language_codes or [])
+        self.custom_vocabulary = list(custom_vocabulary or [])
+        self.diarize = diarize
+        self.word_timestamps = word_timestamps
+        self.store = bool(store)
+        self.max_audio_seconds = _gemini_max_audio_seconds(max_audio_seconds)
+        self.usage_events: list[object] = []
+        if self.model != "gemini-3.5-transcribe":
+            raise ProviderError(
+                "Gemini Transcribe local tests require model: gemini-3.5-transcribe."
+            )
+        if not self.word_timestamps:
+            raise ProviderError(
+                "Gemini Transcribe requires asr.word_timestamps: true for DubSync's timing contract."
+            )
+        if self.store:
+            raise ProviderError("Gemini Transcribe local tests require asr.store: false.")
+        if len(self.custom_vocabulary) > 1000:
+            raise ProviderError("Gemini Transcribe custom vocabulary supports at most 1000 terms.")
+
+    def transcribe(self, audio_path: Path) -> list[Word]:
+        if not self.api_key:
+            raise ProviderError("GEMINI_API_KEY is required for Gemini 3.5 Transcribe.")
+        if self.word_timestamps or self.diarize:
+            duration = _audio_seconds_for_limit(audio_path)
+            if duration is None:
+                raise ProviderError(
+                    "Gemini 3.5 Transcribe audio duration could not be verified; "
+                    "use the DubSync CLI to normalize the input to WAV first."
+                )
+            if duration > self.max_audio_seconds:
+                raise ProviderError(
+                    "Gemini 3.5 Transcribe is limited to 30 minutes per request when "
+                    "word timestamps or speaker diarization are enabled; automatic "
+                    "chunking is intentionally not enabled for this comparison path."
+                )
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise ProviderError("Install dubsync[cloud] to use Gemini 3.5 Transcribe.") from exc
+
+        client = None
+        uploaded_name = ""
+        try:
+            client = genai.Client(api_key=self.api_key)
+            audio_file = client.files.upload(file=str(audio_path))
+            uploaded_name = str(_field(audio_file, "name", "") or "")
+            uploaded_uri = str(_field(audio_file, "uri", "") or "")
+            if not uploaded_uri:
+                raise ProviderError("Gemini file upload did not return an audio URI.")
+            response = client.interactions.create(
+                model=self.model,
+                input=[
+                    {
+                        "type": "audio",
+                        "uri": uploaded_uri,
+                        "mime_type": _field(audio_file, "mime_type", _guess_audio_mime_type(audio_path)),
+                    }
+                ],
+                generation_config={"transcription_config": self._transcription_config()},
+                store=False,
+            )
+        except Exception as exc:
+            raise ProviderError(
+                f"Gemini 3.5 Transcribe failed: {_redact_provider_message(exc, [self.api_key])}"
+            ) from None
+        finally:
+            if client is not None and uploaded_name:
+                try:
+                    client.files.delete(name=uploaded_name)
+                except Exception as cleanup_exc:  # pragma: no cover - provider cleanup warning
+                    logger.warning(
+                        "Gemini Transcribe could not delete uploaded file %s: %s",
+                        uploaded_name,
+                        _redact_provider_message(cleanup_exc, [self.api_key]),
+                    )
+
+        usage = _field(response, "usage", None)
+        if usage is not None:
+            self.usage_events.append({"usage": usage})
+        words = _words_from_gemini_transcribe_response(response)
+        if not words:
+            raise ProviderError(
+                "Gemini 3.5 Transcribe returned no word annotations; keep verbatim word timestamps enabled."
+            )
+        return words
+
+    def _transcription_config(self) -> dict[str, object]:
+        config: dict[str, object] = {}
+        if self.language_codes:
+            config["language_codes"] = self.language_codes
+        if self.custom_vocabulary:
+            config["custom_vocabulary"] = self.custom_vocabulary
+        mode: dict[str, object] = {"type": "verbatim"}
+        if self.diarize:
+            mode["diarization_mode"] = "speaker"
+        if self.word_timestamps:
+            mode["timestamp_granularities"] = ["word"]
+        config["mode"] = mode
+        return config
+
+
 class WhisperXAdapter:
     def __init__(
         self,
@@ -298,7 +423,7 @@ class WhisperXAdapter:
         return whisperx.assign_word_speakers(diarize_segments, result)
 
 
-def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
+def adapter_from_config(config: dict[str, object], *, local_mode: bool = False) -> ASRAdapter:
     asr_config = config.get("asr", {}) if isinstance(config, dict) else {}
     if not isinstance(asr_config, dict):
         raise ProviderError("providers.yaml asr section must be a mapping")
@@ -324,6 +449,19 @@ def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
             model=str(asr_config.get("model", "universal-3-pro")),
             speaker_labels=bool(asr_config.get("speaker_labels", True)),
+        )
+    if _is_gemini_transcribe_provider(provider):
+        if not local_mode:
+            raise ProviderError("Gemini 3.5 Transcribe ASR is only available in --local test mode.")
+        return GeminiTranscribeAdapter(
+            api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
+            model=str(asr_config.get("model", "gemini-3.5-transcribe")),
+            language_codes=_asr_language_codes(asr_config),
+            custom_vocabulary=_gemini_custom_vocabulary(asr_config),
+            diarize=bool(asr_config.get("diarize", True)),
+            word_timestamps=bool(asr_config.get("word_timestamps", True)),
+            store=bool(asr_config.get("store", False)),
+            max_audio_seconds=asr_config.get("max_audio_seconds", GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS),
         )
     if provider == "whisperx":
         return WhisperXAdapter(
@@ -352,8 +490,32 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
     provider = str(asr_config.get("provider", "elevenlabs")).lower()
     if provider == "whisperx":
         asr_config["language"] = normalized
+    elif _is_gemini_transcribe_provider(provider):
+        asr_config["language_codes"] = [normalized]
     else:
         asr_config["language_code"] = normalized
+    next_config["asr"] = asr_config
+    return next_config
+
+
+def apply_local_asr_config(config: dict[str, object], local: bool) -> dict[str, object]:
+    if not local:
+        return dict(config)
+    next_config = dict(config)
+    existing = next_config.get("asr", {})
+    asr_config = dict(existing) if isinstance(existing, dict) else {}
+    local_override = asr_config.get("local", {})
+    if isinstance(local_override, dict) and local_override:
+        preserved = {
+            key: value
+            for key, value in asr_config.items()
+            if key not in {"fixture_path", "language_code", "local", "model", "model_id", "provider"}
+        }
+        preserved.update(local_override)
+        asr_config = preserved
+    elif not _is_gemini_transcribe_provider(str(asr_config.get("provider", "")).lower()):
+        asr_config["provider"] = "whisperx"
+    asr_config.pop("fixture_path", None)
     next_config["asr"] = asr_config
     return next_config
 
@@ -532,6 +694,56 @@ def _asr_keyterms(asr_config: dict[str, object]) -> list[str]:
     return terms
 
 
+def _asr_language_codes(asr_config: dict[str, object]) -> list[str]:
+    configured = asr_config.get("language_codes")
+    if isinstance(configured, list):
+        codes: list[str] = []
+        for item in configured:
+            if not isinstance(item, str):
+                raise ProviderError("asr.language_codes must be a list of strings")
+            code = item.strip()
+            if code and code not in codes:
+                codes.append(code)
+        return codes
+    if configured is not None:
+        raise ProviderError("asr.language_codes must be a list of strings")
+    language_code = asr_config.get("language_code")
+    if isinstance(language_code, str) and language_code.strip():
+        return [language_code.strip()]
+    return []
+
+
+def _gemini_custom_vocabulary(asr_config: dict[str, object]) -> list[str]:
+    configured = asr_config.get("custom_vocabulary", [])
+    if configured is None:
+        terms: list[str] = []
+    elif isinstance(configured, list):
+        terms = []
+        for item in configured:
+            if not isinstance(item, str):
+                raise ProviderError("asr.custom_vocabulary must be a list of strings")
+            term = item.strip()
+            if term and term not in terms:
+                terms.append(term)
+    else:
+        raise ProviderError("asr.custom_vocabulary must be a list of strings")
+    for term in _asr_keyterms(asr_config):
+        if term not in terms:
+            terms.append(term)
+    if len(terms) > 1000:
+        raise ProviderError("Gemini Transcribe custom vocabulary supports at most 1000 terms.")
+    return terms
+
+
+def _is_gemini_transcribe_provider(provider: str) -> bool:
+    return provider.lower().replace("-", "_") in {
+        "gemini",
+        "gemini_transcribe",
+        "gemini_3.5_transcribe",
+        "gemini_3_5_transcribe",
+    }
+
+
 def _words_from_whisperx_result(result: dict[str, object]) -> list[Word]:
     raw_words = result.get("word_segments")
     if raw_words is None:
@@ -556,3 +768,101 @@ def _words_from_whisperx_result(result: dict[str, object]) -> list[Word]:
             )
         )
     return words
+
+
+def _words_from_gemini_transcribe_response(response: object) -> list[Word]:
+    words: list[Word] = []
+    for step in _iter_items(_field(response, "steps", [])):
+        for content in _iter_items(_field(step, "content", [])):
+            for annotation in _iter_items(_field(content, "annotations", [])):
+                payload = _gemini_annotation_payload(annotation)
+                if _field(payload, "type", None) != "word_info":
+                    continue
+                text = _field(payload, "text", "")
+                start = _seconds_offset(_field(payload, "start_offset", None))
+                end = _seconds_offset(_field(payload, "end_offset", None))
+                if not text or start is None or end is None:
+                    continue
+                words.append(
+                    Word(
+                        text=str(text),
+                        start=start,
+                        end=end,
+                        confidence=_optional_float(_field(payload, "confidence", None)),
+                        speaker_id=_field(payload, "speaker", None),
+                    )
+                )
+    return words
+
+
+def _gemini_annotation_payload(annotation: object) -> object:
+    raw = _field(annotation, "raw", None)
+    if isinstance(raw, dict):
+        return raw
+    return annotation
+
+
+def _iter_items(items: object) -> Iterable[object]:
+    if isinstance(items, Iterable) and not isinstance(items, (str, bytes, dict)):
+        return items
+    return []
+
+
+def _seconds_offset(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    total_seconds = getattr(value, "total_seconds", None)
+    if callable(total_seconds):
+        try:
+            seconds = float(total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)s\s*", value)
+    if match is None:
+        return None
+    seconds = float(match.group(1))
+    return seconds if math.isfinite(seconds) else None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and 0.0 <= number <= 1.0 else None
+
+
+def _redact_provider_message(error: object, secrets: Iterable[str | None]) -> str:
+    message = str(error)
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    return re.sub(r"AIza[0-9A-Za-z_-]{35}", "[redacted]", message)
+
+
+def _audio_seconds_for_limit(path: Path) -> float | None:
+    seconds = audio_seconds(path)
+    return seconds if seconds > 0 else None
+
+
+def _gemini_max_audio_seconds(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProviderError("asr.max_audio_seconds must be a number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ProviderError("asr.max_audio_seconds must be finite and greater than zero")
+    if seconds > GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS:
+        raise ProviderError("asr.max_audio_seconds cannot exceed Gemini's 1800-second limit")
+    return seconds
+
+
+def _guess_audio_mime_type(path: Path) -> str:
+    guessed, _encoding = mimetypes.guess_type(path.name)
+    return guessed or "audio/wav"

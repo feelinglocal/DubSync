@@ -243,7 +243,9 @@ def test_default_asr_prices_match_plan_cost_table():
     assert asr_dollars_per_hour("elevenlabs", {}) == 0.22
     assert asr_dollars_per_hour("openai", {}) == 0.36
     assert asr_dollars_per_hour("assemblyai", {}) == 0.23
+    assert asr_dollars_per_hour("gemini", {}) == 0.3
     assert asr_dollars_per_hour("gemini_transcribe", {}) == 0.3
+    assert asr_dollars_per_hour("gemini_3_5_transcribe", {}) == 0.3
     assert asr_dollars_per_hour("gemini-3.5-transcribe", {}) == 0.3
     assert asr_dollars_per_hour("whisperx", {}) == 0.0
     assert asr_dollars_per_hour("elevenlabs", {"dollars_per_hour": 0.5}) == 0.5

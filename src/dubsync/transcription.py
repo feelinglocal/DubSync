@@ -11,7 +11,7 @@ from .cue_segmentation import group_words_for_cues
 from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_adapter_from_config
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
-from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
+from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language, apply_local_asr_config
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .reports import write_qc_report
@@ -89,7 +89,7 @@ def generate_srt_from_audio(
     model = str(asr_config.get("model_id", asr_config.get("model", provider)))
     cost_meter = CostMeter()
     adapter = CachedASRAdapter(
-        adapter_from_config(provider_config),
+        adapter_from_config(provider_config, local_mode=local),
         JsonDiskCache(episode_workdir / "asr-cache"),
         model,
         asr_config,
@@ -232,15 +232,7 @@ def _cue_word_indices(cues: list[Cue], words: list[Word]) -> dict[int, list[int]
 
 
 def _provider_config(config: dict[str, object], *, local: bool) -> dict[str, object]:
-    if not local:
-        return dict(config)
-    next_config = dict(config)
-    existing = next_config.get("asr", {})
-    asr_config = dict(existing) if isinstance(existing, dict) else {}
-    asr_config["provider"] = "whisperx"
-    asr_config.pop("fixture_path", None)
-    next_config["asr"] = asr_config
-    return next_config
+    return apply_local_asr_config(config, local)
 
 
 def _punctuation_scene_gap(config: dict[str, object]) -> float:

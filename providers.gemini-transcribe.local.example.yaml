@@ -1,0 +1,19 @@
+asr:
+  provider: elevenlabs
+  model_id: scribe_v2
+  diarize: true
+  local:
+    provider: gemini_transcribe
+    model: gemini-3.5-transcribe
+    language_codes:
+      - de-DE
+    diarize: true
+    word_timestamps: true
+    store: false
+    custom_vocabulary: []
+
+llm:
+  provider: openai
+  model: gpt-5.6-luna
+  timeout_seconds: 90
+  max_retries: 2
