@@ -8,7 +8,7 @@ import pytest
 
 from dubsync.llm_providers import AnthropicLLMAdapter, GeminiLLMAdapter, OpenAILLMAdapter
 from dubsync.models import Cue, DivergenceSpan
-from dubsync.providers import AssemblyAIAdapter, ElevenLabsScribeAdapter, OpenAIWhisperAdapter
+from dubsync.providers import AssemblyAIAdapter, ElevenLabsScribeAdapter, GeminiTranscribeAdapter, OpenAIWhisperAdapter, ProviderError
 
 
 def _require_env(name: str) -> str:
@@ -46,6 +46,7 @@ def test_live_smoke_file_covers_all_configured_cloud_providers():
         "test_live_gemini_punctuation_smoke",
         "test_live_anthropic_adjudication_smoke",
         "test_live_elevenlabs_scribe_smoke",
+        "test_live_gemini_transcribe_smoke",
         "test_live_openai_whisper_smoke",
         "test_live_assemblyai_smoke",
     }.issubset(live_tests)
@@ -91,6 +92,23 @@ def test_live_elevenlabs_scribe_smoke(tmp_path):
     _tiny_wav(audio)
 
     words = ElevenLabsScribeAdapter(api_key=api_key).transcribe(audio)
+
+    assert isinstance(words, list)
+
+
+@pytest.mark.live
+def test_live_gemini_transcribe_smoke(tmp_path):
+    _require_module("google.genai")
+    api_key = _require_env("GEMINI_API_KEY")
+    audio = tmp_path / "tiny.wav"
+    _tiny_wav(audio)
+
+    try:
+        words = GeminiTranscribeAdapter(api_key=api_key).transcribe(audio)
+    except ProviderError as exc:
+        if "word annotations" not in str(exc):
+            raise
+        words = []
 
     assert isinstance(words, list)
 

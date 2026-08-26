@@ -91,6 +91,21 @@ def test_fuzzy_name_variant_stays_visible_for_audio_adjudication():
     assert result.divergence_spans[0].asr_text == "Tristan"
 
 
+def test_divergence_with_unknown_asr_confidence_remains_unscored():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Tristen\n"
+        "\n"
+    )
+    words = [Word(text="Tristan", start=0.1, end=0.6, confidence=None)]
+
+    result = align_cues_to_words(cues, words)
+
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].confidence == 0.0
+
+
 def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     calls = 0
     original_similarity = aligner._similarity

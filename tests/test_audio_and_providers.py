@@ -15,9 +15,11 @@ from dubsync.models import Word
 from dubsync.providers import (
     AssemblyAIAdapter,
     CachedASRAdapter,
+    GeminiTranscribeAdapter,
     ProviderError,
     WhisperXAdapter,
     adapter_from_config,
+    apply_local_asr_config,
     repair_word_stream,
 )
 
@@ -478,6 +480,273 @@ def test_elevenlabs_adapter_passes_configured_keyterms_to_scribe_v2(tmp_path, mo
     assert calls["convert"]["diarize"] is True
     assert calls["convert"]["language_code"] == "de"
     assert calls["convert"]["keyterms"] == ["Drachen-Evolutionssystem", "Luna", "Matthew"]
+
+
+def test_gemini_transcribe_adapter_maps_word_info_annotations(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    calls: dict[str, object] = {}
+
+    class FakeFiles:
+        def upload(self, file):
+            calls["upload"] = file
+            return SimpleNamespace(uri="files/audio-1", mime_type="audio/wav")
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            calls["create"] = kwargs
+            return SimpleNamespace(
+                output_text="Hallo Welt",
+                steps=[
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(
+                                annotations=[
+                                    SimpleNamespace(
+                                        type="word_info",
+                                        text="Hallo",
+                                        speaker="spk_1",
+                                        start_offset="0.100s",
+                                        end_offset="0.450s",
+                                    ),
+                                    {
+                                        "type": "word_info",
+                                        "text": "Welt",
+                                        "speaker": "spk_1",
+                                        "start_offset": "0.500s",
+                                        "end_offset": "0.850s",
+                                    },
+                                ]
+                            )
+                        ]
+                    )
+                ],
+            )
+
+    class FakeClient:
+        def __init__(self, api_key):
+            calls["api_key"] = api_key
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    fake_genai = SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+
+    adapter = GeminiTranscribeAdapter(
+        api_key="test-key",
+        language_codes=["de-DE"],
+        custom_vocabulary=["Drachen-Evolutionssystem", "Luna"],
+    )
+
+    words = adapter.transcribe(audio)
+
+    assert [word.text for word in words] == ["Hallo", "Welt"]
+    assert [word.speaker_id for word in words] == ["spk_1", "spk_1"]
+    assert words[0].start == 0.1
+    assert words[1].end == 0.85
+    assert words[0].confidence is None
+    assert calls["upload"] == str(audio)
+    assert calls["api_key"] == "test-key"
+    assert calls["create"] == {
+        "model": "gemini-3.5-transcribe",
+        "store": False,
+        "input": [{"type": "audio", "uri": "files/audio-1", "mime_type": "audio/wav"}],
+        "generation_config": {
+            "transcription_config": {
+                "language_codes": ["de-DE"],
+                "custom_vocabulary": ["Drachen-Evolutionssystem", "Luna"],
+                "mode": {
+                    "type": "verbatim",
+                    "diarization_mode": "speaker",
+                    "timestamp_granularities": ["word"],
+                },
+            }
+        },
+    }
+
+
+def test_gemini_transcribe_unwraps_sdk_unknown_annotations_and_deletes_upload(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    calls: dict[str, object] = {}
+
+    class FakeFiles:
+        def upload(self, file):
+            calls["upload"] = file
+            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
+
+        def delete(self, *, name):
+            calls["delete"] = name
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            calls["create"] = kwargs
+            return SimpleNamespace(
+                status="completed",
+                steps=[
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(
+                                annotations=[
+                                    SimpleNamespace(
+                                        type="UNKNOWN",
+                                        raw={
+                                            "type": "word_info",
+                                            "text": "Hallo",
+                                            "speaker": "spk_1",
+                                            "start_offset": "0.100s",
+                                            "end_offset": "0.450s",
+                                        },
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                ],
+            )
+
+    class FakeClient:
+        def __init__(self, api_key):
+            calls["api_key"] = api_key
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    fake_genai = SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+
+    words = GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
+
+    assert [word.text for word in words] == ["Hallo"]
+    assert words[0].confidence is None
+    assert calls["delete"] == "files/audio-1"
+
+
+def test_gemini_transcribe_deletes_upload_when_interaction_fails(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    calls: dict[str, object] = {}
+
+    class FakeFiles:
+        def upload(self, file):
+            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
+
+        def delete(self, *, name):
+            calls["delete"] = name
+
+    class FakeInteractions:
+        def create(self, **kwargs):
+            raise RuntimeError("temporary provider failure")
+
+    class FakeClient:
+        def __init__(self, api_key):
+            self.files = FakeFiles()
+            self.interactions = FakeInteractions()
+
+    fake_genai = SimpleNamespace(Client=FakeClient)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+
+    with pytest.raises(ProviderError, match="Gemini 3.5 Transcribe failed"):
+        GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
+
+    assert calls["delete"] == "files/audio-1"
+
+
+def test_gemini_transcribe_factory_accepts_deduplicated_custom_vocabulary():
+    adapter = adapter_from_config(
+        {
+            "asr": {
+                "provider": "gemini_transcribe",
+                "api_key": "test-key",
+                "custom_vocabulary": ["Luna", "Drachen-Evolutionssystem", "Luna"],
+                "character_names": ["Matthew", "Luna"],
+            }
+        },
+        local_mode=True,
+    )
+
+    assert isinstance(adapter, GeminiTranscribeAdapter)
+    assert adapter.custom_vocabulary == ["Luna", "Drachen-Evolutionssystem", "Matthew"]
+
+
+def test_gemini_transcribe_rejects_invalid_request_limit():
+    with pytest.raises(ProviderError, match="max_audio_seconds"):
+        adapter_from_config(
+            {
+                "asr": {
+                    "provider": "gemini_transcribe",
+                    "api_key": "test-key",
+                    "max_audio_seconds": 1800.1,
+                }
+            },
+            local_mode=True,
+        )
+
+
+def test_gemini_transcribe_requires_local_mode():
+    with pytest.raises(ProviderError, match="only available in --local"):
+        adapter_from_config({"asr": {"provider": "gemini_transcribe", "api_key": "test-key"}})
+
+    adapter = adapter_from_config(
+        {"asr": {"provider": "gemini_transcribe", "api_key": "test-key"}},
+        local_mode=True,
+    )
+
+    assert isinstance(adapter, GeminiTranscribeAdapter)
+
+
+def test_local_mode_uses_nested_gemini_transcribe_override():
+    config = {
+        "asr": {
+            "provider": "elevenlabs",
+            "model_id": "scribe_v2",
+            "diarize": True,
+            "local": {
+                "provider": "gemini_transcribe",
+                "model": "gemini-3.5-transcribe",
+                "language_codes": ["de-DE"],
+                "custom_vocabulary": ["Drachen-Evolutionssystem"],
+            },
+        }
+    }
+
+    local_config = apply_local_asr_config(config, local=True)
+
+    assert local_config["asr"] == {
+        "provider": "gemini_transcribe",
+        "diarize": True,
+        "model": "gemini-3.5-transcribe",
+        "language_codes": ["de-DE"],
+        "custom_vocabulary": ["Drachen-Evolutionssystem"],
+    }
+    assert config["asr"]["provider"] == "elevenlabs"
+
+
+def test_gemini_transcribe_fails_clearly_without_word_annotations(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+
+    class FakeClient:
+        def __init__(self, api_key):
+            del api_key
+            self.files = SimpleNamespace(upload=lambda file: SimpleNamespace(uri=file, mime_type="audio/wav"))
+            self.interactions = SimpleNamespace(create=lambda **_kwargs: SimpleNamespace(output_text="Hallo Welt", steps=[]))
+
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=SimpleNamespace(Client=FakeClient)))
+
+    with pytest.raises(ProviderError, match="word annotations"):
+        GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
+
+
+def test_gemini_transcribe_rejects_overlong_timestamp_request(tmp_path):
+    audio = tmp_path / "long.wav"
+    with wave.open(str(audio), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(1)
+        wav.writeframes(b"\x00\x00" * 1801)
+
+    with pytest.raises(ProviderError, match="30 minutes"):
+        GeminiTranscribeAdapter(api_key="test-key").transcribe(audio)
 
 
 def test_whisperx_adapter_transcribes_and_aligns_with_word_timestamps(tmp_path, monkeypatch):
