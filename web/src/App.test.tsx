@@ -117,6 +117,28 @@ describe('DubSync workspace', () => {
     expect(within(precisionRow).getByText('$50 minimum')).toBeVisible()
   })
 
+  it('offers Portuguese and submits the pt language code', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'portuguese-job', token: 'portuguese-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const languageSelect = screen.getByLabelText('Language')
+    expect(within(languageSelect).getByRole('option', { name: 'Portuguese' })).toHaveValue('pt')
+    await user.selectOptions(languageSelect, 'pt')
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('language')).toBe('pt')
+  })
+
   it('clearly marks precision processing as coming soon', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
     render(<App />)
