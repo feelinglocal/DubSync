@@ -1,8 +1,10 @@
+> **Retired:** Gemini 3.5 Transcribe ASR is disabled in CLI, web, UI, and queued jobs. This file is retained only as historical TDD evidence; do not use the setup below. Production transcription uses ElevenLabs Scribe v2.
+
 # Gemini 3.5 Transcribe Local Pilot Evidence
 
 ## Scope and sources
 
-This pilot adds Gemini 3.5 Transcribe as an opt-in local comparison provider. It does not replace the ElevenLabs Scribe v2 default and does not change any Render or web deployment configuration.
+Historical context: this retired pilot added Gemini 3.5 Transcribe as an opt-in local comparison provider. It never replaced the ElevenLabs Scribe v2 default and did not change Render or web deployment configuration.
 
 The request and response contract was checked against Google's official documentation:
 
@@ -24,7 +26,9 @@ Additional RED hardening checks caught and drove fixes for:
 - Gemini provider aliases bypassing cost metering.
 - A cost-normalization regression for the existing `whisper-1` alias.
 
-## Verification
+## Archived Verification
+
+The results below describe the retired pilot at its historical commit; they are not current product capability claims.
 
 - Focused Gemini adapter, local routing, CLI integration, artifact, confidence, cost, and documentation tests passed.
 - `python -m pytest --cov=dubsync --cov-report=term-missing` passed: 605 passed, 8 deselected, 86.10% total coverage.
@@ -33,7 +37,7 @@ Additional RED hardening checks caught and drove fixes for:
 - A full 49.4-second local episode 032 sync passed with 125 Gemini words, 2 speakers, and a metered cost of `$0.004117`.
 - The final live adapter deletes the uploaded Google file in `finally`, rejects `store: true`, redacts the configured key from provider errors, and suppresses an unredacted chained exception.
 
-## Fresh 30-second comparison
+## Archived 30-second comparison
 
 Both providers processed the same normalized first 30 seconds of episode 032, with `--no-llm`, fresh caches, and separate work directories.
 
@@ -54,9 +58,11 @@ Artifacts are ignored local files under:
 - `work/asr-compare-20260827/gemini/`
 - `work/asr-compare-20260827/scribe/`
 
-## Implementation guarantees
+## Historical Pilot Guarantees (Superseded)
 
-| Behavior | Guarantee |
+These rows document the retired adapter's former contract. Current code rejects this ASR provider before any client or upload is created.
+
+| Behavior | Former pilot guarantee |
 |---|---|
 | Default provider | `provider.yaml` remains ElevenLabs Scribe v2. |
 | Local-only enforcement | Gemini ASR is rejected unless the caller explicitly uses `--local`. |

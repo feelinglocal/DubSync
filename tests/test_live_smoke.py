@@ -3,14 +3,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import wave
-from pathlib import Path
 
 import pytest
 
 from dubsync.llm_providers import AnthropicLLMAdapter, GeminiLLMAdapter, OpenAILLMAdapter
 from dubsync.models import Cue, DivergenceSpan
-from dubsync.cost import audio_seconds
-from dubsync.providers import AssemblyAIAdapter, ElevenLabsScribeAdapter, GeminiTranscribeAdapter, OpenAIWhisperAdapter
+from dubsync.providers import AssemblyAIAdapter, ElevenLabsScribeAdapter, OpenAIWhisperAdapter
 
 
 def _require_env(name: str) -> str:
@@ -48,7 +46,6 @@ def test_live_smoke_file_covers_all_configured_cloud_providers():
         "test_live_gemini_punctuation_smoke",
         "test_live_anthropic_adjudication_smoke",
         "test_live_elevenlabs_scribe_smoke",
-        "test_live_gemini_transcribe_smoke",
         "test_live_openai_whisper_smoke",
         "test_live_assemblyai_smoke",
     }.issubset(live_tests)
@@ -96,24 +93,6 @@ def test_live_elevenlabs_scribe_smoke(tmp_path):
     words = ElevenLabsScribeAdapter(api_key=api_key).transcribe(audio)
 
     assert isinstance(words, list)
-
-
-@pytest.mark.live
-def test_live_gemini_transcribe_smoke():
-    _require_module("google.genai")
-    api_key = _require_env("GEMINI_API_KEY")
-    audio = Path(_require_env("DUBSYNC_LIVE_TRANSCRIBE_AUDIO"))
-    assert audio.is_file(), f"DUBSYNC_LIVE_TRANSCRIBE_AUDIO does not exist: {audio}"
-    duration = audio_seconds(audio)
-    assert 0 < duration <= 60, "Gemini live smoke audio must be a WAV no longer than 60 seconds"
-
-    words = GeminiTranscribeAdapter(
-        api_key=api_key,
-        language_codes=["de-DE"],
-    ).transcribe(audio)
-
-    assert words
-    assert all(word.end > word.start >= 0 for word in words)
 
 
 @pytest.mark.live

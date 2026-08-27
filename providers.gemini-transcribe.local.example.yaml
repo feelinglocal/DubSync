@@ -1,16 +1,9 @@
+# Historical filename retained so existing links fail safely. Gemini 3.5
+# transcription is disabled; this example now uses the supported ASR.
 asr:
   provider: elevenlabs
   model_id: scribe_v2
   diarize: true
-  local:
-    provider: gemini_transcribe
-    model: gemini-3.5-transcribe
-    language_codes:
-      - de-DE
-    diarize: true
-    word_timestamps: true
-    store: false
-    custom_vocabulary: []
 
 llm:
   provider: openai

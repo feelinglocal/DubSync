@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .models import Cue, Word
 from .profanity import normalize_german_profanity_token
@@ -119,6 +120,7 @@ class SRTToken:
     token_index: int
 
 
+@lru_cache(maxsize=16_384)
 def normalize_token(value: str) -> str:
     profanity = normalize_german_profanity_token(value)
     if profanity is not None:

@@ -81,20 +81,7 @@ Live provider smoke tests are opt-in because they can spend API credits:
 python -m pytest --live tests/test_live_smoke.py
 ```
 
-Gemini 3.5 Transcribe is an optional testing provider, not the default web/production provider. The CLI comparison remains available with `--local`: install the cloud extra, set `GEMINI_API_KEY`, and use the dedicated local example config:
-
-```powershell
-python -m dubsync sync episode.srt episode.wav `
-  -o episode.gemini-transcribe.synced.srt `
-  --providers providers.gemini-transcribe.local.example.yaml `
-  --workdir workdir-gemini-transcribe `
-  --local `
-  --no-llm
-```
-
-The adapter uses `gemini-3.5-transcribe` through Google's Interactions API with uploaded audio, verbatim mode, word timestamps, optional speaker diarization, `store: false`, optional `language_code` / `language_codes`, and `keyterms` / `character_names` as custom vocabulary. Google documents a 30-minute limit when timestamps or diarization are enabled; split longer series audio into episode-sized or sub-episode files before using this test path.
-
-The normal web processing pipeline can expose the same ASR model behind a server-controlled test toggle while retaining its configured adjudication, punctuation, and speaker-mapping stages. Set `DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=1` together with `GEMINI_API_KEY`, rebuild the frontend, and restart the web app. The backend then exposes the toggle for both sync and audio-to-SRT jobs, accepts only the exact `gemini-3.5-transcribe` selection, persists that selection for queued workers, and rejects files over 1,800 seconds before provider processing. This feature is disabled by default; leave the flag unset or `0` in Render until the experiment is intentionally approved for deployment.
+Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. ElevenLabs Scribe v2 is the supported cloud ASR for normal sync and audio-to-SRT work. `GEMINI_API_KEY` is still used by the separate Gemini 3.7 Flash adjudication and punctuation passes.
 
 Create `.env` as needed:
 
@@ -132,7 +119,7 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 
 `--resume asr` reloads persisted ingest/style artifacts before rerunning ASR. `--resume align` and later stages reuse `workdir/<episode>/asr.json` instead of calling ASR again. `--resume adjudicate` reloads persisted ingest and alignment artifacts before rerunning adjudication. `--resume rebuild` reloads persisted ingest, alignment, and adjudication artifacts before re-cueing. `--resume verify` reloads `align.json` and `rebuild.json`, so verification/report generation starts from the persisted rebuilt subtitle artifact instead of recomputing earlier stages from the source SRT.
 
-`--local` disables LLM calls and selects a local-test ASR path. By default it uses WhisperX; to test Gemini 3.5 Transcribe locally, put a nested `asr.local` block in your providers YAML and run with `--local --providers <that-file>`. Direct provider configuration remains blocked outside `--local`; the only non-local exception is the backend-authorized web testing selection described above, and the default ASR remains unchanged.
+`--local` disables LLM calls and selects the WhisperX local-test ASR path. Normal cloud processing continues to use the configured ElevenLabs Scribe v2 adapter.
 
 ## Provider Matrix
 
@@ -141,7 +128,7 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 | ASR primary | ElevenLabs Scribe v2 | Implemented optional adapter | `asr.provider: elevenlabs`, `model_id: scribe_v2`, `diarize: true`, optional `keyterms` / `character_names` |
 | ASR fallback | OpenAI Whisper | Implemented optional adapter, no diarization | `asr.provider: openai`, `model: whisper-1` |
 | ASR fallback | AssemblyAI | Implemented optional adapter | `asr.provider: assemblyai`, `model: universal-3-pro` or `universal-2`, `speaker_labels: true` |
-| ASR comparison | Gemini 3.5 Transcribe | Implemented for `--local` and the disabled-by-default web testing toggle; direct configuration is blocked outside `--local`; requires `dubsync[cloud]` and `GEMINI_API_KEY`; limited to 30-minute timestamp/diarization requests | `asr.local.provider: gemini_transcribe` or `DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=1`; exact model `gemini-3.5-transcribe`; `store: false` |
+| ASR retired | Gemini 3.5 Transcribe | Disabled; provider selectors reject it in CLI, web, and queued jobs | No supported configuration |
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
 | LLM text default | OpenAI GPT-5.6 Luna | Implemented adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
@@ -184,16 +171,6 @@ asr:
   character_names:
     - Luna
     - Matthew
-  # Used only with --local. Keep this in a private local providers file for tests.
-  local:
-    provider: gemini_transcribe
-    model: gemini-3.5-transcribe
-    language_codes: ["de-DE"]
-    diarize: true
-    word_timestamps: true
-    store: false
-    custom_vocabulary:
-      - Drachen-Evolutionssystem
 
 llm:
   provider: openai
@@ -280,7 +257,6 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 | Item | Planned cost basis |
 |---|---|
 | Scribe v2 ASR | audio seconds x provider hourly price (`$0.22/hr`, or `$0.27/hr` when `keyterms` or `character_names` enable keyterm prompting) |
-| Gemini 3.5 Transcribe local comparison ASR | audio seconds x provider price (`$0.30/hr`, from Google's `$0.005/min` file-transcription rate) |
 | AssemblyAI ASR | audio seconds x provider/model hourly price (`$0.21/hr` for `universal-3-pro`, `$0.15/hr` for `universal-2`, plus `$0.02/hr` when `speaker_labels` is enabled; enabled by default) |
 | LLM adjudication/punctuation | input/output tokens x model price |
 | Audio snippet double-checks | inline snippet audio duration is included in Gemini input usage when provider metadata is available |

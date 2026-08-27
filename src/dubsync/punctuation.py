@@ -12,6 +12,9 @@ class PunctuationValidationError(ValueError):
     pass
 
 
+_MAX_PUNCTUATION_BATCH_CUES = 40
+
+
 class PunctuationAdapter(Protocol):
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
         raise NotImplementedError
@@ -63,10 +66,17 @@ def apply_punctuation_pass(
         if next_text is None:
             updated.append(cue)
             continue
+        source_cue = source_by_id.get(cue.index)
+        source_words_unchanged = _source_words_unchanged(cue, source_cue)
+        validation_source = source_cue.plain_text if source_words_unchanged and source_cue is not None else cue.plain_text
         try:
-            validate_punctuation_only(cue.plain_text, next_text.replace("\n", " "))
+            validate_punctuation_only(validation_source, next_text.replace("\n", " "))
         except PunctuationValidationError as exc:
-            updated.append(cue)
+            updated.append(
+                cue.with_lines(source_cue.lines)
+                if source_words_unchanged and source_cue is not None
+                else cue
+            )
             flags.append(
                 QCFlag(
                     kind="invalid_punctuation_change",
@@ -81,8 +91,6 @@ def apply_punctuation_pass(
             )
             continue
 
-        source_cue = source_by_id.get(cue.index)
-        source_words_unchanged = _source_words_unchanged(cue, source_cue)
         lines = (
             _restore_source_line_breaks(source_cue.lines, next_text)
             if source_words_unchanged
@@ -141,7 +149,38 @@ def _scene_batches(cues: list[Cue], scene_gap_seconds: float) -> list[list[Cue]]
         else:
             batches[-1].append(cue)
         previous = cue
+    return [
+        chunk
+        for batch in batches
+        for chunk in _split_cue_batch_by_size(batch, _MAX_PUNCTUATION_BATCH_CUES)
+    ]
+
+
+def _split_cue_batch_by_size(cues: list[Cue], max_size: int) -> list[list[Cue]]:
+    if len(cues) <= max_size:
+        return [cues]
+    batches: list[list[Cue]] = []
+    remaining = list(cues)
+    while len(remaining) > max_size:
+        split_at = _widest_internal_cue_gap_index(remaining[: max_size + 1])
+        if split_at <= 0 or split_at > max_size:
+            split_at = max_size
+        batches.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    if remaining:
+        batches.append(remaining)
     return batches
+
+
+def _widest_internal_cue_gap_index(cues: list[Cue]) -> int:
+    best_index = len(cues) - 1
+    best_gap: int | None = None
+    for index, (previous, current) in enumerate(zip(cues, cues[1:]), start=1):
+        gap = current.start_ms - previous.end_ms
+        if best_gap is None or gap >= best_gap:
+            best_gap = gap
+            best_index = index
+    return best_index
 
 
 def _word_freeze_signature(text: str) -> list[str]:

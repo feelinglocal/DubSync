@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from .changes import apply_adjudication_decisions
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
 from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues
+from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
@@ -268,6 +269,7 @@ def sync_episode(
             provider_config,
             decisions,
             adjudication_flags,
+            source_cue_count=len(cues),
         )
         flags.extend(adjudication_flags)
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
@@ -276,6 +278,7 @@ def sync_episode(
             _hold_incomplete_source_insertions(
                 alignment.divergence_spans,
                 provider_config,
+                source_cue_count=len(cues),
             )
         )
         provider_decisions: list[AdjudicationDecision] = []
@@ -326,11 +329,13 @@ def sync_episode(
                         audio_snippets=audio_snippets,
                         source_cues=cues,
                     )
-                _record_llm_usage_events(
-                    cost_meter,
-                    llm_adapter,
-                    provider_config,
-                    pass_name="adjudication",
+                provider_flags.extend(
+                    _record_llm_usage_events(
+                        cost_meter,
+                        llm_adapter,
+                        provider_config,
+                        pass_name="adjudication",
+                    )
                 )
             else:
                 provider_decisions, provider_flags = cached_adjudication
@@ -446,7 +451,14 @@ def sync_episode(
             speaker_map = speaker_mapping_adapter.map_speakers(rebuilt)
             if speaker_mapping_uses_llm:
                 _write_cached_speaker_mapping(episode_workdir, rebuilt, provider_config, speaker_map)
-            _record_llm_usage_events(cost_meter, speaker_mapping_adapter, provider_config, pass_name="speaker_mapping")
+            flags.extend(
+                _record_llm_usage_events(
+                    cost_meter,
+                    speaker_mapping_adapter,
+                    provider_config,
+                    pass_name="speaker_mapping",
+                )
+            )
         else:
             speaker_map = cached_speaker_map
         _write_json(episode_workdir / "speaker_map.json", speaker_map)
@@ -484,7 +496,14 @@ def sync_episode(
                     max_lines_per_cue=profile.max_lines_per_cue,
                     source_cues=cues,
                 )
-                _record_llm_usage_events(cost_meter, punctuation_adapter, provider_config, pass_name="punctuation")
+                punctuation_flags.extend(
+                    _record_llm_usage_events(
+                        cost_meter,
+                        punctuation_adapter,
+                        provider_config,
+                        pass_name="punctuation",
+                    )
+                )
             else:
                 rebuilt, punctuation_flags = cached_punctuation
             flags.extend(punctuation_flags)
@@ -619,6 +638,51 @@ def _fps_summary_metadata(
         "fps_source": source,
         "fps_detection_confident": bool(detection.confident),
     }
+
+
+def _alignment_summary_metadata(
+    alignment: AlignmentResult,
+    *,
+    source_cue_count: int,
+) -> dict[str, object]:
+    unmatched_count = len(set(alignment.unmatched_cue_ids))
+    unmatched_ratio = (
+        min(1.0, unmatched_count / source_cue_count)
+        if source_cue_count > 0
+        else 0.0
+    )
+    diagnostics = alignment.diagnostics
+    return {
+        "alignment_anchor_coverage": alignment.anchor_coverage,
+        "alignment_unmatched_cue_ratio": round(unmatched_ratio, 4),
+        "alignment_divergence_span_count": len(alignment.divergence_spans),
+        "alignment_band_limited": diagnostics.band_limited,
+        "alignment_unresolved": diagnostics.unresolved,
+        "alignment_unbanded_fallback": diagnostics.unbanded_fallback,
+        "alignment_prior_used": diagnostics.prior_used,
+        "alignment_transform_rate": diagnostics.transform_rate,
+    }
+
+
+def _alignment_health_flags(
+    alignment: AlignmentResult,
+    *,
+    source_cue_count: int,
+) -> list[QCFlag]:
+    if source_cue_count <= 0 or alignment.anchor_coverage >= 0.8:
+        return []
+    severity = "error" if alignment.anchor_coverage < 0.5 else "warning"
+    return [
+        QCFlag(
+            kind="alignment_anchor_coverage_low",
+            cue_ids=[],
+            message=(
+                f"Only {alignment.anchor_coverage:.1%} of source tokens anchored to "
+                "acoustic words; review divergence spans and unmatched cues before delivery."
+            ),
+            severity=severity,
+        )
+    ]
 
 
 def _load_style_profile_for_resume(path: Path, resume_stage: str | None) -> StyleProfile | None:
@@ -1188,10 +1252,12 @@ def _run_verify_stage(
     if audio_for_asr != audio_path:
         flags.extend(silence_flags_for_cues(audio_for_asr, rebuilt))
 
+    flags.extend(episode_editorial_addition_flags(source_cues, rebuilt))
     rebuilt, profanity_flags = apply_german_profanity_censorship(rebuilt, source_cues)
     flags.extend(profanity_flags)
     flags.extend(span_coverage_flags(source_cues, rebuilt, alignment.divergence_spans, decisions))
     flags.extend(name_spelling_inconsistency_flags(source_cues, rebuilt))
+    flags.extend(_alignment_health_flags(alignment, source_cue_count=len(source_cues)))
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(flags)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1205,7 +1271,10 @@ def _run_verify_stage(
         flags,
         style_issues,
         cue_scores,
-        summary_metadata=fps_summary_metadata,
+        summary_metadata={
+            **(fps_summary_metadata or {}),
+            **_alignment_summary_metadata(alignment, source_cue_count=len(source_cues)),
+        },
     )
     _write_json(
         episode_workdir / "verify.json",
@@ -1304,14 +1373,32 @@ def _record_llm_usage_events(
     adapter: object,
     provider_config: dict[str, object],
     pass_name: str | None = None,
-) -> None:
+) -> list[QCFlag]:
     llm_config = llm_config_for_pass(provider_config, pass_name)
     if not isinstance(llm_config, dict):
-        return
+        return []
     provider = str(llm_config.get("provider", "gemini")).lower()
     model = str(llm_config.get("model") or _default_llm_model(provider))
+    unmetered_reasons: set[str] = set()
     for event in drain_usage_events(adapter):
-        record_llm_usage(cost_meter, provider, model, llm_config, event)
+        reason = record_llm_usage(cost_meter, provider, model, llm_config, event)
+        if reason is not None:
+            unmetered_reasons.add(reason)
+    if not unmetered_reasons:
+        return []
+    pass_label = pass_name or "llm"
+    return [
+        QCFlag(
+            kind="cost_unmetered",
+            cue_ids=[],
+            message=(
+                f"{pass_label} usage for {model} was not added to cost totals: "
+                f"{', '.join(sorted(unmetered_reasons))}. Configure token prices or "
+                "use a provider response that reports token usage."
+            ),
+            severity="warning",
+        )
+    ]
 
 
 def _adjudication_scene_gap_seconds(provider_config: dict[str, object]) -> float:
@@ -1434,6 +1521,8 @@ def _expanded_adlib_cue_flags(
 def _hold_incomplete_source_insertions(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
+    *,
+    source_cue_count: int | None = None,
 ) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
     max_duration = _generation_float_config(
         provider_config,
@@ -1444,7 +1533,9 @@ def _hold_incomplete_source_insertions(
     held_decisions: list[AdjudicationDecision] = []
     flags: list[QCFlag] = []
     for span in spans:
-        hold = _incomplete_source_hold(span, max_duration)
+        hold = _oversized_adjudication_span_hold(span, source_cue_count)
+        if hold is None:
+            hold = _incomplete_source_hold(span, max_duration)
         if hold is None:
             provider_spans.append(span)
             continue
@@ -1513,15 +1604,55 @@ def _incomplete_source_hold(
     return decision, flag
 
 
+def _oversized_adjudication_span_hold(
+    span: DivergenceSpan,
+    source_cue_count: int | None,
+) -> tuple[AdjudicationDecision, QCFlag] | None:
+    if source_cue_count is None or source_cue_count < 25 or not span.cue_ids:
+        return None
+    cue_count = len(set(span.cue_ids))
+    ceiling = max(ceil(source_cue_count * 0.20), 5)
+    if cue_count <= ceiling:
+        return None
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="keep_srt",
+        final_text=span.srt_text,
+        confidence=0.0,
+        speaker=span.speaker_ids[0] if len(span.speaker_ids) == 1 else None,
+        character="unknown",
+        reason=(
+            "Source-backed divergence covered too many cues for safe automatic "
+            "adjudication; source text was retained for review."
+        ),
+    )
+    flag = QCFlag(
+        kind="oversized_adjudication_span_held",
+        cue_ids=span.cue_ids,
+        message=(
+            f"Divergence span covered {cue_count} of {source_cue_count} source cues, "
+            f"above the automatic adjudication ceiling of {ceiling}; retained source "
+            "text instead of sending a collapsed episode section to adjudication."
+        ),
+        severity="error",
+        start=span.start,
+        end=span.end,
+    )
+    return decision, flag
+
+
 def _apply_incomplete_source_holds_to_decisions(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
     decisions: list[AdjudicationDecision],
     adjudication_flags: list[QCFlag],
+    *,
+    source_cue_count: int | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
         spans,
         provider_config,
+        source_cue_count=source_cue_count,
     )
     if not held_decisions:
         return decisions, adjudication_flags
@@ -1537,7 +1668,11 @@ def _apply_incomplete_source_holds_to_decisions(
     retained_flags = [
         flag
         for flag in adjudication_flags
-        if flag.kind != "generated_adlib_rejected_incomplete_source"
+        if flag.kind
+        not in {
+            "generated_adlib_rejected_incomplete_source",
+            "oversized_adjudication_span_held",
+        }
     ]
     return ordered_decisions, [*retained_flags, *incomplete_source_flags]
 
@@ -1549,7 +1684,11 @@ def _unsafe_incomplete_source_resume_case_ids(
     rebuilt: list[Cue],
     source_cues: list[Cue],
 ) -> list[str]:
-    _, held_decisions, _ = _hold_incomplete_source_insertions(spans, provider_config)
+    _, held_decisions, _ = _hold_incomplete_source_insertions(
+        spans,
+        provider_config,
+        source_cue_count=len(source_cues),
+    )
     decisions_by_case = {decision.case_id: decision for decision in decisions}
     spans_by_case = {span.case_id: span for span in spans}
     source_ids = {cue.index for cue in source_cues}

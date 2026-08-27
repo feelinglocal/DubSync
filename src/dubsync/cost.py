@@ -160,11 +160,13 @@ def record_llm_usage(
     model: str,
     config: dict[str, object],
     response: object,
-) -> None:
+) -> str | None:
     usage = token_usage_from_response(response)
+    if usage is None:
+        return "usage metadata unavailable"
     prices = llm_token_prices(provider, model, config)
-    if usage is None or prices is None:
-        return
+    if prices is None:
+        return "token pricing unavailable"
 
     input_per_million, output_per_million = prices
     meter.add_tokens(
@@ -174,6 +176,7 @@ def record_llm_usage(
         input_per_million,
         output_per_million,
     )
+    return None
 
 
 def audio_seconds(path: Path) -> float:

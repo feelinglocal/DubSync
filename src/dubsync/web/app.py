@@ -24,7 +24,11 @@ from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..audio import probe_audio_duration
-from ..providers import GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS, GEMINI_TRANSCRIBE_MODEL
+from ..providers import (
+    GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
+    GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
+    GEMINI_TRANSCRIBE_MODEL,
+)
 from .batch_uploads import (
     AUDIO_EXTENSIONS,
     MAX_BATCH_ITEMS,
@@ -1000,25 +1004,17 @@ def _validate_transcription_provider(value: str, *, settings: WebSettings) -> st
     normalized = value.strip().lower() or DEFAULT_TRANSCRIPTION_PROVIDER
     if normalized not in TRANSCRIPTION_PROVIDER_VALUES:
         raise HTTPException(status_code=422, detail="Invalid transcription provider.")
-    if normalized == GEMINI_TRANSCRIBE_MODEL and not settings.enable_gemini_transcribe_web_testing:
+    if normalized == GEMINI_TRANSCRIBE_MODEL:
         raise HTTPException(
             status_code=422,
-            detail="Gemini 3.5 Transcribe testing is not enabled for this service.",
-        )
-    if normalized == GEMINI_TRANSCRIBE_MODEL and not _gemini_transcribe_api_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini 3.5 Transcribe testing is not configured.",
+            detail=GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
         )
     return normalized
 
 
 def _gemini_transcribe_web_available(settings: WebSettings) -> bool:
-    return settings.enable_gemini_transcribe_web_testing and _gemini_transcribe_api_configured()
-
-
-def _gemini_transcribe_api_configured() -> bool:
-    return bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
+    del settings
+    return False
 
 
 async def _save_upload(upload: UploadFile | StarletteUploadFile, destination: Path, limit: int) -> int:

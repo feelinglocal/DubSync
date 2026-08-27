@@ -25,8 +25,8 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
           <span className="section-label" id={sourceName ? undefined : titleId}>{sourceName ? 'Source' : 'Latest job'}</span>
           {sourceName && <span className="job-source-name" id={titleId}>{sourceName}</span>}
           <strong>{complete ? `${job.result?.cue_count ?? 0} cues ready` : failed ? 'Job failed' : job.status === 'processing' ? 'Processing dialogue' : 'Waiting to start'}</strong>
-          <span>{job.error || (complete ? 'Your result and QC files are ready.' : 'You can keep this page open while DubSync works.')}</span>
-          {fpsStatus && <span>{fpsStatus}</span>}
+          <span className={failed ? 'job-message is-error' : 'job-message'}>{job.error || (complete ? 'Your result and QC files are ready.' : 'You can keep this page open while DubSync works.')}</span>
+          {fpsStatus && <span className="job-detail">{fpsStatus}</span>}
         </div>
         <span className="job-progress">{job.progress}%</span>
       </div>

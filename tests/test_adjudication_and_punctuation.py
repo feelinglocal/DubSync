@@ -97,6 +97,17 @@ def test_llm_adjudication_batches_spans_by_scene_gap():
     assert flags == []
 
 
+def test_llm_adjudication_caps_dense_scene_batches():
+    llm = RecordingLLMAdapter()
+    spans = [make_span(f"case-{index}", float(index), float(index) + 0.5) for index in range(1, 31)]
+
+    decisions, flags = AdjudicationEngine(llm, scene_gap_seconds=4.0).adjudicate(spans)
+
+    assert [len(batch) for batch in llm.batches] == [25, 5]
+    assert [decision.case_id for decision in decisions] == [span.case_id for span in spans]
+    assert flags == []
+
+
 def test_adjudication_passes_audio_snippets_to_snippet_aware_adapter(tmp_path):
     adapter = RecordingSnippetAwareAdapter()
     span = make_span("case-1", 1.0, 2.0)

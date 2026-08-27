@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from io import BytesIO
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -111,7 +112,7 @@ def _batch_download_payload(batch: dict[str, object]) -> dict[str, object]:
 
 
 def _database_row_counts(database: Path) -> dict[str, int]:
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         tables = [
             row[0]
             for row in connection.execute(
@@ -389,7 +390,7 @@ def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selecti
     assert len({job.style for job in captured}) == 1
 
 
-def test_batch_propagates_enabled_gemini_transcribe_selection_to_every_child(tmp_path, monkeypatch):
+def test_batch_rejects_disabled_gemini_transcribe_selection(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     captured: list[JobRecord] = []
 
@@ -412,15 +413,10 @@ def test_batch_propagates_enabled_gemini_transcribe_selection_to_every_child(tmp
             transcription_provider="gemini-3.5-transcribe",
         )
 
-    assert response.status_code == 202
-    assert {job["transcription_provider"] for job in response.json()["jobs"]} == {
-        "gemini-3.5-transcribe"
-    }
-    assert len(captured) == 2
-    assert {job.transcription_provider for job in captured} == {"gemini-3.5-transcribe"}
-    persisted = app.state.jobs.store.by_batch_id(response.json()["id"])
-    assert len(persisted) == 2
-    assert {job.transcription_provider for job in persisted} == {"gemini-3.5-transcribe"}
+    assert response.status_code == 422
+    assert "disabled" in response.json()["detail"].lower()
+    assert captured == []
+    assert app.state.jobs.store.by_batch_id(response.json().get("id", "")) == []
 
 
 def test_sync_batch_applies_one_max_lines_option_to_every_child(tmp_path):
@@ -762,7 +758,7 @@ def test_outstanding_child_limit_rejects_a_whole_batch_without_partial_rows(tmp_
         finally:
             release.set()
 
-    with sqlite3.connect(app.state.jobs.store.db_path) as connection:
+    with closing(sqlite3.connect(app.state.jobs.store.db_path)) as connection:
         rows = connection.execute("SELECT source_name FROM jobs ORDER BY created_at").fetchall()
     assert [row[0] for row in rows] == ["first"]
 
@@ -1038,66 +1034,67 @@ def test_job_store_migrates_legacy_rows_idempotently_and_keeps_old_downloads_wor
     qc_html.write_text("<h1>QC</h1>", encoding="utf-8")
     now = datetime.now(UTC)
     database = settings.data_dir / "jobs.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """
-            CREATE TABLE jobs (
-                id TEXT PRIMARY KEY,
-                token_hash TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK(mode IN ('sync', 'generate')),
-                status TEXT NOT NULL CHECK(status IN ('queued', 'processing', 'complete', 'failed')),
-                progress INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                directory TEXT NOT NULL,
-                audio_path TEXT NOT NULL,
-                srt_path TEXT,
-                fps REAL NOT NULL,
-                language TEXT NOT NULL,
-                style TEXT NOT NULL,
-                output_srt TEXT,
-                qc_json TEXT,
-                qc_html TEXT,
-                changes_srt TEXT,
-                cost_usd REAL,
-                cue_count INTEGER,
-                error TEXT
+    with closing(sqlite3.connect(database)) as connection:
+        with connection:
+            connection.execute(
+                """
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('sync', 'generate')),
+                    status TEXT NOT NULL CHECK(status IN ('queued', 'processing', 'complete', 'failed')),
+                    progress INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    audio_path TEXT NOT NULL,
+                    srt_path TEXT,
+                    fps REAL NOT NULL,
+                    language TEXT NOT NULL,
+                    style TEXT NOT NULL,
+                    output_srt TEXT,
+                    qc_json TEXT,
+                    qc_html TEXT,
+                    changes_srt TEXT,
+                    cost_usd REAL,
+                    cue_count INTEGER,
+                    error TEXT
+                )
+                """
             )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO jobs (
-                id, token_hash, mode, status, progress, created_at, updated_at, expires_at,
-                directory, audio_path, srt_path, fps, language, style, output_srt,
-                qc_json, qc_html, changes_srt, cost_usd, cue_count, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "legacy",
-                hash_job_token("legacy-token"),
-                "sync",
-                "complete",
-                100,
-                now.isoformat(),
-                now.isoformat(),
-                (now + timedelta(hours=24)).isoformat(),
-                str(directory),
-                str(audio),
-                str(subtitle),
-                30.0,
-                "auto",
-                "source",
-                str(output),
-                str(qc_json),
-                str(qc_html),
-                None,
-                0.01,
-                1,
-                None,
-            ),
-        )
+            connection.execute(
+                """
+                INSERT INTO jobs (
+                    id, token_hash, mode, status, progress, created_at, updated_at, expires_at,
+                    directory, audio_path, srt_path, fps, language, style, output_srt,
+                    qc_json, qc_html, changes_srt, cost_usd, cue_count, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy",
+                    hash_job_token("legacy-token"),
+                    "sync",
+                    "complete",
+                    100,
+                    now.isoformat(),
+                    now.isoformat(),
+                    (now + timedelta(hours=24)).isoformat(),
+                    str(directory),
+                    str(audio),
+                    str(subtitle),
+                    30.0,
+                    "auto",
+                    "source",
+                    str(output),
+                    str(qc_json),
+                    str(qc_html),
+                    None,
+                    0.01,
+                    1,
+                    None,
+                ),
+            )
 
     app = create_app(settings=settings, processor=lambda job, _settings: _artifacts(job))
     with TestClient(app) as client:
@@ -1123,7 +1120,7 @@ def test_job_store_migrates_legacy_rows_idempotently_and_keeps_old_downloads_wor
     assert legacy.batch_id is None
     assert legacy.batch_position is None
     assert legacy.transcription_provider == "default"
-    with sqlite3.connect(first.db_path) as connection:
+    with closing(sqlite3.connect(first.db_path)) as connection:
         columns = [row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()]
     assert columns.count("source_name") == 1
     assert columns.count("batch_id") == 1

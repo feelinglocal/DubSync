@@ -58,9 +58,12 @@ _LLM_PASS_CONFIG_KEYS = {
 _GEMINI_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
 _GEMINI_37_THINKING_LEVELS = {"low", "medium", "high"}
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-_ADJUDICATION_PROMPT_VERSION = "adjudication-v6-gemini37-complete-context-boundary"
-_PUNCTUATION_PROMPT_VERSION = "punctuation-v4-gemini37-complete-context-freeze"
+_ADJUDICATION_PROMPT_VERSION = "adjudication-v7-gemini37-context-first-boundary"
+_PUNCTUATION_PROMPT_VERSION = "punctuation-v5-gemini37-context-first-freeze"
 _SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v2-context-only"
+_ANTHROPIC_MAX_OUTPUT_TOKENS = 8_192
+_ANTHROPIC_ADJUDICATION_TOKENS_PER_CASE = 320
+_ANTHROPIC_PUNCTUATION_TOKENS_PER_CUE = 160
 
 
 class GeminiLLMAdapter:  # pragma: no cover - live provider path
@@ -252,7 +255,10 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
         client = Anthropic(api_key=self.api_key)
         response = client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=_anthropic_output_tokens(
+                len(spans),
+                per_item=_ANTHROPIC_ADJUDICATION_TOKENS_PER_CASE,
+            ),
             messages=[{"role": "user", "content": _adjudication_prompt(spans, confidence_gate=self.confidence_gate)}],
             output_config={
                 "format": {
@@ -277,7 +283,10 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
         client = Anthropic(api_key=self.api_key)
         response = client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=_anthropic_output_tokens(
+                len(cues),
+                per_item=_ANTHROPIC_PUNCTUATION_TOKENS_PER_CUE,
+            ),
             messages=[{"role": "user", "content": _punctuation_prompt(cues)}],
             output_config={
                 "format": {
@@ -314,6 +323,13 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
         )
         self.usage_events.append(response)
         return _speaker_mapping_dict(SpeakerMappingBatch.model_validate_json(response.content[0].text))
+
+
+def _anthropic_output_tokens(item_count: int, *, per_item: int) -> int:
+    return min(
+        _ANTHROPIC_MAX_OUTPUT_TOKENS,
+        max(1_024, max(0, item_count) * per_item),
+    )
 
 
 def drain_usage_events(adapter: object) -> list[object]:
@@ -534,9 +550,9 @@ def _adjudication_prompt(
         "instructions": instructions,
         "allowed_verdicts": ["keep_srt", "use_audio", "hybrid"],
         "confidence_gate": confidence_gate,
-        "spans": [span.model_dump() for span in spans],
         "episode_context_role": "read_only ordered source subtitle context; never copy unrelated text into final_text",
         "episode_context": _episode_context_payload(episode_context or []),
+        "spans": [span.model_dump() for span in spans],
         "audio_snippets": [
             {
                 "case_id": snippet.case_id,
@@ -568,8 +584,8 @@ def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = 
             "Before returning each cue, verify that its alphanumeric token sequence, line-break positions, and quotation-mark sequence match the input exactly; if any differ, return that cue unchanged.",
             "Return only the structured cue results; no commentary.",
         ],
-        "editable_cue_ids": [cue.index for cue in cues],
         "episode_context": _episode_context_payload(episode_context or cues),
+        "editable_cue_ids": [cue.index for cue in cues],
         "cues": [
             {
                 "cue_id": cue.index,

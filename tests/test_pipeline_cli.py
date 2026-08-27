@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import wave
-from types import SimpleNamespace
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
 from dubsync.cli import app
-from dubsync.models import AudioSnippet, Cue, DivergenceSpan
+from dubsync.models import AlignmentResult, AudioSnippet, Cue, DivergenceSpan
 import dubsync.pipeline as pipeline_module
-from dubsync.pipeline import _punctuation_cache_key, _speaker_mapping_cache_key
+from dubsync.pipeline import (
+    _alignment_health_flags,
+    _alignment_summary_metadata,
+    _punctuation_cache_key,
+    _speaker_mapping_cache_key,
+)
 from dubsync.srt_io import parse_srt_text
 from dubsync.text_metrics import display_width
 from dubsync.tokenize import alphanumeric_signature
@@ -76,6 +79,57 @@ def test_incomplete_source_guard_leaves_source_backed_and_short_adlib_spans_unch
     assert provider_spans == [source_backed, short_adlib, source_free_without_asr_words]
     assert held_decisions == []
     assert flags == []
+
+
+def test_incomplete_source_guard_holds_oversized_source_backed_span():
+    spans = [
+        DivergenceSpan(
+            case_id="case-small",
+            cue_ids=[1, 2, 3, 4, 5],
+            srt_text="small source span",
+            asr_text="small replacement span",
+            start=1.0,
+            end=6.0,
+            srt_token_indices=[0, 1, 2],
+            asr_word_indices=[0, 1, 2],
+        ),
+        DivergenceSpan(
+            case_id="case-huge",
+            cue_ids=list(range(1, 9)),
+            srt_text="huge source span",
+            asr_text="huge replacement span",
+            start=10.0,
+            end=70.0,
+            srt_token_indices=list(range(16)),
+            asr_word_indices=list(range(20)),
+        ),
+    ]
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        spans,
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+        source_cue_count=30,
+    )
+
+    assert provider_spans == [spans[0]]
+    assert [decision.case_id for decision in held_decisions] == ["case-huge"]
+    assert held_decisions[0].verdict == "keep_srt"
+    assert [flag.kind for flag in flags] == ["oversized_adjudication_span_held"]
+    assert flags[0].severity == "error"
+    assert flags[0].old_text is None
+    assert flags[0].new_text is None
+
+
+def test_alignment_summary_metadata_and_health_flags_surface_low_coverage():
+    alignment = AlignmentResult(anchor_coverage=0.4, unmatched_cue_ids=[2, 3])
+
+    metadata = _alignment_summary_metadata(alignment, source_cue_count=4)
+    flags = _alignment_health_flags(alignment, source_cue_count=4)
+
+    assert metadata["alignment_anchor_coverage"] == 0.4
+    assert metadata["alignment_unmatched_cue_ratio"] == 0.5
+    assert flags[0].kind == "alignment_anchor_coverage_low"
+    assert flags[0].severity == "error"
 
 
 def test_incomplete_source_guard_holds_source_free_spans_with_invalid_timing():
@@ -2641,14 +2695,12 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
     assert "Traceback" not in result.output
 
 
-def test_cli_sync_local_mode_uses_nested_gemini_transcribe_override(tmp_path, monkeypatch):
+def test_cli_sync_local_mode_rejects_nested_gemini_transcribe_override(tmp_path, monkeypatch):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
     out_path = tmp_path / "episode.gemini.synced.srt"
     workdir = tmp_path / "work"
-    calls: dict[str, object] = {}
-
     srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo Welt\n\n", encoding="utf-8")
     with wave.open(str(audio_path), "wb") as wav:
         wav.setnchannels(1)
@@ -2676,51 +2728,6 @@ def test_cli_sync_local_mode_uses_nested_gemini_transcribe_override(tmp_path, mo
         encoding="utf-8",
     )
 
-    class FakeFiles:
-        def upload(self, file):
-            calls["upload"] = file
-            return SimpleNamespace(name="files/audio-1", uri="files/audio-1", mime_type="audio/wav")
-
-        def delete(self, *, name):
-            calls["delete"] = name
-
-    class FakeInteractions:
-        def create(self, **kwargs):
-            calls["create"] = kwargs
-            return SimpleNamespace(
-                steps=[
-                    SimpleNamespace(
-                        content=[
-                            SimpleNamespace(
-                                annotations=[
-                                    {
-                                        "type": "word_info",
-                                        "text": "Hallo",
-                                        "speaker": "spk_1",
-                                        "start_offset": "0.100s",
-                                        "end_offset": "0.450s",
-                                    },
-                                    {
-                                        "type": "word_info",
-                                        "text": "Welt",
-                                        "speaker": "spk_1",
-                                        "start_offset": "0.500s",
-                                        "end_offset": "0.850s",
-                                    },
-                                ]
-                            )
-                        ]
-                    )
-                ]
-            )
-
-    class FakeClient:
-        def __init__(self, api_key):
-            calls["api_key"] = api_key
-            self.files = FakeFiles()
-            self.interactions = FakeInteractions()
-
-    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=SimpleNamespace(Client=FakeClient)))
     monkeypatch.setattr("dubsync.pipeline.normalize_audio", lambda source, _dest, **_kwargs: source)
 
     result = CliRunner().invoke(
@@ -2739,20 +2746,9 @@ def test_cli_sync_local_mode_uses_nested_gemini_transcribe_override(tmp_path, mo
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    asr_payload = json.loads((workdir / "episode" / "asr.json").read_text(encoding="utf-8"))
-    cost_payload = json.loads((workdir / "episode" / "cost.json").read_text(encoding="utf-8"))
-    assert asr_payload["metadata"]["provider"] == "gemini_transcribe"
-    assert asr_payload["metadata"]["model"] == "gemini-3.5-transcribe"
-    assert calls["api_key"] == "test-key"
-    assert calls["delete"] == "files/audio-1"
-    assert calls["create"]["generation_config"]["transcription_config"]["mode"] == {
-        "type": "verbatim",
-        "diarization_mode": "speaker",
-        "timestamp_granularities": ["word"],
-    }
-    assert cost_payload["items"][0]["provider"] == "gemini-3.5-transcribe"
-    assert parse_srt_text(out_path.read_text(encoding="utf-8"))[0].plain_text == "Hallo Welt"
+    assert result.exit_code != 0
+    assert "Gemini 3.5 Transcribe ASR is disabled" in result.output
+    assert not out_path.exists()
 
 
 def test_cli_batch_accepts_fps_flag(tmp_path, shifted_srt_text, shifted_wordstream):

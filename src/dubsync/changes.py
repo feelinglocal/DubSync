@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import re
 
+from .editorial_guard import (
+    EditorialGuardError,
+    validate_adjudication_editorial_contract,
+    validate_editorial_text,
+)
 from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
 from .style_profile import StyleProfile
 from .text_metrics import contains_character_level_script, display_width, token_texts, wrap_visual_width
@@ -93,6 +98,11 @@ def apply_adjudication_decisions(
                         end=span.end,
                     )
                 )
+            continue
+
+        guard_flag = _editorial_guard_rejection(span, decision, cue_ids)
+        if guard_flag is not None:
+            flags.append(guard_flag)
             continue
 
         if not cue_ids:
@@ -290,7 +300,93 @@ def apply_adjudication_decisions(
 
         updated.append(cue.with_lines(replacement))
 
+    updated, flags = _restore_cues_rejected_by_editorial_guard(
+        cues_by_id,
+        updated,
+        flags,
+        changed_cue_ids=set(replacements_by_cue),
+    )
     return _merge_adlibs_positionally(updated, adlib_cues), flags
+
+
+def _editorial_guard_rejection(
+    span: DivergenceSpan,
+    decision: AdjudicationDecision,
+    cue_ids: list[int],
+) -> QCFlag | None:
+    try:
+        validate_adjudication_editorial_contract(
+            span,
+            decision,
+            allow_word_change=decision.verdict in {"use_audio", "hybrid"},
+        )
+    except EditorialGuardError as exc:
+        return QCFlag(
+            kind="editorial_guard_rejected",
+            cue_ids=cue_ids,
+            message=str(exc),
+            severity="error",
+            confidence=decision.confidence,
+            old_text=span.srt_text,
+            new_text=decision.final_text,
+            start=span.start,
+            end=span.end,
+        )
+    return None
+
+
+def _restore_cues_rejected_by_editorial_guard(
+    source_by_id: dict[int, Cue],
+    updated: list[Cue],
+    flags: list[QCFlag],
+    *,
+    changed_cue_ids: set[int],
+) -> tuple[list[Cue], list[QCFlag]]:
+    rejected: dict[int, QCFlag] = {}
+    for cue in updated:
+        source = source_by_id.get(cue.index)
+        if source is None or cue.index not in changed_cue_ids:
+            continue
+        try:
+            validate_editorial_text(source.text, cue.text, allow_word_change=True)
+        except EditorialGuardError as exc:
+            rejected[cue.index] = QCFlag(
+                kind="editorial_guard_rejected",
+                cue_ids=[cue.index],
+                message=str(exc),
+                severity="error",
+                old_text=source.text,
+                new_text=cue.text,
+                start=source.start_ms / 1000.0,
+                end=source.end_ms / 1000.0,
+            )
+    if not rejected:
+        return updated, flags
+
+    rejected_ids = set(rejected)
+    for flag in flags:
+        if flag.kind == "text_changed" and rejected_ids.intersection(flag.cue_ids):
+            rejected_ids.update(flag.cue_ids)
+
+    restored = [
+        source_by_id[cue.index]
+        if cue.index in rejected_ids and cue.index in source_by_id
+        else cue
+        for cue in updated
+    ]
+    retained_flags = [
+        flag
+        for flag in flags
+        if not (
+            flag.kind == "text_changed"
+            and rejected_ids.intersection(flag.cue_ids)
+        )
+    ]
+    guard_flags = [
+        flag.model_copy(update={"cue_ids": sorted(rejected_ids)})
+        for flag in rejected.values()
+    ]
+    return restored, [*retained_flags, *guard_flags]
 
 
 def _merge_adlibs_positionally(cues: list[Cue], adlib_cues: list[Cue]) -> list[Cue]:

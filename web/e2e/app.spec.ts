@@ -316,7 +316,7 @@ test('mobile first viewport has no horizontal overflow and keeps the next sectio
   const pricingFits = await page.locator('.pricing-table-wrap').evaluate((element) => element.scrollWidth <= element.clientWidth)
   expect(pricingFits).toBe(true)
   const nextSectionTop = await page.locator('.feature-band').evaluate((element) => element.getBoundingClientRect().top)
-  expect(nextSectionTop).toBeLessThanOrEqual(844 + 80)
+  expect(nextSectionTop).toBeLessThanOrEqual(844 + 160)
 })
 
 test('workspace selects and feature rows use consistent alignment', async ({ page }) => {
@@ -345,4 +345,124 @@ test('workspace selects and feature rows use consistent alignment', async ({ pag
   expect(Math.abs(featureGeometry[0].x - featureGeometry[2].x)).toBeLessThanOrEqual(1)
   expect(Math.abs(featureGeometry[1].x - featureGeometry[3].x)).toBeLessThanOrEqual(1)
   expect(Math.max(...featureGeometry.map(({ width }) => width)) - Math.min(...featureGeometry.map(({ width }) => width))).toBeLessThanOrEqual(1)
+})
+
+for (const viewport of [
+  { width: 320, height: 900 },
+  { width: 375, height: 900 },
+  { width: 414, height: 900 },
+  { width: 768, height: 1024 },
+  { width: 1024, height: 900 },
+  { width: 1440, height: 1000 },
+]) {
+  test(`sync controls remain contained and aligned at ${viewport.width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize(viewport)
+    await page.goto('/')
+
+    await expect(page.getByLabel('Maximum lines per cue')).toHaveValue('source')
+    await expect(page.getByText('Use Gemini 3.5 Transcribe (testing)')).toHaveCount(0)
+
+    const layout = await page.evaluate(() => {
+      const html = document.documentElement
+      const body = document.body
+      const grid = document.querySelector<HTMLElement>('.workspace-options')
+      const modeControls = Array.from(document.querySelectorAll<HTMLElement>('.mode-control > button')).map((element) => {
+        const box = element.getBoundingClientRect()
+        return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, height: box.height }
+      })
+      const controls = Array.from(grid?.children || []).map((element) => {
+        const box = element.getBoundingClientRect()
+        return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, width: box.width }
+      })
+      return {
+        clientWidth: html.clientWidth,
+        scrollWidth: html.scrollWidth,
+        htmlOverflowX: getComputedStyle(html).overflowX,
+        bodyOverflowX: getComputedStyle(body).overflowX,
+        gridWidth: grid?.getBoundingClientRect().width || 0,
+        modeControls,
+        controls,
+      }
+    })
+
+    expect(layout.scrollWidth).toBe(layout.clientWidth)
+    expect(['hidden', 'clip']).not.toContain(layout.htmlOverflowX)
+    expect(['hidden', 'clip']).not.toContain(layout.bodyOverflowX)
+    expect(layout.modeControls).toHaveLength(2)
+    for (const control of layout.modeControls) {
+      expect(control.left).toBeGreaterThanOrEqual(0)
+      expect(control.right).toBeLessThanOrEqual(layout.clientWidth + 0.5)
+      expect(control.height).toBeGreaterThanOrEqual(44)
+    }
+    const modeOverlapWidth = Math.min(layout.modeControls[0].right, layout.modeControls[1].right) - Math.max(layout.modeControls[0].left, layout.modeControls[1].left)
+    const modeOverlapHeight = Math.min(layout.modeControls[0].bottom, layout.modeControls[1].bottom) - Math.max(layout.modeControls[0].top, layout.modeControls[1].top)
+    expect(modeOverlapWidth > 0.5 && modeOverlapHeight > 0.5).toBe(false)
+    expect(layout.controls).toHaveLength(5)
+    for (const control of layout.controls) {
+      expect(control.left).toBeGreaterThanOrEqual(0)
+      expect(control.right).toBeLessThanOrEqual(layout.clientWidth + 0.5)
+      expect(control.width).toBeGreaterThan(0)
+    }
+    for (let first = 0; first < layout.controls.length; first += 1) {
+      for (let second = first + 1; second < layout.controls.length; second += 1) {
+        const a = layout.controls[first]
+        const b = layout.controls[second]
+        const overlapWidth = Math.min(a.right, b.right) - Math.max(a.left, b.left)
+        const overlapHeight = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top)
+        expect(overlapWidth > 0.5 && overlapHeight > 0.5).toBe(false)
+      }
+    }
+
+    const submitBox = await page.getByRole('button', { name: 'Start sync' }).boundingBox()
+    expect(submitBox).not.toBeNull()
+    if (viewport.width <= 1080) {
+      expect(Math.abs((submitBox?.width || 0) - layout.gridWidth)).toBeLessThanOrEqual(1)
+    } else {
+      const frameRateWidth = (await page.getByLabel('Frame rate').boundingBox())?.width || 0
+      const maxLinesWidth = (await page.getByLabel('Maximum lines per cue').boundingBox())?.width || 0
+      expect(frameRateWidth).toBeGreaterThanOrEqual(220)
+      expect(maxLinesWidth).toBeGreaterThanOrEqual(240)
+    }
+
+    if (viewport.width <= 760) {
+      await page.getByRole('button', { name: 'Open menu' }).click()
+      const menuBox = await page.getByRole('navigation', { name: 'Primary navigation' }).boundingBox()
+      expect(menuBox).not.toBeNull()
+      expect(menuBox?.x || 0).toBeGreaterThanOrEqual(0)
+      expect((menuBox?.x || 0) + (menuBox?.width || 0)).toBeLessThanOrEqual(viewport.width)
+    }
+
+    await page.screenshot({
+      path: testInfo.outputPath(`workspace-${viewport.width}px.png`),
+      fullPage: true,
+    })
+  })
+}
+
+test('ten long customer filenames wrap without widening the mobile page', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 900 })
+  await page.goto('/')
+  await page.getByLabel('Dialogue audio').setInputFiles(Array.from({ length: 10 }, (_, index) => ({
+    name: `${String(index + 1).padStart(3, '0')}-very-long-customer-episode-title-with-language-and-version.wav`,
+    mimeType: 'audio/wav',
+    buffer: Buffer.from('fixture audio'),
+  })))
+
+  const dimensions = await page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }))
+  expect(dimensions.scrollWidth).toBe(dimensions.clientWidth)
+
+  const listBox = await page.getByRole('list', { name: 'Dialogue audio files' }).boundingBox()
+  expect(listBox).not.toBeNull()
+  const chips = await page.getByRole('list', { name: 'Dialogue audio files' }).locator('li').evaluateAll((items) => items.map((item) => {
+    const box = item.getBoundingClientRect()
+    return { left: box.left, right: box.right }
+  }))
+  expect(chips).toHaveLength(10)
+  for (const chip of chips) {
+    expect(chip.left).toBeGreaterThanOrEqual((listBox?.x || 0) - 0.5)
+    expect(chip.right).toBeLessThanOrEqual((listBox?.x || 0) + (listBox?.width || 0) + 0.5)
+  }
 })

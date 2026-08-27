@@ -297,6 +297,19 @@ def test_adjudication_prompt_includes_complete_ordered_episode_context():
     assert "read_only" in prompt["episode_context_role"]
 
 
+def test_adjudication_prompt_keeps_shared_context_before_batch_specific_payload():
+    raw_prompt = _adjudication_prompt(
+        [DivergenceSpan(case_id="case-2", cue_ids=[2], srt_text="Bleib.", asr_text="bleib")],
+        episode_context=[Cue(index=2, start_ms=900, end_ms=1_600, lines=["Bleib."])],
+    )
+    prompt = json.loads(raw_prompt)
+    keys = list(prompt)
+
+    assert prompt["prompt_version"] == "adjudication-v7-gemini37-context-first-boundary"
+    assert keys.index("episode_context") < keys.index("spans")
+    assert keys.index("episode_context") < keys.index("audio_snippets")
+
+
 def test_punctuation_prompt_includes_speaker_and_character_labels():
     prompt = json.loads(
         _punctuation_prompt(
@@ -372,6 +385,20 @@ def test_punctuation_prompt_separates_editable_batch_from_complete_episode_conte
     assert prompt["editable_cue_ids"] == [2]
     assert [item["cue_id"] for item in prompt["episode_context"]] == [1, 2, 3]
     assert prompt["cues"][0]["cue_id"] == 2
+
+
+def test_punctuation_prompt_keeps_shared_context_before_editable_batch_payload():
+    episode = [
+        Cue(index=1, start_ms=0, end_ms=800, lines=["Vorher."]),
+        Cue(index=2, start_ms=900, end_ms=1_600, lines=["bleib hier"]),
+    ]
+
+    prompt = json.loads(_punctuation_prompt([episode[1]], episode_context=episode))
+    keys = list(prompt)
+
+    assert prompt["prompt_version"] == "punctuation-v5-gemini37-context-first-freeze"
+    assert keys.index("episode_context") < keys.index("editable_cue_ids")
+    assert keys.index("episode_context") < keys.index("cues")
 
 
 def test_gemini_adjudication_prompt_uses_configured_confidence_gate(monkeypatch):

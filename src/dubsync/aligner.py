@@ -67,12 +67,13 @@ class _AlignmentRun:
     ops: list[_Op]
     unbanded_fallback: bool = False
     band_limited: bool = False
+    unresolved: bool = False
 
 
 def _similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
-    return fuzz.ratio(left, right) / 100.0
+    return fuzz.ratio(left, right, score_cutoff=MATCH_THRESHOLD * 100.0) / 100.0
 
 
 def _timing_priors(
@@ -301,7 +302,6 @@ def _align_tokens_detailed(
         token_time_priors,
         word_time_centers,
     )
-    last_run: _AlignmentRun | None = None
     band_limited = False
     remaining_cells = ALIGNMENT_CELL_BUDGET
     for attempt_index, margin in enumerate(_retry_margins(band_margin, max(n, m))):
@@ -325,19 +325,13 @@ def _align_tokens_detailed(
             ops=ops,
             unbanded_fallback=attempt_index > 0 and margin >= max(n, m),
         )
-        last_run = run
         if margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
             continue
         return run
-    if last_run is not None:
-        return _AlignmentRun(
-            ops=last_run.ops,
-            unbanded_fallback=last_run.unbanded_fallback,
-            band_limited=True,
-        )
     return _AlignmentRun(
         ops=_fully_divergent_ops(n, m),
         band_limited=True,
+        unresolved=True,
     )
 
 
@@ -633,6 +627,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     ops = preliminary_run.ops
     unbanded_fallback = preliminary_run.unbanded_fallback
     band_limited = preliminary_run.band_limited
+    unresolved = preliminary_run.unresolved
     prior_attempted = _has_repeated_alignment_candidates(tokens, words_norm)
     prior_used = False
     transform: _TimeTransform | None = None
@@ -656,6 +651,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             ops = prior_run.ops
             unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
             band_limited = band_limited or prior_run.band_limited
+            unresolved = unresolved or prior_run.unresolved
     matches: list[TokenMatch] = []
     cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
 
@@ -695,6 +691,23 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
                 end=episode_end,
             )
         )
+    if unresolved:
+        episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
+        episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
+        flags.append(
+            QCFlag(
+                kind="alignment_unresolved",
+                cue_ids=[],
+                message=(
+                    "Alignment could not be resolved within the bounded cell budget; "
+                    "the reviewable whole-span artifact was retained instead of silently "
+                    "accepting a collapsed alignment."
+                ),
+                severity="error",
+                start=episode_start,
+                end=episode_end,
+            )
+        )
 
     return AlignmentResult(
         token_matches=matches,
@@ -715,6 +728,7 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             transform_anchor_count=transform.anchor_count if transform is not None else 0,
             unbanded_fallback=unbanded_fallback,
             band_limited=band_limited,
+            unresolved=unresolved,
         ),
     )
 

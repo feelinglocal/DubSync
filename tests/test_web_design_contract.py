@@ -70,6 +70,29 @@ def test_long_source_names_wrap_inside_mobile_status_surfaces():
         assert "overflow-wrap: anywhere" in rule.group("body")
 
 
+def test_responsive_layout_uses_real_grid_constraints_instead_of_clipping_overflow():
+    css = (WEB_SOURCE / "styles.css").read_text(encoding="utf-8")
+
+    for selector in ("html", "body"):
+        rule = re.search(rf"^{selector}\s*\{{(?P<body>[^}}]*)\}}", css, re.MULTILINE)
+        assert rule is not None, f"Missing {selector} style rule"
+        assert "overflow-x: clip" not in rule.group("body")
+        assert "overflow-x: hidden" not in rule.group("body")
+
+    for selector in ("main-nav a", "site-footer nav a", "mode-control button", "primary-button"):
+        pattern = r"\." + re.escape(selector).replace(r"\ ", r"\s+") + r"\s*\{(?P<body>[^}]*)\}"
+        rule = re.search(pattern, css)
+        assert rule is not None, f"Missing .{selector} style rule"
+        assert "white-space: nowrap" in rule.group("body")
+
+    assert ".workspace-options.is-sync" in css
+    assert ".workspace-options.is-sync.has-access-code" in css
+    assert "@media (max-width: 1080px)" in css
+    assert "@media (max-width: 760px)" in css
+    assert "@media (max-width: 480px)" in css
+    assert ".mode-control {\n    grid-template-columns: 1fr;" in css
+
+
 def test_brand_and_crawler_assets_are_declared_and_shippable():
     index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
 

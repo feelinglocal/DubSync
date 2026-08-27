@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from dubsync.llm_providers import (
+    AnthropicLLMAdapter,
     GeminiLLMAdapter,
     OpenAILLMAdapter,
     llm_adapter_from_config,
     punctuation_adapter_from_config,
 )
+from dubsync.models import Cue, DivergenceSpan
 from dubsync.pipeline import _adjudication_confidence_gate, _adjudication_scene_gap_seconds, _punctuation_scene_gap_seconds
 
 
@@ -244,3 +248,63 @@ def test_fixture_punctuation_settings_without_responses_do_not_create_static_ada
     }
 
     assert punctuation_adapter_from_config(config) is None
+
+
+def test_anthropic_output_budget_scales_with_bounded_batch_size(monkeypatch):
+    captured: list[dict[str, object]] = []
+    payloads = iter(
+        [
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "case_id": f"case-{index}",
+                            "verdict": "keep_srt",
+                            "final_text": "Quelle",
+                            "confidence": 0.9,
+                            "reason": "fixture",
+                        }
+                        for index in range(25)
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "cues": [
+                        {"cue_id": index, "text": "Text."}
+                        for index in range(1, 41)
+                    ]
+                }
+            ),
+        ]
+    )
+
+    class Messages:
+        def create(self, **kwargs):
+            captured.append(kwargs)
+            return SimpleNamespace(content=[SimpleNamespace(text=next(payloads))])
+
+    class Anthropic:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.messages = Messages()
+
+    monkeypatch.setitem(__import__("sys").modules, "anthropic", SimpleNamespace(Anthropic=Anthropic))
+    adapter = AnthropicLLMAdapter(api_key="fixture-key")
+    spans = [
+        DivergenceSpan(
+            case_id=f"case-{index}",
+            cue_ids=[index + 1],
+            srt_text="Quelle",
+            asr_text="Audio",
+            confidence=0.5,
+        )
+        for index in range(25)
+    ]
+    cues = [Cue(index=index, start_ms=index * 1000, end_ms=index * 1000 + 800, lines=["Text"])
+            for index in range(1, 41)]
+
+    adapter.adjudicate(spans)
+    adapter.punctuate(cues)
+
+    assert [request["max_tokens"] for request in captured] == [8000, 6400]

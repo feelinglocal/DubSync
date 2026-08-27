@@ -153,7 +153,7 @@ def test_public_config_hides_gemini_transcribe_testing_by_default(tmp_path):
     assert "GEMINI_API_KEY" not in response.text
 
 
-def test_public_config_exposes_gemini_transcribe_testing_only_when_enabled(tmp_path, monkeypatch):
+def test_public_config_keeps_gemini_transcribe_testing_disabled_when_flag_is_set(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
     app = create_app(settings=settings, processor=_fake_processor)
@@ -162,7 +162,7 @@ def test_public_config_exposes_gemini_transcribe_testing_only_when_enabled(tmp_p
         response = client.get("/api/config")
 
     assert response.status_code == 200
-    assert response.json()["gemini_transcribe_testing_available"] is True
+    assert response.json()["gemini_transcribe_testing_available"] is False
     assert response.json()["gemini_transcribe_max_audio_seconds"] == 1800
 
 
@@ -223,13 +223,13 @@ def test_single_job_rejects_gemini_transcribe_when_testing_is_disabled(tmp_path)
         )
 
     assert response.status_code == 422
-    assert "not enabled" in response.json()["detail"].lower()
+    assert "disabled" in response.json()["detail"].lower()
     assert captured == []
     assert list(settings.data_dir.glob("job-*")) == []
 
 
-def test_single_job_rejects_gemini_transcribe_when_key_is_missing(tmp_path, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+def test_single_job_rejects_gemini_transcribe_even_when_flag_and_key_are_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     captured: list[JobRecord] = []
 
     def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
@@ -248,13 +248,13 @@ def test_single_job_rejects_gemini_transcribe_when_key_is_missing(tmp_path, monk
             },
         )
 
-    assert response.status_code == 503
-    assert "not configured" in response.json()["detail"].lower()
+    assert response.status_code == 422
+    assert "disabled" in response.json()["detail"].lower()
     assert captured == []
     assert list(settings.data_dir.glob("job-*")) == []
 
 
-def test_single_job_accepts_and_persists_enabled_gemini_transcribe_selection(tmp_path, monkeypatch):
+def test_single_job_does_not_persist_disabled_gemini_transcribe_selection(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     captured: list[JobRecord] = []
 
@@ -278,12 +278,10 @@ def test_single_job_accepts_and_persists_enabled_gemini_transcribe_selection(tmp
             },
         )
 
-    assert response.status_code == 202
-    assert response.json()["transcription_provider"] == "gemini-3.5-transcribe"
-    assert captured[0].transcription_provider == "gemini-3.5-transcribe"
-    persisted = app.state.jobs.store.get(response.json()["id"])
-    assert persisted is not None
-    assert persisted.transcription_provider == "gemini-3.5-transcribe"
+    assert response.status_code == 422
+    assert "disabled" in response.json()["detail"].lower()
+    assert captured == []
+    assert list(settings.data_dir.glob("job-*")) == []
 
 
 def test_single_job_rejects_invalid_transcription_provider(tmp_path):
@@ -306,28 +304,28 @@ def test_single_job_rejects_invalid_transcription_provider(tmp_path):
     assert response.json()["detail"] == "Invalid transcription provider."
 
 
-@pytest.mark.parametrize(
-    ("duration_seconds", "expected_status"),
-    [(1800.0, 202), (1800.001, 422)],
-)
-def test_gemini_transcribe_web_intake_enforces_1800_second_per_file_boundary(
+def test_gemini_transcribe_web_intake_rejects_before_duration_processing(
     tmp_path,
     monkeypatch,
-    duration_seconds,
-    expected_status,
 ):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     captured: list[JobRecord] = []
+    duration_probe_called = False
 
     def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
         captured.append(job)
         return _fake_processor(job, settings)
 
+    def duration_probe(*_args, **_kwargs) -> float:
+        nonlocal duration_probe_called
+        duration_probe_called = True
+        return 1800.0
+
     settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
     app = create_app(
         settings=settings,
         processor=capture,
-        audio_duration_probe=lambda *_args, **_kwargs: duration_seconds,
+        audio_duration_probe=duration_probe,
     )
     with TestClient(app) as client:
         response = client.post(
@@ -339,14 +337,11 @@ def test_gemini_transcribe_web_intake_enforces_1800_second_per_file_boundary(
             },
         )
 
-    assert response.status_code == expected_status
-    if expected_status == 202:
-        assert len(captured) == 1
-        assert captured[0].transcription_provider == "gemini-3.5-transcribe"
-    else:
-        assert "1800" in response.json()["detail"]
-        assert captured == []
-        assert list(settings.data_dir.glob("job-*")) == []
+    assert response.status_code == 422
+    assert "disabled" in response.json()["detail"].lower()
+    assert captured == []
+    assert duration_probe_called is False
+    assert list(settings.data_dir.glob("job-*")) == []
 
 
 def test_generate_job_resolves_preset_and_custom_styles_before_queueing(tmp_path):
@@ -1045,7 +1040,7 @@ def test_default_processor_forwards_selected_language_to_generate_pipeline(tmp_p
     assert calls["audio_limits"].max_job_storage_bytes == settings.max_job_storage_bytes
 
 
-def test_default_processor_forwards_gemini_asr_on_the_production_sync_path(tmp_path, monkeypatch):
+def test_default_processor_rejects_stale_gemini_asr_on_the_production_sync_path(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
     settings.ensure_directories()
@@ -1071,34 +1066,16 @@ def test_default_processor_forwards_gemini_asr_on_the_production_sync_path(tmp_p
         retention_hours=24,
         transcription_provider="gemini-3.5-transcribe",
     )
-    calls = {}
-
-    def fake_sync(_srt, _audio, output, _workdir, **kwargs):
-        calls.update(kwargs)
-        output.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-        artifacts = directory / "artifacts"
-        artifacts.mkdir()
-        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
-        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
-        return SimpleNamespace(
-            output_srt=output,
-            episode_workdir=artifacts,
-            report={"summary": {"cue_count": 1}},
-            cost_meter=SimpleNamespace(total_usd=0.01),
-        )
+    def fake_sync(*_args, **_kwargs):
+        raise AssertionError("disabled Gemini selection reached the sync pipeline")
 
     monkeypatch.setattr("dubsync.web.jobs.sync_episode", fake_sync)
 
-    default_processor(job, settings)
-
-    assert calls["transcription_provider"] == "gemini-3.5-transcribe"
-    assert calls["allow_gemini_transcribe_web"] is True
-    assert calls["language"] == "pt"
-    assert calls.get("local", False) is False
-    assert calls.get("no_llm", False) is False
+    with pytest.raises(ValueError, match="disabled"):
+        default_processor(job, settings)
 
 
-def test_default_processor_forwards_gemini_asr_on_the_production_generate_path(tmp_path, monkeypatch):
+def test_default_processor_rejects_stale_gemini_asr_on_the_production_generate_path(tmp_path, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
     settings.ensure_directories()
@@ -1119,31 +1096,13 @@ def test_default_processor_forwards_gemini_asr_on_the_production_generate_path(t
         retention_hours=24,
         transcription_provider="gemini-3.5-transcribe",
     )
-    calls = {}
-
-    def fake_generate(_audio, output, _workdir, **kwargs):
-        calls.update(kwargs)
-        output.write_text("1\n00:00:00,000 --> 00:00:00,500\nPronto.\n", encoding="utf-8")
-        artifacts = directory / "artifacts"
-        artifacts.mkdir()
-        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
-        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
-        return SimpleNamespace(
-            output_srt=output,
-            episode_workdir=artifacts,
-            report={"summary": {"cue_count": 1}},
-            cost_meter=SimpleNamespace(total_usd=0.01),
-        )
+    def fake_generate(*_args, **_kwargs):
+        raise AssertionError("disabled Gemini selection reached the generate pipeline")
 
     monkeypatch.setattr("dubsync.web.jobs.generate_srt_from_audio", fake_generate)
 
-    default_processor(job, settings)
-
-    assert calls["transcription_provider"] == "gemini-3.5-transcribe"
-    assert calls["allow_gemini_transcribe_web"] is True
-    assert calls["language"] == "pt"
-    assert calls.get("local", False) is False
-    assert calls.get("no_llm", False) is False
+    with pytest.raises(ValueError, match="disabled"):
+        default_processor(job, settings)
 
 
 def test_default_processor_rejects_persisted_gemini_selection_when_web_testing_is_disabled(
@@ -1180,7 +1139,7 @@ def test_default_processor_rejects_persisted_gemini_selection_when_web_testing_i
 
     monkeypatch.setattr("dubsync.web.jobs.sync_episode", unexpected_sync)
 
-    with pytest.raises(ValueError, match="not enabled"):
+    with pytest.raises(ValueError, match="disabled"):
         default_processor(job, settings)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 
 
@@ -32,14 +33,14 @@ def refine_cues_to_speech_activity(
 
     refined: list[Cue] = []
     flags: list[QCFlag] = []
-    sorted_regions = sorted(regions, key=lambda region: (region.start, region.end))
+    region_index = SpeechRegionIndex(regions)
 
     for index, cue in enumerate(cues):
         word_window = _word_window_for_cue(cue, words, alignment)
         cue_regions = (
-            _regions_from_word_window(word_window, sorted_regions, options)
+            _regions_from_word_window(word_window, region_index, options)
             if word_window is not None
-            else _regions_overlapping_cue(cue, sorted_regions)
+            else _regions_overlapping_cue(cue, region_index)
         )
         if cue_regions is None:
             refined.append(cue)
@@ -103,14 +104,10 @@ def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfil
     )
 
 
-def _regions_overlapping_cue(cue: Cue, regions: list[SpeechRegion]) -> tuple[SpeechRegion, SpeechRegion] | None:
+def _regions_overlapping_cue(cue: Cue, region_index: SpeechRegionIndex) -> tuple[SpeechRegion, SpeechRegion] | None:
     cue_start = cue.start_ms / 1000.0
     cue_end = cue.end_ms / 1000.0
-    overlapping = [
-        region
-        for region in regions
-        if region.end > cue_start and region.start < cue_end
-    ]
+    overlapping = region_index.overlapping(cue_start, cue_end)
     if not overlapping:
         return None
     return overlapping[0], overlapping[-1]
@@ -135,35 +132,31 @@ def _word_window_for_cue(
 
 def _regions_from_word_window(
     word_window: list[Word],
-    regions: list[SpeechRegion],
+    region_index: SpeechRegionIndex,
     config: BoundaryRefinementConfig,
 ) -> tuple[SpeechRegion, SpeechRegion] | None:
     first_word = word_window[0]
     last_word = word_window[-1]
-    start_region = _region_containing_timestamp(first_word.start, regions)
+    start_region = _region_containing_timestamp(first_word.start, region_index)
     if start_region is None:
-        start_region = _region_overlapping_word(first_word, regions)
+        start_region = _region_overlapping_word(first_word, region_index)
     end_probe = last_word.start if _is_word_duration_outlier(last_word, config) else last_word.end
-    end_region = _region_containing_timestamp(end_probe, regions)
+    end_region = _region_containing_timestamp(end_probe, region_index)
     if end_region is None:
-        end_region = _region_containing_timestamp(last_word.start, regions) or _region_overlapping_word(last_word, regions)
+        end_region = _region_containing_timestamp(last_word.start, region_index) or _region_overlapping_word(last_word, region_index)
     if start_region is None or end_region is None:
         return None
     return start_region, end_region
 
 
-def _region_containing_timestamp(timestamp: float, regions: list[SpeechRegion]) -> SpeechRegion | None:
-    for region in regions:
-        if region.start <= timestamp <= region.end:
-            return region
-    return None
+def _region_containing_timestamp(timestamp: float, region_index: SpeechRegionIndex) -> SpeechRegion | None:
+    match = region_index.first_containing(timestamp)
+    return match[1] if match is not None else None
 
 
-def _region_overlapping_word(word: Word, regions: list[SpeechRegion]) -> SpeechRegion | None:
-    for region in regions:
-        if region.end > word.start and region.start < word.end:
-            return region
-    return None
+def _region_overlapping_word(word: Word, region_index: SpeechRegionIndex) -> SpeechRegion | None:
+    overlapping = region_index.overlapping(word.start, word.end)
+    return overlapping[0] if overlapping else None
 
 
 def _is_word_duration_outlier(word: Word, config: BoundaryRefinementConfig) -> bool:

@@ -114,12 +114,13 @@ describe('shared components', () => {
 
     rerender(<JobPanel job={job({ status: 'failed', error: 'Provider unavailable.' })} onDownload={onDownload} downloading={null} />)
     expect(screen.getByText('Job failed')).toBeVisible()
-    expect(screen.getByText('Provider unavailable.')).toBeVisible()
+    expect(screen.getByText('Provider unavailable.')).toHaveClass('job-message', 'is-error')
     expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
 
     rerender(<JobPanel job={job({ status: 'complete', progress: 100, result: { cue_count: 18, cost_usd: 0.03, fps: 24, fps_source: 'detected', fps_detection_confident: true }, downloads: ['srt', 'qc-json', 'qc-html'] })} onDownload={onDownload} downloading={null} />)
     expect(screen.getByText('18 cues ready')).toBeVisible()
-    expect(screen.getByText('24 fps detected')).toBeVisible()
+    expect(screen.getByText('Your result and QC files are ready.')).toHaveClass('job-message')
+    expect(screen.getByText('24 fps detected')).toHaveClass('job-detail')
     await userEvent.click(screen.getByRole('button', { name: 'QC JSON' }))
     await userEvent.click(screen.getByRole('button', { name: 'QC report' }))
     await userEvent.click(screen.getByRole('button', { name: 'Download SRT' }))

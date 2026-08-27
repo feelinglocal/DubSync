@@ -14,7 +14,7 @@ from typing import Callable, Literal
 
 from dubsync.audio import AudioNormalizationLimits, tree_size_bytes
 from dubsync.pipeline import sync_episode
-from dubsync.providers import GEMINI_TRANSCRIBE_MODEL
+from dubsync.providers import GEMINI_TRANSCRIBE_DISABLED_MESSAGE, GEMINI_TRANSCRIBE_MODEL
 from dubsync.srt_io import parse_srt_text
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import derive_style_profile
@@ -651,11 +651,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     workdir = job.directory / "work"
     language = None if job.language == "auto" else job.language
     uses_gemini_transcribe = job.transcription_provider == GEMINI_TRANSCRIBE_MODEL
-    if uses_gemini_transcribe and not settings.enable_gemini_transcribe_web_testing:
-        raise ValueError("Gemini 3.5 Transcribe web testing is not enabled")
-    allow_gemini_transcribe_web = (
-        uses_gemini_transcribe and settings.enable_gemini_transcribe_web_testing
-    )
+    if uses_gemini_transcribe:
+        raise ValueError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
     audio_limits = AudioNormalizationLimits(
         max_duration_seconds=settings.max_audio_duration_seconds,
         probe_timeout_seconds=settings.ffprobe_timeout_seconds,
@@ -673,7 +670,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "fps": job.fps,
             "language": language,
             "transcription_provider": job.transcription_provider,
-            "allow_gemini_transcribe_web": allow_gemini_transcribe_web,
+            "allow_gemini_transcribe_web": False,
             "audio_limits": audio_limits,
         }
         sync_style = parse_sync_style_request(job.style)
@@ -703,7 +700,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "fps": job.fps,
             "language": language,
             "transcription_provider": job.transcription_provider,
-            "allow_gemini_transcribe_web": allow_gemini_transcribe_web,
+            "allow_gemini_transcribe_web": False,
             "audio_limits": audio_limits,
         }
         if job.style.strip().lower() != "standard":

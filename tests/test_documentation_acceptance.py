@@ -114,33 +114,23 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     assert "GEMINI_API_KEY" in example_text
 
 
-def test_readme_and_provider_example_document_local_gemini_transcribe():
+def test_docs_retire_gemini_transcribe_and_keep_elevenlabs_asr():
     readme = Path("README.md").read_text(encoding="utf-8")
     example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
     env_example = Path(".env.example").read_text(encoding="utf-8")
-    local_example = yaml.safe_load(Path("providers.gemini-transcribe.local.example.yaml").read_text(encoding="utf-8"))
+    retired_example_text = Path("providers.gemini-transcribe.local.example.yaml").read_text(encoding="utf-8")
+    retired_example = yaml.safe_load(retired_example_text)
 
-    for expected in (
-        "Gemini 3.5 Transcribe",
-        "asr.local",
-        "blocked outside `--local`",
-        "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=1",
-        "disabled by default",
-        "$0.005/min",
-    ):
-        assert expected in readme
-    assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=0" in env_example
-    for expected in (
-        "local:",
-        "provider: gemini_transcribe",
-        "model: gemini-3.5-transcribe",
-        "word_timestamps: true",
-        "store: false",
-    ):
-        assert expected in example_text
-    assert local_example["asr"]["provider"] == "elevenlabs"
-    assert local_example["asr"]["local"]["provider"] == "gemini_transcribe"
-    assert local_example["asr"]["local"]["model"] == "gemini-3.5-transcribe"
+    assert "Gemini 3.5 Transcribe ASR is disabled" in readme
+    assert "ElevenLabs Scribe v2" in readme
+    assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING" not in readme
+    assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING" not in env_example
+    assert "provider: gemini_transcribe" not in example_text
+    assert "model: gemini-3.5-transcribe" not in example_text
+    assert "provider: gemini_transcribe" not in retired_example_text
+    assert "model: gemini-3.5-transcribe" not in retired_example_text
+    assert retired_example["asr"]["provider"] == "elevenlabs"
+    assert "local" not in retired_example["asr"]
 
 
 def test_production_llm_passes_use_requested_models_and_thinking_levels():

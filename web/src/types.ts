@@ -70,7 +70,7 @@ export interface JobResponse {
   source_name?: string | null
   batch_id?: string | null
   batch_position?: number | null
-  transcription_provider?: 'default' | 'gemini-3.5-transcribe'
+  transcription_provider?: 'default'
   mode: JobMode
   status: JobStatus
   progress: number

@@ -2,17 +2,6 @@ asr:
   provider: elevenlabs
   model_id: scribe_v2
   diarize: true
-  # Optional LOCAL-only ASR comparison path. This is used only when the CLI is
-  # run with --local; normal sync/generate runs keep the ElevenLabs settings above.
-  # local:
-  #   provider: gemini_transcribe
-  #   model: gemini-3.5-transcribe
-  #   language_codes: ["de-DE"]
-  #   diarize: true
-  #   word_timestamps: true
-  #   store: false
-  #   custom_vocabulary:
-  #     - Drachen-Evolutionssystem
 
 llm:
   provider: openai

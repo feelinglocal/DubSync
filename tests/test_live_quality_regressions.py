@@ -360,3 +360,14 @@ def test_highly_repetitive_song_like_adlib_is_rejected_with_qc_flag() -> None:
     assert flags[0].new_text == lyrics
     assert flags[0].start == 50.0
     assert flags[0].end == 54.0
+
+
+def test_normalize_token_uses_bounded_cache_for_hot_alignment_paths():
+    normalize_token.cache_clear()
+
+    assert normalize_token("gehen") == "gehen"
+    assert normalize_token("gehen") == "gehen"
+
+    info = normalize_token.cache_info()
+    assert info.hits >= 1
+    assert info.maxsize is not None

@@ -35,6 +35,20 @@ def test_punctuation_pass_batches_cues_by_scene_gap():
     assert flags == []
 
 
+def test_punctuation_pass_caps_dense_scene_batches():
+    adapter = RecordingPunctuationAdapter()
+    cues = [
+        Cue(index=index, start_ms=index * 1_000, end_ms=index * 1_000 + 500, lines=[f"cue {index}"])
+        for index in range(1, 46)
+    ]
+
+    updated, flags = apply_punctuation_pass(cues, adapter, scene_gap_seconds=4.0)
+
+    assert [len(batch) for batch in adapter.batches] == [40, 5]
+    assert updated == cues
+    assert flags == []
+
+
 def test_punctuation_pass_preserves_valid_proposed_line_breaks():
     cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello", "there"])]
     adapter = StaticPunctuationAdapter({1: "Hello,\nthere."})
@@ -65,6 +79,57 @@ def test_punctuation_pass_rejects_model_added_german_dialogue_quotes():
     assert [flag.kind for flag in flags] == ["invalid_punctuation_change"]
     assert flags[0].severity == "error"
     assert "quotation mark signature changed" in flags[0].message
+
+
+def test_punctuation_pass_anchors_quotes_to_source_when_words_are_unchanged():
+    source_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["„Hallo Welt“"])]
+    rebuilt_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Hallo Welt"])]
+    adapter = StaticPunctuationAdapter({1: "„Hallo Welt“"})
+
+    updated, flags = apply_punctuation_pass(
+        rebuilt_cues,
+        adapter,
+        source_cues=source_cues,
+    )
+
+    assert flags == []
+    assert updated[0].text == "„Hallo Welt“"
+
+
+def test_punctuation_pass_validates_word_unchanged_cue_against_source_quotes():
+    source_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["„Wer bist du?“"])]
+    rebuilt_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=['"Wer bist du?"'])]
+    adapter = StaticPunctuationAdapter({1: '"Wer bist du?"'})
+
+    updated, flags = apply_punctuation_pass(rebuilt_cues, adapter, source_cues=source_cues)
+
+    assert updated[0].start_ms == rebuilt_cues[0].start_ms
+    assert updated[0].end_ms == rebuilt_cues[0].end_ms
+    assert updated[0].text == source_cues[0].text
+    assert [flag.kind for flag in flags] == ["invalid_punctuation_change"]
+    assert "quotation mark signature changed" in flags[0].message
+
+
+def test_punctuation_pass_allows_legitimate_quotes_in_word_changed_cue():
+    source_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Hallo."])]
+    rebuilt_cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=['Er sagte "Hallo".'])]
+    adapter = StaticPunctuationAdapter({1: 'Er sagte "Hallo!"'})
+
+    updated, flags = apply_punctuation_pass(rebuilt_cues, adapter, source_cues=source_cues)
+
+    assert flags == []
+    assert updated[0].text == 'Er sagte "Hallo!"'
+
+
+def test_punctuation_pass_anchors_quotes_to_changed_text_when_words_changed():
+    source = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Wer bist du?"])]
+    rebuilt = [Cue(index=1, start_ms=10, end_ms=990, lines=["„Bleib hier?“"])]
+    adapter = StaticPunctuationAdapter({1: "„Bleib hier!“"})
+
+    updated, flags = apply_punctuation_pass(rebuilt, adapter, source_cues=source)
+
+    assert flags == []
+    assert updated[0].text == "„Bleib hier!“"
 
 
 def test_punctuation_pass_reflows_an_overlong_model_line():

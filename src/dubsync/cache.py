@@ -28,7 +28,7 @@ class CacheKey(BaseModel):
 
     @classmethod
     def from_audio(cls, audio_path: Path, model: str, params: dict[str, Any]) -> "CacheKey":
-        audio_sha = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+        audio_sha = _sha256_file(audio_path)
         cache_params = _cache_safe_params(params)
         canonical = _canonical_json(
             {"kind": "audio", "audio_sha256": audio_sha, "model": model, "params": cache_params}
@@ -84,3 +84,11 @@ def _cache_safe_params(value: Any) -> Any:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

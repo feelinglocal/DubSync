@@ -133,7 +133,7 @@ def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     assert calls < (token_count * token_count) // 2
 
 
-def test_alignment_limits_unique_exact_retry_instead_of_unbounded_full_width(monkeypatch):
+def test_alignment_budget_exhaustion_rejects_a_bounded_run_that_misses_a_unique_exact_pair(monkeypatch):
     monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
     token_count = 300
     cues = [
@@ -149,10 +149,15 @@ def test_alignment_limits_unique_exact_retry_instead_of_unbounded_full_width(mon
 
     result = align_cues_to_words(cues, words)
 
-    assert result.anchor_coverage > 0.5
+    assert result.token_matches == []
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text.startswith("filler")
+    assert result.divergence_spans[0].asr_text.startswith("filler")
     assert result.diagnostics.unbanded_fallback is False
     assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is True
     assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    assert any(flag.kind == "alignment_unresolved" and flag.severity == "error" for flag in result.flags)
 
 
 def test_alignment_retry_margins_progress_without_automatic_full_width():
@@ -184,7 +189,28 @@ def test_alignment_budget_exhaustion_preserves_a_reviewable_whole_span(monkeypat
     assert result.divergence_spans[0].srt_text == "alpha beta"
     assert result.divergence_spans[0].asr_text == "alpha beta"
     assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is True
     assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    unresolved = [flag for flag in result.flags if flag.kind == "alignment_unresolved"]
+    assert len(unresolved) == 1
+    assert unresolved[0].severity == "error"
+
+
+def test_similarity_uses_score_cutoff_without_rejecting_near_length_german_pairs(monkeypatch):
+    calls: list[tuple[str, str, float | None]] = []
+
+    def fake_ratio(left: str, right: str, score_cutoff: float | None = None) -> float:
+        calls.append((left, right, score_cutoff))
+        return 88.9
+
+    monkeypatch.setattr(aligner.fuzz, "ratio", fake_ratio)
+
+    assert aligner._similarity("gehen", "gehe") == 0.889
+    assert aligner._similarity("Haus", "Hause") == 0.889
+    assert calls == [
+        ("gehen", "gehe", 85.0),
+        ("Haus", "Hause", 85.0),
+    ]
 
 
 def test_band_windows_keep_distant_priors_disjoint_and_bounded():

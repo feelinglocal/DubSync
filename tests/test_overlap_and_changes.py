@@ -1,11 +1,37 @@
 from __future__ import annotations
 
 from dubsync.changes import apply_adjudication_decisions, flow_text_to_lines
+from dubsync.editorial_guard import episode_editorial_addition_flags
 from dubsync.models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
 from dubsync.overlap import apply_overlap_policy
 from dubsync.reports import write_changes_diff, write_qc_report
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
+
+
+def test_episode_editorial_detector_flags_only_unexplained_additions():
+    source = [Cue(index=1, start_ms=0, end_ms=1000, lines=['Er sagt "Hallo".'])]
+
+    flags = episode_editorial_addition_flags(
+        source,
+        [Cue(index=1, start_ms=0, end_ms=1000, lines=['Er sagt "Hallo" und „Tschüss“. <i>W***</i>'])],
+    )
+
+    assert [flag.kind for flag in flags] == ["editorial_signature_unexplained"]
+    assert flags[0].severity == "error"
+    assert "quotation marks" in flags[0].message
+    assert "markup" in flags[0].message
+    assert "censor masks" in flags[0].message
+
+
+def test_episode_editorial_detector_allows_preserved_or_removed_source_marks():
+    source = [Cue(index=1, start_ms=0, end_ms=1000, lines=['<i>„Hallo“</i> W***'])]
+
+    assert episode_editorial_addition_flags(source, source) == []
+    assert episode_editorial_addition_flags(
+        source,
+        [Cue(index=1, start_ms=0, end_ms=1000, lines=["Hallo W"])]
+    ) == []
 
 
 def test_apply_adjudication_replaces_text_for_use_audio_and_flags_change():
@@ -25,6 +51,134 @@ def test_apply_adjudication_replaces_text_for_use_audio_and_flags_change():
     assert flags[0].kind == "text_changed"
     assert flags[0].old_text == "old line"
     assert flags[0].new_text == "new spoken line"
+
+
+def test_apply_adjudication_rejects_unexplained_editorial_mark_changes():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["Wer bist du?"])]
+    span = DivergenceSpan(case_id="case-1", cue_ids=[1], srt_text="Wer bist du?", asr_text="wer bist du")
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="„Wer bist du?“",
+        confidence=0.92,
+        reason="fixture quote drift",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed == cues
+    assert [flag.kind for flag in flags] == ["editorial_guard_rejected"]
+    assert flags[0].severity == "error"
+    assert "quotation mark signature changed" in flags[0].message
+
+
+def test_apply_adjudication_allows_quotes_when_source_span_contains_quotes():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=['"Wer bist du?"'])]
+    span = DivergenceSpan(case_id="case-1", cue_ids=[1], srt_text='"Wer bist du?"', asr_text="wer bist du")
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text='"Wer bist du?"',
+        confidence=0.92,
+        reason="fixture",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed[0].plain_text == '"Wer bist du?"'
+    assert flags[0].kind == "text_changed"
+
+
+def test_apply_adjudication_rejects_added_markup():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["Mist."])]
+    span = DivergenceSpan(case_id="case-1", cue_ids=[1], srt_text="Mist", asr_text="Mist")
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="<i>Mist.</i>",
+        confidence=0.92,
+        reason="fixture markup drift",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed == cues
+    assert [flag.kind for flag in flags] == ["editorial_guard_rejected"]
+    assert flags[0].severity == "error"
+    assert "markup" in flags[0].message
+
+
+def test_apply_adjudication_rejects_removed_source_censor_mask():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["Verd*mmt."])]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="Verd*mmt",
+        asr_text="Verdammt",
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="Verdammt.",
+        confidence=0.92,
+        reason="fixture censor-mask drift",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed == cues
+    assert [flag.kind for flag in flags] == ["editorial_guard_rejected"]
+    assert flags[0].severity == "error"
+    assert "censor" in flags[0].message
+
+
+def test_apply_adjudication_preserves_source_quotes_outside_divergent_tokens():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["„Hallo Welt“"])]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="Hallo Welt",
+        asr_text="Guten Tag",
+        srt_token_indices=[0, 1],
+        asr_word_indices=[0, 1],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="Guten Tag",
+        confidence=0.92,
+        reason="fixture wording change",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed[0].plain_text == "„Guten Tag“"
+    assert [flag.kind for flag in flags] == ["text_changed"]
+
+
+def test_apply_adjudication_preserves_source_markup_outside_divergent_tokens():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["<i>Hallo Welt</i>"])]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="Hallo Welt",
+        asr_text="Guten Tag",
+        srt_token_indices=[0, 1],
+        asr_word_indices=[0, 1],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="use_audio",
+        final_text="Guten Tag",
+        confidence=0.92,
+        reason="fixture wording change",
+    )
+
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+
+    assert changed == cues
+    assert [flag.kind for flag in flags] == ["editorial_guard_rejected"]
+    assert "markup" in flags[0].message
 
 
 def test_apply_adjudication_replaces_only_divergent_phrase_inside_single_cue():

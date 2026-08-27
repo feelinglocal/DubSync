@@ -156,7 +156,7 @@ describe('DubSync workspace', () => {
     expect(screen.queryByText('Testing only. Maximum 30 minutes per audio file.')).not.toBeInTheDocument()
   })
 
-  it('shows the enabled Gemini 3.5 Transcribe testing toggle unchecked with its audio limit', async () => {
+  it('hides the Gemini 3.5 Transcribe testing toggle even if stale config enables it', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       ...configResponse,
       gemini_transcribe_testing_available: true,
@@ -164,12 +164,12 @@ describe('DubSync workspace', () => {
 
     render(<App />)
 
-    const toggle = await screen.findByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })
-    expect(toggle).not.toBeChecked()
-    expect(screen.getByText('Testing only. Maximum 30 minutes per audio file.')).toBeVisible()
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Testing only. Maximum 30 minutes per audio file.')).not.toBeInTheDocument()
   })
 
-  it('sends the Gemini 3.5 Transcribe provider when selected for a single sync', async () => {
+  it('keeps single sync on the default transcription provider even if stale config enables Gemini testing', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ...configResponse,
@@ -183,16 +183,15 @@ describe('DubSync workspace', () => {
     render(<App />)
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
 
-    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
     await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
     await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
     await user.click(screen.getByRole('button', { name: 'Start sync' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
   })
 
-  it('keeps the Gemini 3.5 Transcribe toggle available for audio-to-SRT generation', async () => {
+  it('keeps audio-to-SRT generation on the default transcription provider', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ...configResponse,
@@ -207,16 +206,15 @@ describe('DubSync workspace', () => {
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
-    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
     await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
     await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect((fetchMock.mock.calls[1][1]?.body as FormData).get('mode')).toBe('generate')
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
   })
 
-  it('sends the Gemini 3.5 Transcribe provider when selected for a sync batch', async () => {
+  it('keeps sync batches on the default transcription provider', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ...configResponse,
@@ -227,7 +225,6 @@ describe('DubSync workspace', () => {
     render(<App />)
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
 
-    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
     await user.upload(screen.getByLabelText('Dialogue audio'), [
       new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
       new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
@@ -240,7 +237,7 @@ describe('DubSync workspace', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(fetchMock.mock.calls[1][0]).toBe('/api/batches')
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
   })
 
   it('does not request Gemini 3.5 Transcribe when the testing toggle is left unchecked', async () => {
@@ -257,7 +254,7 @@ describe('DubSync workspace', () => {
     render(<App />)
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
 
-    expect(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeChecked()
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
     await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
     await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
     await user.click(screen.getByRole('button', { name: 'Start sync' }))

@@ -9,6 +9,9 @@ from .models import AdjudicationDecision, AudioSnippet, DivergenceSpan, QCFlag
 from .tokenize import alphanumeric_signature
 
 
+_MAX_ADJUDICATION_BATCH_SPANS = 25
+
+
 class LLMAdapter(Protocol):
     def adjudicate(self, spans: list[DivergenceSpan]) -> list[dict[str, object]]:
         raise NotImplementedError
@@ -185,7 +188,11 @@ class AdjudicationEngine:
             else:
                 batches[-1].append(span)
             previous = span
-        return batches
+        return [
+            chunk
+            for batch in batches
+            for chunk in _split_span_batch_by_size(batch, _MAX_ADJUDICATION_BATCH_SPANS)
+        ]
 
     @staticmethod
     def _span_for_payload(
@@ -226,6 +233,38 @@ def _starts_new_scene(previous: DivergenceSpan, current: DivergenceSpan, scene_g
     if previous.end is None or current.start is None:
         return False
     return current.start - previous.end > scene_gap_seconds
+
+
+def _split_span_batch_by_size(
+    spans: list[DivergenceSpan],
+    max_size: int,
+) -> list[list[DivergenceSpan]]:
+    if len(spans) <= max_size:
+        return [spans]
+    batches: list[list[DivergenceSpan]] = []
+    remaining = list(spans)
+    while len(remaining) > max_size:
+        split_at = _widest_internal_span_gap_index(remaining[: max_size + 1])
+        if split_at <= 0 or split_at > max_size:
+            split_at = max_size
+        batches.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    if remaining:
+        batches.append(remaining)
+    return batches
+
+
+def _widest_internal_span_gap_index(spans: list[DivergenceSpan]) -> int:
+    best_index = len(spans) - 1
+    best_gap: float | None = None
+    for index, (previous, current) in enumerate(zip(spans, spans[1:]), start=1):
+        if previous.end is None or current.start is None:
+            continue
+        gap = current.start - previous.end
+        if best_gap is None or gap >= best_gap:
+            best_gap = gap
+            best_index = index
+    return best_index
 
 
 def _keep_srt_decision(span: DivergenceSpan, reason: str) -> AdjudicationDecision:
