@@ -18,6 +18,8 @@ const configResponse = {
   billing_enabled: false,
   access_code_required: false,
   jobs_available: true,
+  gemini_transcribe_testing_available: false,
+  gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {
     default_preset: 'standard',
     presets: [
@@ -137,6 +139,107 @@ describe('DubSync workspace', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect((fetchMock.mock.calls[1][1]?.body as FormData).get('language')).toBe('pt')
+  })
+
+  it.each([
+    ['when the availability flag is omitted', Object.fromEntries(
+      Object.entries(configResponse).filter(([key]) => key !== 'gemini_transcribe_testing_available'),
+    )],
+    ['when the availability flag is false', configResponse],
+  ])('hides the Gemini 3.5 Transcribe testing toggle %s', async (_scenario, config) => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(config), { status: 200 }))
+
+    render(<App />)
+
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Testing only. Maximum 30 minutes per audio file.')).not.toBeInTheDocument()
+  })
+
+  it('shows the enabled Gemini 3.5 Transcribe testing toggle unchecked with its audio limit', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+
+    render(<App />)
+
+    const toggle = await screen.findByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })
+    expect(toggle).not.toBeChecked()
+    expect(screen.getByText('Testing only. Maximum 30 minutes per audio file.')).toBeVisible()
+  })
+
+  it('sends the Gemini 3.5 Transcribe provider when selected for a single sync', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'gemini-job', token: 'gemini-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+  })
+
+  it('sends the Gemini 3.5 Transcribe provider when selected for a sync batch', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/batches')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+  })
+
+  it('does not request Gemini 3.5 Transcribe when the testing toggle is left unchecked', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'default-provider-job', token: 'default-provider-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    expect(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeChecked()
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
   })
 
   it('clearly marks precision processing as coming soon', async () => {

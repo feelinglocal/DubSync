@@ -81,6 +81,7 @@ def _post_batch(
     fps: float | str | None = 30,
     language: str = "auto",
     style: str = "standard",
+    transcription_provider: str | None = None,
 ):
     data = {
         "mode": mode,
@@ -89,6 +90,8 @@ def _post_batch(
     }
     if fps is not None:
         data["fps"] = str(fps)
+    if transcription_provider is not None:
+        data["transcription_provider"] = transcription_provider
     return client.post(
         "/api/batches",
         data=data,
@@ -384,6 +387,40 @@ def test_generate_batch_accepts_audio_only_and_applies_shared_options_in_selecti
     assert all(job.fps == 25 for job in captured)
     assert all(job.language == "id" for job in captured)
     assert len({job.style for job in captured}) == 1
+
+
+def test_batch_propagates_enabled_gemini_transcribe_selection_to_every_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    captured: list[JobRecord] = []
+
+    def processor(job: JobRecord, _settings: WebSettings) -> ProcessedArtifacts:
+        captured.append(job)
+        return _artifacts(job)
+
+    settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
+    app = create_app(
+        settings=settings,
+        processor=processor,
+        audio_duration_probe=lambda *_args, **_kwargs: 1800.0,
+    )
+
+    with TestClient(app) as client:
+        response = _post_batch(
+            client,
+            [("one.wav", b"one"), ("two.wav", b"two")],
+            [("one.srt", SRT_BYTES), ("two.srt", SRT_BYTES)],
+            transcription_provider="gemini-3.5-transcribe",
+        )
+
+    assert response.status_code == 202
+    assert {job["transcription_provider"] for job in response.json()["jobs"]} == {
+        "gemini-3.5-transcribe"
+    }
+    assert len(captured) == 2
+    assert {job.transcription_provider for job in captured} == {"gemini-3.5-transcribe"}
+    persisted = app.state.jobs.store.by_batch_id(response.json()["id"])
+    assert len(persisted) == 2
+    assert {job.transcription_provider for job in persisted} == {"gemini-3.5-transcribe"}
 
 
 def test_sync_batch_applies_one_max_lines_option_to_every_child(tmp_path):
@@ -1085,8 +1122,10 @@ def test_job_store_migrates_legacy_rows_idempotently_and_keeps_old_downloads_wor
     assert legacy.source_name is None
     assert legacy.batch_id is None
     assert legacy.batch_position is None
+    assert legacy.transcription_provider == "default"
     with sqlite3.connect(first.db_path) as connection:
         columns = [row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()]
     assert columns.count("source_name") == 1
     assert columns.count("batch_id") == 1
     assert columns.count("batch_position") == 1
+    assert columns.count("transcription_provider") == 1

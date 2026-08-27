@@ -16,11 +16,13 @@ from dubsync.models import Word
 from dubsync.providers import (
     AssemblyAIAdapter,
     CachedASRAdapter,
+    GEMINI_TRANSCRIBE_MODEL,
     GeminiTranscribeAdapter,
     ProviderError,
     WhisperXAdapter,
     adapter_from_config,
     apply_local_asr_config,
+    apply_transcription_provider_config,
     repair_word_stream,
 )
 
@@ -768,6 +770,53 @@ def test_gemini_transcribe_requires_local_mode():
     )
 
     assert isinstance(adapter, GeminiTranscribeAdapter)
+
+
+def test_gemini_transcribe_web_testing_requires_explicit_adapter_authorization():
+    config = {
+        "asr": {
+            "provider": "gemini_transcribe",
+            "model": GEMINI_TRANSCRIBE_MODEL,
+            "api_key": "test-key",
+            "word_timestamps": True,
+            "store": False,
+        }
+    }
+
+    with pytest.raises(ProviderError, match="only available in --local"):
+        adapter_from_config(config)
+
+    adapter = adapter_from_config(config, allow_gemini_transcribe_web=True)
+
+    assert isinstance(adapter, GeminiTranscribeAdapter)
+
+
+def test_gemini_transcribe_web_override_is_exact_immutable_and_preserves_normal_llm_config():
+    config = {
+        "asr": {
+            "provider": "elevenlabs",
+            "model_id": "scribe_v2",
+            "diarize": True,
+            "keyterms": ["DubSync"],
+            "local": {"provider": "whisperx"},
+        },
+        "llm": {"provider": "openai", "model": "gpt-5.6-luna"},
+    }
+
+    resolved = apply_transcription_provider_config(config, GEMINI_TRANSCRIBE_MODEL)
+
+    assert config["asr"]["provider"] == "elevenlabs"
+    assert config["asr"]["local"] == {"provider": "whisperx"}
+    assert resolved["llm"] == config["llm"]
+    assert resolved["asr"] == {
+        "provider": "gemini_transcribe",
+        "model": GEMINI_TRANSCRIBE_MODEL,
+        "diarize": True,
+        "keyterms": ["DubSync"],
+        "word_timestamps": True,
+        "store": False,
+        "max_audio_seconds": 1800.0,
+    }
 
 
 def test_local_mode_uses_nested_gemini_transcribe_override():
