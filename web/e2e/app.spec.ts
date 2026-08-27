@@ -305,7 +305,7 @@ test('brand, theme, and crawler surfaces use the production identity', async ({ 
   expect(missing.status()).toBe(404)
 })
 
-test('mobile first viewport has no horizontal overflow and introduces the next section', async ({ page }) => {
+test('mobile first viewport has no horizontal overflow and keeps the next section near the fold', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/')
   const dimensions = await page.evaluate(() => ({
@@ -315,7 +315,8 @@ test('mobile first viewport has no horizontal overflow and introduces the next s
   expect(dimensions.scrollWidth).toBe(dimensions.clientWidth)
   const pricingFits = await page.locator('.pricing-table-wrap').evaluate((element) => element.scrollWidth <= element.clientWidth)
   expect(pricingFits).toBe(true)
-  await expect(page.getByRole('heading', { name: 'Professional subtitle sync and auto captioning' })).toBeInViewport()
+  const nextSectionTop = await page.locator('.feature-band').evaluate((element) => element.getBoundingClientRect().top)
+  expect(nextSectionTop).toBeLessThanOrEqual(844 + 80)
 })
 
 test('workspace selects and feature rows use consistent alignment', async ({ page }) => {
@@ -330,7 +331,7 @@ test('workspace selects and feature rows use consistent alignment', async ({ pag
       iconCentered: iconBox ? Math.abs((controlBox.top + controlBox.height / 2) - (iconBox.top + iconBox.height / 2)) : 999,
     }
   }))
-  expect(selectGeometry).toHaveLength(2)
+  expect(selectGeometry).toHaveLength(3)
   for (const geometry of selectGeometry) {
     expect(geometry.iconInset).toBeGreaterThanOrEqual(12)
     expect(geometry.iconCentered).toBeLessThanOrEqual(1)

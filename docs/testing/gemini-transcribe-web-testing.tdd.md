@@ -19,7 +19,8 @@ No plan file was supplied. The journey was derived from the request: as a DubSyn
 | 3 | Gemini web intake rejects files over 1,800 seconds before provider processing. | `tests/test_web_app.py::test_gemini_transcribe_web_intake_enforces_1800_second_per_file_boundary` | Integration | PASS | Same focused pytest command -> `167 passed` |
 | 4 | The frontend hides the toggle when unavailable, sends the provider only when checked, and keeps it available for sync, generate, and batch submissions. | `web/src/App.test.tsx` | Unit/UI | PASS | `npm --prefix web test -- src/App.test.tsx` -> `37 passed` |
 | 5 | Frontend types and production bundle are valid. | `npm --prefix web run typecheck`; `npm --prefix web run build` | Build | PASS | TypeScript completed; Vite built `web/dist` successfully |
-| 6 | The running local production-style app exposes the toggle without leaking key material. | `Invoke-RestMethod http://127.0.0.1:8001/api/config` | Smoke | PASS | `gemini_transcribe_testing_available=True`, `gemini_transcribe_max_audio_seconds=1800`, `HasSecretText=False` |
+| 6 | Existing critical browser workflows still pass after the toggle work. | `npm --prefix web run test:e2e` | End-to-end | PASS | `11 passed`; two stale baseline assertions were updated to validate the current three-select layout and keep the next section near the mobile fold |
+| 7 | The running local production-style app exposes the toggle without leaking key material. | `Invoke-RestMethod http://127.0.0.1:8000/api/config`; headless Playwright smoke | Smoke | PASS | Availability `True`, limit `1800`, no secret-named config field; toggle visible in sync and generate, unchecked by default; no job submitted |
 
 ## Security Notes
 
@@ -31,6 +32,19 @@ No plan file was supplied. The journey was derived from the request: as a DubSyn
 
 ## Coverage And Known Gaps
 
+- Full backend suite with coverage: `622 passed, 8 deselected`; total coverage `86.16%` (80% required).
+- Full frontend suite with coverage: `71 passed`; statements `90.96%`, branches `87.62%`, functions `91.30%`, lines `94.18%`.
 - `npm --prefix web audit --audit-level=high` reported `0 vulnerabilities`.
-- `python -m pip_audit --format columns` reported existing Python dependency vulnerabilities in the active environment. This web-toggle change did not add dependency files; those findings should be triaged separately before treating the Python environment as production-clean.
-- No paid Gemini web job was run in this validation. The local server was started on `http://127.0.0.1:8001` with the feature flag set only for that server process.
+- `python -m pip_audit` reported 29 existing findings across 9 installed Python packages. This web-toggle change did not add or change dependency files; treat that environment debt separately before calling the Python environment production-clean.
+- No paid Gemini web job was run. The ignored local `.env` enables the test toggle for `http://127.0.0.1:8000`; `.env.example` and Render remain disabled by default.
+
+## TDD Checkpoints
+
+- RED contracts: `53c4c7d`, `c572386`, and `ae8fc46` failed on missing UI, intake, persistence, processor routing, and documentation behavior.
+- GREEN implementation: `bb5e6dd` passed the focused backend and frontend contracts before the full-suite runs above.
+
+## Primary References
+
+- Google model card: <https://ai.google.dev/gemini-api/docs/models/gemini-3.5-transcribe>
+- Google audio transcription guide: <https://ai.google.dev/gemini-api/docs/transcribe>
+- Google Files API retention and deletion guide: <https://ai.google.dev/gemini-api/docs/files>
