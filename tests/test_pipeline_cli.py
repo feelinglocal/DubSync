@@ -9,7 +9,13 @@ import yaml
 from typer.testing import CliRunner
 
 from dubsync.cli import app
-from dubsync.models import AlignmentResult, AudioSnippet, Cue, DivergenceSpan
+from dubsync.models import (
+    AdjudicationDecision,
+    AlignmentResult,
+    AudioSnippet,
+    Cue,
+    DivergenceSpan,
+)
 import dubsync.pipeline as pipeline_module
 from dubsync.pipeline import (
     _alignment_health_flags,
@@ -118,6 +124,65 @@ def test_incomplete_source_guard_holds_oversized_source_backed_span():
     assert flags[0].severity == "error"
     assert flags[0].old_text is None
     assert flags[0].new_text is None
+
+
+def test_unresolved_alignment_guard_holds_short_source_backed_span():
+    span = DivergenceSpan(
+        case_id="case-unresolved",
+        cue_ids=[1, 2],
+        srt_text="source text stays",
+        asr_text="audio text must not replace it",
+        start=1.0,
+        end=4.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1, 2, 3],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [span],
+        {},
+        source_cue_count=2,
+        alignment_unresolved=True,
+    )
+
+    assert provider_spans == []
+    assert [decision.verdict for decision in held_decisions] == ["keep_srt"]
+    assert held_decisions[0].final_text == span.srt_text
+    assert [flag.kind for flag in flags] == ["unresolved_alignment_adjudication_held"]
+    assert flags[0].severity == "error"
+
+
+def test_unresolved_alignment_guard_overrides_stale_resume_decision():
+    span = DivergenceSpan(
+        case_id="case-unresolved",
+        cue_ids=[1],
+        srt_text="source text stays",
+        asr_text="stale replacement",
+        start=1.0,
+        end=2.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1],
+    )
+    stale_decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="use_audio",
+        final_text=span.asr_text,
+        confidence=0.99,
+        reason="stale pre-guard decision",
+    )
+
+    decisions, flags = pipeline_module._apply_incomplete_source_holds_to_decisions(
+        [span],
+        {},
+        [stale_decision],
+        [],
+        source_cue_count=1,
+        alignment_unresolved=True,
+    )
+
+    assert [decision.verdict for decision in decisions] == ["keep_srt"]
+    assert decisions[0].final_text == span.srt_text
+    assert [flag.kind for flag in flags] == ["unresolved_alignment_adjudication_held"]
 
 
 def test_alignment_summary_metadata_and_health_flags_surface_low_coverage():
@@ -644,6 +709,114 @@ def test_cli_sync_offline_fixture_outputs_reports(tmp_path, shifted_srt_text, sh
     assert verify["cue_scores"] == report["cue_scores"]
     assert verify["style_issues"] == report["style_issues"]
     assert "Cost meter" in result.output
+
+
+def test_cli_sync_unresolved_alignment_never_calls_adjudication_for_short_source(
+    tmp_path,
+    monkeypatch,
+):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nalpha beta\n\n"
+        "2\n00:00:01,100 --> 00:00:02,000\ngamma delta\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "replace", "start": 0.1, "end": 0.3},
+                    {"text": "all", "start": 0.4, "end": 0.6},
+                    {"text": "source", "start": 1.2, "end": 1.4},
+                    {"text": "text", "start": 1.5, "end": 1.7},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "replace all source text",
+                            "confidence": 0.99,
+                            "reason": "fixture decision must never be requested",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    unresolved_alignment = AlignmentResult(
+        divergence_spans=[
+            DivergenceSpan(
+                case_id="case-1",
+                cue_ids=[1, 2],
+                srt_text="alpha beta gamma delta",
+                asr_text="replace all source text",
+                start=0.1,
+                end=1.7,
+                srt_token_indices=[0, 1, 2, 3],
+                asr_word_indices=[0, 1, 2, 3],
+            )
+        ],
+        unmatched_cue_ids=[1, 2],
+        diagnostics={"band_limited": True, "unresolved": True},
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "align_cues_to_words",
+        lambda _cues, _words: unresolved_alignment,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "llm_adapter_from_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unresolved source-backed alignment must not reach adjudication")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [cue.plain_text for cue in parse_srt_text(out_path.read_text(encoding="utf-8"))] == [
+        "alpha beta",
+        "gamma delta",
+    ]
+    adjudication = json.loads(
+        (workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8")
+    )
+    assert adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert any(
+        flag["kind"] == "unresolved_alignment_adjudication_held"
+        for flag in adjudication["flags"]
+    )
 
 
 def test_cli_sync_writes_overlap_detection_fixture_report(tmp_path):

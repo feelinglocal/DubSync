@@ -214,6 +214,7 @@ def sync_episode(
             resume_decisions,
             rebuilt,
             cues,
+            alignment_unresolved=resume_alignment.diagnostics.unresolved,
         )
         if unsafe_cases:
             raise RuntimeError(
@@ -270,6 +271,7 @@ def sync_episode(
             decisions,
             adjudication_flags,
             source_cue_count=len(cues),
+            alignment_unresolved=alignment.diagnostics.unresolved,
         )
         flags.extend(adjudication_flags)
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
@@ -279,6 +281,7 @@ def sync_episode(
                 alignment.divergence_spans,
                 provider_config,
                 source_cue_count=len(cues),
+                alignment_unresolved=alignment.diagnostics.unresolved,
             )
         )
         provider_decisions: list[AdjudicationDecision] = []
@@ -1523,6 +1526,7 @@ def _hold_incomplete_source_insertions(
     provider_config: dict[str, object],
     *,
     source_cue_count: int | None = None,
+    alignment_unresolved: bool = False,
 ) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
     max_duration = _generation_float_config(
         provider_config,
@@ -1533,7 +1537,13 @@ def _hold_incomplete_source_insertions(
     held_decisions: list[AdjudicationDecision] = []
     flags: list[QCFlag] = []
     for span in spans:
-        hold = _oversized_adjudication_span_hold(span, source_cue_count)
+        hold = (
+            _unresolved_alignment_adjudication_hold(span)
+            if alignment_unresolved
+            else None
+        )
+        if hold is None:
+            hold = _oversized_adjudication_span_hold(span, source_cue_count)
         if hold is None:
             hold = _incomplete_source_hold(span, max_duration)
         if hold is None:
@@ -1604,6 +1614,39 @@ def _incomplete_source_hold(
     return decision, flag
 
 
+def _unresolved_alignment_adjudication_hold(
+    span: DivergenceSpan,
+) -> tuple[AdjudicationDecision, QCFlag] | None:
+    if not span.cue_ids and not span.srt_token_indices:
+        return None
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="keep_srt",
+        final_text=span.srt_text,
+        confidence=0.0,
+        speaker=span.speaker_ids[0] if len(span.speaker_ids) == 1 else None,
+        character="unknown",
+        reason=(
+            "Alignment was unresolved within the bounded cell budget; source text "
+            "was retained instead of permitting an unanchored adjudication rewrite."
+        ),
+    )
+    flag = QCFlag(
+        kind="unresolved_alignment_adjudication_held",
+        cue_ids=span.cue_ids,
+        message=(
+            "Source-backed divergence was not sent to adjudication because alignment "
+            "was unresolved; retained source text for manual review."
+        ),
+        severity="error",
+        old_text=span.srt_text,
+        new_text=span.asr_text,
+        start=span.start,
+        end=span.end,
+    )
+    return decision, flag
+
+
 def _oversized_adjudication_span_hold(
     span: DivergenceSpan,
     source_cue_count: int | None,
@@ -1648,11 +1691,13 @@ def _apply_incomplete_source_holds_to_decisions(
     adjudication_flags: list[QCFlag],
     *,
     source_cue_count: int | None = None,
+    alignment_unresolved: bool = False,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
         spans,
         provider_config,
         source_cue_count=source_cue_count,
+        alignment_unresolved=alignment_unresolved,
     )
     if not held_decisions:
         return decisions, adjudication_flags
@@ -1672,6 +1717,7 @@ def _apply_incomplete_source_holds_to_decisions(
         not in {
             "generated_adlib_rejected_incomplete_source",
             "oversized_adjudication_span_held",
+            "unresolved_alignment_adjudication_held",
         }
     ]
     return ordered_decisions, [*retained_flags, *incomplete_source_flags]
@@ -1683,11 +1729,14 @@ def _unsafe_incomplete_source_resume_case_ids(
     decisions: list[AdjudicationDecision],
     rebuilt: list[Cue],
     source_cues: list[Cue],
+    *,
+    alignment_unresolved: bool = False,
 ) -> list[str]:
     _, held_decisions, _ = _hold_incomplete_source_insertions(
         spans,
         provider_config,
         source_cue_count=len(source_cues),
+        alignment_unresolved=alignment_unresolved,
     )
     decisions_by_case = {decision.case_id: decision for decision in decisions}
     spans_by_case = {span.case_id: span for span in spans}
