@@ -117,15 +117,19 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
 def test_readme_and_provider_example_document_local_gemini_transcribe():
     readme = Path("README.md").read_text(encoding="utf-8")
     example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
     local_example = yaml.safe_load(Path("providers.gemini-transcribe.local.example.yaml").read_text(encoding="utf-8"))
 
     for expected in (
         "Gemini 3.5 Transcribe",
         "asr.local",
         "blocked outside `--local`",
+        "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=1",
+        "disabled by default",
         "$0.005/min",
     ):
         assert expected in readme
+    assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING=0" in env_example
     for expected in (
         "local:",
         "provider: gemini_transcribe",
