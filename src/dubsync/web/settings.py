@@ -39,6 +39,7 @@ class WebSettings:
     active_job_timeout_hours: float = 24.0
     job_access_code: str | None = None
     require_job_access_code: bool = False
+    enable_gemini_transcribe_web_testing: bool = False
 
     @property
     def max_jobs_per_hour(self) -> int:
@@ -109,6 +110,10 @@ class WebSettings:
             require_job_access_code=_env_bool(
                 "DUBSYNC_REQUIRE_JOB_ACCESS_CODE",
                 os.getenv("RENDER", "").strip().lower() == "true",
+            ),
+            enable_gemini_transcribe_web_testing=_env_bool(
+                "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING",
+                False,
             ),
         )
 

@@ -50,6 +50,8 @@ export interface PublicConfig {
   billing_enabled: boolean
   access_code_required: boolean
   jobs_available: boolean
+  gemini_transcribe_testing_available?: boolean
+  gemini_transcribe_max_audio_seconds?: number
   generation_styles: GenerationStylesConfig
   sync_style_limits: Pick<Record<GenerationStyleValueKey, GenerationStyleLimit>, 'max_lines_per_cue'>
 }
@@ -68,6 +70,7 @@ export interface JobResponse {
   source_name?: string | null
   batch_id?: string | null
   batch_position?: number | null
+  transcription_provider?: 'default' | 'gemini-3.5-transcribe'
   mode: JobMode
   status: JobStatus
   progress: number
@@ -96,6 +99,8 @@ export const defaultConfig: PublicConfig = {
   billing_enabled: false,
   access_code_required: false,
   jobs_available: false,
+  gemini_transcribe_testing_available: false,
+  gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {
     default_preset: 'standard',
     presets: [

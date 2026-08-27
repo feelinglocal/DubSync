@@ -24,6 +24,7 @@ from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..audio import probe_audio_duration
+from ..providers import GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS, GEMINI_TRANSCRIBE_MODEL
 from .batch_uploads import (
     AUDIO_EXTENSIONS,
     MAX_BATCH_ITEMS,
@@ -82,15 +83,17 @@ FRONTEND_ROUTE_METADATA = {
 }
 SITE_ORIGIN = "https://dubsync.onrender.com"
 MAX_BATCH_PARSER_FILES = 21
-MAX_BATCH_PARSER_FIELDS = 5
+MAX_BATCH_PARSER_FIELDS = 6
 MAX_BATCH_FIELD_BYTES = 64 * 1024
 MAX_BATCH_DOWNLOAD_BODY_BYTES = 16 * 1024
 BATCH_ARCHIVE_SPOOL_BYTES = 8 * 1024 * 1024
 ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
-MAX_SINGLE_PARSER_FIELDS = 5
+MAX_SINGLE_PARSER_FIELDS = 6
 MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
 FPS_RESULT_SOURCES = frozenset({"detected", "fallback", "explicit"})
+DEFAULT_TRANSCRIPTION_PROVIDER = "default"
+TRANSCRIPTION_PROVIDER_VALUES = frozenset({DEFAULT_TRANSCRIPTION_PROVIDER, GEMINI_TRANSCRIBE_MODEL})
 
 
 def create_app(
@@ -174,6 +177,8 @@ def create_app(
             "billing_enabled": False,
             "access_code_required": access_code_required,
             "jobs_available": jobs_available,
+            "gemini_transcribe_testing_available": _gemini_transcribe_web_available(resolved_settings),
+            "gemini_transcribe_max_audio_seconds": int(GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS),
             "generation_styles": public_generation_styles(),
             "sync_style_limits": public_sync_style_limits(),
         }
@@ -188,11 +193,16 @@ def create_app(
         language: str,
         style: str,
         sync_max_lines_per_cue: int | None,
+        transcription_provider: str,
     ) -> dict[str, object]:
         normalized_mode = _validate_mode(mode)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
         _validate_options(mode=normalized_mode, fps=fps, language=language)
+        selected_transcription_provider = _validate_transcription_provider(
+            transcription_provider,
+            settings=resolved_settings,
+        )
         resolved_sync_style = _sync_style_for_mode(normalized_mode, sync_max_lines_per_cue)
         source_name = _validate_source_filename(audio)
         audio_extension = _validate_audio(audio)
@@ -264,8 +274,16 @@ def create_app(
                 audio_path=audio_path,
                 settings=resolved_settings,
                 store=service.store,
-                normalization_required=normalization_required,
+                normalization_required=(
+                    normalization_required
+                    or selected_transcription_provider == GEMINI_TRANSCRIBE_MODEL
+                ),
                 audio_duration_probe=audio_duration_probe,
+                max_audio_duration_seconds=(
+                    GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS
+                    if selected_transcription_provider == GEMINI_TRANSCRIBE_MODEL
+                    else None
+                ),
             )
             job = new_job_record(
                 job_id=job_id,
@@ -279,6 +297,7 @@ def create_app(
                 style=resolved_style,
                 retention_hours=resolved_settings.retention_hours,
                 source_name=source_name,
+                transcription_provider=selected_transcription_provider,
             )
             try:
                 service.store.create_many(
@@ -325,6 +344,11 @@ def create_app(
                 language=_batch_text_field(form, "language", default="auto"),
                 style=_batch_text_field(form, "style", default="standard"),
                 sync_max_lines_per_cue=_batch_sync_max_lines_field(form),
+                transcription_provider=_batch_text_field(
+                    form,
+                    "transcription_provider",
+                    default=DEFAULT_TRANSCRIPTION_PROVIDER,
+                ),
             )
         finally:
             await form.close()
@@ -340,6 +364,10 @@ def create_app(
             style = _batch_text_field(form, "style", default="standard")
             sync_max_lines_per_cue = _batch_sync_max_lines_field(form)
             _validate_options(mode=normalized_mode, fps=fps, language=language)
+            selected_transcription_provider = _validate_transcription_provider(
+                _batch_text_field(form, "transcription_provider", default=DEFAULT_TRANSCRIPTION_PROVIDER),
+                settings=resolved_settings,
+            )
             resolved_sync_style = _sync_style_for_mode(normalized_mode, sync_max_lines_per_cue)
 
             audio_uploads = _batch_file_field(form, "audio")
@@ -415,8 +443,16 @@ def create_app(
                         audio_path=audio_path,
                         settings=resolved_settings,
                         store=service.store,
-                        normalization_required=normalization_required,
+                        normalization_required=(
+                            normalization_required
+                            or selected_transcription_provider == GEMINI_TRANSCRIBE_MODEL
+                        ),
                         audio_duration_probe=audio_duration_probe,
+                        max_audio_duration_seconds=(
+                            GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS
+                            if selected_transcription_provider == GEMINI_TRANSCRIBE_MODEL
+                            else None
+                        ),
                     )
                     jobs.append(
                         new_job_record(
@@ -433,6 +469,7 @@ def create_app(
                             source_name=source_name,
                             batch_id=batch_id,
                             batch_position=position,
+                            transcription_provider=selected_transcription_provider,
                         )
                     )
                     tokens.append(token)
@@ -762,7 +799,14 @@ async def _parse_single_form(request: Request) -> FormData:
 
 
 def _validate_single_form_shape(form: FormData) -> None:
-    allowed_fields = {"mode", "fps", "language", "style", "sync_max_lines_per_cue"}
+    allowed_fields = {
+        "mode",
+        "fps",
+        "language",
+        "style",
+        "sync_max_lines_per_cue",
+        "transcription_provider",
+    }
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
         allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
@@ -784,7 +828,14 @@ async def _parse_batch_form(request: Request) -> FormData:
 
 
 def _validate_batch_form_shape(form: FormData) -> None:
-    allowed_fields = {"mode", "fps", "language", "style", "sync_max_lines_per_cue"}
+    allowed_fields = {
+        "mode",
+        "fps",
+        "language",
+        "style",
+        "sync_max_lines_per_cue",
+        "transcription_provider",
+    }
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
         allowed = allowed_files if isinstance(value, StarletteUploadFile) else allowed_fields
@@ -945,6 +996,31 @@ def _validate_options(*, mode: JobMode, fps: float | None, language: str) -> Non
         raise HTTPException(status_code=422, detail="Invalid language code.")
 
 
+def _validate_transcription_provider(value: str, *, settings: WebSettings) -> str:
+    normalized = value.strip().lower() or DEFAULT_TRANSCRIPTION_PROVIDER
+    if normalized not in TRANSCRIPTION_PROVIDER_VALUES:
+        raise HTTPException(status_code=422, detail="Invalid transcription provider.")
+    if normalized == GEMINI_TRANSCRIBE_MODEL and not settings.enable_gemini_transcribe_web_testing:
+        raise HTTPException(
+            status_code=422,
+            detail="Gemini 3.5 Transcribe testing is not enabled for this service.",
+        )
+    if normalized == GEMINI_TRANSCRIBE_MODEL and not _gemini_transcribe_api_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini 3.5 Transcribe testing is not configured.",
+        )
+    return normalized
+
+
+def _gemini_transcribe_web_available(settings: WebSettings) -> bool:
+    return settings.enable_gemini_transcribe_web_testing and _gemini_transcribe_api_configured()
+
+
+def _gemini_transcribe_api_configured() -> bool:
+    return bool(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip())
+
+
 async def _save_upload(upload: UploadFile | StarletteUploadFile, destination: Path, limit: int) -> int:
     size = 0
     try:
@@ -977,6 +1053,7 @@ def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object
         "source_name": job.source_name,
         "batch_id": job.batch_id,
         "batch_position": job.batch_position,
+        "transcription_provider": job.transcription_provider,
         "result": None,
         "downloads": [],
     }

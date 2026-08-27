@@ -30,9 +30,13 @@ async def reserve_processing_storage(
     store: JobStore,
     normalization_required: bool,
     audio_duration_probe: Callable[..., float],
+    max_audio_duration_seconds: float | None = None,
 ) -> None:
     additional_bytes = settings.max_job_work_bytes
     if normalization_required:
+        duration_limit = settings.max_audio_duration_seconds
+        if max_audio_duration_seconds is not None:
+            duration_limit = min(duration_limit, max_audio_duration_seconds)
         try:
             duration = await asyncio.to_thread(
                 audio_duration_probe,
@@ -41,12 +45,12 @@ async def reserve_processing_storage(
             )
         except (AudioNormalizeError, OSError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="Audio duration could not be verified.") from exc
-        if duration > settings.max_audio_duration_seconds:
+        if duration > duration_limit:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     "Audio is too long. "
-                    f"Use audio no longer than {settings.max_audio_duration_seconds:g} seconds."
+                    f"Use audio no longer than {duration_limit:g} seconds."
                 ),
             )
         predicted_bytes = predicted_normalized_audio_bytes(duration)

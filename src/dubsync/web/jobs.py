@@ -14,6 +14,7 @@ from typing import Callable, Literal
 
 from dubsync.audio import AudioNormalizationLimits, tree_size_bytes
 from dubsync.pipeline import sync_episode
+from dubsync.providers import GEMINI_TRANSCRIBE_MODEL
 from dubsync.srt_io import parse_srt_text
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import derive_style_profile
@@ -67,6 +68,7 @@ class JobRecord:
     cost_usd: float | None = None
     cue_count: int | None = None
     error: str | None = None
+    transcription_provider: str = "default"
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,9 @@ class JobStore:
                     changes_srt TEXT,
                     cost_usd REAL,
                     cue_count INTEGER,
-                    error TEXT
+                    error TEXT,
+                    transcription_provider TEXT NOT NULL DEFAULT 'default'
+                        CHECK(transcription_provider IN ('default', 'gemini-3.5-transcribe'))
                 )
                 """
             )
@@ -138,6 +142,11 @@ class JobStore:
                 ("source_name", "TEXT"),
                 ("batch_id", "TEXT"),
                 ("batch_position", "INTEGER"),
+                (
+                    "transcription_provider",
+                    "TEXT NOT NULL DEFAULT 'default' "
+                    "CHECK(transcription_provider IN ('default', 'gemini-3.5-transcribe'))",
+                ),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}")
@@ -277,8 +286,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, token_hash, mode, status, progress, created_at, updated_at, expires_at,
                     directory, audio_path, srt_path, fps, language, style,
-                    source_name, batch_id, batch_position
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_name, batch_id, batch_position, transcription_provider
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -299,6 +308,7 @@ class JobStore:
                         job.source_name,
                         job.batch_id,
                         job.batch_position,
+                        job.transcription_provider,
                     )
                     for job in jobs
                 ],
@@ -640,6 +650,12 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     output_path = job.directory / output_name
     workdir = job.directory / "work"
     language = None if job.language == "auto" else job.language
+    uses_gemini_transcribe = job.transcription_provider == GEMINI_TRANSCRIBE_MODEL
+    if uses_gemini_transcribe and not settings.enable_gemini_transcribe_web_testing:
+        raise ValueError("Gemini 3.5 Transcribe web testing is not enabled")
+    allow_gemini_transcribe_web = (
+        uses_gemini_transcribe and settings.enable_gemini_transcribe_web_testing
+    )
     audio_limits = AudioNormalizationLimits(
         max_duration_seconds=settings.max_audio_duration_seconds,
         probe_timeout_seconds=settings.ffprobe_timeout_seconds,
@@ -656,6 +672,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "providers_path": settings.providers_path,
             "fps": job.fps,
             "language": language,
+            "transcription_provider": job.transcription_provider,
+            "allow_gemini_transcribe_web": allow_gemini_transcribe_web,
             "audio_limits": audio_limits,
         }
         sync_style = parse_sync_style_request(job.style)
@@ -684,6 +702,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "providers_path": settings.providers_path,
             "fps": job.fps,
             "language": language,
+            "transcription_provider": job.transcription_provider,
+            "allow_gemini_transcribe_web": allow_gemini_transcribe_web,
             "audio_limits": audio_limits,
         }
         if job.style.strip().lower() != "standard":
@@ -757,6 +777,7 @@ def new_job_record(
     source_name: str | None = None,
     batch_id: str | None = None,
     batch_position: int | None = None,
+    transcription_provider: str = "default",
 ) -> JobRecord:
     now = datetime.now(UTC)
     return JobRecord(
@@ -777,6 +798,7 @@ def new_job_record(
         source_name=source_name,
         batch_id=batch_id,
         batch_position=batch_position,
+        transcription_provider=transcription_provider,
     )
 
 
@@ -806,6 +828,7 @@ def _record(row: sqlite3.Row) -> JobRecord:
         cost_usd=row["cost_usd"],
         cue_count=row["cue_count"],
         error=row["error"],
+        transcription_provider=row["transcription_provider"] or "default",
     )
 
 

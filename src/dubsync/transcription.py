@@ -11,7 +11,13 @@ from .cue_segmentation import group_words_for_cues
 from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_adapter_from_config
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
-from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language, apply_local_asr_config
+from .providers import (
+    CachedASRAdapter,
+    adapter_from_config,
+    apply_asr_language,
+    apply_local_asr_config,
+    apply_transcription_provider_config,
+)
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .reports import write_qc_report
@@ -60,6 +66,8 @@ def generate_srt_from_audio(
     fps: float | None = None,
     local: bool = False,
     language: str | None = None,
+    transcription_provider: str = "default",
+    allow_gemini_transcribe_web: bool = False,
     style_profile: StyleProfile | None = None,
     generation_constraints: GenerationConstraints | None = None,
     audio_limits: AudioNormalizationLimits | None = None,
@@ -70,7 +78,11 @@ def generate_srt_from_audio(
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
 
-    provider_config = apply_asr_language(_provider_config(load_yaml(providers_path), local=local), language)
+    provider_config = apply_transcription_provider_config(
+        _provider_config(load_yaml(providers_path), local=local),
+        transcription_provider,
+    )
+    provider_config = apply_asr_language(provider_config, language)
     if local:
         no_llm = True
     asr_config = provider_config.get("asr", {})
@@ -89,7 +101,11 @@ def generate_srt_from_audio(
     model = str(asr_config.get("model_id", asr_config.get("model", provider)))
     cost_meter = CostMeter()
     adapter = CachedASRAdapter(
-        adapter_from_config(provider_config, local_mode=local),
+        adapter_from_config(
+            provider_config,
+            local_mode=local,
+            allow_gemini_transcribe_web=allow_gemini_transcribe_web,
+        ),
         JsonDiskCache(episode_workdir / "asr-cache"),
         model,
         asr_config,

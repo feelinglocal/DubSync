@@ -39,6 +39,7 @@ from .providers import (
     adapter_from_config,
     apply_asr_language,
     apply_local_asr_config,
+    apply_transcription_provider_config,
     repair_word_stream,
 )
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
@@ -104,6 +105,8 @@ def sync_episode(
     resume: str | None = None,
     local: bool = False,
     language: str | None = None,
+    transcription_provider: str = "default",
+    allow_gemini_transcribe_web: bool = False,
     audio_limits: AudioNormalizationLimits | None = None,
     style_profile: StyleProfile | None = None,
 ) -> PipelineResult:
@@ -141,7 +144,11 @@ def sync_episode(
         _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues]})
         _write_json(style_artifact_path, profile.model_dump())
 
-    provider_config = apply_asr_language(_apply_local_mode(load_yaml(providers_path), local), language)
+    provider_config = apply_transcription_provider_config(
+        _apply_local_mode(load_yaml(providers_path), local),
+        transcription_provider,
+    )
+    provider_config = apply_asr_language(provider_config, language)
     if local:
         no_llm = True
     audio_for_asr = audio_path
@@ -157,7 +164,11 @@ def sync_episode(
                 episode_workdir / "audio.16k.wav",
                 limits=audio_limits,
             )
-        raw_adapter = adapter_from_config(provider_config, local_mode=local)
+        raw_adapter = adapter_from_config(
+            provider_config,
+            local_mode=local,
+            allow_gemini_transcribe_web=allow_gemini_transcribe_web,
+        )
         if isinstance(asr_config, dict):
             asr_provider = str(asr_config.get("provider", "fixture"))
             model_name = str(asr_config.get("model_id", asr_config.get("model", asr_provider)))

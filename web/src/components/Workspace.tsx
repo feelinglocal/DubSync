@@ -26,6 +26,7 @@ interface DownloadState {
 
 export function Workspace({ config }: { config: PublicConfig }) {
   const batchNamingHelpId = useId()
+  const geminiToggleId = useId()
   const [accesses, setAccesses] = useState<ActiveJobAccess[]>(readActiveJobs)
   const initialAccesses = useRef(accesses)
   const initiallyRestoringIds = useRef(new Set(accesses.map((access) => access.id)))
@@ -40,6 +41,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [stylePreset, setStylePreset] = useState(config.generation_styles.default_preset)
   const [customStyle, setCustomStyle] = useState<GenerationStyleDraft>(DEFAULT_STYLE_DRAFT)
   const [styleSample, setStyleSample] = useState<File | null>(null)
+  const [useGeminiTranscribe, setUseGeminiTranscribe] = useState(false)
   const [accessCode, setAccessCode] = useState('')
   const [jobs, setJobs] = useState<JobResponse[]>([])
   const [pollRevision, setPollRevision] = useState(0)
@@ -204,6 +206,9 @@ export function Workspace({ config }: { config: PublicConfig }) {
     }
     if (fps !== 'auto') body.set('fps', fps)
     body.set('language', language)
+    if (useGeminiTranscribe && config.gemini_transcribe_testing_available) {
+      body.set('transcription_provider', 'gemini-3.5-transcribe')
+    }
     if (mode === 'generate') {
       const style = styleSource === 'preset'
         ? { source: 'preset', preset: stylePreset }
@@ -318,6 +323,23 @@ export function Workspace({ config }: { config: PublicConfig }) {
               <label><span className="field-label">Maximum lines per cue</span><span className="select-control"><select value={syncMaxLines} onChange={(event) => setSyncMaxLines(event.target.value)}><option value="source">Keep source style (default)</option>{syncLineOptions(config).map((value) => <option key={value} value={value}>{value} {value === 1 ? 'line' : 'lines'}</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
             )}
             <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="pt">Portuguese</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
+            {config.gemini_transcribe_testing_available && (
+              <div className="testing-toggle">
+                <span className="field-label">Transcription model</span>
+                <label className="checkbox-control" htmlFor={geminiToggleId}>
+                  <input
+                    id={geminiToggleId}
+                    type="checkbox"
+                    checked={useGeminiTranscribe}
+                    onChange={(event) => setUseGeminiTranscribe(event.target.checked)}
+                  />
+                  <span>Use Gemini 3.5 Transcribe (testing)</span>
+                </label>
+                <span className="field-note">
+                  Testing only. Maximum {Math.floor((config.gemini_transcribe_max_audio_seconds ?? 1800) / 60)} minutes per audio file.
+                </span>
+              </div>
+            )}
             {config.access_code_required && config.jobs_available && (
               <label><span className="field-label">Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
             )}

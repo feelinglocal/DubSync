@@ -19,6 +19,7 @@ from .models import QCFlag, Word
 
 logger = logging.getLogger(__name__)
 GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS = 30 * 60.0
+GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 
 
 class ProviderError(RuntimeError):
@@ -242,7 +243,7 @@ class GeminiTranscribeAdapter:  # pragma: no cover - live provider path
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gemini-3.5-transcribe",
+        model: str = GEMINI_TRANSCRIBE_MODEL,
         language_codes: list[str] | None = None,
         custom_vocabulary: list[str] | None = None,
         diarize: bool = True,
@@ -259,16 +260,16 @@ class GeminiTranscribeAdapter:  # pragma: no cover - live provider path
         self.store = bool(store)
         self.max_audio_seconds = _gemini_max_audio_seconds(max_audio_seconds)
         self.usage_events: list[object] = []
-        if self.model != "gemini-3.5-transcribe":
+        if self.model != GEMINI_TRANSCRIBE_MODEL:
             raise ProviderError(
-                "Gemini Transcribe local tests require model: gemini-3.5-transcribe."
+                "Gemini Transcribe testing requires model: gemini-3.5-transcribe."
             )
         if not self.word_timestamps:
             raise ProviderError(
                 "Gemini Transcribe requires asr.word_timestamps: true for DubSync's timing contract."
             )
         if self.store:
-            raise ProviderError("Gemini Transcribe local tests require asr.store: false.")
+            raise ProviderError("Gemini Transcribe testing requires asr.store: false.")
         if len(self.custom_vocabulary) > 1000:
             raise ProviderError("Gemini Transcribe custom vocabulary supports at most 1000 terms.")
 
@@ -423,7 +424,12 @@ class WhisperXAdapter:
         return whisperx.assign_word_speakers(diarize_segments, result)
 
 
-def adapter_from_config(config: dict[str, object], *, local_mode: bool = False) -> ASRAdapter:
+def adapter_from_config(
+    config: dict[str, object],
+    *,
+    local_mode: bool = False,
+    allow_gemini_transcribe_web: bool = False,
+) -> ASRAdapter:
     asr_config = config.get("asr", {}) if isinstance(config, dict) else {}
     if not isinstance(asr_config, dict):
         raise ProviderError("providers.yaml asr section must be a mapping")
@@ -451,11 +457,11 @@ def adapter_from_config(config: dict[str, object], *, local_mode: bool = False) 
             speaker_labels=bool(asr_config.get("speaker_labels", True)),
         )
     if _is_gemini_transcribe_provider(provider):
-        if not local_mode:
-            raise ProviderError("Gemini 3.5 Transcribe ASR is only available in --local test mode.")
+        if not local_mode and not allow_gemini_transcribe_web:
+            raise ProviderError("Gemini 3.5 Transcribe ASR is only available in --local test mode or the web testing flow.")
         return GeminiTranscribeAdapter(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
-            model=str(asr_config.get("model", "gemini-3.5-transcribe")),
+            model=str(asr_config.get("model", GEMINI_TRANSCRIBE_MODEL)),
             language_codes=_asr_language_codes(asr_config),
             custom_vocabulary=_gemini_custom_vocabulary(asr_config),
             diarize=bool(asr_config.get("diarize", True)),
@@ -494,6 +500,33 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
         asr_config["language_codes"] = [normalized]
     else:
         asr_config["language_code"] = normalized
+    next_config["asr"] = asr_config
+    return next_config
+
+
+def apply_transcription_provider_config(config: dict[str, object], provider: str) -> dict[str, object]:
+    normalized = provider.strip().lower()
+    if normalized in {"", "default"}:
+        return dict(config)
+    if normalized != GEMINI_TRANSCRIBE_MODEL:
+        raise ProviderError("Invalid transcription provider.")
+    next_config = dict(config)
+    existing = next_config.get("asr", {})
+    existing_asr = existing if isinstance(existing, dict) else {}
+    preserved_vocabulary = {
+        key: value
+        for key, value in existing_asr.items()
+        if key in {"character_names", "custom_vocabulary", "keyterms"}
+    }
+    asr_config = {
+        **preserved_vocabulary,
+        "provider": "gemini_transcribe",
+        "model": GEMINI_TRANSCRIBE_MODEL,
+        "diarize": True,
+        "word_timestamps": True,
+        "store": False,
+        "max_audio_seconds": GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
+    }
     next_config["asr"] = asr_config
     return next_config
 
