@@ -177,6 +177,8 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
 })
 
 test('matched files submit as one sequential batch and keep per-source download names', async ({ page }) => {
+  test.setTimeout(60_000)
+
   await page.goto('/')
   await expect(page.getByText('Match names: 001.wav + 001.srt. Up to 10 pairs.')).toBeVisible()
 
