@@ -1098,6 +1098,54 @@ def test_default_processor_forwards_gemini_asr_on_the_production_sync_path(tmp_p
     assert calls.get("no_llm", False) is False
 
 
+def test_default_processor_forwards_gemini_asr_on_the_production_generate_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    settings = replace(_settings(tmp_path), enable_gemini_transcribe_web_testing=True)
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-gemini-generate-path"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    job = new_job_record(
+        job_id="gemini-generate-path",
+        token_hash=hash_job_token("token"),
+        mode="generate",
+        directory=directory,
+        audio_path=audio,
+        srt_path=None,
+        fps=30,
+        language="pt",
+        style="standard",
+        retention_hours=24,
+        transcription_provider="gemini-3.5-transcribe",
+    )
+    calls = {}
+
+    def fake_generate(_audio, output, _workdir, **kwargs):
+        calls.update(kwargs)
+        output.write_text("1\n00:00:00,000 --> 00:00:00,500\nPronto.\n", encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output,
+            episode_workdir=artifacts,
+            report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.01),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.generate_srt_from_audio", fake_generate)
+
+    default_processor(job, settings)
+
+    assert calls["transcription_provider"] == "gemini-3.5-transcribe"
+    assert calls["allow_gemini_transcribe_web"] is True
+    assert calls["language"] == "pt"
+    assert calls.get("local", False) is False
+    assert calls.get("no_llm", False) is False
+
+
 def test_default_processor_rejects_persisted_gemini_selection_when_web_testing_is_disabled(
     tmp_path,
     monkeypatch,

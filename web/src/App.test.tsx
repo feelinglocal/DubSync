@@ -192,6 +192,30 @@ describe('DubSync workspace', () => {
     expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
   })
 
+  it('keeps the Gemini 3.5 Transcribe toggle available for audio-to-SRT generation', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'gemini-generate-job', token: 'gemini-generate-token', mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('mode')).toBe('generate')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('gemini-3.5-transcribe')
+  })
+
   it('sends the Gemini 3.5 Transcribe provider when selected for a sync batch', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
