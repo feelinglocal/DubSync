@@ -4,6 +4,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from statistics import median
+from typing import Literal
 
 from rapidfuzz import fuzz
 
@@ -28,6 +29,7 @@ from .models import (
     TokenMatch,
     Word,
 )
+from .subtitle_annotations import cue_has_bracketed_screen_text
 from .tokenize import SRTToken, normalized_words, tokenize_cues
 
 MATCH_THRESHOLD = 0.85
@@ -38,6 +40,7 @@ NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
+MISSING_AUDIO_GUARD_VERSION = 2
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 
 @dataclass(frozen=True)
@@ -620,8 +623,17 @@ def _build_anchor_regions(
 def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     tokens = tokenize_cues(cues)
     words_norm = normalized_words(words)
+    excluded_screen_text_cue_ids = [
+        cue.index for cue in cues if cue_has_bracketed_screen_text(cue)
+    ]
     if not tokens:
-        return AlignmentResult()
+        return AlignmentResult(
+            diagnostics=AlignmentDiagnostics(
+                excluded_screen_text_cue_ids=excluded_screen_text_cue_ids,
+                missing_audio_guard_version=MISSING_AUDIO_GUARD_VERSION,
+            )
+        )
+    tokenized_cue_ids = {token.cue_id for token in tokens}
 
     preliminary_run = _align_tokens_detailed(tokens, words_norm)
     ops = preliminary_run.ops
@@ -652,28 +664,49 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
             band_limited = band_limited or prior_run.band_limited
             unresolved = unresolved or prior_run.unresolved
-    matches: list[TokenMatch] = []
-    cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
+    if not unresolved:
+        ops = _prefer_unique_full_cue_windows(ops, tokens, words_norm)
+    provisional_matches = _token_matches_from_ops(ops, tokens)
+    flags = _alignment_outlier_flags(provisional_matches, cues, tokens, words)
+    rejected_outlier_cue_ids = _rejectable_outlier_cue_ids(flags)
+    if rejected_outlier_cue_ids:
+        ops = _without_cue_matches(ops, tokens, rejected_outlier_cue_ids)
 
-    for op in ops:
-        if op.kind != "match" or op.srt_index is None or op.asr_index is None:
-            continue
-        token = tokens[op.srt_index]
-        matches.append(
-            TokenMatch(
-                cue_id=token.cue_id,
-                srt_token_index=op.srt_index,
-                asr_word_index=op.asr_index,
-                score=round(op.score, 4),
-            )
-        )
-        cue_word_indices.setdefault(token.cue_id, []).append(op.asr_index)
+    matches = _token_matches_from_ops(ops, tokens)
+    cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
+    for match in matches:
+        cue_word_indices.setdefault(match.cue_id, []).append(match.asr_word_index)
 
     divergence_spans = _build_divergences(ops, tokens, words)
     anchor_regions = _build_anchor_regions(ops, tokens, words)
-    unmatched_cue_ids = [cue.index for cue in cues if not cue_word_indices.get(cue.index)]
+    unmatched_cue_ids = [
+        cue.index
+        for cue in cues
+        if cue.index in tokenized_cue_ids and not cue_word_indices.get(cue.index)
+    ]
     anchor_coverage = len(matches) / len(tokens)
-    flags = _alignment_outlier_flags(matches, cues, tokens, words)
+    missing_audio_cue_ids = sorted(
+        rejected_outlier_cue_ids
+        | _source_only_unmatched_cue_ids(unmatched_cue_ids, divergence_spans)
+        | _source_only_zero_window_cue_ids(divergence_spans)
+    )
+    cue_by_id = {cue.index: cue for cue in cues}
+    for cue_id in missing_audio_cue_ids:
+        cue = cue_by_id.get(cue_id)
+        flags.append(
+            QCFlag(
+                kind="missing_audio_timing_held",
+                cue_ids=[cue_id],
+                message=(
+                    "No trustworthy local speech evidence was available for this source cue; "
+                    "its source text and timing are locked instead of borrowing another passage."
+                ),
+                severity="error",
+                old_text=cue.text if cue is not None else None,
+                start=cue.start_ms / 1000.0 if cue is not None else None,
+                end=cue.end_ms / 1000.0 if cue is not None else None,
+            )
+        )
     if band_limited:
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
@@ -729,8 +762,255 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             unbanded_fallback=unbanded_fallback,
             band_limited=band_limited,
             unresolved=unresolved,
+            excluded_screen_text_cue_ids=excluded_screen_text_cue_ids,
+            missing_audio_cue_ids=missing_audio_cue_ids,
+            missing_audio_guard_version=MISSING_AUDIO_GUARD_VERSION,
         ),
     )
+
+
+def _token_matches_from_ops(
+    ops: list[_Op],
+    tokens: list[SRTToken],
+) -> list[TokenMatch]:
+    return [
+        TokenMatch(
+            cue_id=tokens[op.srt_index].cue_id,
+            srt_token_index=op.srt_index,
+            asr_word_index=op.asr_index,
+            score=round(op.score, 4),
+        )
+        for op in ops
+        if op.kind == "match"
+        and op.srt_index is not None
+        and op.asr_index is not None
+    ]
+
+
+def _rejectable_outlier_cue_ids(
+    flags: list[QCFlag],
+) -> set[int]:
+    """Reject only timing failures strong enough to fail closed."""
+
+    return {
+        cue_id
+        for flag in flags
+        if flag.severity == "error"
+        and flag.kind in {"alignment_outlier", "alignment_model_unavailable"}
+        for cue_id in flag.cue_ids
+    }
+
+
+def _without_cue_matches(
+    ops: list[_Op],
+    tokens: list[SRTToken],
+    cue_ids: set[int],
+) -> list[_Op]:
+    filtered: list[_Op] = []
+    for op in ops:
+        if (
+            op.kind == "match"
+            and op.srt_index is not None
+            and op.asr_index is not None
+            and tokens[op.srt_index].cue_id in cue_ids
+        ):
+            filtered.extend(
+                [
+                    _Op("delete", op.srt_index, None, 0.0),
+                    _Op("insert", None, op.asr_index, 0.0),
+                ]
+            )
+            continue
+        filtered.append(op)
+    return filtered
+
+
+def _source_only_unmatched_cue_ids(
+    unmatched_cue_ids: list[int],
+    spans: list[DivergenceSpan],
+) -> set[int]:
+    locked: set[int] = set()
+    for cue_id in unmatched_cue_ids:
+        relevant = [span for span in spans if cue_id in span.cue_ids]
+        if relevant and all(
+            not span.asr_word_indices and not span.asr_text.strip()
+            for span in relevant
+        ):
+            locked.add(cue_id)
+    return locked
+
+
+def _source_only_zero_window_cue_ids(spans: list[DivergenceSpan]) -> set[int]:
+    locked: set[int] = set()
+    for span in spans:
+        has_valid_window = (
+            span.start is not None
+            and span.end is not None
+            and math.isfinite(span.start)
+            and math.isfinite(span.end)
+            and span.end > span.start
+        )
+        if (
+            span.cue_ids
+            and span.srt_text.strip()
+            and not span.asr_word_indices
+            and not span.asr_text.strip()
+            and not has_valid_window
+        ):
+            locked.update(span.cue_ids)
+    return locked
+
+
+def _prefer_unique_full_cue_windows(
+    ops: list[_Op],
+    tokens: list[SRTToken],
+    words_norm: list[str],
+) -> list[_Op]:
+    """Repair repeated-token theft when a later cue has a provable full window."""
+
+    if not tokens or not words_norm:
+        return ops
+
+    exact_pairs = _unique_full_cue_exact_pairs(tokens, words_norm)
+    if not exact_pairs:
+        return ops
+
+    matched_pairs = {
+        (op.srt_index, op.asr_index)
+        for op in ops
+        if op.kind == "match"
+        and op.srt_index is not None
+        and op.asr_index is not None
+    }
+    desired_pairs = _monotonic_exact_pair_map(matched_pairs, exact_pairs)
+    if desired_pairs == matched_pairs:
+        return ops
+    return _ops_from_exact_pairs(len(tokens), len(words_norm), desired_pairs)
+
+
+def _unique_full_cue_exact_pairs(
+    tokens: list[SRTToken],
+    words_norm: list[str],
+) -> set[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for token_indices in _token_indices_by_cue(tokens).values():
+        target = [tokens[index].normalized for index in token_indices]
+        if len(target) < 2:
+            continue
+        windows = _exact_sequence_windows(words_norm, target, limit=2)
+        if len(windows) != 1:
+            continue
+        start = windows[0]
+        pairs.update(
+            (token_index, start + offset)
+            for offset, token_index in enumerate(token_indices)
+        )
+    return pairs
+
+
+def _token_indices_by_cue(tokens: list[SRTToken]) -> dict[int, list[int]]:
+    by_cue: dict[int, list[int]] = {}
+    for token_index, token in enumerate(tokens):
+        by_cue.setdefault(token.cue_id, []).append(token_index)
+    return by_cue
+
+
+def _exact_sequence_windows(
+    haystack: list[str],
+    needle: list[str],
+    *,
+    limit: int,
+) -> list[int]:
+    if not needle or len(needle) > len(haystack):
+        return []
+    windows: list[int] = []
+    for start in range(0, len(haystack) - len(needle) + 1):
+        if haystack[start : start + len(needle)] != needle:
+            continue
+        windows.append(start)
+        if len(windows) >= limit:
+            return windows
+    return windows
+
+
+def _monotonic_exact_pair_map(
+    matched_pairs: set[tuple[int | None, int | None]],
+    preferred_pairs: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    preferred = sorted(preferred_pairs)
+    if any(
+        left_srt >= right_srt or left_word >= right_word
+        for (left_srt, left_word), (right_srt, right_word) in zip(
+            preferred,
+            preferred[1:],
+        )
+    ):
+        return {
+            (srt_index, asr_index)
+            for srt_index, asr_index in matched_pairs
+            if srt_index is not None and asr_index is not None
+        }
+
+    selected = set(preferred)
+    used_srt = {srt_index for srt_index, _ in selected}
+    used_words = {word_index for _, word_index in selected}
+    existing_pairs = sorted(
+        (srt_index, asr_index)
+        for srt_index, asr_index in matched_pairs
+        if srt_index is not None and asr_index is not None
+    )
+    for srt_index, word_index in existing_pairs:
+        if (srt_index, word_index) in selected:
+            continue
+        if srt_index in used_srt or word_index in used_words:
+            continue
+        previous_words = [
+            preferred_word
+            for preferred_srt, preferred_word in preferred
+            if preferred_srt < srt_index
+        ]
+        next_words = [
+            preferred_word
+            for preferred_srt, preferred_word in preferred
+            if preferred_srt > srt_index
+        ]
+        if previous_words and word_index <= previous_words[-1]:
+            continue
+        if next_words and word_index >= next_words[0]:
+            continue
+        selected.add((srt_index, word_index))
+        used_srt.add(srt_index)
+        used_words.add(word_index)
+    return selected
+
+
+def _ops_from_exact_pairs(
+    token_count: int,
+    word_count: int,
+    pairs: set[tuple[int, int]],
+) -> list[_Op]:
+    ops: list[_Op] = []
+    token_cursor = 0
+    word_cursor = 0
+    for token_index, word_index in sorted(pairs):
+        if token_index < token_cursor or word_index < word_cursor:
+            continue
+        while token_cursor < token_index:
+            ops.append(_Op("delete", token_cursor, None, 0.0))
+            token_cursor += 1
+        while word_cursor < word_index:
+            ops.append(_Op("insert", None, word_cursor, 0.0))
+            word_cursor += 1
+        ops.append(_Op("match", token_index, word_index, 1.0))
+        token_cursor = token_index + 1
+        word_cursor = word_index + 1
+    while token_cursor < token_count:
+        ops.append(_Op("delete", token_cursor, None, 0.0))
+        token_cursor += 1
+    while word_cursor < word_count:
+        ops.append(_Op("insert", None, word_cursor, 0.0))
+        word_cursor += 1
+    return ops
 
 
 def _alignment_outlier_flags(
@@ -740,16 +1020,33 @@ def _alignment_outlier_flags(
     words: list[Word],
 ) -> list[QCFlag]:
     cue_by_id = {cue.index: cue for cue in cues}
-    observations: list[tuple[TokenMatch, Cue, Word, float, float]] = []
+    matches_by_cue: dict[int, list[TokenMatch]] = {}
     for match in matches:
-        cue = cue_by_id.get(match.cue_id)
+        matches_by_cue.setdefault(match.cue_id, []).append(match)
+
+    observations: list[tuple[list[TokenMatch], Cue, Word, float, float]] = []
+    for cue_id, cue_matches in matches_by_cue.items():
+        cue = cue_by_id.get(cue_id)
         if cue is None:
             continue
-        word = words[match.asr_word_index]
+        matched_words = [words[match.asr_word_index] for match in cue_matches]
+        word_centers = [(word.start + word.end) / 2.0 for word in matched_words]
+        word_center = median(word_centers)
+        representative_index = min(
+            range(len(matched_words)),
+            key=lambda index: abs(word_centers[index] - word_center),
+        )
         cue_center = (cue.start_ms + cue.end_ms) / 2000.0
-        word_center = (word.start + word.end) / 2.0
-        observations.append((match, cue, word, cue_center, word_center))
-    if len(observations) < 3:
+        observations.append(
+            (
+                cue_matches,
+                cue,
+                matched_words[representative_index],
+                cue_center,
+                word_center,
+            )
+        )
+    if len(observations) < 2:
         return []
     observations = sorted(observations, key=lambda item: item[3])
 
@@ -757,12 +1054,44 @@ def _alignment_outlier_flags(
         [(cue_center, word_center) for _, _, _, cue_center, word_center in observations]
     )
     if transform is None:
+        threshold_seconds = _alignment_outlier_threshold_seconds(cues)
+        if len(observations) == 2:
+            offsets = [
+                word_center - cue_center
+                for _, _, _, cue_center, word_center in observations
+            ]
+            locally_anchored = [
+                index
+                for index, offset in enumerate(offsets)
+                if abs(offset) <= 3.0
+            ]
+            if len(locally_anchored) == 1:
+                anchor_index = locally_anchored[0]
+                suspect_index = 1 - anchor_index
+                residual = offsets[suspect_index] - offsets[anchor_index]
+                cue_matches, cue, word, _, _ = observations[suspect_index]
+                suspect_token_count = sum(
+                    1 for token in tokens if token.cue_id == cue.index
+                )
+                if abs(residual) > threshold_seconds and suspect_token_count <= 2:
+                    return [
+                        _alignment_outlier_flag(
+                            residual,
+                            cue_matches,
+                            cue,
+                            word,
+                            tokens,
+                            severity="error",
+                        )
+                    ]
+                if abs(residual) <= threshold_seconds:
+                    return []
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
         return [
             QCFlag(
                 kind="alignment_model_unavailable",
-                cue_ids=sorted({match.cue_id for match, *_rest in observations}),
+                cue_ids=sorted(cue.index for _, cue, *_rest in observations),
                 message=(
                     "Matched anchors could not produce a stable episode timing model; "
                     "review alignment order and timing before accepting this artifact."
@@ -774,37 +1103,55 @@ def _alignment_outlier_flags(
         ]
 
     threshold_seconds = _alignment_outlier_threshold_seconds(cues)
-    outlier_by_cue: dict[int, tuple[float, TokenMatch, Cue, Word]] = {}
-    for match, cue, word, cue_center, word_center in observations:
+    outlier_by_cue: dict[int, tuple[float, list[TokenMatch], Cue, Word]] = {}
+    for cue_matches, cue, word, cue_center, word_center in observations:
         expected_word_center = transform.rate * cue_center + transform.offset_seconds
         residual = word_center - expected_word_center
         if abs(residual) <= threshold_seconds:
             continue
-        current = outlier_by_cue.get(match.cue_id)
+        current = outlier_by_cue.get(cue.index)
         if current is None or abs(residual) > abs(current[0]):
-            outlier_by_cue[match.cue_id] = (residual, match, cue, word)
+            outlier_by_cue[cue.index] = (residual, cue_matches, cue, word)
 
-    flags: list[QCFlag] = []
-    for residual, match, cue, word in outlier_by_cue.values():
-        token_text = tokens[match.srt_token_index].text
-        flags.append(
-            QCFlag(
-                kind="alignment_outlier",
-                cue_ids=[match.cue_id],
-                message=(
-                    f"Matched token '{token_text}' is {abs(residual):.1f}s from the "
-                    "episode timing model; "
-                    "hold this alignment for review."
-                ),
-                severity="warning",
-                confidence=round(match.score, 4),
-                old_text=cue.text,
-                new_text=word.text,
-                start=cue.start_ms / 1000.0,
-                end=cue.end_ms / 1000.0,
-            )
+    hard_reject_seconds = max(3.0, threshold_seconds)
+    return [
+        _alignment_outlier_flag(
+            residual,
+            cue_matches,
+            cue,
+            word,
+            tokens,
+            severity="error" if abs(residual) > hard_reject_seconds else "warning",
         )
-    return flags
+        for residual, cue_matches, cue, word in outlier_by_cue.values()
+    ]
+
+
+def _alignment_outlier_flag(
+    residual: float,
+    cue_matches: list[TokenMatch],
+    cue: Cue,
+    word: Word,
+    tokens: list[SRTToken],
+    *,
+    severity: Literal["warning", "error"],
+) -> QCFlag:
+    representative_match = cue_matches[0]
+    token_text = tokens[representative_match.srt_token_index].text
+    return QCFlag(
+        kind="alignment_outlier",
+        cue_ids=[cue.index],
+        message=(
+            f"Matched cue near token '{token_text}' is {abs(residual):.1f}s from "
+            "the episode timing model; weak timing evidence is held for review."
+        ),
+        severity=severity,
+        confidence=round(min(match.score for match in cue_matches), 4),
+        old_text=cue.text,
+        new_text=word.text,
+        start=cue.start_ms / 1000.0,
+        end=cue.end_ms / 1000.0,
+    )
 
 
 def _alignment_outlier_threshold_seconds(cues: list[Cue]) -> float:

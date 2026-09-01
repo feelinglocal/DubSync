@@ -111,3 +111,89 @@ def test_extract_audio_snippets_rejects_an_insufficient_work_budget_before_ffmpe
 
     assert calls == []
     assert list((tmp_path / "snippets").glob("*")) == []
+
+
+def test_extract_audio_snippets_can_stop_at_budget_for_optional_pipeline_snippets(
+    tmp_path,
+    monkeypatch,
+):
+    audio_path = tmp_path / "episode.wav"
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    output_dir = tmp_path / "snippets"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        del check, capture_output, text, timeout
+        calls.append([str(part) for part in cmd])
+        cmd[-1].write_bytes(b"RIFFsnippetWAVEfmt ")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr("dubsync.audio_snippets.subprocess.run", fake_run)
+
+    snippets = extract_audio_snippets(
+        audio_path,
+        [
+            DivergenceSpan(
+                case_id="case-1",
+                cue_ids=[1],
+                srt_text="old line",
+                asr_text="new line",
+                start=1.0,
+                end=2.0,
+            ),
+            DivergenceSpan(
+                case_id="case-2",
+                cue_ids=[2],
+                srt_text="old line",
+                asr_text="new line",
+                start=10.0,
+                end=30.0,
+            ),
+        ],
+        output_dir,
+        max_total_bytes=256 * 1024,
+        fail_on_budget_exceeded=False,
+    )
+
+    assert [snippet.case_id for snippet in snippets] == ["case-1"]
+    assert len(calls) == 1
+    assert [path.name for path in output_dir.glob("*.wav")] == ["case-1.wav"]
+
+
+def test_extract_audio_snippets_can_cap_optional_snippet_count(
+    tmp_path,
+    monkeypatch,
+):
+    audio_path = tmp_path / "episode.wav"
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    output_dir = tmp_path / "snippets"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check, capture_output, text, timeout=None):
+        del check, capture_output, text, timeout
+        calls.append([str(part) for part in cmd])
+        cmd[-1].write_bytes(b"RIFFsnippetWAVEfmt ")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr("dubsync.audio_snippets.subprocess.run", fake_run)
+
+    snippets = extract_audio_snippets(
+        audio_path,
+        [
+            DivergenceSpan(
+                case_id=f"case-{index}",
+                cue_ids=[index],
+                srt_text="old line",
+                asr_text="new line",
+                start=float(index),
+                end=float(index) + 0.5,
+            )
+            for index in range(1, 5)
+        ],
+        output_dir,
+        fail_on_budget_exceeded=False,
+        max_snippets=2,
+    )
+
+    assert [snippet.case_id for snippet in snippets] == ["case-1", "case-2"]
+    assert len(calls) == 2

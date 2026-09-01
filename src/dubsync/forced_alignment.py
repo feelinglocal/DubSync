@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from .models import Cue, ForcedAlignmentCue, QCFlag
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue, speech_text_for_alignment
 from .tokenize import alphanumeric_signature
 
 
@@ -39,7 +40,7 @@ class MMSForcedAlignmentAdapter:
         self.device = device
 
     def align(self, audio_path: Path, cues: list[Cue]) -> list[ForcedAlignmentCue]:
-        transcript = " ".join(cue.plain_text for cue in cues).strip()
+        transcript = " ".join(speech_text_for_alignment(cue) for cue in cues).strip()
         if not transcript:
             return []
         try:
@@ -97,6 +98,8 @@ def apply_forced_alignment(
     cues: list[Cue],
     alignments: list[ForcedAlignmentCue],
     profile: StyleProfile,
+    *,
+    protected_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     if not alignments:
         return cues, []
@@ -105,8 +108,12 @@ def apply_forced_alignment(
     updated: list[Cue] = []
     flags: list[QCFlag] = []
     min_duration_ms = int(profile.min_cue_dur * 1000)
+    protected = protected_cue_ids or set()
 
     for cue in cues:
+        if cue.index in protected or is_bracketed_screen_text_cue(cue):
+            updated.append(cue)
+            continue
         alignment = by_cue.get(cue.index)
         if alignment is None:
             updated.append(cue)
@@ -136,7 +143,7 @@ def _cue_alignments_from_word_timestamps(cues: list[Cue], word_timestamps: list[
     alignments: list[ForcedAlignmentCue] = []
     cursor = 0
     for cue in cues:
-        token_count = len(alphanumeric_signature(cue.plain_text))
+        token_count = len(alphanumeric_signature(speech_text_for_alignment(cue)))
         if token_count <= 0:
             continue
         chunk = word_timestamps[cursor : cursor + token_count]

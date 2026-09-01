@@ -15,6 +15,8 @@ class Cue(BaseModel):
     lines: list[str]
     speaker_id: str | None = None
     character: str | None = None
+    prompt_scene_id: int | None = Field(default=None, ge=1, exclude=True)
+    prompt_scene_position: int | None = Field(default=None, ge=1, exclude=True)
 
     @field_validator("lines")
     @classmethod
@@ -96,6 +98,8 @@ class DivergenceSpan(BaseModel):
     right_anchor_start: float | None = None
     left_anchor_speaker_id: str | None = None
     right_anchor_speaker_id: str | None = None
+    prompt_scene_id: int | None = Field(default=None, ge=1, exclude=True)
+    prompt_scene_position: int | None = Field(default=None, ge=1, exclude=True)
 
 
 class AudioSnippet(BaseModel):
@@ -132,6 +136,9 @@ class AlignmentDiagnostics(BaseModel):
     unbanded_fallback: bool = False
     band_limited: bool = False
     unresolved: bool = False
+    excluded_screen_text_cue_ids: list[int] = Field(default_factory=list)
+    missing_audio_cue_ids: list[int] = Field(default_factory=list)
+    missing_audio_guard_version: int = Field(default=0, ge=0)
 
 
 class AlignmentResult(BaseModel):

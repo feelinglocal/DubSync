@@ -302,6 +302,22 @@ def test_overlap_dash_policy_does_not_merge_unknown_speaker_overlap():
     assert flags[0].end == 2.0
 
 
+def test_overlap_dash_policy_does_not_merge_a_missing_audio_cue():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=2200, lines=["spoken"], speaker_id="A"),
+        Cue(index=2, start_ms=1800, end_ms=2800, lines=["missing"], speaker_id="B"),
+    ]
+
+    unchanged, flags = apply_overlap_policy(
+        cues,
+        policy="dash",
+        protected_cue_ids={2},
+    )
+
+    assert unchanged == cues
+    assert not any(flag.kind == "overlap_dash_merge" for flag in flags)
+
+
 def test_overlap_stack_policy_flags_unknown_speaker_overlap():
     cues = [
         Cue(index=1, start_ms=1000, end_ms=2000, lines=["first"]),

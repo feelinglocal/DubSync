@@ -56,6 +56,47 @@ def test_alignment_normalizes_digits_and_spoken_number_words():
     assert result.cue_word_indices == {1: [0, 1, 2, 3]}
 
 
+def test_alignment_ignores_bracket_only_visual_text_for_spoken_timing():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n[Station of Beijing]\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nhello there\n\n"
+    )
+    words = [
+        Word(text="hello", start=10.00, end=10.20),
+        Word(text="there", start=10.25, end=10.50),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.divergence_spans == []
+    assert result.unmatched_cue_ids == []
+    assert result.cue_word_indices == {2: [0, 1]}
+
+
+def test_alignment_uses_only_spoken_text_from_mixed_bracket_cue():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "[This company is not for you]\n"
+        "Lime is not for you.\n"
+        "\n"
+    )
+    words = [
+        Word(text="Lime", start=3.00, end=3.20),
+        Word(text="is", start=3.25, end=3.32),
+        Word(text="not", start=3.35, end=3.45),
+        Word(text="for", start=3.50, end=3.62),
+        Word(text="you", start=3.70, end=3.90),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.divergence_spans == []
+    assert result.cue_word_indices == {1: [0, 1, 2, 3, 4]}
+
+
 def test_alignment_normalizes_german_hyphen_compounds_and_ordinals():
     cues = parse_srt_text(
         "1\n00:00:00,000 --> 00:00:01,000\nLevel-1-Versager dritte Prufung\n\n"
@@ -70,6 +111,46 @@ def test_alignment_normalizes_german_hyphen_compounds_and_ordinals():
 
     assert result.anchor_coverage == 1.0
     assert result.divergence_spans == []
+
+
+def test_alignment_ignores_bracketed_screen_text_lines_without_losing_spoken_lines():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "[Document: Final admission notice]\n"
+        "I accept.\n"
+        "\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "[Episode 1]\n"
+        "\n"
+        "3\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "We go now.\n"
+        "\n"
+    )
+    words = [
+        Word(text="I", start=10.00, end=10.10, confidence=0.98),
+        Word(text="accept", start=10.12, end=10.40, confidence=0.98),
+        Word(text="We", start=20.00, end=20.10, confidence=0.98),
+        Word(text="go", start=20.12, end=20.22, confidence=0.98),
+        Word(text="now", start=20.24, end=20.50, confidence=0.98),
+    ]
+
+    alignment = align_cues_to_words(cues, words)
+    rebuilt, flags = rebuild_cues(cues, words, alignment, StyleProfile(fps=30.0, min_cue_dur=0.5))
+
+    assert alignment.anchor_coverage == 1.0
+    assert alignment.divergence_spans == []
+    assert alignment.cue_word_indices == {1: [0, 1], 3: [2, 3, 4]}
+    assert alignment.unmatched_cue_ids == []
+    assert rebuilt[0].text == "[Document: Final admission notice]\nI accept."
+    assert rebuilt[0].start_ms == 10000
+    assert rebuilt[0].end_ms == 10500
+    assert rebuilt[1].plain_text == "[Episode 1]"
+    assert rebuilt[1].start_ms == 1000
+    assert rebuilt[1].end_ms == 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
 
 
 def test_fuzzy_name_variant_stays_visible_for_audio_adjudication():
@@ -369,9 +450,79 @@ def test_recue_default_keep_flagged_preserves_unmatched_cue():
 
     assert [cue.index for cue in rebuilt] == [1, 2]
     assert any(flag.kind == "unmatched_cue" and flag.cue_ids == [2] for flag in flags)
-    assert any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
-    assert rebuilt[1].start_ms != 1000
-    assert rebuilt[1].end_ms != 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    assert rebuilt[1].start_ms == 1000
+    assert rebuilt[1].end_ms == 2000
+
+
+def test_recue_preserves_missing_middle_source_timing_between_matched_neighbors():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nalpha one\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nmissing middle\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\nomega three\n\n"
+    )
+    words = [
+        Word(text="alpha", start=10.00, end=10.20),
+        Word(text="one", start=10.25, end=10.50),
+        Word(text="omega", start=20.00, end=20.20),
+        Word(text="three", start=20.25, end=20.50),
+    ]
+    alignment = align_cues_to_words(cues, words)
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5, drop_policy="keep_flagged")
+
+    rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
+
+    missing = next(cue for cue in rebuilt if cue.index == 2)
+    assert alignment.unmatched_cue_ids == [2]
+    assert alignment.diagnostics.missing_audio_cue_ids == [2]
+    assert missing.start_ms == 2000
+    assert missing.end_ms == 3000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+
+
+def test_alignment_does_not_assign_partial_repeated_missing_cue_to_later_sentence():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\ntake the card\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\ntake the ring\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\ntake the sword\n\n"
+    )
+    words = [
+        Word(text="take", start=10.00, end=10.10),
+        Word(text="the", start=10.15, end=10.20),
+        Word(text="card", start=10.25, end=10.50),
+        Word(text="take", start=20.00, end=20.10),
+        Word(text="the", start=20.15, end=20.20),
+        Word(text="sword", start=20.25, end=20.50),
+    ]
+
+    alignment = align_cues_to_words(cues, words)
+
+    assert alignment.cue_word_indices == {1: [0, 1, 2], 3: [3, 4, 5]}
+    assert alignment.unmatched_cue_ids == [2]
+
+
+def test_recue_keeps_bracket_only_visual_text_at_source_timing_without_interpolation():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nmatched line\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\n[Station of Beijing]\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nnext line\n\n"
+    )
+    words = [
+        Word(text="matched", start=10.0, end=10.2),
+        Word(text="line", start=10.25, end=10.5),
+        Word(text="next", start=20.0, end=20.2),
+        Word(text="line", start=20.25, end=20.5),
+    ]
+    alignment = align_cues_to_words(cues, words)
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5, drop_policy="remove")
+
+    rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
+
+    visual = next(cue for cue in rebuilt if cue.index == 2)
+    assert visual.start_ms == 2000
+    assert visual.end_ms == 4000
+    assert visual.text == "[Station of Beijing]"
+    assert not any(flag.cue_ids == [2] for flag in flags)
 
 
 def test_recue_drop_policy_remove_drops_unmatched_cue_with_qc_flag():

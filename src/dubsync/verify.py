@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .models import AlignmentResult, Cue, CueScore, ForcedAlignmentCue, QCFlag, StyleIssue, Word
 from .style_profile import StyleProfile
+from .subtitle_annotations import cue_has_spoken_text, speech_text_for_alignment
 from .text_metrics import display_width
 
 
@@ -39,6 +40,8 @@ def score_cues(
     scores: list[CueScore] = []
 
     for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
         forced = forced_by_cue.get(cue.index)
         if forced is not None:
             scores.append(
@@ -87,6 +90,8 @@ def score_cues(
 def cps_sanity_flags(cues: list[Cue], *, max_cps: float = 30.0, min_cps: float = 2.0) -> list[QCFlag]:
     flags: list[QCFlag] = []
     for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
         cps = _cue_cps(cue)
         if cps > max_cps:
             flags.append(
@@ -119,7 +124,7 @@ def _cue_cps(cue: Cue) -> float:
     duration_seconds = cue.duration_ms / 1000.0
     if duration_seconds <= 0:
         return 0.0
-    return round(display_width(cue.plain_text) / duration_seconds, 3)
+    return round(display_width(speech_text_for_alignment(cue)) / duration_seconds, 3)
 
 
 def _same_or_unknown_speaker(previous: Cue, cue: Cue) -> bool:

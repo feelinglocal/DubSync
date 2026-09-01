@@ -9,6 +9,13 @@ from .editorial_guard import (
 )
 from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
 from .style_profile import StyleProfile
+from .subtitle_annotations import (
+    alignment_token_character_spans,
+    bracketed_screen_text_spans,
+    cue_has_bracketed_screen_text,
+    speech_text_for_alignment,
+    text_without_bracketed_screen_text,
+)
 from .text_metrics import contains_character_level_script, display_width, token_texts, wrap_visual_width
 from .tokenize import alphanumeric_signature
 
@@ -40,6 +47,11 @@ def apply_adjudication_decisions(
             continue
 
         cue_ids = [cue_id for cue_id in span.cue_ids if cue_id in cues_by_id]
+        annotated_cue_ids = [
+            cue_id
+            for cue_id in cue_ids
+            if cue_has_bracketed_screen_text(cues_by_id[cue_id])
+        ]
         if not decision.final_text.strip():
             if len(cue_ids) == 1:
                 cue_id = cue_ids[0]
@@ -49,16 +61,26 @@ def apply_adjudication_decisions(
                     span,
                     cue_token_offsets[cue_id],
                 )
-                if _is_partial_cue_span(cue, span, bounds):
+                if (
+                    cue_id in annotated_cue_ids and bounds is not None
+                ) or _is_partial_cue_span(cue, span, bounds):
                     if bounds is not None:
-                        token_edits_by_cue.setdefault(cue_id, []).append(
-                            (bounds[0], bounds[1], "")
+                        candidate_edits = [
+                            *token_edits_by_cue.get(cue_id, []),
+                            (bounds[0], bounds[1], ""),
+                        ]
+                        changed_text = _apply_cue_token_edits(
+                            cue,
+                            candidate_edits,
                         )
-                        changed_text = _apply_token_edits(
-                            cue.plain_text,
-                            token_edits_by_cue[cue_id],
-                        )
+                        if changed_text is None:
+                            flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
+                            continue
+                        token_edits_by_cue[cue_id] = candidate_edits
                     else:
+                        if cue_id in annotated_cue_ids:
+                            flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
+                            continue
                         changed_text = _cue_text_with_span_replacement(cue, span, "")
                         replacements_by_cue[cue_id] = flow_text_to_lines(
                             changed_text,
@@ -77,6 +99,9 @@ def apply_adjudication_decisions(
                             end=span.end,
                         )
                     )
+                    continue
+                if cue_id in annotated_cue_ids:
+                    flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
                     continue
             if cue_ids:
                 should_remove = profile.drop_policy == "remove"
@@ -118,13 +143,20 @@ def apply_adjudication_decisions(
                     cue,
                 )
                 if insertion_offset is not None:
-                    token_edits_by_cue.setdefault(adlib_cue_id, []).append(
-                        (insertion_offset, insertion_offset, decision.final_text)
+                    candidate_edits = [
+                        *token_edits_by_cue.get(adlib_cue_id, []),
+                        (insertion_offset, insertion_offset, decision.final_text),
+                    ]
+                    changed_text = _apply_cue_token_edits(
+                        cue,
+                        candidate_edits,
                     )
-                    changed_text = _apply_token_edits(
-                        cue.plain_text,
-                        token_edits_by_cue[adlib_cue_id],
-                    )
+                    if changed_text is None:
+                        flags.append(
+                            _screen_text_adjudication_hold([adlib_cue_id], span, decision)
+                        )
+                        continue
+                    token_edits_by_cue[adlib_cue_id] = candidate_edits
                     flags.append(
                         QCFlag(
                             kind="text_changed",
@@ -137,6 +169,9 @@ def apply_adjudication_decisions(
                             end=span.end,
                         )
                     )
+                    continue
+                if cue_has_bracketed_screen_text(cue):
+                    flags.append(_screen_text_adjudication_hold([adlib_cue_id], span, decision))
                     continue
                 replacements_by_cue[adlib_cue_id] = lines
                 continue
@@ -179,13 +214,18 @@ def apply_adjudication_decisions(
                     bounds,
                     decision.final_text,
                 )
-                token_edits_by_cue.setdefault(cue_id, []).append(
-                    (bounds[0], bounds[1], localized_replacement)
+                candidate_edits = [
+                    *token_edits_by_cue.get(cue_id, []),
+                    (bounds[0], bounds[1], localized_replacement),
+                ]
+                changed_text = _apply_cue_token_edits(
+                    cue,
+                    candidate_edits,
                 )
-                changed_text = _apply_token_edits(
-                    cue.plain_text,
-                    token_edits_by_cue[cue_id],
-                )
+                if changed_text is None:
+                    flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
+                    continue
+                token_edits_by_cue[cue_id] = candidate_edits
                 flags.append(
                     QCFlag(
                         kind="text_changed",
@@ -199,6 +239,10 @@ def apply_adjudication_decisions(
                     )
                 )
                 continue
+
+        if annotated_cue_ids:
+            flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
+            continue
 
         if len(cue_ids) > 1 and span.srt_token_indices and len(alphanumeric_signature(decision.final_text)) == 1:
             applied_multi_cue_edit = False
@@ -265,16 +309,22 @@ def apply_adjudication_decisions(
 
     final_token_edit_text_by_cue: dict[int, str] = {}
     for cue_id, edits in token_edits_by_cue.items():
-        changed_text = _apply_token_edits(cues_by_id[cue_id].plain_text, edits)
+        changed_text = _apply_cue_token_edits(cues_by_id[cue_id], edits)
+        if changed_text is None:
+            continue
         final_token_edit_text_by_cue[cue_id] = changed_text
         if not alphanumeric_signature(changed_text):
             removed_cue_ids.add(cue_id)
             replacements_by_cue.pop(cue_id, None)
             continue
-        replacements_by_cue[cue_id] = flow_text_to_lines(
-            changed_text,
-            profile.max_chars_per_line,
-            profile.max_lines_per_cue,
+        replacements_by_cue[cue_id] = (
+            changed_text.splitlines()
+            if cue_has_bracketed_screen_text(cues_by_id[cue_id])
+            else flow_text_to_lines(
+                changed_text,
+                profile.max_chars_per_line,
+                profile.max_lines_per_cue,
+            )
         )
 
     flags = [
@@ -333,6 +383,27 @@ def _editorial_guard_rejection(
             end=span.end,
         )
     return None
+
+
+def _screen_text_adjudication_hold(
+    cue_ids: list[int],
+    span: DivergenceSpan,
+    decision: AdjudicationDecision,
+) -> QCFlag:
+    return QCFlag(
+        kind="screen_text_adjudication_held",
+        cue_ids=cue_ids,
+        message=(
+            "Adjudication was held because its alignment-token edit could not be "
+            "reconstructed without risking bracketed screen text or its source layout."
+        ),
+        severity="error",
+        confidence=decision.confidence,
+        old_text=span.srt_text,
+        new_text=decision.final_text,
+        start=span.start,
+        end=span.end,
+    )
 
 
 def _restore_cues_rejected_by_editorial_guard(
@@ -458,7 +529,7 @@ def _cue_token_offsets(cues: list[Cue]) -> dict[int, int]:
     offset = 0
     for cue in cues:
         offsets[cue.index] = offset
-        offset += len(alphanumeric_signature(cue.plain_text))
+        offset += len(alphanumeric_signature(speech_text_for_alignment(cue)))
     return offsets
 
 
@@ -467,7 +538,7 @@ def _span_token_bounds_for_cue(
     span: DivergenceSpan,
     cue_token_offset: int,
 ) -> tuple[int, int] | None:
-    cue_signature = alphanumeric_signature(cue.plain_text)
+    cue_signature = alphanumeric_signature(speech_text_for_alignment(cue))
     local_indices = sorted(
         {
             token_index - cue_token_offset
@@ -487,7 +558,7 @@ def _is_partial_cue_span(
     span: DivergenceSpan,
     bounds: tuple[int, int] | None,
 ) -> bool:
-    cue_token_count = len(alphanumeric_signature(cue.plain_text))
+    cue_token_count = len(alphanumeric_signature(speech_text_for_alignment(cue)))
     if bounds is not None:
         return bounds != (0, cue_token_count)
     span_signature = alphanumeric_signature(span.srt_text)
@@ -508,7 +579,7 @@ def _anchored_insertion_offset(
     if right_cue_id == cue_id:
         return 0
     if left_cue_id == cue_id:
-        return len(alphanumeric_signature(cue.plain_text))
+        return len(alphanumeric_signature(speech_text_for_alignment(cue)))
     return None
 
 
@@ -518,7 +589,7 @@ def _localized_indexed_replacement(
     bounds: tuple[int, int],
     final_text: str,
 ) -> str:
-    cue_signature = alphanumeric_signature(cue.plain_text)
+    cue_signature = alphanumeric_signature(speech_text_for_alignment(cue))
     final_signature = alphanumeric_signature(final_text)
     if not final_signature:
         return ""
@@ -570,7 +641,105 @@ def _apply_token_edits(
     source_text: str,
     edits: list[tuple[int, int, str]],
 ) -> str:
-    token_spans = _token_character_spans(source_text)
+    return _apply_token_edits_with_spans(
+        source_text,
+        edits,
+        _token_character_spans(source_text),
+    )
+
+
+def _apply_cue_token_edits(
+    cue: Cue,
+    edits: list[tuple[int, int, str]],
+) -> str | None:
+    if not cue_has_bracketed_screen_text(cue):
+        return _apply_token_edits(cue.plain_text, edits)
+    token_spans = alignment_token_character_spans(cue)
+    annotation_spans = bracketed_screen_text_spans(cue.text)
+    if token_spans is None or not _annotated_token_edits_are_safe(
+        edits,
+        token_spans,
+        annotation_spans,
+    ):
+        return None
+    return _apply_token_edits_with_spans(
+        cue.text,
+        edits,
+        list(token_spans),
+        append_at_last_token=True,
+        preserve_line_breaks=True,
+        protected_fragments=_screen_text_protected_fragments(cue),
+    )
+
+
+def _annotated_token_edits_are_safe(
+    edits: list[tuple[int, int, str]],
+    token_spans: tuple[tuple[int, int], ...],
+    annotation_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    previous_end = 0
+    for _, (start_token, end_token, replacement) in sorted(
+        enumerate(edits),
+        key=lambda item: (item[1][0], item[1][1], item[0]),
+    ):
+        if (
+            start_token < previous_end
+            or start_token < 0
+            or end_token < start_token
+            or end_token > len(token_spans)
+            or any(character in replacement for character in "[]\r\n")
+        ):
+            return False
+
+        if start_token < len(token_spans):
+            start_character = token_spans[start_token][0]
+        elif token_spans:
+            start_character = token_spans[-1][1]
+        else:
+            return False
+        end_character = (
+            token_spans[end_token - 1][1]
+            if end_token > start_token
+            else start_character
+        )
+        if any(
+            start_character < annotation_end and end_character > annotation_start
+            for annotation_start, annotation_end in annotation_spans
+        ):
+            return False
+        if start_token == end_token and any(
+            annotation_start < start_character < annotation_end
+            for annotation_start, annotation_end in annotation_spans
+        ):
+            return False
+
+        previous_end = end_token
+    return True
+
+
+def _screen_text_protected_fragments(cue: Cue) -> tuple[str, ...]:
+    residue_lines = text_without_bracketed_screen_text(cue.text).split("\n")
+    standalone_lines = [
+        line
+        for line, residue in zip(cue.lines, residue_lines, strict=True)
+        if line and not residue.strip()
+    ]
+    annotation_fragments = [
+        cue.text[start:end]
+        for start, end in bracketed_screen_text_spans(cue.text)
+    ]
+    return tuple([*standalone_lines, *annotation_fragments])
+
+
+def _apply_token_edits_with_spans(
+    source_text: str,
+    edits: list[tuple[int, int, str]],
+    token_spans: list[tuple[int, int]],
+    *,
+    append_at_last_token: bool = False,
+    preserve_line_breaks: bool = False,
+    protected_fragments: tuple[str, ...] = (),
+) -> str:
     if not token_spans:
         inserted = " ".join(replacement.strip() for _, _, replacement in edits if replacement.strip())
         return _restore_terminal_punctuation(inserted, source_text)
@@ -588,6 +757,8 @@ def _apply_token_edits(
         start_character = (
             token_spans[bounded_start][0]
             if bounded_start < len(token_spans)
+            else token_spans[-1][1]
+            if append_at_last_token
             else len(source_text)
         )
         end_character = (
@@ -636,9 +807,37 @@ def _apply_token_edits(
         previous_token_end = bounded_end
 
     pieces.append(source_text[cursor:])
-    normalized = re.sub(r"\s+", " ", "".join(pieces)).strip()
-    normalized = re.sub(r"\s+([,.;:!?\u2026])", r"\1", normalized)
+    raw_text, protected = _protect_text_fragments("".join(pieces), protected_fragments)
+    normalized = re.sub(
+        r"[^\S\r\n]+" if preserve_line_breaks else r"\s+",
+        " ",
+        raw_text,
+    ).strip()
+    if preserve_line_breaks:
+        normalized = re.sub(r" *(\r?\n) *", r"\1", normalized)
+    punctuation_spacing = r"[^\S\r\n]+" if preserve_line_breaks else r"\s+"
+    normalized = re.sub(rf"{punctuation_spacing}([,.;:!?\u2026])", r"\1", normalized)
+    for marker, fragment in protected:
+        normalized = normalized.replace(marker, fragment)
     return _restore_terminal_punctuation(normalized, source_text)
+
+
+def _protect_text_fragments(
+    text: str,
+    fragments: tuple[str, ...],
+) -> tuple[str, list[tuple[str, str]]]:
+    protected: list[tuple[str, str]] = []
+    for index, fragment in enumerate(sorted(fragments, key=len, reverse=True)):
+        if not fragment:
+            continue
+        marker = f"\ufdd0{index}\ufdd1"
+        while marker in text:
+            marker += "\ufdd1"
+        if fragment not in text:
+            continue
+        text = text.replace(fragment, marker, 1)
+        protected.append((marker, fragment))
+    return text, protected
 
 
 def _token_character_spans(text: str) -> list[tuple[int, int]]:
@@ -667,7 +866,7 @@ def _split_units(text: str) -> tuple[list[str], str]:
 
 def _cue_text_with_span_replacement(cue: Cue, span: DivergenceSpan, final_text: str) -> str:
     replacement = final_text.strip()
-    cue_signature = alphanumeric_signature(cue.plain_text)
+    cue_signature = alphanumeric_signature(speech_text_for_alignment(cue))
     span_signature = alphanumeric_signature(span.srt_text)
     if not cue_signature or not span_signature or len(span_signature) >= len(cue_signature):
         return replacement
@@ -676,7 +875,10 @@ def _cue_text_with_span_replacement(cue: Cue, span: DivergenceSpan, final_text: 
     if bounds is None:
         return replacement
 
-    cue_tokens = token_texts(cue.plain_text)
+    cue_tokens = [
+        cue.plain_text[start:end]
+        for start, end in _token_character_spans(cue.plain_text)
+    ]
     start, end = bounds
     final_signature = alphanumeric_signature(replacement)
     before_tokens = cue_tokens[:start]

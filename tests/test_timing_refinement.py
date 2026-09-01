@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dubsync.models import Cue, SpeechRegion
+from dubsync.models import AlignmentResult, Cue, SpeechRegion
 from dubsync.style_profile import StyleProfile
 from dubsync.timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 
@@ -49,6 +49,24 @@ def test_refine_cues_to_speech_activity_preserves_timing_without_overlap():
         [SpeechRegion(start=5.1, end=6.3)],
         StyleProfile(fps=30.0),
         BoundaryRefinementConfig(max_leading_silence_ms=150, max_trailing_silence_ms=300),
+    )
+
+    assert refined == [cue]
+    assert flags == []
+
+
+def test_refinement_cannot_borrow_nearby_speech_for_a_missing_audio_cue():
+    cue = Cue(index=2, start_ms=5000, end_ms=6000, lines=["missing line"])
+    alignment = AlignmentResult(
+        unmatched_cue_ids=[2],
+        diagnostics={"missing_audio_cue_ids": [2]},
+    )
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue],
+        [SpeechRegion(start=5.4, end=5.7)],
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+        alignment=alignment,
     )
 
     assert refined == [cue]

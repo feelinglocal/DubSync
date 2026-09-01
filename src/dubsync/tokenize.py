@@ -7,6 +7,7 @@ from functools import lru_cache
 
 from .models import Cue, Word
 from .profanity import normalize_german_profanity_token
+from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import token_texts
 
 TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -156,7 +157,7 @@ def _fold_latin_number_text(value: str) -> str:
 def tokenize_cues(cues: list[Cue]) -> list[SRTToken]:
     tokens: list[SRTToken] = []
     for cue in cues:
-        for raw in token_texts(cue.plain_text):
+        for raw in token_texts(speech_text_for_alignment(cue)):
             normalized = normalize_token(raw)
             if not normalized:
                 continue

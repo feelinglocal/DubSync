@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from dubsync.cli import app
 from dubsync.models import Cue
 from dubsync.punctuation import StaticPunctuationAdapter, apply_punctuation_pass
+from dubsync.providers import ProviderError
 from dubsync.srt_io import parse_srt_text
 
 
@@ -18,6 +19,11 @@ class RecordingPunctuationAdapter:
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
         self.batches.append([cue.index for cue in cues])
         return {}
+
+
+class FailingPunctuationAdapter:
+    def punctuate(self, cues: list[Cue]) -> dict[int, str]:
+        raise ProviderError("provider timed out")
 
 
 def test_punctuation_pass_batches_cues_by_scene_gap():
@@ -35,6 +41,23 @@ def test_punctuation_pass_batches_cues_by_scene_gap():
     assert flags == []
 
 
+def test_punctuation_provider_failure_preserves_source_cues_with_qc_flag():
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=500, lines=["hello"]),
+        Cue(index=2, start_ms=1000, end_ms=1500, lines=["there"]),
+    ]
+
+    updated, flags = apply_punctuation_pass(
+        cues,
+        FailingPunctuationAdapter(),
+        scene_gap_seconds=4.0,
+    )
+
+    assert updated == cues
+    assert [flag.kind for flag in flags] == ["punctuation_provider_unavailable"]
+    assert flags[0].cue_ids == [1, 2]
+
+
 def test_punctuation_pass_caps_dense_scene_batches():
     adapter = RecordingPunctuationAdapter()
     cues = [
@@ -47,6 +70,57 @@ def test_punctuation_pass_caps_dense_scene_batches():
     assert [len(batch) for batch in adapter.batches] == [40, 5]
     assert updated == cues
     assert flags == []
+
+
+def test_punctuation_pass_packs_many_sparse_scenes_for_long_episode_scaling():
+    cues = [
+        Cue(
+            index=index,
+            start_ms=index * 10_000,
+            end_ms=index * 10_000 + 1_000,
+            lines=[f"Line {index}"],
+        )
+        for index in range(1, 82)
+    ]
+    adapter = RecordingPunctuationAdapter()
+
+    updated, flags = apply_punctuation_pass(cues, adapter, scene_gap_seconds=4.0)
+
+    assert [len(batch) for batch in adapter.batches] == [40, 40, 1]
+    assert [cue_id for batch in adapter.batches for cue_id in batch] == list(range(1, 82))
+    assert updated == cues
+    assert flags == []
+
+
+def test_packed_punctuation_batches_retain_explicit_scene_identity():
+    scene_batches: list[list[tuple[int | None, int | None]]] = []
+
+    class SceneRecordingAdapter(RecordingPunctuationAdapter):
+        def punctuate(self, cues):
+            scene_batches.append(
+                [
+                    (cue.prompt_scene_id, cue.prompt_scene_position)
+                    for cue in cues
+                ]
+            )
+            return super().punctuate(cues)
+
+    cues = [
+        Cue(
+            index=index,
+            start_ms=index * 10_000,
+            end_ms=index * 10_000 + 1_000,
+            lines=[f"Line {index}"],
+        )
+        for index in range(1, 42)
+    ]
+
+    apply_punctuation_pass(cues, SceneRecordingAdapter(), scene_gap_seconds=4.0)
+
+    assert scene_batches == [
+        [(index, 1) for index in range(1, 41)],
+        [(41, 1)],
+    ]
 
 
 def test_punctuation_pass_preserves_valid_proposed_line_breaks():

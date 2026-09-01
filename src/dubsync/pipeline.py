@@ -10,14 +10,15 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from .adjudication import AdjudicationEngine, KeepSRTAdapter
-from .aligner import align_cues_to_words
+from .adjudication_snippets import BoundedAudioSnippetBatchSource
+from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
 from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache
 from .changes import apply_adjudication_decisions
 from .config import load_style_profile, load_yaml
-from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
+from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
 from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues
 from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
@@ -53,6 +54,7 @@ from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
+from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text
 from .timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 from .tokenize import alphanumeric_signature
 from .vad import (
@@ -84,6 +86,16 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "vad_provider_fallback",
     }
 )
+
+_TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
+    {
+        "audio_snippet_unavailable",
+        "invalid_llm_response",
+        "llm_provider_unavailable",
+    }
+)
+
+_TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
 
 class PipelineResult:
@@ -201,9 +213,12 @@ def sync_episode(
                 },
             },
         )
+    long_audio_llm_flag = None if no_llm else _long_audio_llm_skip_flag(audio_for_asr, provider_config)
+    llm_disabled_for_episode = no_llm or long_audio_llm_flag is not None
 
     if resume_stage == "verify":
         resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
+        _validate_alignment_screen_text_provenance(resume_alignment, cues)
         resume_decisions = _load_adjudication_artifact(
             episode_workdir / "adjudicate.json"
         )[0]
@@ -215,6 +230,7 @@ def sync_episode(
             rebuilt,
             cues,
             alignment_unresolved=resume_alignment.diagnostics.unresolved,
+            missing_audio_cue_ids=set(resume_alignment.diagnostics.missing_audio_cue_ids),
         )
         if unsafe_cases:
             raise RuntimeError(
@@ -249,6 +265,7 @@ def sync_episode(
 
     if resume_stage in {"adjudicate", "rebuild"}:
         alignment = _load_alignment_artifact(episode_workdir / "align.json")
+        _validate_alignment_screen_text_provenance(alignment, cues)
     else:
         alignment = align_cues_to_words(cues, words)
         alignment = _alignment_with_adjudication_context(alignment, cues)
@@ -262,6 +279,8 @@ def sync_episode(
         *alignment.flags,
         *detect_source_errors(cues),
     ]
+    if long_audio_llm_flag is not None:
+        flags.append(long_audio_llm_flag)
     decisions: list[AdjudicationDecision] = []
     if resume_stage == "rebuild":
         decisions, adjudication_flags = _load_adjudication_artifact(episode_workdir / "adjudicate.json")
@@ -270,8 +289,9 @@ def sync_episode(
             provider_config,
             decisions,
             adjudication_flags,
-            source_cue_count=len(cues),
+            source_cue_count=_spoken_source_cue_count(cues),
             alignment_unresolved=alignment.diagnostics.unresolved,
+            missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
         )
         flags.extend(adjudication_flags)
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
@@ -280,38 +300,43 @@ def sync_episode(
             _hold_incomplete_source_insertions(
                 alignment.divergence_spans,
                 provider_config,
-                source_cue_count=len(cues),
+                source_cue_count=_spoken_source_cue_count(cues),
                 alignment_unresolved=alignment.diagnostics.unresolved,
+                missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
             )
         )
         provider_decisions: list[AdjudicationDecision] = []
         provider_flags: list[QCFlag] = []
         if provider_spans:
-            audio_snippets = (
-                {}
-                if no_llm
-                else _adjudication_audio_snippets(
+            audio_snippet_source = (
+                None
+                if llm_disabled_for_episode
+                else _adjudication_audio_snippet_source(
                     audio_for_asr,
                     episode_workdir,
-                    provider_spans,
                     provider_config,
                 )
             )
+            audio_snippet_context = (
+                audio_snippet_source.cache_context()
+                if audio_snippet_source is not None
+                else None
+            )
             cached_adjudication = (
                 None
-                if no_llm
+                if llm_disabled_for_episode
                 else _load_cached_adjudication(
                     episode_workdir,
                     provider_spans,
                     provider_config,
-                    audio_snippets=audio_snippets,
+                    audio_snippet_context=audio_snippet_context,
                     source_cues=cues,
                 )
             )
             if cached_adjudication is None:
                 llm_adapter = (
                     KeepSRTAdapter()
-                    if no_llm
+                    if llm_disabled_for_episode
                     else llm_adapter_from_config(provider_config, pass_name="adjudication")
                 )
                 _set_adapter_episode_context(llm_adapter, cues)
@@ -319,17 +344,32 @@ def sync_episode(
                     llm_adapter,
                     confidence_gate=_adjudication_confidence_gate(provider_config),
                     scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
-                    audio_snippets=audio_snippets,
+                    audio_snippet_batches=(
+                        audio_snippet_source.load
+                        if audio_snippet_source is not None
+                        else None
+                    ),
                 )
-                provider_decisions, provider_flags = engine.adjudicate(provider_spans)
-                if not no_llm:
+                provider_decisions, engine_flags = engine.adjudicate(provider_spans)
+                snippet_flags = (
+                    audio_snippet_source.flags()
+                    if audio_snippet_source is not None
+                    else []
+                )
+                provider_flags = [*snippet_flags, *engine_flags]
+                if audio_snippet_source is not None:
+                    _write_json(
+                        episode_workdir / "audio_snippets.json",
+                        audio_snippet_source.manifest(),
+                    )
+                if not llm_disabled_for_episode:
                     _write_cached_adjudication(
                         episode_workdir,
                         provider_spans,
                         provider_config,
                         provider_decisions,
                         provider_flags,
-                        audio_snippets=audio_snippets,
+                        audio_snippet_context=audio_snippet_context,
                         source_cues=cues,
                     )
                 provider_flags.extend(
@@ -354,13 +394,16 @@ def sync_episode(
             if span.case_id in decisions_by_case
         ]
         adjudication_flags = [*incomplete_source_flags, *provider_flags]
-        if no_llm:
+        if llm_disabled_for_episode:
             for span in provider_spans:
                 adjudication_flags.append(
                     QCFlag(
                         kind="divergence_unresolved",
                         cue_ids=span.cue_ids,
-                        message="Text divergence found while LLM adjudication is disabled.",
+                        message=(
+                            "Text divergence found while LLM adjudication is disabled "
+                            "for this episode."
+                        ),
                         old_text=span.srt_text,
                         new_text=span.asr_text,
                         start=span.start,
@@ -442,10 +485,18 @@ def sync_episode(
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
     )
     flags.extend(recue_flags)
-    rebuilt, overlap_flags = apply_overlap_policy(rebuilt, profile.overlap_policy)
+    rebuilt, overlap_flags = apply_overlap_policy(
+        rebuilt,
+        profile.overlap_policy,
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+    )
     flags.extend(overlap_flags)
     speaker_mapping_uses_llm = _speaker_mapping_uses_llm(provider_config)
-    speaker_mapping_adapter = None if no_llm and speaker_mapping_uses_llm else speaker_mapping_adapter_from_config(provider_config)
+    speaker_mapping_adapter = (
+        None
+        if llm_disabled_for_episode and speaker_mapping_uses_llm
+        else speaker_mapping_adapter_from_config(provider_config)
+    )
     if speaker_mapping_adapter is not None:
         cached_speaker_map = (
             _load_cached_speaker_mapping(episode_workdir, rebuilt, provider_config) if speaker_mapping_uses_llm else None
@@ -467,49 +518,53 @@ def sync_episode(
         _write_json(episode_workdir / "speaker_map.json", speaker_map)
         rebuilt = _cues_with_speaker_characters(rebuilt, speaker_map)
         flags.extend(speaker_mapping_flags(speaker_map))
-    if not no_llm:
-        punctuation_adapter = punctuation_adapter_from_config(provider_config)
-        if punctuation_adapter is not None:
-            punctuation_input = rebuilt
-            _set_adapter_episode_context(punctuation_adapter, punctuation_input)
-            cached_punctuation = _load_cached_punctuation(
-                episode_workdir,
-                punctuation_input,
-                provider_config,
-                max_chars_per_line=profile.max_chars_per_line,
-                max_lines_per_cue=profile.max_lines_per_cue,
-                source_cues=cues,
-            )
-            if cached_punctuation is None:
-                rebuilt, punctuation_flags = apply_punctuation_pass(
-                    punctuation_input,
-                    punctuation_adapter,
-                    scene_gap_seconds=_punctuation_scene_gap_seconds(provider_config),
-                    max_chars_per_line=profile.max_chars_per_line,
-                    max_lines_per_cue=profile.max_lines_per_cue,
-                    source_cues=cues,
-                )
-                _write_cached_punctuation(
+    if not llm_disabled_for_episode:
+        punctuation_skip_flag = _long_audio_punctuation_skip_flag(audio_for_asr, provider_config)
+        if punctuation_skip_flag is not None:
+            flags.append(punctuation_skip_flag)
+        else:
+            punctuation_adapter = punctuation_adapter_from_config(provider_config)
+            if punctuation_adapter is not None:
+                punctuation_input = rebuilt
+                _set_adapter_episode_context(punctuation_adapter, punctuation_input)
+                cached_punctuation = _load_cached_punctuation(
                     episode_workdir,
                     punctuation_input,
                     provider_config,
-                    rebuilt,
-                    punctuation_flags,
                     max_chars_per_line=profile.max_chars_per_line,
                     max_lines_per_cue=profile.max_lines_per_cue,
                     source_cues=cues,
                 )
-                punctuation_flags.extend(
-                    _record_llm_usage_events(
-                        cost_meter,
+                if cached_punctuation is None:
+                    rebuilt, punctuation_flags = apply_punctuation_pass(
+                        punctuation_input,
                         punctuation_adapter,
-                        provider_config,
-                        pass_name="punctuation",
+                        scene_gap_seconds=_punctuation_scene_gap_seconds(provider_config),
+                        max_chars_per_line=profile.max_chars_per_line,
+                        max_lines_per_cue=profile.max_lines_per_cue,
+                        source_cues=cues,
                     )
-                )
-            else:
-                rebuilt, punctuation_flags = cached_punctuation
-            flags.extend(punctuation_flags)
+                    _write_cached_punctuation(
+                        episode_workdir,
+                        punctuation_input,
+                        provider_config,
+                        rebuilt,
+                        punctuation_flags,
+                        max_chars_per_line=profile.max_chars_per_line,
+                        max_lines_per_cue=profile.max_lines_per_cue,
+                        source_cues=cues,
+                    )
+                    punctuation_flags.extend(
+                        _record_llm_usage_events(
+                            cost_meter,
+                            punctuation_adapter,
+                            provider_config,
+                            pass_name="punctuation",
+                        )
+                    )
+                else:
+                    rebuilt, punctuation_flags = cached_punctuation
+                flags.extend(punctuation_flags)
     return _run_verify_stage(
         episode_workdir=episode_workdir,
         output_path=output_path,
@@ -664,7 +719,35 @@ def _alignment_summary_metadata(
         "alignment_unbanded_fallback": diagnostics.unbanded_fallback,
         "alignment_prior_used": diagnostics.prior_used,
         "alignment_transform_rate": diagnostics.transform_rate,
+        "alignment_missing_audio_cue_count": len(diagnostics.missing_audio_cue_ids),
     }
+
+
+def _spoken_source_cue_count(cues: list[Cue]) -> int:
+    return sum(1 for cue in cues if cue_has_spoken_text(cue))
+
+
+def _validate_alignment_screen_text_provenance(
+    alignment: AlignmentResult,
+    cues: list[Cue],
+) -> None:
+    expected = sorted(
+        cue.index for cue in cues if cue_has_bracketed_screen_text(cue)
+    )
+    observed = sorted(alignment.diagnostics.excluded_screen_text_cue_ids)
+    if observed != expected:
+        raise RuntimeError(
+            "Cannot resume from this alignment artifact because its bracketed "
+            "screen-text provenance does not match the current source SRT; "
+            "resume from align so bracketed non-spoken text can be excluded "
+            "from timing synchronization."
+        )
+    if alignment.diagnostics.missing_audio_guard_version != MISSING_AUDIO_GUARD_VERSION:
+        raise RuntimeError(
+            "Cannot resume from this alignment artifact because it predates the "
+            "missing-audio timing guard; resume from align so unfinished dialogue "
+            "cannot borrow timing from another passage."
+        )
 
 
 def _alignment_health_flags(
@@ -769,6 +852,7 @@ def _load_cached_adjudication(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    audio_snippet_context: dict[str, object] | None = None,
     source_cues: list[Cue] | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]] | None:
     cache = JsonDiskCache(episode_workdir / "llm-cache")
@@ -777,6 +861,7 @@ def _load_cached_adjudication(
             spans,
             provider_config,
             audio_snippets=audio_snippets,
+            audio_snippet_context=audio_snippet_context,
             source_cues=source_cues,
         )
     )
@@ -784,10 +869,11 @@ def _load_cached_adjudication(
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("decisions"), list) or not isinstance(payload.get("flags"), list):
         raise ValueError("invalid LLM adjudication cache artifact")
-    return (
-        [AdjudicationDecision.model_validate(item) for item in payload["decisions"]],
-        [QCFlag.model_validate(item) for item in payload["flags"]],
-    )
+    decisions = [AdjudicationDecision.model_validate(item) for item in payload["decisions"]]
+    flags = [QCFlag.model_validate(item) for item in payload["flags"]]
+    if any(flag.kind in _TRANSIENT_ADJUDICATION_FLAG_KINDS for flag in flags):
+        return None
+    return decisions, flags
 
 
 def _write_cached_adjudication(
@@ -797,14 +883,18 @@ def _write_cached_adjudication(
     decisions: list[AdjudicationDecision],
     flags: list[QCFlag],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    audio_snippet_context: dict[str, object] | None = None,
     source_cues: list[Cue] | None = None,
 ) -> None:
+    if any(flag.kind in _TRANSIENT_ADJUDICATION_FLAG_KINDS for flag in flags):
+        return
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     cache.write(
         _adjudication_cache_key(
             spans,
             provider_config,
             audio_snippets=audio_snippets,
+            audio_snippet_context=audio_snippet_context,
             source_cues=source_cues,
         ),
         {
@@ -837,10 +927,11 @@ def _load_cached_punctuation(
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("cues"), list) or not isinstance(payload.get("flags"), list):
         raise ValueError("invalid LLM punctuation cache artifact")
-    return (
-        [Cue.model_validate(item) for item in payload["cues"]],
-        [QCFlag.model_validate(item) for item in payload["flags"]],
-    )
+    output_cues = [Cue.model_validate(item) for item in payload["cues"]]
+    flags = [QCFlag.model_validate(item) for item in payload["flags"]]
+    if any(flag.kind in _TRANSIENT_PUNCTUATION_FLAG_KINDS for flag in flags):
+        return None
+    return output_cues, flags
 
 
 def _write_cached_punctuation(
@@ -854,6 +945,8 @@ def _write_cached_punctuation(
     max_lines_per_cue: int,
     source_cues: list[Cue] | None = None,
 ) -> None:
+    if any(flag.kind in _TRANSIENT_PUNCTUATION_FLAG_KINDS for flag in flags):
+        return
     cache = JsonDiskCache(episode_workdir / "llm-cache")
     cache.write(
         _punctuation_cache_key(
@@ -899,6 +992,7 @@ def _adjudication_cache_key(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    audio_snippet_context: dict[str, object] | None = None,
     source_cues: list[Cue] | None = None,
 ) -> CacheKey:
     llm_config = llm_config_for_pass(provider_config, "adjudication")
@@ -916,6 +1010,7 @@ def _adjudication_cache_key(
             else None
         ),
         "audio_snippets": _audio_snippet_cache_payload(audio_snippets or {}),
+        "audio_snippet_context": audio_snippet_context,
     }
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))
 
@@ -967,33 +1062,40 @@ def _llm_cache_params(llm_config: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in llm_config.items() if key != "responses"}
 
 
-def _adjudication_audio_snippets(
+def _adjudication_audio_snippet_source(
     audio_path: Path,
     episode_workdir: Path,
-    spans: list[DivergenceSpan],
     provider_config: dict[str, object],
-) -> dict[str, AudioSnippet]:
-    enabled, pad_seconds, max_duration_seconds = _adjudication_audio_snippet_options(provider_config)
+) -> BoundedAudioSnippetBatchSource | None:
+    (
+        enabled,
+        pad_seconds,
+        max_duration_seconds,
+        max_snippets_per_batch,
+        max_audio_duration_seconds,
+    ) = (
+        _adjudication_audio_snippet_options(provider_config)
+    )
     if not enabled:
-        return {}
-    snippets = extract_audio_snippets(
+        return None
+    return BoundedAudioSnippetBatchSource(
         audio_path,
-        spans,
         episode_workdir / "audio-snippets",
         pad_seconds=pad_seconds,
         max_duration_seconds=max_duration_seconds,
+        max_snippets_per_batch=max_snippets_per_batch,
+        max_audio_duration_seconds=max_audio_duration_seconds,
+        extractor=extract_audio_snippets,
     )
-    _write_json(episode_workdir / "audio_snippets.json", {"snippets": [snippet.model_dump() for snippet in snippets]})
-    return {snippet.case_id: snippet for snippet in snippets}
 
 
-def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> tuple[bool, float, float]:
+def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> tuple[bool, float, float, int, float]:
     llm_config = llm_config_for_pass(provider_config, "adjudication")
     value = llm_config.get("audio_snippet_double_check", False)
     if value in (False, None):
-        return (False, 2.0, 20.0)
+        return (False, 2.0, 20.0, 25, 90 * 60.0)
     if value is True:
-        return (True, 2.0, 20.0)
+        return (True, 2.0, 20.0, 25, 90 * 60.0)
     if not isinstance(value, dict):
         raise ValueError("llm.adjudication.audio_snippet_double_check must be a mapping or boolean")
     enabled = value.get("enabled", False)
@@ -1011,11 +1113,33 @@ def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> t
         20.0,
         "llm.adjudication.audio_snippet_double_check.max_duration_seconds",
     )
+    max_snippets_per_batch = _int_config(
+        value,
+        "max_snippets_per_batch",
+        25,
+        "llm.adjudication.audio_snippet_double_check.max_snippets_per_batch",
+    )
+    max_audio_duration_seconds = _float_config(
+        value,
+        "max_audio_duration_seconds",
+        90 * 60.0,
+        "llm.adjudication.audio_snippet_double_check.max_audio_duration_seconds",
+    )
     if pad_seconds < 0:
         raise ValueError("llm.adjudication.audio_snippet_double_check.pad_seconds must be non-negative")
     if max_duration_seconds <= 0:
         raise ValueError("llm.adjudication.audio_snippet_double_check.max_duration_seconds must be positive")
-    return (enabled, pad_seconds, max_duration_seconds)
+    if max_snippets_per_batch <= 0:
+        raise ValueError("llm.adjudication.audio_snippet_double_check.max_snippets_per_batch must be positive")
+    if max_audio_duration_seconds <= 0:
+        raise ValueError("llm.adjudication.audio_snippet_double_check.max_audio_duration_seconds must be positive")
+    return (
+        enabled,
+        pad_seconds,
+        max_duration_seconds,
+        max_snippets_per_batch,
+        max_audio_duration_seconds,
+    )
 
 
 def _float_config(source: dict[str, object], key: str, default: float, label: str) -> float:
@@ -1173,11 +1297,23 @@ def _run_verify_stage(
     speech_regions = []
     min_coverage = min_coverage_from_config(provider_config)
     boundary_refinement = _boundary_refinement_config(provider_config)
+    missing_audio_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
-        forced_alignments = forced_alignment_adapter.align(audio_for_asr, rebuilt)
+        forced_alignment_input = [
+            cue for cue in rebuilt if cue.index not in missing_audio_cue_ids
+        ]
+        forced_alignments = forced_alignment_adapter.align(
+            audio_for_asr,
+            forced_alignment_input,
+        )
         _write_json(episode_workdir / "forced_align.json", {"cues": [alignment.model_dump() for alignment in forced_alignments]})
-        rebuilt, forced_alignment_flags = apply_forced_alignment(rebuilt, forced_alignments, profile)
+        rebuilt, forced_alignment_flags = apply_forced_alignment(
+            rebuilt,
+            forced_alignments,
+            profile,
+            protected_cue_ids=missing_audio_cue_ids,
+        )
         flags.extend(forced_alignment_flags)
     overlap_detection_adapter = overlap_detection_adapter_from_config(provider_config)
     if overlap_detection_adapter is not None:
@@ -1222,10 +1358,17 @@ def _run_verify_stage(
                     min_coverage,
                 )
             )
+    rebuilt, missing_audio_restore_flags = _restore_missing_audio_source_cues(
+        rebuilt,
+        source_cues,
+        missing_audio_cue_ids,
+    )
+    flags.extend(missing_audio_restore_flags)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
         no_overlaps=_output_no_overlaps(provider_config),
+        protected_cue_ids=missing_audio_cue_ids,
     )
     flags.extend(final_order_flags)
     if speech_regions:
@@ -1260,7 +1403,12 @@ def _run_verify_stage(
     flags.extend(profanity_flags)
     flags.extend(span_coverage_flags(source_cues, rebuilt, alignment.divergence_spans, decisions))
     flags.extend(name_spelling_inconsistency_flags(source_cues, rebuilt))
-    flags.extend(_alignment_health_flags(alignment, source_cue_count=len(source_cues)))
+    flags.extend(
+        _alignment_health_flags(
+            alignment,
+            source_cue_count=_spoken_source_cue_count(source_cues),
+        )
+    )
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(flags)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1276,7 +1424,10 @@ def _run_verify_stage(
         cue_scores,
         summary_metadata={
             **(fps_summary_metadata or {}),
-            **_alignment_summary_metadata(alignment, source_cue_count=len(source_cues)),
+            **_alignment_summary_metadata(
+                alignment,
+                source_cue_count=_spoken_source_cue_count(source_cues),
+            ),
         },
     )
     _write_json(
@@ -1369,6 +1520,45 @@ def _unique_flags(flags: list[QCFlag]) -> list[QCFlag]:
 def _speaker_mapping_uses_llm(provider_config: dict[str, object]) -> bool:
     mapping_config = provider_config.get("speaker_mapping", {}) if isinstance(provider_config, dict) else {}
     return isinstance(mapping_config, dict) and str(mapping_config.get("provider", "")).lower() == "llm"
+
+
+def _long_audio_llm_skip_flag(
+    audio_path: Path,
+    provider_config: dict[str, object],
+) -> QCFlag | None:
+    return None
+
+
+def _long_audio_punctuation_skip_flag(
+    audio_path: Path,
+    provider_config: dict[str, object],
+) -> QCFlag | None:
+    llm_config = llm_config_for_pass(provider_config, "punctuation")
+    provider = str(llm_config.get("provider", "gemini")).lower()
+    if provider == "fixture":
+        return None
+    max_duration_seconds = _float_config(
+        llm_config,
+        "max_audio_duration_seconds",
+        30 * 60.0,
+        "llm.punctuation.max_audio_duration_seconds",
+    )
+    if max_duration_seconds <= 0:
+        raise ValueError("llm.punctuation.max_audio_duration_seconds must be positive")
+    duration_seconds = audio_seconds(audio_path)
+    if duration_seconds <= 0 or duration_seconds <= max_duration_seconds:
+        return None
+    return QCFlag(
+        kind="punctuation_skipped_for_long_audio",
+        cue_ids=[],
+        message=(
+            "LLM punctuation was skipped because the episode audio is "
+            f"{duration_seconds:g} seconds, above the configured "
+            f"{max_duration_seconds:g} second punctuation limit. Existing text, "
+            "line structure, and cue timing were preserved."
+        ),
+        severity="warning",
+    )
 
 
 def _record_llm_usage_events(
@@ -1527,6 +1717,7 @@ def _hold_incomplete_source_insertions(
     *,
     source_cue_count: int | None = None,
     alignment_unresolved: bool = False,
+    missing_audio_cue_ids: set[int] | None = None,
 ) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
     max_duration = _generation_float_config(
         provider_config,
@@ -1536,12 +1727,15 @@ def _hold_incomplete_source_insertions(
     provider_spans: list[DivergenceSpan] = []
     held_decisions: list[AdjudicationDecision] = []
     flags: list[QCFlag] = []
+    missing_audio = missing_audio_cue_ids or set()
     for span in spans:
-        hold = (
-            _unresolved_alignment_adjudication_hold(span)
-            if alignment_unresolved
-            else None
-        )
+        hold = _missing_audio_source_hold(span, missing_audio)
+        if hold is None:
+            hold = (
+                _unresolved_alignment_adjudication_hold(span)
+                if alignment_unresolved
+                else None
+            )
         if hold is None:
             hold = _oversized_adjudication_span_hold(span, source_cue_count)
         if hold is None:
@@ -1553,6 +1747,105 @@ def _hold_incomplete_source_insertions(
         held_decisions.append(decision)
         flags.append(flag)
     return provider_spans, held_decisions, flags
+
+
+def _missing_audio_source_hold(
+    span: DivergenceSpan,
+    missing_audio_cue_ids: set[int],
+) -> tuple[AdjudicationDecision, QCFlag] | None:
+    referenced_cue_ids = set(span.cue_ids)
+    if span.left_anchor_cue_id is not None:
+        referenced_cue_ids.add(span.left_anchor_cue_id)
+    if span.right_anchor_cue_id is not None:
+        referenced_cue_ids.add(span.right_anchor_cue_id)
+    protected_cue_ids = referenced_cue_ids & missing_audio_cue_ids
+    if (
+        not protected_cue_ids
+        or (not span.srt_text.strip() and not span.asr_text.strip())
+    ):
+        return None
+    decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="keep_srt",
+        final_text=span.srt_text,
+        confidence=0.0,
+        speaker=span.speaker_ids[0] if len(span.speaker_ids) == 1 else None,
+        character="unknown",
+        reason=(
+            "The source cue had no trustworthy local speech evidence; source text and "
+            "timing were retained instead of assigning unrelated audio."
+        ),
+    )
+    flag = QCFlag(
+        kind="missing_audio_source_cue_held",
+        cue_ids=sorted(protected_cue_ids),
+        message=(
+            "Source-backed text was not sent to adjudication because its audio is "
+            "missing or timing-inconsistent; retained the source cue for review."
+        ),
+        severity="error",
+        old_text=span.srt_text,
+        new_text=span.asr_text,
+        start=span.start,
+        end=span.end,
+    )
+    return decision, flag
+
+
+def _restore_missing_audio_source_cues(
+    rebuilt: list[Cue],
+    source_cues: list[Cue],
+    protected_cue_ids: set[int],
+) -> tuple[list[Cue], list[QCFlag]]:
+    if not protected_cue_ids:
+        return list(rebuilt), []
+
+    source_by_id = {
+        cue.index: cue
+        for cue in source_cues
+        if cue.index in protected_cue_ids
+    }
+    restored_ids: set[int] = set()
+    restored: list[Cue] = []
+    for cue in rebuilt:
+        source = source_by_id.get(cue.index)
+        if source is None:
+            restored.append(cue)
+            continue
+        exact_source = source.model_copy(
+            update={
+                "speaker_id": cue.speaker_id,
+                "character": cue.character,
+            }
+        )
+        restored.append(exact_source)
+        if (
+            cue.start_ms != source.start_ms
+            or cue.end_ms != source.end_ms
+            or cue.lines != source.lines
+        ):
+            restored_ids.add(cue.index)
+
+    present_ids = {cue.index for cue in restored}
+    for cue in source_cues:
+        if cue.index not in source_by_id or cue.index in present_ids:
+            continue
+        restored.append(cue.model_copy(deep=True))
+        restored_ids.add(cue.index)
+
+    if not restored_ids:
+        return restored, []
+    return restored, [
+        QCFlag(
+            kind="missing_audio_source_cue_restored",
+            cue_ids=sorted(restored_ids),
+            message=(
+                "A missing-audio source cue was restored to its exact editorial text and "
+                "timing after downstream processing attempted to alter it."
+            ),
+            severity="error",
+        )
+    ]
 
 
 def _set_adapter_episode_context(adapter: object, cues: list[Cue]) -> None:
@@ -1692,12 +1985,14 @@ def _apply_incomplete_source_holds_to_decisions(
     *,
     source_cue_count: int | None = None,
     alignment_unresolved: bool = False,
+    missing_audio_cue_ids: set[int] | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
         spans,
         provider_config,
         source_cue_count=source_cue_count,
         alignment_unresolved=alignment_unresolved,
+        missing_audio_cue_ids=missing_audio_cue_ids,
     )
     if not held_decisions:
         return decisions, adjudication_flags
@@ -1718,6 +2013,7 @@ def _apply_incomplete_source_holds_to_decisions(
             "generated_adlib_rejected_incomplete_source",
             "oversized_adjudication_span_held",
             "unresolved_alignment_adjudication_held",
+            "missing_audio_source_cue_held",
         }
     ]
     return ordered_decisions, [*retained_flags, *incomplete_source_flags]
@@ -1731,12 +2027,14 @@ def _unsafe_incomplete_source_resume_case_ids(
     source_cues: list[Cue],
     *,
     alignment_unresolved: bool = False,
+    missing_audio_cue_ids: set[int] | None = None,
 ) -> list[str]:
     _, held_decisions, _ = _hold_incomplete_source_insertions(
         spans,
         provider_config,
-        source_cue_count=len(source_cues),
+        source_cue_count=_spoken_source_cue_count(source_cues),
         alignment_unresolved=alignment_unresolved,
+        missing_audio_cue_ids=missing_audio_cue_ids,
     )
     decisions_by_case = {decision.case_id: decision for decision in decisions}
     spans_by_case = {span.case_id: span for span in spans}
@@ -1994,9 +2292,11 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
         return alignment
 
     adlib_cue_ids_by_case = adlib_cue_ids_by_case or {}
+    protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     for span in spans:
-        if span.case_id not in timed_decisions:
+        decision = timed_decisions.get(span.case_id)
+        if decision is None:
             continue
         adlib_cue_id = adlib_cue_ids_by_case.get(span.case_id)
         if adlib_cue_id is not None:
@@ -2005,6 +2305,12 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
             )
             continue
         for cue_id, spoken_indices in _span_word_indices_by_cue(span).items():
+            if cue_id in protected_cue_ids:
+                continue
+            if decision.verdict == "keep_srt":
+                existing = cue_word_indices.get(cue_id, [])
+                if not existing:
+                    continue
             combined = sorted(set(cue_word_indices.get(cue_id, []) + spoken_indices))
             if combined:
                 cue_word_indices[cue_id] = combined

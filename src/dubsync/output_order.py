@@ -4,6 +4,7 @@ from rapidfuzz import fuzz
 
 from .models import Cue, QCFlag
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue
 from .text_metrics import display_width
 from .tokenize import alphanumeric_signature
 
@@ -15,9 +16,21 @@ def finalize_cues_for_output(
     no_overlaps: bool = True,
     max_cps: float | None = None,
     max_cue_duration_seconds: float | None = None,
+    protected_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
-    flags = _source_order_inversion_flags(cues)
-    ordered = sorted(cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
+    protected = protected_cue_ids or set()
+    untouched_cues = [
+        cue
+        for cue in cues
+        if cue.index in protected or is_bracketed_screen_text_cue(cue)
+    ]
+    dialogue_cues = [
+        cue
+        for cue in cues
+        if cue.index not in protected and not is_bracketed_screen_text_cue(cue)
+    ]
+    flags = _source_order_inversion_flags(dialogue_cues)
+    ordered = sorted(dialogue_cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
     merged, merge_flags = _merge_duplicate_overlaps(ordered)
     flags.extend(merge_flags)
     if max_cps is not None:
@@ -39,8 +52,12 @@ def finalize_cues_for_output(
     if no_overlaps:
         finalized, overlap_flags = _resolve_residual_overlaps(merged, profile)
         flags.extend(overlap_flags)
-    _assert_monotonic_starts(finalized)
-    return finalized, flags
+    combined = sorted(
+        [*finalized, *untouched_cues],
+        key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
+    )
+    _assert_monotonic_starts(combined)
+    return combined, flags
 
 
 def _source_order_inversion_flags(cues: list[Cue]) -> list[QCFlag]:

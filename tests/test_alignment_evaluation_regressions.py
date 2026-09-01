@@ -41,9 +41,73 @@ def test_alignment_flags_large_drift_relative_to_episode_offset():
 
     result = align_cues_to_words(cues, words)
 
-    assert result.cue_word_indices[4] == [303]
+    assert 4 not in result.cue_word_indices
+    assert result.unmatched_cue_ids == [4]
+    assert result.diagnostics.missing_audio_cue_ids == [4]
     outliers = [flag for flag in result.flags if flag.kind == "alignment_outlier"]
     assert [flag.cue_ids for flag in outliers] == [[4]]
+
+
+def test_alignment_holds_complete_sentence_far_from_episode_timing_model():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:04,000\nmissing full phrase\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.1, end=0.2),
+        Word(text="beta", start=1.1, end=1.2),
+        Word(text="gamma", start=2.1, end=2.2),
+        Word(text="missing", start=50.0, end=50.2),
+        Word(text="full", start=50.25, end=50.4),
+        Word(text="phrase", start=50.45, end=50.7),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert 4 not in result.cue_word_indices
+    assert 4 in result.unmatched_cue_ids
+    assert 4 in result.diagnostics.missing_audio_cue_ids
+
+
+def test_alignment_holds_far_match_with_only_one_trustworthy_local_anchor():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nopening anchor\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nmissing phrase\n\n"
+    )
+    words = [
+        Word(text="opening", start=0.1, end=0.3),
+        Word(text="anchor", start=0.32, end=0.6),
+        Word(text="missing", start=50.0, end=50.2),
+        Word(text="phrase", start=50.25, end=50.5),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {1: [0, 1]}
+    assert result.unmatched_cue_ids == [2]
+    assert result.diagnostics.missing_audio_cue_ids == [2]
+
+
+def test_alignment_holds_partial_source_phrase_when_no_audio_window_exists():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nbefore missing words after\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nfinal anchor\n\n"
+    )
+    words = [
+        Word(text="before", start=0.7, end=1.0),
+        Word(text="after", start=1.0, end=1.3),
+        Word(text="final", start=3.1, end=3.3),
+        Word(text="anchor", start=3.4, end=3.6),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices[1] == [0, 1]
+    assert result.diagnostics.missing_audio_cue_ids == [1]
+    missing = next(flag for flag in result.flags if flag.kind == "missing_audio_timing_held")
+    assert missing.cue_ids == [1]
 
 
 def test_alignment_does_not_flag_uniform_episode_shift_as_an_outlier():
@@ -61,6 +125,7 @@ def test_alignment_does_not_flag_uniform_episode_shift_as_an_outlier():
     result = align_cues_to_words(cues, words)
 
     assert not any(flag.kind == "alignment_outlier" for flag in result.flags)
+    assert result.diagnostics.missing_audio_cue_ids == []
 
 
 def test_alignment_flags_scrambled_episode_when_model_fit_is_unavailable():

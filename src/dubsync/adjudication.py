@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from rapidfuzz import fuzz
 from pydantic import ValidationError
 
 from .models import AdjudicationDecision, AudioSnippet, DivergenceSpan, QCFlag
+from .providers import ProviderError
 from .tokenize import alphanumeric_signature
 
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
+_MAX_UNPACKED_SCENE_BATCHES = 16
 
 
 class LLMAdapter(Protocol):
@@ -24,6 +28,12 @@ class SnippetAwareLLMAdapter(Protocol):
         audio_snippets: dict[str, AudioSnippet],
     ) -> list[dict[str, object]]:
         raise NotImplementedError
+
+
+AudioSnippetBatchLoader = Callable[
+    [list[DivergenceSpan]],
+    AbstractContextManager[dict[str, AudioSnippet]],
+]
 
 
 class StaticLLMAdapter:
@@ -57,11 +67,13 @@ class AdjudicationEngine:
         confidence_gate: float = 0.7,
         scene_gap_seconds: float = 4.0,
         audio_snippets: dict[str, AudioSnippet] | None = None,
+        audio_snippet_batches: AudioSnippetBatchLoader | None = None,
     ):
         self.llm = llm
         self.confidence_gate = confidence_gate
         self.scene_gap_seconds = scene_gap_seconds
         self.audio_snippets = dict(audio_snippets or {})
+        self.audio_snippet_batches = audio_snippet_batches
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
         decisions_by_case: dict[str, AdjudicationDecision] = {}
@@ -74,28 +86,38 @@ class AdjudicationEngine:
                 decisions_by_case[span.case_id] = heuristic_decision
 
         invalid_spans: list[DivergenceSpan] = []
+        provider_failed_spans: list[DivergenceSpan] = []
         if llm_spans:
             for batch in self._scene_batches(llm_spans):
-                llm_decisions, batch_invalid_spans = self._validate_raw(self._adjudicate_batch(batch), batch)
+                try:
+                    raw_decisions = self._adjudicate_batch(batch)
+                except (ProviderError, OSError):
+                    provider_failed_spans.extend(batch)
+                    continue
+                llm_decisions, batch_invalid_spans = self._validate_raw(raw_decisions, batch)
                 decisions_by_case = {**decisions_by_case, **llm_decisions}
                 invalid_spans.extend(batch_invalid_spans)
             if invalid_spans:
                 retry_invalid_spans: list[DivergenceSpan] = []
                 for batch in self._scene_batches(invalid_spans):
-                    retry_decisions, batch_invalid_spans = self._validate_raw(
-                        self._adjudicate_batch(batch),
-                        batch,
-                    )
+                    try:
+                        raw_retry_decisions = self._adjudicate_batch(batch)
+                    except (ProviderError, OSError):
+                        provider_failed_spans.extend(batch)
+                        continue
+                    retry_decisions, batch_invalid_spans = self._validate_raw(raw_retry_decisions, batch)
                     decisions_by_case = {**decisions_by_case, **retry_decisions}
                     retry_invalid_spans.extend(batch_invalid_spans)
                 invalid_spans = retry_invalid_spans
 
         decisions: list[AdjudicationDecision] = []
         flags: list[QCFlag] = []
+        provider_failed_case_ids = {span.case_id for span in provider_failed_spans}
 
         for span in spans:
             decision = decisions_by_case.get(span.case_id)
             if decision is None:
+                provider_failed = span.case_id in provider_failed_case_ids
                 decision = AdjudicationDecision(
                     case_id=span.case_id,
                     verdict="keep_srt",
@@ -103,13 +125,25 @@ class AdjudicationEngine:
                     confidence=0.0,
                     speaker=span.speaker_ids[0] if span.speaker_ids else None,
                     character="unknown",
-                    reason="Invalid LLM response; preserved source SRT.",
+                    reason=(
+                        "Adjudication provider failed; preserved source SRT."
+                        if provider_failed
+                        else "Invalid LLM response; preserved source SRT."
+                    ),
                 )
                 flags.append(
                     QCFlag(
-                        kind="invalid_llm_response",
+                        kind=(
+                            "llm_provider_unavailable"
+                            if provider_failed
+                            else "invalid_llm_response"
+                        ),
                         cue_ids=span.cue_ids,
-                        message="LLM response failed schema validation.",
+                        message=(
+                            "LLM adjudication provider failed; source SRT was preserved."
+                            if provider_failed
+                            else "LLM response failed schema validation."
+                        ),
                         severity="error",
                         old_text=span.srt_text,
                         new_text=span.asr_text,
@@ -137,6 +171,19 @@ class AdjudicationEngine:
 
     def _adjudicate_batch(self, batch: list[DivergenceSpan]) -> list[dict[str, object]]:
         snippets = {span.case_id: self.audio_snippets[span.case_id] for span in batch if span.case_id in self.audio_snippets}
+        if self.audio_snippet_batches is not None:
+            with self.audio_snippet_batches(batch) as loaded_snippets:
+                return self._call_adjudication_adapter(
+                    batch,
+                    {**snippets, **loaded_snippets},
+                )
+        return self._call_adjudication_adapter(batch, snippets)
+
+    def _call_adjudication_adapter(
+        self,
+        batch: list[DivergenceSpan],
+        snippets: dict[str, AudioSnippet],
+    ) -> list[dict[str, object]]:
         if snippets and hasattr(self.llm, "adjudicate_with_audio"):
             return getattr(self.llm, "adjudicate_with_audio")(batch, snippets)
         return self.llm.adjudicate(batch)
@@ -188,11 +235,26 @@ class AdjudicationEngine:
             else:
                 batches[-1].append(span)
             previous = span
-        return [
+        annotated_scenes = [
+            [
+                span.model_copy(
+                    update={
+                        "prompt_scene_id": scene_id,
+                        "prompt_scene_position": position,
+                    }
+                )
+                for position, span in enumerate(batch, start=1)
+            ]
+            for scene_id, batch in enumerate(batches, start=1)
+        ]
+        scene_chunks = [
             chunk
-            for batch in batches
+            for batch in annotated_scenes
             for chunk in _split_span_batch_by_size(batch, _MAX_ADJUDICATION_BATCH_SPANS)
         ]
+        if len(scene_chunks) <= _MAX_UNPACKED_SCENE_BATCHES:
+            return scene_chunks
+        return _pack_scene_chunks(scene_chunks, _MAX_ADJUDICATION_BATCH_SPANS)
 
     @staticmethod
     def _span_for_payload(
@@ -209,6 +271,20 @@ class AdjudicationEngine:
         if index < len(spans):
             return spans[index]
         return None
+
+
+def _pack_scene_chunks(
+    scene_chunks: list[list[DivergenceSpan]],
+    max_size: int,
+) -> list[list[DivergenceSpan]]:
+    packed: list[list[DivergenceSpan]] = []
+    current: list[DivergenceSpan] = []
+    for chunk in scene_chunks:
+        if current and len(current) + len(chunk) > max_size:
+            packed = [*packed, current]
+            current = []
+        current = [*current, *chunk]
+    return [*packed, current] if current else packed
 
 
 def _heuristic_decision(span: DivergenceSpan) -> AdjudicationDecision | None:

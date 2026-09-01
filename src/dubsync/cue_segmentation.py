@@ -5,6 +5,10 @@ from collections import Counter
 
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .style_profile import StyleProfile
+from .subtitle_annotations import (
+    cue_has_bracketed_screen_text,
+    text_without_bracketed_screen_text,
+)
 from .text_metrics import contains_character_level_script, wrap_visual_width
 from .tokenize import alphanumeric_signature
 
@@ -195,6 +199,9 @@ def split_overlong_existing_cues(
         if source_cue_ids is not None and cue.index not in source_cue_ids:
             split_cues.append(cue)
             continue
+        if cue_has_bracketed_screen_text(cue):
+            split_cues.append(cue)
+            continue
         exceeds_explicit_lines = len(cue.lines) > profile.max_lines_per_cue
         exceeds_wrapped_lines = len(wrap_visual_width(cue.plain_text, profile.max_chars_per_line)) > profile.max_lines_per_cue
         if not exceeds_explicit_lines and not exceeds_wrapped_lines:
@@ -378,7 +385,11 @@ def _word_groups_for_source_lines(
     groups: list[list[int]] = []
     word_position = 0
     for line in lines:
-        target_token_count = len(alphanumeric_signature(_text_without_subtitle_markup(line)))
+        target_token_count = len(
+            alphanumeric_signature(
+                _text_without_subtitle_markup(text_without_bracketed_screen_text(line))
+            )
+        )
         if target_token_count <= 0:
             return None
         group: list[int] = []
@@ -468,7 +479,9 @@ def _retained_word_window(
     word_indices: list[int],
 ) -> tuple[list[int], str]:
     ordered = _ordered_valid_word_indices(words, word_indices)
-    target_tokens = alphanumeric_signature(_text_without_subtitle_markup(text))
+    target_tokens = alphanumeric_signature(
+        _text_without_subtitle_markup(text_without_bracketed_screen_text(text))
+    )
     if not target_tokens:
         return ordered, "full"
     if not ordered:
@@ -501,7 +514,9 @@ def _retained_word_window(
 
 
 def _has_unique_exact_text_window(text: str, words: list[Word], word_indices: list[int]) -> bool:
-    target_tokens = alphanumeric_signature(_text_without_subtitle_markup(text))
+    target_tokens = alphanumeric_signature(
+        _text_without_subtitle_markup(text_without_bracketed_screen_text(text))
+    )
     if not target_tokens:
         return True
     candidate_tokens: list[str] = []

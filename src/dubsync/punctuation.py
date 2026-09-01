@@ -5,6 +5,8 @@ import unicodedata
 from typing import Protocol
 
 from .models import Cue, QCFlag
+from .providers import ProviderError
+from .subtitle_annotations import cue_has_bracketed_screen_text
 from .text_metrics import display_width, wrap_visual_width
 
 
@@ -13,6 +15,7 @@ class PunctuationValidationError(ValueError):
 
 
 _MAX_PUNCTUATION_BATCH_CUES = 40
+_MAX_UNPACKED_SCENE_BATCHES = 16
 
 
 class PunctuationAdapter(Protocol):
@@ -25,7 +28,12 @@ class StaticPunctuationAdapter:
         self.responses = {int(cue_id): text for cue_id, text in responses.items()}
 
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
-        return {cue.index: self.responses[cue.index] for cue in cues if cue.index in self.responses}
+        return {
+            cue.index: self.responses[cue.index]
+            for cue in cues
+            if not cue_has_bracketed_screen_text(cue)
+            and cue.index in self.responses
+        }
 
 
 def validate_punctuation_only(before: str, after: str) -> str:
@@ -47,21 +55,48 @@ def apply_punctuation_pass(
     source_by_id = {
         cue.index: cue for cue in (cues if source_cues is None else source_cues)
     }
-    prompt_cues = [
-        cue.with_lines(source_by_id[cue.index].lines)
-        if _source_words_unchanged(cue, source_by_id.get(cue.index))
-        else cue
+    annotated_cue_ids = {
+        cue.index
         for cue in cues
+        if cue_has_bracketed_screen_text(cue)
+        or (
+            cue.index in source_by_id
+            and cue_has_bracketed_screen_text(source_by_id[cue.index])
+        )
+    }
+    prompt_cues = [
+        (
+            cue.with_lines(source_by_id[cue.index].lines)
+            if _source_words_unchanged(cue, source_by_id.get(cue.index))
+            else cue
+        )
+        for cue in cues
+        if cue.index not in annotated_cue_ids
     ]
     proposed: dict[int, str] = {}
+    flags: list[QCFlag] = []
     for batch in _scene_batches(prompt_cues, scene_gap_seconds):
-        proposed.update(adapter.punctuate(batch))
+        try:
+            proposed.update(adapter.punctuate(batch))
+        except (ProviderError, OSError):
+            flags.append(
+                QCFlag(
+                    kind="punctuation_provider_unavailable",
+                    cue_ids=[cue.index for cue in batch],
+                    message="LLM punctuation provider failed; source punctuation was preserved.",
+                    severity="error",
+                    start=batch[0].start_ms / 1000.0 if batch else None,
+                    end=batch[-1].end_ms / 1000.0 if batch else None,
+                )
+            )
     if not proposed:
-        return cues, []
+        return cues, flags
 
     updated: list[Cue] = []
-    flags: list[QCFlag] = []
     for cue in cues:
+        if cue.index in annotated_cue_ids:
+            updated.append(cue)
+            continue
         next_text = proposed.get(cue.index)
         if next_text is None:
             updated.append(cue)
@@ -149,11 +184,37 @@ def _scene_batches(cues: list[Cue], scene_gap_seconds: float) -> list[list[Cue]]
         else:
             batches[-1].append(cue)
         previous = cue
-    return [
+    annotated_scenes = [
+        [
+            cue.model_copy(
+                update={
+                    "prompt_scene_id": scene_id,
+                    "prompt_scene_position": position,
+                }
+            )
+            for position, cue in enumerate(batch, start=1)
+        ]
+        for scene_id, batch in enumerate(batches, start=1)
+    ]
+    scene_chunks = [
         chunk
-        for batch in batches
+        for batch in annotated_scenes
         for chunk in _split_cue_batch_by_size(batch, _MAX_PUNCTUATION_BATCH_CUES)
     ]
+    if len(scene_chunks) <= _MAX_UNPACKED_SCENE_BATCHES:
+        return scene_chunks
+    return _pack_scene_chunks(scene_chunks, _MAX_PUNCTUATION_BATCH_CUES)
+
+
+def _pack_scene_chunks(scene_chunks: list[list[Cue]], max_size: int) -> list[list[Cue]]:
+    packed: list[list[Cue]] = []
+    current: list[Cue] = []
+    for chunk in scene_chunks:
+        if current and len(current) + len(chunk) > max_size:
+            packed = [*packed, current]
+            current = []
+        current = [*current, *chunk]
+    return [*packed, current] if current else packed
 
 
 def _split_cue_batch_by_size(cues: list[Cue], max_size: int) -> list[list[Cue]]:

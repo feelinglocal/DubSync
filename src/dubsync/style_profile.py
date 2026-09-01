@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from .models import Cue
+from .subtitle_annotations import cue_has_spoken_text, text_without_bracketed_screen_text
 from .text_metrics import display_width
 
 FPS_CANDIDATES = (23.976, 24.0, 25.0, 29.97, 30.0)
@@ -141,21 +142,45 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
     if not cues:
         return StyleProfile()
 
-    durations = [cue.duration_ms / 1000.0 for cue in cues]
-    line_counts = [len(cue.lines) for cue in cues]
-    line_widths = [display_width(line) for cue in cues for line in cue.lines]
+    dialogue_cues = [cue for cue in cues if cue_has_spoken_text(cue)] or list(cues)
+    dialogue_lines = [
+        line
+        for cue in dialogue_cues
+        for line in text_without_bracketed_screen_text(cue.text).splitlines()
+        if line.strip()
+    ]
+    durations = [cue.duration_ms / 1000.0 for cue in dialogue_cues]
+    line_counts = [
+        max(
+            1,
+            len(
+                [
+                    line
+                    for line in text_without_bracketed_screen_text(cue.text).splitlines()
+                    if line.strip()
+                ]
+            ),
+        )
+        for cue in dialogue_cues
+    ]
+    line_widths = [display_width(line) for line in dialogue_lines] or [
+        display_width(line) for cue in dialogue_cues for line in cue.lines
+    ]
     max_lines = _robust_upper_limit(line_counts)
     max_chars = _robust_upper_limit(line_widths)
-    allow_zero_gap = any(left.end_ms == right.start_ms for left, right in zip(cues, cues[1:]))
+    allow_zero_gap = any(
+        left.end_ms == right.start_ms
+        for left, right in zip(dialogue_cues, dialogue_cues[1:])
+    )
     observed_min_duration = min(durations)
     min_duration = _robust_lower_limit(durations)
 
     notes: list[str] = []
-    if any(line != line.rstrip() for cue in cues for line in cue.lines):
+    if any(line != line.rstrip() for cue in dialogue_cues for line in cue.lines):
         notes.append("trailing text whitespace normalized on write")
 
     return StyleProfile(
-        fps=detect_fps(cues),
+        fps=detect_fps(dialogue_cues),
         max_lines_per_cue=max(2, max_lines),
         max_chars_per_line=max(26, max_chars),
         min_cue_dur=min(round(min_duration, 3), 0.5),

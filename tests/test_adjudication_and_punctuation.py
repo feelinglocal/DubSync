@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from dubsync.adjudication import AdjudicationEngine, StaticLLMAdapter
 from dubsync.models import AudioSnippet, DivergenceSpan
 from dubsync.punctuation import PunctuationValidationError, validate_punctuation_only
+from dubsync.providers import ProviderError
 
 
 class SequencedLLMAdapter:
@@ -23,6 +26,15 @@ class CountingLLMAdapter:
     def adjudicate(self, spans: list[DivergenceSpan]) -> list[dict[str, object]]:
         self.calls += 1
         return []
+
+
+class FailingLLMAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def adjudicate(self, spans: list[DivergenceSpan]) -> list[dict[str, object]]:
+        self.calls += 1
+        raise ProviderError("provider timed out")
 
 
 class RecordingLLMAdapter:
@@ -104,6 +116,107 @@ def test_llm_adjudication_caps_dense_scene_batches():
     decisions, flags = AdjudicationEngine(llm, scene_gap_seconds=4.0).adjudicate(spans)
 
     assert [len(batch) for batch in llm.batches] == [25, 5]
+    assert [decision.case_id for decision in decisions] == [span.case_id for span in spans]
+    assert flags == []
+
+
+def test_llm_adjudication_packs_many_sparse_scenes_for_long_episode_scaling():
+    llm = RecordingLLMAdapter()
+    spans = [
+        make_span(f"case-{index}", float(index * 10), float(index * 10) + 1.0)
+        for index in range(1, 31)
+    ]
+
+    decisions, flags = AdjudicationEngine(llm, scene_gap_seconds=4.0).adjudicate(spans)
+
+    assert [len(batch) for batch in llm.batches] == [25, 5]
+    assert [case_id for batch in llm.batches for case_id in batch] == [
+        span.case_id for span in spans
+    ]
+    assert [decision.case_id for decision in decisions] == [span.case_id for span in spans]
+    assert flags == []
+
+
+def test_packed_adjudication_batches_retain_explicit_scene_identity():
+    scene_batches: list[list[tuple[int | None, int | None]]] = []
+
+    class SceneRecordingAdapter(RecordingLLMAdapter):
+        def adjudicate(self, spans):
+            scene_batches.append(
+                [
+                    (span.prompt_scene_id, span.prompt_scene_position)
+                    for span in spans
+                ]
+            )
+            return super().adjudicate(spans)
+
+    spans = [
+        make_span(f"case-{index}", float(index * 10), float(index * 10) + 1.0)
+        for index in range(1, 31)
+    ]
+
+    AdjudicationEngine(SceneRecordingAdapter(), scene_gap_seconds=4.0).adjudicate(spans)
+
+    assert scene_batches == [
+        [(index, 1) for index in range(1, 26)],
+        [(index, 1) for index in range(26, 31)],
+    ]
+
+
+def test_adjudication_streams_audio_snippets_for_every_bounded_batch(tmp_path):
+    loaded_batches: list[list[str]] = []
+    released_batches: list[list[str]] = []
+
+    class BatchRecordingAdapter:
+        def __init__(self):
+            self.audio_batches: list[list[str]] = []
+
+        def adjudicate_with_audio(self, spans, audio_snippets):
+            self.audio_batches.append(list(audio_snippets))
+            return [
+                {
+                    "case_id": span.case_id,
+                    "verdict": "use_audio",
+                    "final_text": span.asr_text,
+                    "confidence": 0.91,
+                    "speaker": None,
+                    "character": "unknown",
+                    "reason": "audio snippet confirms the spoken line",
+                }
+                for span in spans
+            ]
+
+    @contextmanager
+    def snippets_for_batch(batch):
+        case_ids = [span.case_id for span in batch]
+        loaded_batches.append(case_ids)
+        snippets = {
+            span.case_id: AudioSnippet(
+                case_id=span.case_id,
+                path=str(tmp_path / f"{span.case_id}.wav"),
+                mime_type="audio/wav",
+                start=span.start or 0.0,
+                end=span.end or 0.0,
+            )
+            for span in batch
+        }
+        try:
+            yield snippets
+        finally:
+            released_batches.append(case_ids)
+
+    adapter = BatchRecordingAdapter()
+    spans = [make_span(f"case-{index}", float(index), float(index) + 0.5) for index in range(1, 31)]
+
+    decisions, flags = AdjudicationEngine(
+        adapter,
+        scene_gap_seconds=4.0,
+        audio_snippet_batches=snippets_for_batch,
+    ).adjudicate(spans)
+
+    assert [len(batch) for batch in loaded_batches] == [25, 5]
+    assert released_batches == loaded_batches
+    assert adapter.audio_batches == loaded_batches
     assert [decision.case_id for decision in decisions] == [span.case_id for span in spans]
     assert flags == []
 
@@ -262,6 +375,28 @@ def test_invalid_llm_payload_degrades_after_retry_with_qc_flag():
     assert decisions[0].verdict == "keep_srt"
     assert decisions[0].final_text == "source text"
     assert "invalid_llm_response" in {flag.kind for flag in flags}
+
+
+def test_provider_failure_degrades_to_source_srt_with_qc_flag():
+    span = DivergenceSpan(
+        case_id="case-2",
+        cue_ids=[4],
+        srt_text="source text",
+        asr_text="spoken text",
+        start=1.0,
+        end=2.0,
+        confidence=0.80,
+        speaker_ids=[],
+    )
+    llm = FailingLLMAdapter()
+
+    decisions, flags = AdjudicationEngine(llm).adjudicate([span])
+
+    assert llm.calls == 1
+    assert decisions[0].verdict == "keep_srt"
+    assert decisions[0].final_text == "source text"
+    assert decisions[0].reason == "Adjudication provider failed; preserved source SRT."
+    assert "llm_provider_unavailable" in {flag.kind for flag in flags}
 
 
 def test_punctuation_validator_accepts_case_and_punctuation_changes_only():

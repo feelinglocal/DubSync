@@ -5,9 +5,10 @@ import wave
 from pathlib import Path
 from typing import Protocol
 
-from .models import Cue, QCFlag, SpeechRegion
 from .region_index import SpeechRegionIndex
 from .silence import _dbfs, _mono_pcm16, _validate_pcm16
+from .models import Cue, QCFlag, SpeechRegion
+from .subtitle_annotations import cue_has_spoken_text
 
 
 class SpeechActivityAdapter(Protocol):
@@ -158,6 +159,8 @@ def speech_activity_flags_for_cues(
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
     for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0
         duration = cue_end - cue_start
@@ -187,6 +190,8 @@ def trailing_silence_flags_for_cues(
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
     for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0
         overlapping = region_index.overlapping(cue_start, cue_end)
@@ -223,6 +228,8 @@ def dropped_line_flags_for_unmatched_cues(
     region_index = SpeechRegionIndex(regions)
     for cue in cues:
         if cue.index not in unmatched:
+            continue
+        if not cue_has_spoken_text(cue):
             continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0

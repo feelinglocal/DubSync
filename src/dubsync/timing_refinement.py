@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue
 
 
 @dataclass(frozen=True)
@@ -31,11 +32,21 @@ def refine_cues_to_speech_activity(
     if not options.enabled or not regions:
         return cues, []
 
+    protected = (
+        set(alignment.diagnostics.missing_audio_cue_ids)
+        if alignment is not None
+        else set()
+    )
+    dialogue_cues = [
+        cue
+        for cue in cues
+        if cue.index not in protected and not is_bracketed_screen_text_cue(cue)
+    ]
     refined: list[Cue] = []
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
 
-    for index, cue in enumerate(cues):
+    for index, cue in enumerate(dialogue_cues):
         word_window = _word_window_for_cue(cue, words, alignment)
         cue_regions = (
             _regions_from_word_window(word_window, region_index, options)
@@ -54,8 +65,8 @@ def refine_cues_to_speech_activity(
             else _refined_end_ms(cue, end_region, profile, options)
         )
         end_cap_ms = None
-        if index + 1 < len(cues):
-            end_cap_ms = cues[index + 1].start_ms
+        if index + 1 < len(dialogue_cues):
+            end_cap_ms = dialogue_cues[index + 1].start_ms
             end_ms = min(end_ms, end_cap_ms)
         end_ms = max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
         if end_cap_ms is not None and end_ms > end_cap_ms:
@@ -85,7 +96,14 @@ def refine_cues_to_speech_activity(
         if minimum_unattainable:
             flags.append(_min_duration_unattainable_flag(cue, next_cue, profile))
 
-    return refined, flags
+    refined_by_id = {cue.index: cue for cue in refined}
+    merged = [
+        cue
+        if cue.index in protected or is_bracketed_screen_text_cue(cue)
+        else refined_by_id[cue.index]
+        for cue in cues
+    ]
+    return merged, flags
 
 
 def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfile) -> QCFlag:

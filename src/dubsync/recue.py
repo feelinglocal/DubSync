@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue
 
 
 @dataclass(frozen=True)
@@ -37,25 +38,14 @@ def rebuild_cues(
     flags.extend(timing_flags)
     next_start_by_cue = _next_start_by_same_speaker(cues, timings)
 
-    for cue_position, cue in enumerate(cues):
+    for cue in cues:
         timing = timings.get(cue.index)
         if timing is None:
             should_remove = profile.drop_policy == "remove"
-            interpolated = None if should_remove else _interpolated_timing(cue_position, cues, timings, profile)
-            if interpolated is not None:
-                rebuilt.append(cue.with_timing(interpolated.start_ms, interpolated.end_ms))
-                flags.append(
-                    QCFlag(
-                        kind="interpolated_timing",
-                        cue_ids=[cue.index],
-                        message="Unmatched cue was kept but re-timed by interpolation between matched neighboring cues.",
-                        old_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
-                        new_text=f"{interpolated.start_ms / 1000.0:.3f} --> {interpolated.end_ms / 1000.0:.3f}",
-                        start=interpolated.start_ms / 1000.0,
-                        end=interpolated.end_ms / 1000.0,
-                    )
-                )
-            elif not should_remove:
+            if is_bracketed_screen_text_cue(cue):
+                rebuilt.append(cue)
+                continue
+            if not should_remove:
                 rebuilt.append(cue)
             flags.append(
                 QCFlag(
@@ -76,71 +66,11 @@ def rebuild_cues(
         end_ms = _extend_into_available_gap(timing, next_start_by_cue.get(cue.index), profile)
         rebuilt.append(cue.with_timing(timing.start_ms, end_ms).model_copy(update={"speaker_id": timing.speaker_id}))
 
-    return _enforce_monotonic(rebuilt, profile), flags
-
-
-def _interpolated_timing(
-    cue_position: int,
-    cues: list[Cue],
-    timings: dict[int, _CueTiming],
-    profile: StyleProfile,
-) -> _CueTiming | None:
-    cue = cues[cue_position]
-    previous = _neighbor_timing(cues[:cue_position], timings, reverse=True)
-    nxt = _neighbor_timing(cues[cue_position + 1 :], timings, reverse=False)
-    duration_ms = max(profile.snap_ceil(profile.min_cue_dur * 1000), min(cue.duration_ms, 2000))
-
-    if previous is not None and nxt is not None:
-        previous_cue, previous_timing = previous
-        next_cue, next_timing = nxt
-        source_span = max(1, next_cue.start_ms - previous_cue.end_ms)
-        ratio = min(1.0, max(0.0, (cue.start_ms - previous_cue.end_ms) / source_span))
-        target_start = previous_timing.end_ms + ratio * max(0, next_timing.start_ms - previous_timing.end_ms)
-        start_ms = profile.snap_floor(target_start)
-        end_cap = next_timing.start_ms
-        end_ms = min(end_cap, profile.snap_ceil(start_ms + duration_ms))
-        if end_ms <= start_ms:
-            start_ms = max(previous_timing.end_ms, profile.snap_floor(end_cap - duration_ms))
-            end_ms = max(end_cap, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
-        return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
-
-    if previous is not None:
-        previous_cue, previous_timing = previous
-        source_gap_ms = max(0, cue.start_ms - previous_cue.end_ms)
-        start_ms = profile.snap_floor(previous_timing.end_ms + source_gap_ms)
-        end_ms = profile.snap_ceil(start_ms + duration_ms)
-        return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
-
-    if nxt is not None:
-        next_cue, next_timing = nxt
-        source_gap_ms = max(0, next_cue.start_ms - cue.end_ms)
-        gap_preserved_end_ms = min(
-            next_timing.start_ms,
-            profile.snap_ceil(next_timing.start_ms - source_gap_ms),
-        )
-        end_ms = (
-            gap_preserved_end_ms
-            if gap_preserved_end_ms >= duration_ms
-            else next_timing.start_ms
-        )
-        start_ms = max(0, profile.snap_floor(end_ms - duration_ms))
-        return _CueTiming(start_ms=start_ms, end_ms=end_ms, min_end_ms=end_ms, speaker_id=None)
-
-    return None
-
-
-def _neighbor_timing(
-    cues: list[Cue],
-    timings: dict[int, _CueTiming],
-    *,
-    reverse: bool,
-) -> tuple[Cue, _CueTiming] | None:
-    iterable = reversed(cues) if reverse else iter(cues)
-    for cue in iterable:
-        timing = timings.get(cue.index)
-        if timing is not None:
-            return cue, timing
-    return None
+    return _enforce_monotonic(
+        rebuilt,
+        profile,
+        preserve_source_timing_ids=set(alignment.unmatched_cue_ids),
+    ), flags
 
 
 def _cue_timings(
@@ -271,12 +201,21 @@ def _dominant_speaker(words: list[Word]) -> str | None:
     return Counter(speakers).most_common(1)[0][0]
 
 
-def _enforce_monotonic(cues: list[Cue], profile: StyleProfile) -> list[Cue]:
+def _enforce_monotonic(
+    cues: list[Cue],
+    profile: StyleProfile,
+    *,
+    preserve_source_timing_ids: set[int] | None = None,
+) -> list[Cue]:
     if not cues:
         return []
+    preserved = preserve_source_timing_ids or set()
     adjusted: list[Cue] = []
     previous_by_speaker: dict[str, Cue] = {}
     for cue in cues:
+        if cue.index in preserved or is_bracketed_screen_text_cue(cue):
+            adjusted.append(cue)
+            continue
         speaker_key = _speaker_key(cue.speaker_id)
         previous = previous_by_speaker.get(speaker_key)
         if previous is not None and cue.start_ms < previous.end_ms:

@@ -15,7 +15,12 @@ from dubsync.llm_providers import (
     punctuation_adapter_from_config,
 )
 from dubsync.models import Cue, DivergenceSpan
-from dubsync.pipeline import _adjudication_confidence_gate, _adjudication_scene_gap_seconds, _punctuation_scene_gap_seconds
+from dubsync.pipeline import (
+    _adjudication_audio_snippet_options,
+    _adjudication_confidence_gate,
+    _adjudication_scene_gap_seconds,
+    _punctuation_scene_gap_seconds,
+)
 
 
 def test_live_llm_adapters_can_be_configured_per_pass():
@@ -212,6 +217,23 @@ def test_adjudication_confidence_gate_uses_llm_pass_override():
     }
 
     assert _adjudication_confidence_gate(config) == 0.82
+
+
+def test_audio_snippet_defaults_cover_supported_long_jobs_and_full_adjudication_batches():
+    config = {
+        "llm": {
+            "provider": "gemini",
+            "adjudication": {"audio_snippet_double_check": {"enabled": True}},
+        }
+    }
+
+    enabled, _pad, _duration, max_snippets, max_audio_duration = (
+        _adjudication_audio_snippet_options(config)
+    )
+
+    assert enabled is True
+    assert max_snippets == 25
+    assert max_audio_duration >= 90 * 60.0
 
 
 def test_punctuation_scene_gap_uses_llm_pass_override():

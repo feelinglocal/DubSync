@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,13 @@ from .adjudication import LLMAdapter, StaticLLMAdapter
 from .models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan
 from .punctuation import PunctuationAdapter, StaticPunctuationAdapter
 from .providers import ProviderError
+from .subtitle_annotations import (
+    cue_has_bracketed_screen_text,
+    speech_text_for_alignment,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class AdjudicationBatch(BaseModel):
@@ -58,9 +66,9 @@ _LLM_PASS_CONFIG_KEYS = {
 _GEMINI_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
 _GEMINI_37_THINKING_LEVELS = {"low", "medium", "high"}
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-_ADJUDICATION_PROMPT_VERSION = "adjudication-v7-gemini37-context-first-boundary"
-_PUNCTUATION_PROMPT_VERSION = "punctuation-v5-gemini37-context-first-freeze"
-_SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v2-context-only"
+_ADJUDICATION_PROMPT_VERSION = "adjudication-v9-explicit-scene-isolation"
+_PUNCTUATION_PROMPT_VERSION = "punctuation-v8-explicit-scene-isolation"
+_SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v3-spoken-residue-only"
 _ANTHROPIC_MAX_OUTPUT_TOKENS = 8_192
 _ANTHROPIC_ADJUDICATION_TOKENS_PER_CASE = 320
 _ANTHROPIC_PUNCTUATION_TOKENS_PER_CUE = 160
@@ -74,12 +82,16 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
         confidence_gate: float = 0.7,
         thinking_level: str | None = None,
         cached_content: str | None = None,
+        timeout_seconds: float = 90.0,
+        max_retries: int = 2,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model = model
         self.confidence_gate = confidence_gate
         self.thinking_level = _normalize_gemini_thinking_level(thinking_level, model)
         self.cached_content = cached_content
+        self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
         self.usage_events: list[object] = []
         self.episode_context: list[Cue] = []
 
@@ -100,9 +112,11 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             response_schema=AdjudicationBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
         )
-        self.usage_events.append(response)
-        return AdjudicationBatch.model_validate_json(_response_text(response)).model_dump()["decisions"]
+        self.usage_events.append(_usage_event(response))
+        return _validated_gemini_response(response, AdjudicationBatch).model_dump()["decisions"]
 
     def adjudicate_with_audio(
         self,
@@ -124,11 +138,16 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
             audio_snippets=audio_snippets,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
         )
-        self.usage_events.append(response)
-        return AdjudicationBatch.model_validate_json(_response_text(response)).model_dump()["decisions"]
+        self.usage_events.append(_usage_event(response))
+        return _validated_gemini_response(response, AdjudicationBatch).model_dump()["decisions"]
 
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
+        cues = _punctuation_eligible_cues(cues)
+        if not cues:
+            return {}
         if not self.api_key:
             raise ProviderError("GEMINI_API_KEY is required for Gemini punctuation.")
         response = _gemini_generate_json(
@@ -138,10 +157,17 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             response_schema=PunctuationBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
         )
-        self.usage_events.append(response)
-        batch = PunctuationBatch.model_validate_json(_response_text(response))
-        return {item.cue_id: item.text for item in batch.cues}
+        self.usage_events.append(_usage_event(response))
+        batch = _validated_gemini_response(response, PunctuationBatch)
+        editable_ids = {cue.index for cue in cues}
+        return {
+            item.cue_id: item.text
+            for item in batch.cues
+            if item.cue_id in editable_ids
+        }
 
     def map_speakers(self, cues: list[Cue]) -> dict[str, str]:
         if not self.api_key:
@@ -153,9 +179,11 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             response_schema=SpeakerMappingBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
+            timeout_seconds=self.timeout_seconds,
+            max_retries=self.max_retries,
         )
-        self.usage_events.append(response)
-        return _speaker_mapping_dict(SpeakerMappingBatch.model_validate_json(_response_text(response)))
+        self.usage_events.append(_usage_event(response))
+        return _speaker_mapping_dict(_validated_gemini_response(response, SpeakerMappingBatch))
 
 
 class OpenAILLMAdapter:  # pragma: no cover - live provider path
@@ -189,6 +217,9 @@ class OpenAILLMAdapter:  # pragma: no cover - live provider path
         return batch.model_dump()["decisions"]
 
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
+        cues = _punctuation_eligible_cues(cues)
+        if not cues:
+            return {}
         batch = self._parse(
             task="punctuation",
             instructions=(
@@ -198,7 +229,12 @@ class OpenAILLMAdapter:  # pragma: no cover - live provider path
             prompt=_punctuation_prompt(cues),
             response_schema=PunctuationBatch,
         )
-        return {item.cue_id: item.text for item in batch.cues}
+        editable_ids = {cue.index for cue in cues}
+        return {
+            item.cue_id: item.text
+            for item in batch.cues
+            if item.cue_id in editable_ids
+        }
 
     def map_speakers(self, cues: list[Cue]) -> dict[str, str]:
         batch = self._parse(
@@ -233,7 +269,7 @@ class OpenAILLMAdapter:  # pragma: no cover - live provider path
             reasoning={"effort": self.reasoning_effort},
             store=False,
         )
-        self.usage_events.append(response)
+        self.usage_events.append(_usage_event(response))
         return _openai_parsed_response(response, response_schema)
 
 
@@ -268,11 +304,14 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
                 }
             },
         )
-        self.usage_events.append(response)
+        self.usage_events.append(_usage_event(response))
         text = response.content[0].text
         return AdjudicationBatch.model_validate_json(text).model_dump()["decisions"]
 
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
+        cues = _punctuation_eligible_cues(cues)
+        if not cues:
+            return {}
         if not self.api_key:
             raise ProviderError("ANTHROPIC_API_KEY is required for Anthropic punctuation.")
         try:
@@ -296,9 +335,14 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
                 }
             },
         )
-        self.usage_events.append(response)
+        self.usage_events.append(_usage_event(response))
         batch = PunctuationBatch.model_validate_json(response.content[0].text)
-        return {item.cue_id: item.text for item in batch.cues}
+        editable_ids = {cue.index for cue in cues}
+        return {
+            item.cue_id: item.text
+            for item in batch.cues
+            if item.cue_id in editable_ids
+        }
 
     def map_speakers(self, cues: list[Cue]) -> dict[str, str]:
         if not self.api_key:
@@ -321,7 +365,7 @@ class AnthropicLLMAdapter:  # pragma: no cover - live provider path
                 }
             },
         )
-        self.usage_events.append(response)
+        self.usage_events.append(_usage_event(response))
         return _speaker_mapping_dict(SpeakerMappingBatch.model_validate_json(response.content[0].text))
 
 
@@ -339,6 +383,34 @@ def drain_usage_events(adapter: object) -> list[object]:
     drained = list(events)
     events.clear()
     return drained
+
+
+def _usage_event(response: object) -> dict[str, object]:
+    event: dict[str, object] = {}
+    for key in ("usage", "usage_metadata"):
+        value = _object_field(response, key)
+        if value is not None:
+            event[key] = _plain_usage(value)
+    return event
+
+
+def _plain_usage(usage: object) -> object:
+    if usage is None or isinstance(usage, (str, int, float, bool)):
+        return usage
+    if isinstance(usage, dict):
+        return {str(key): _plain_usage(value) for key, value in usage.items()}
+    if isinstance(usage, (list, tuple)):
+        return [_plain_usage(value) for value in usage]
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
+        return _plain_usage(model_dump())
+    if hasattr(usage, "__dict__"):
+        return {
+            key: _plain_usage(value)
+            for key, value in vars(usage).items()
+            if not key.startswith("_")
+        }
+    return usage
 
 
 def llm_config_for_pass(config: dict[str, Any], pass_name: str | None = None) -> dict[str, Any]:
@@ -379,6 +451,8 @@ def llm_adapter_from_config(config: dict[str, Any], pass_name: str | None = None
             confidence_gate=confidence_gate,
             thinking_level=_gemini_thinking_level_from_config(llm_config, pass_name, str(model or "gemini-3.5-flash")),
             cached_content=_gemini_cached_content_from_config(llm_config),
+            timeout_seconds=_positive_float_config(llm_config, "timeout_seconds", 90.0),
+            max_retries=_nonnegative_int_config(llm_config, "max_retries", 2),
         )
     if provider == "openai":
         if _audio_snippets_enabled(llm_config):
@@ -531,6 +605,7 @@ def _adjudication_prompt(
         "Listen to each attached audio snippet when one is provided; use it only to determine the literal words spoken in that case.",
         "Weigh the original SRT span, ASR hypothesis, neighboring cue context, speaker IDs, and character labels. Audio and ASR word timing are acoustic evidence; matched neighboring SRT text is editorial context.",
         "Treat context_before, context_after, anchor cue IDs, anchor times, speaker IDs, and character labels as read-only context. Never copy neighboring text into final_text.",
+        "Treat scene_id as a hard scene boundary. Decide each case independently; never carry dialogue, speaker assumptions, or evidence between different scene IDs.",
         "Context can disambiguate meaning, spelling, speaker continuity, and sentence boundaries. Context cannot prove unheard words. Do not change the source solely because an ASR hypothesis is different or more fluent.",
         "Prefer the source SRT when the audio is ambiguous, noisy, overlapped, musical, or when ASR appears to mistranscribe a plausible source word.",
         "Treat divergence start/end times, source cue times, and audio snippet boundaries as a strict locality check. If a partial audio window would compress, omit, or absorb dialogue outside its evidence, choose keep_srt or report below-gate confidence; never rewrite a whole cue from partial audio.",
@@ -552,7 +627,7 @@ def _adjudication_prompt(
         "confidence_gate": confidence_gate,
         "episode_context_role": "read_only ordered source subtitle context; never copy unrelated text into final_text",
         "episode_context": _episode_context_payload(episode_context or []),
-        "spans": [span.model_dump() for span in spans],
+        "spans": [_adjudication_span_payload(span) for span in spans],
         "audio_snippets": [
             {
                 "case_id": snippet.case_id,
@@ -566,6 +641,8 @@ def _adjudication_prompt(
 
 
 def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = None) -> str:
+    editable_cues = _punctuation_eligible_cues(cues)
+    context_cues = _punctuation_eligible_cues(episode_context or editable_cues)
     payload = {
         "task": "Apply subtitle punctuation and casing while preserving the supplied editorial structure.",
         "prompt_version": _PUNCTUATION_PROMPT_VERSION,
@@ -577,6 +654,7 @@ def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = 
             "Preserve the source line-break positions represented by source_lines. Do not flatten, add, move, or remove line breaks.",
             "Do not add, remove, or restyle quotation marks, including German „ “, English “ ”, guillemets « », single guillemets ‹ ›, or straight quotes. Never wrap ordinary dialogue in quotes when the source has none.",
             "Use the full ordered batch, including previous and next cues, speakers, characters, and timing metadata, as sentence context; change only punctuation, casing, and spacing inside each returned cue.",
+            "Treat different scene IDs as hard scene boundaries; never carry sentence punctuation, speaker assumptions, or text between them.",
             "For German, apply natural sentence punctuation without decorative dialogue quotes; preserve existing ellipses, dashes, censorship masks, names, numbers, and compounds.",
             "Leave a cue unchanged when punctuation would require guessing speaker intent, adding missing words, or changing subtitle line structure.",
             "Use speaker and character labels only as context for sentence punctuation; never copy labels into subtitle text.",
@@ -584,8 +662,8 @@ def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = 
             "Before returning each cue, verify that its alphanumeric token sequence, line-break positions, and quotation-mark sequence match the input exactly; if any differ, return that cue unchanged.",
             "Return only the structured cue results; no commentary.",
         ],
-        "episode_context": _episode_context_payload(episode_context or cues),
-        "editable_cue_ids": [cue.index for cue in cues],
+        "episode_context": _episode_context_payload(context_cues),
+        "editable_cue_ids": [cue.index for cue in editable_cues],
         "cues": [
             {
                 "cue_id": cue.index,
@@ -597,11 +675,34 @@ def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = 
                 "text": cue.text,
                 "speaker_id": cue.speaker_id,
                 "character": cue.character,
+                **(
+                    {
+                        "scene_id": cue.prompt_scene_id,
+                        "scene_position": cue.prompt_scene_position,
+                    }
+                    if cue.prompt_scene_id is not None
+                    else {}
+                ),
             }
-            for position, cue in enumerate(cues, start=1)
+            for position, cue in enumerate(editable_cues, start=1)
         ],
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _adjudication_span_payload(span: DivergenceSpan) -> dict[str, object]:
+    payload = span.model_dump()
+    if span.prompt_scene_id is None:
+        return payload
+    return {
+        **payload,
+        "scene_id": span.prompt_scene_id,
+        "scene_position": span.prompt_scene_position,
+    }
+
+
+def _punctuation_eligible_cues(cues: list[Cue]) -> list[Cue]:
+    return [cue for cue in cues if not cue_has_bracketed_screen_text(cue)]
 
 
 def _episode_context_payload(cues: list[Cue]) -> list[dict[str, object]]:
@@ -624,7 +725,12 @@ def _speaker_mapping_prompt(cues: list[Cue]) -> str:
     for cue in cues:
         if not cue.speaker_id:
             continue
-        samples.setdefault(cue.speaker_id, []).append({"cue_id": cue.index, "text": cue.plain_text})
+        sample_text = speech_text_for_alignment(cue)
+        if not sample_text:
+            continue
+        samples.setdefault(cue.speaker_id, []).append(
+            {"cue_id": cue.index, "text": sample_text}
+        )
     payload = {
         "task": "Map diarization speaker clusters to character names from dialogue evidence only.",
         "prompt_version": _SPEAKER_MAPPING_PROMPT_VERSION,
@@ -704,40 +810,69 @@ def _gemini_generate_json(
     thinking_level: str | None = None,
     cached_content: str | None = None,
     audio_snippets: dict[str, AudioSnippet] | None = None,
+    timeout_seconds: float = 90.0,
+    max_retries: int = 2,
 ) -> object:
     try:
         from google import genai
     except ImportError as exc:
         raise ProviderError("Install dubsync[cloud] to use Gemini.") from exc
 
-    client = genai.Client(api_key=api_key)
-    config: dict[str, object] = {
-        "response_mime_type": "application/json",
-        "response_schema": response_schema,
-    }
-    if thinking_level:
-        config["thinking_config"] = {"thinking_level": thinking_level}
-    if cached_content:
-        config["cached_content"] = cached_content
-    contents: object = prompt
-    if audio_snippets:
-        try:
-            from google.genai import types
-        except ImportError as exc:
-            raise ProviderError("Install dubsync[cloud] to use Gemini audio snippets.") from exc
-        contents = [prompt]
-        for snippet in audio_snippets.values():
-            contents.append(
-                types.Part.from_bytes(
-                    data=Path(snippet.path).read_bytes(),
-                    mime_type=snippet.mime_type,
+    client = None
+    try:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=_gemini_http_options(timeout_seconds, max_retries),
+        )
+        config: dict[str, object] = {
+            "response_mime_type": "application/json",
+            "response_schema": response_schema,
+        }
+        if thinking_level:
+            config["thinking_config"] = {"thinking_level": thinking_level}
+        if cached_content:
+            config["cached_content"] = cached_content
+        contents: object = prompt
+        if audio_snippets:
+            try:
+                from google.genai import types
+            except ImportError as exc:
+                raise ProviderError(
+                    "Install dubsync[cloud] to use Gemini audio snippets."
+                ) from exc
+            contents = [prompt]
+            for snippet in audio_snippets.values():
+                contents.append(
+                    types.Part.from_bytes(
+                        data=Path(snippet.path).read_bytes(),
+                        mime_type=snippet.mime_type,
+                    )
                 )
-            )
-    return client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=config,
-    )
+        return client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+    except ProviderError:
+        raise
+    except Exception as exc:
+        raise ProviderError("Gemini request failed.") from exc
+    finally:
+        close = getattr(client, "close", None) if client is not None else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Gemini client cleanup failed after request completion.", exc_info=True)
+
+
+def _gemini_http_options(timeout_seconds: float, max_retries: int) -> dict[str, object]:
+    timeout_ms = max(1, int(timeout_seconds * 1000))
+    retry_attempts = max(1, int(max_retries) + 1)
+    return {
+        "timeout": timeout_ms,
+        "retry_options": {"attempts": retry_attempts},
+    }
 
 
 def _response_text(response: object) -> str:
@@ -748,3 +883,15 @@ def _response_text(response: object) -> str:
     if isinstance(output_text, str) and output_text:
         return output_text
     raise ProviderError("Gemini response did not include text content.")
+
+
+def _validated_gemini_response(
+    response: object,
+    response_schema: type[BaseModel],
+) -> BaseModel:
+    try:
+        return response_schema.model_validate_json(_response_text(response))
+    except ProviderError:
+        raise
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ProviderError("Gemini returned an invalid structured response.") from exc

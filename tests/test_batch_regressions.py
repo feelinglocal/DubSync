@@ -38,6 +38,28 @@ def test_keep_srt_divergence_still_extends_to_spoken_span_words():
     assert updated.cue_word_indices[18] == [58, 59, 60, 61, 62, 63]
 
 
+def test_keep_srt_divergence_without_existing_match_does_not_gain_asr_timing():
+    alignment = AlignmentResult(cue_word_indices={})
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[18],
+        srt_text="source-only line",
+        asr_text="unrelated audio",
+        asr_word_indices=[63, 64],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="keep_srt",
+        final_text="source-only line",
+        confidence=0.2,
+        reason="audio did not prove this source cue was spoken",
+    )
+
+    updated = _alignment_with_decision_words(alignment, [decision], [span])
+
+    assert updated.cue_word_indices == {}
+
+
 def test_recue_ceil_snaps_end_so_last_syllable_is_not_cut():
     cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Das Ding ist mindestens Level 15."])]
     words = [Word(text="funfzehn.", start=0.25, end=0.501, confidence=0.95)]
@@ -73,7 +95,7 @@ def test_recue_trims_impossible_word_cluster_before_timing():
     assert flags[0].kind == "timing_outlier_trimmed"
 
 
-def test_unmatched_kept_cue_is_interpolated_instead_of_source_timed():
+def test_unmatched_kept_cue_preserves_source_timing_instead_of_interpolation():
     cues = [
         Cue(index=1, start_ms=0, end_ms=1000, lines=["before"]),
         Cue(index=2, start_ms=1000, end_ms=2000, lines=["missing"]),
@@ -87,13 +109,14 @@ def test_unmatched_kept_cue_is_interpolated_instead_of_source_timed():
 
     rebuilt, flags = rebuild_cues(cues, words, alignment, StyleProfile(fps=30.0, min_cue_dur=0.5))
 
-    interpolated = next(cue for cue in rebuilt if cue.index == 2)
-    assert interpolated.start_ms != 1000
-    assert interpolated.end_ms != 2000
-    assert any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    unmatched = next(cue for cue in rebuilt if cue.index == 2)
+    assert unmatched.start_ms == 1000
+    assert unmatched.end_ms == 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    assert any(flag.kind == "unmatched_cue" and flag.cue_ids == [2] for flag in flags)
 
 
-def test_trailing_unmatched_cue_preserves_source_gap_after_previous_match():
+def test_trailing_unmatched_cue_preserves_source_timing_after_previous_match():
     cues = [
         Cue(index=56, start_ms=98800, end_ms=99566, lines=["Ach, komm schon."]),
         Cue(index=57, start_ms=104333, end_ms=105433, lines=["Ahh!"]),
@@ -116,7 +139,8 @@ def test_trailing_unmatched_cue_preserves_source_gap_after_previous_match():
     )
 
     trailing = next(cue for cue in rebuilt if cue.index == 57)
-    assert trailing.start_ms >= 104500
+    assert trailing.start_ms == 104333
+    assert trailing.end_ms == 105433
     assert trailing.duration_ms == 1100
 
 

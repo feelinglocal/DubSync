@@ -28,6 +28,8 @@ def extract_audio_snippets(
     ffmpeg: str = "ffmpeg",
     ffmpeg_timeout_seconds: float | None = None,
     max_total_bytes: int | None = None,
+    fail_on_budget_exceeded: bool = True,
+    max_snippets: int | None = None,
 ) -> list[AudioSnippet]:
     try:
         resolved_timeout = resolve_ffmpeg_timeout_seconds(ffmpeg_timeout_seconds)
@@ -38,6 +40,8 @@ def extract_audio_snippets(
     used_bytes = 0
     snippets: list[AudioSnippet] = []
     for span in spans:
+        if max_snippets is not None and len(snippets) >= max_snippets:
+            break
         if span.start is None or span.end is None or span.end <= span.start:
             continue
         start, end = _snippet_window(span.start, span.end, pad_seconds, max_duration_seconds)
@@ -45,6 +49,12 @@ def extract_audio_snippets(
         predicted_bytes = math.ceil((end - start) * 32_000) + SNIPPET_WAV_ALLOWANCE_BYTES
         remaining_bytes = resolved_max_bytes - used_bytes
         if predicted_bytes > remaining_bytes:
+            if not fail_on_budget_exceeded:
+                break
+            raise AudioSnippetError("Audio snippets would exceed the job storage budget")
+        if predicted_bytes <= 0:
+            if not fail_on_budget_exceeded:
+                break
             raise AudioSnippetError("Audio snippets would exceed the job storage budget")
         _cut_wav_snippet(
             audio_path,

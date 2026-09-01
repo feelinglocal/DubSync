@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .models import Cue, QCFlag
+from .subtitle_annotations import cue_has_spoken_text
 
 
 def silence_flags_for_cues(audio_path: Path, cues: list[Cue], threshold_dbfs: float = -45.0) -> list[QCFlag]:
@@ -21,6 +22,8 @@ def silence_flags_for_cues(audio_path: Path, cues: list[Cue], threshold_dbfs: fl
         if frame_rate <= 0:
             return flags
         for cue in cues:
+            if not cue_has_spoken_text(cue):
+                continue
             start_frame = min(total_frames, max(0, int(cue.start_ms / 1000.0 * frame_rate)))
             end_frame = min(total_frames, max(0, int(cue.end_ms / 1000.0 * frame_rate)))
             if end_frame <= start_frame:
