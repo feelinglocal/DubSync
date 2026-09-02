@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dubsync.models import AlignmentResult, Cue, SpeechRegion
+from dubsync.models import AlignmentResult, Cue, SpeechRegion, Word
 from dubsync.style_profile import StyleProfile
 from dubsync.timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 
@@ -71,6 +71,54 @@ def test_refinement_cannot_borrow_nearby_speech_for_a_missing_audio_cue():
 
     assert refined == [cue]
     assert flags == []
+
+
+def test_refinement_ignores_a_distant_word_already_trimmed_from_the_cue_cluster():
+    cue = Cue(index=392, start_ms=1_044_440, end_ms=1_045_360, lines=["Cadê a Shang Zhitao?"])
+    words = [
+        Word(text="Cadê", start=1_044.468, end=1_044.748),
+        Word(text="a", start=1_044.758, end=1_044.759),
+        Word(text="Zhang", start=1_044.768, end=1_044.948),
+        Word(text="Zitao?", start=1_044.988, end=1_045.308),
+        Word(text="Ah,", start=1_057.818, end=1_057.968),
+    ]
+    alignment = AlignmentResult(cue_word_indices={392: list(range(len(words)))})
+
+    refined, _flags = refine_cues_to_speech_activity(
+        [cue],
+        [
+            SpeechRegion(start=1_044.4, end=1_045.4),
+            SpeechRegion(start=1_057.8, end=1_058.0),
+        ],
+        StyleProfile(fps=25.0, min_cue_dur=0.5),
+        words=words,
+        alignment=alignment,
+    )
+
+    assert refined[0].start_ms == 1_044_440
+    assert refined[0].end_ms <= 1_045_440
+
+
+def test_refinement_ignores_an_impossible_trailing_word_already_trimmed_from_the_cue_cluster():
+    cue = Cue(index=6, start_ms=43_800, end_ms=45_000, lines=["Drache!"])
+    words = [
+        Word(text="Drache!", start=43.82, end=44.98),
+        Word(text="noise", start=45.04, end=55.84),
+    ]
+    alignment = AlignmentResult(cue_word_indices={6: [0, 1]})
+
+    refined, _flags = refine_cues_to_speech_activity(
+        [cue],
+        [
+            SpeechRegion(start=43.8, end=45.0),
+            SpeechRegion(start=45.04, end=55.84),
+        ],
+        StyleProfile(fps=25.0, min_cue_dur=0.5),
+        words=words,
+        alignment=alignment,
+    )
+
+    assert refined[0].end_ms <= 45_040
 
 
 def test_refine_cues_to_speech_activity_does_not_extend_to_following_cues_in_merged_region():

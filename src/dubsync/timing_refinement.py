@@ -8,6 +8,9 @@ from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
 
 
+MAX_INTRA_CUE_WORD_GAP_SECONDS = 1.5
+
+
 @dataclass(frozen=True)
 class BoundaryRefinementConfig:
     enabled: bool = True
@@ -47,7 +50,12 @@ def refine_cues_to_speech_activity(
     region_index = SpeechRegionIndex(regions)
 
     for index, cue in enumerate(dialogue_cues):
-        word_window = _word_window_for_cue(cue, words, alignment)
+        word_window = _word_window_for_cue(
+            cue,
+            words,
+            alignment,
+            max_word_duration_seconds=options.max_word_duration_ms / 1000.0,
+        )
         cue_regions = (
             _regions_from_word_window(word_window, region_index, options)
             if word_window is not None
@@ -135,6 +143,8 @@ def _word_window_for_cue(
     cue: Cue,
     words: list[Word] | None,
     alignment: AlignmentResult | None,
+    *,
+    max_word_duration_seconds: float,
 ) -> list[Word] | None:
     if words is None or alignment is None:
         return None
@@ -145,7 +155,41 @@ def _word_window_for_cue(
     ]
     if not matched:
         return None
-    return sorted(matched, key=lambda word: (word.start, word.end))
+    ordered = sorted(matched, key=lambda word: (word.start, word.end))
+    clusters: list[list[Word]] = []
+    current: list[Word] = []
+    previous: Word | None = None
+    for word in ordered:
+        word_is_outlier = word.end - word.start > max_word_duration_seconds
+        starts_new_cluster = previous is not None and (
+            word.start - previous.end > MAX_INTRA_CUE_WORD_GAP_SECONDS
+            or previous.end - previous.start > max_word_duration_seconds
+        )
+        if word_is_outlier and current:
+            clusters.append(current)
+            current = []
+        if starts_new_cluster and current:
+            clusters.append(current)
+            current = []
+        current.append(word)
+        if word_is_outlier:
+            clusters.append(current)
+            current = []
+        previous = word
+    if current:
+        clusters.append(current)
+    return max(
+        clusters,
+        key=lambda cluster: (
+            sum(
+                1
+                for word in cluster
+                if word.end - word.start <= max_word_duration_seconds
+            ),
+            len(cluster),
+            -(cluster[-1].end - cluster[0].start),
+        ),
+    )
 
 
 def _regions_from_word_window(

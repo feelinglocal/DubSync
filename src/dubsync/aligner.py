@@ -36,11 +36,14 @@ MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
 ALIGNMENT_CELL_BUDGET = 2_000_000
+LOCAL_TRANSPOSITION_RADIUS = 2
+IMPLAUSIBLE_MATCHED_WORD_SECONDS = 2.0
+IMPLAUSIBLE_WORD_TO_CUE_RATIO = 2.0
 NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-MISSING_AUDIO_GUARD_VERSION = 2
+MISSING_AUDIO_GUARD_VERSION = 3
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 
 @dataclass(frozen=True)
@@ -459,7 +462,51 @@ def _misses_unique_exact_pair(
         for op in ops
         if op.kind == "match" and op.srt_index is not None and op.asr_index is not None
     }
-    return not expected.issubset(matched)
+    return any(
+        pair not in matched and not _is_locally_explained_transposition(pair, matched)
+        for pair in expected
+    )
+
+
+def _is_locally_explained_transposition(
+    missed_pair: tuple[int, int],
+    matched_pairs: set[tuple[int, int]],
+) -> bool:
+    """Allow one locally reordered word without discarding an otherwise sound run."""
+
+    missed_srt, missed_asr = missed_pair
+    for srt_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
+        if srt_delta == 0:
+            continue
+        for asr_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
+            if asr_delta == 0 or srt_delta * asr_delta >= 0:
+                continue
+            crossed_srt = missed_srt + srt_delta
+            crossed_asr = missed_asr + asr_delta
+            if (crossed_srt, crossed_asr) not in matched_pairs:
+                continue
+
+            srt_start, srt_end = sorted((missed_srt, crossed_srt))
+            asr_start, asr_end = sorted((missed_asr, crossed_asr))
+            has_left_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_start, asr_start, -1)
+            has_right_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_end, asr_end, 1)
+            if has_left_anchor and has_right_anchor:
+                return True
+    return False
+
+
+def _has_nearby_monotonic_anchor(
+    matched_pairs: set[tuple[int, int]],
+    srt_index: int,
+    asr_index: int,
+    direction: int,
+) -> bool:
+    for srt_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
+        for asr_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
+            candidate = (srt_index + direction * srt_delta, asr_index + direction * asr_delta)
+            if candidate in matched_pairs:
+                return True
+    return False
 
 
 def _span_text_from_tokens(tokens: list[SRTToken], indices: list[int]) -> str:
@@ -663,11 +710,14 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             ops = prior_run.ops
             unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
             band_limited = band_limited or prior_run.band_limited
-            unresolved = unresolved or prior_run.unresolved
+            unresolved = prior_run.unresolved
     if not unresolved:
         ops = _prefer_unique_full_cue_windows(ops, tokens, words_norm)
     provisional_matches = _token_matches_from_ops(ops, tokens)
-    flags = _alignment_outlier_flags(provisional_matches, cues, tokens, words)
+    flags = [
+        *_alignment_outlier_flags(provisional_matches, cues, tokens, words),
+        *_implausible_matched_word_duration_flags(provisional_matches, cues, words),
+    ]
     rejected_outlier_cue_ids = _rejectable_outlier_cue_ids(flags)
     if rejected_outlier_cue_ids:
         ops = _without_cue_matches(ops, tokens, rejected_outlier_cue_ids)
@@ -796,7 +846,12 @@ def _rejectable_outlier_cue_ids(
         cue_id
         for flag in flags
         if flag.severity == "error"
-        and flag.kind in {"alignment_outlier", "alignment_model_unavailable"}
+        and flag.kind
+        in {
+            "alignment_outlier",
+            "alignment_model_unavailable",
+            "implausible_matched_word_duration",
+        }
         for cue_id in flag.cue_ids
     }
 
@@ -1125,6 +1180,51 @@ def _alignment_outlier_flags(
         )
         for residual, cue_matches, cue, word in outlier_by_cue.values()
     ]
+
+
+def _implausible_matched_word_duration_flags(
+    matches: list[TokenMatch],
+    cues: list[Cue],
+    words: list[Word],
+) -> list[QCFlag]:
+    cue_by_id = {cue.index: cue for cue in cues}
+    matches_by_cue: dict[int, list[TokenMatch]] = {}
+    for match in matches:
+        matches_by_cue.setdefault(match.cue_id, []).append(match)
+
+    flags: list[QCFlag] = []
+    for cue_id, cue_matches in matches_by_cue.items():
+        if len(cue_matches) != 1:
+            continue
+        cue = cue_by_id.get(cue_id)
+        if cue is None:
+            continue
+        match = cue_matches[0]
+        word = words[match.asr_word_index]
+        word_duration = max(0.0, word.end - word.start)
+        cue_duration = max(0.0, (cue.end_ms - cue.start_ms) / 1000.0)
+        if word_duration <= IMPLAUSIBLE_MATCHED_WORD_SECONDS:
+            continue
+        if word_duration <= cue_duration * IMPLAUSIBLE_WORD_TO_CUE_RATIO:
+            continue
+        flags.append(
+            QCFlag(
+                kind="implausible_matched_word_duration",
+                cue_ids=[cue_id],
+                message=(
+                    f"The only matched ASR word spans {word_duration:.2f}s versus the "
+                    f"source cue's {cue_duration:.2f}s; its timing is rejected and the "
+                    "source cue is held for review."
+                ),
+                severity="error",
+                confidence=round(match.score, 4),
+                old_text=cue.text,
+                new_text=word.text,
+                start=cue.start_ms / 1000.0,
+                end=cue.end_ms / 1000.0,
+            )
+        )
+    return flags
 
 
 def _alignment_outlier_flag(

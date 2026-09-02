@@ -187,6 +187,47 @@ def test_divergence_with_unknown_asr_confidence_remains_unscored():
     assert result.divergence_spans[0].confidence == 0.0
 
 
+def test_alignment_rejects_an_implausibly_overlong_single_word_match():
+    cues = [Cue(index=771, start_ms=2_087_800, end_ms=2_088_670, lines=["Flora,"])]
+    words = [
+        Word(
+            text="Flora",
+            start=2_083.496,
+            end=2_088.276,
+            confidence=0.99,
+            speaker_id="A",
+        )
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {}
+    assert result.unmatched_cue_ids == [771]
+    assert result.diagnostics.missing_audio_cue_ids == [771]
+    assert result.diagnostics.missing_audio_guard_version == 3
+    duration_flag = next(
+        flag for flag in result.flags if flag.kind == "implausible_matched_word_duration"
+    )
+    assert duration_flag.cue_ids == [771]
+    assert duration_flag.severity == "error"
+    assert any(
+        flag.kind == "missing_audio_timing_held" and flag.cue_ids == [771]
+        for flag in result.flags
+    )
+
+
+def test_alignment_accepts_a_long_word_when_the_source_cue_is_also_long():
+    cues = [Cue(index=1, start_ms=0, end_ms=5_000, lines=["Flora,"])]
+    words = [Word(text="Flora", start=0.1, end=4.88, confidence=0.99, speaker_id="A")]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {1: [0]}
+    assert result.unmatched_cue_ids == []
+    assert result.diagnostics.missing_audio_cue_ids == []
+    assert not any(flag.kind == "implausible_matched_word_duration" for flag in result.flags)
+
+
 def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     calls = 0
     original_similarity = aligner._similarity
@@ -239,6 +280,76 @@ def test_alignment_budget_exhaustion_rejects_a_bounded_run_that_misses_a_unique_
     assert result.diagnostics.unresolved is True
     assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
     assert any(flag.kind == "alignment_unresolved" and flag.severity == "error" for flag in result.flags)
+
+
+def test_alignment_budget_accepts_a_unique_pair_explained_by_an_adjacent_transposition(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
+    cues = [
+        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=["filler"])
+        for index in range(300)
+    ]
+    cues[20] = cues[20].with_lines(["um novo inquilino"])
+    cues[100] = cues[100].with_lines(["novo"])
+    tokens = aligner.tokenize_cues(cues)
+    words_norm = [token.normalized for token in tokens]
+    words_norm[21], words_norm[22] = words_norm[22], words_norm[21]
+
+    run = aligner._align_tokens_detailed(tokens, words_norm)
+
+    assert run.unresolved is False
+    assert run.band_limited is False
+    assert sum(op.kind == "match" for op in run.ops) == len(tokens) - 1
+    assert any(op.kind == "match" and op.srt_index == 21 and op.asr_index == 22 for op in run.ops)
+
+
+def test_local_transposition_check_uses_constant_radius_membership():
+    class MembershipOnlyPairs:
+        def __init__(self, pairs):
+            self.pairs = set(pairs)
+
+        def __contains__(self, pair):
+            return pair in self.pairs
+
+        def __iter__(self):
+            raise AssertionError("transposition proof must not scan every matched pair")
+
+    matched_pairs = MembershipOnlyPairs({(9, 9), (11, 10), (12, 12)})
+
+    assert aligner._is_locally_explained_transposition((10, 11), matched_pairs)
+
+
+def test_successful_timing_prior_replaces_failed_preliminary_unresolved_status(monkeypatch):
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\necho one\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\necho two\n\n"
+    )
+    words = [
+        Word(text="echo", start=0.1, end=0.2),
+        Word(text="one", start=0.3, end=0.4),
+        Word(text="echo", start=1.1, end=1.2),
+        Word(text="two", start=1.3, end=1.4),
+    ]
+    successful_ops = [aligner._Op("match", index, index, 1.0) for index in range(4)]
+    runs = iter(
+        [
+            aligner._AlignmentRun(
+                ops=aligner._fully_divergent_ops(4, 4),
+                band_limited=True,
+                unresolved=True,
+            ),
+            aligner._AlignmentRun(ops=successful_ops),
+        ]
+    )
+    monkeypatch.setattr(aligner, "_align_tokens_detailed", lambda *args, **kwargs: next(runs))
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.diagnostics.prior_used is True
+    assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is False
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    assert not any(flag.kind == "alignment_unresolved" for flag in result.flags)
 
 
 def test_alignment_retry_margins_progress_without_automatic_full_width():
