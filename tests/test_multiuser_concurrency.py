@@ -101,6 +101,18 @@ def _job(
     )
 
 
+def _wait_for_completed_jobs(service: JobService, jobs: tuple[JobRecord, ...]) -> None:
+    deadline = time.monotonic() + 5.0
+    while True:
+        records = [service.store.get(job.id) for job in jobs]
+        statuses = [record.status if record is not None else "missing" for record in records]
+        if statuses == ["complete"] * len(jobs):
+            return
+        assert "failed" not in statuses and "missing" not in statuses, statuses
+        assert time.monotonic() < deadline, f"Jobs did not finish before shutdown: {statuses}"
+        time.sleep(0.01)
+
+
 def test_overlapping_authenticated_intakes_are_isolated_and_both_accepted(
     tmp_path,
     monkeypatch,
@@ -213,6 +225,8 @@ def test_two_workers_overlap_independent_jobs_without_exceeding_the_bound(tmp_pa
         for job in jobs:
             service.submit(job)
         assert two_active.wait(timeout=2.0)
+        release.set()
+        _wait_for_completed_jobs(service, jobs)
     finally:
         release.set()
         service.shutdown()
@@ -277,6 +291,8 @@ def test_two_workers_keep_each_batch_serial_while_batches_overlap(tmp_path):
         service.submit_batch(first_batch)
         service.submit_batch(second_batch)
         assert two_batches_active.wait(timeout=2.0)
+        release.set()
+        _wait_for_completed_jobs(service, jobs)
     finally:
         release.set()
         service.shutdown()
@@ -467,6 +483,8 @@ def test_restart_recovery_keeps_children_of_one_batch_serial_with_two_workers(tm
         service.start()
         assert first_started.wait(timeout=2.0)
         assert not same_batch_overlap.wait(timeout=0.2)
+        release.set()
+        _wait_for_completed_jobs(service, jobs)
     finally:
         release.set()
         service.shutdown()

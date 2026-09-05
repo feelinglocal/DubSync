@@ -1,6 +1,10 @@
 asr:
   fixture_path: web/e2e/fixtures/words.json
 
+llm:
+  provider: fixture
+  responses: {}
+
 generation:
   max_gap_seconds: 0.8
   max_cue_duration_seconds: 5.0

@@ -26,10 +26,15 @@ interface DownloadState {
 
 export function Workspace({ config }: { config: PublicConfig }) {
   const batchNamingHelpId = useId()
-  const [accesses, setAccesses] = useState<ActiveJobAccess[]>(readActiveJobs)
+  const storageReadFailed = useRef(false)
+  const [accesses, setAccesses] = useState<ActiveJobAccess[]>(() => readActiveJobs(() => {
+    storageReadFailed.current = true
+  }))
+  const [storageUnavailable, setStorageUnavailable] = useState(storageReadFailed.current)
   const initialAccesses = useRef(accesses)
   const initiallyRestoringIds = useRef(new Set(accesses.map((access) => access.id)))
   const restoreRequest = useRef<Promise<PromiseSettledResult<JobResponse>[]> | null>(null)
+  const pollingJobIds = useRef(new Set<string>())
   const [mode, setMode] = useState<JobMode>('sync')
   const [audioFiles, setAudioFiles] = useState<File[]>([])
   const [subtitleFiles, setSubtitleFiles] = useState<File[]>([])
@@ -88,7 +93,10 @@ export function Workspace({ config }: { config: PublicConfig }) {
   }, [config.generation_styles, stylePreset])
 
   useEffect(() => {
-    persistAccesses(accesses)
+    // Until saved access has been restored, any write could replace unread tokens.
+    // Keep this mount in memory even if storage becomes writable later.
+    if (storageReadFailed.current) return
+    setStorageUnavailable(!persistAccesses(accesses))
   }, [accesses])
 
   useEffect(() => {
@@ -133,17 +141,23 @@ export function Workspace({ config }: { config: PublicConfig }) {
     jobs.forEach((job) => {
       if (!['queued', 'processing'].includes(job.status)) return
       const access = accesses.find((candidate) => candidate.id === job.id)
-      if (!access) return
+      if (!access || pollingJobIds.current.has(job.id)) return
       scheduledJobIds.add(job.id)
       const timer = window.setTimeout(() => {
+        if (pollingJobIds.current.has(job.id)) return
+        pollingJobIds.current.add(job.id)
         void loadJob(job.id, access.token)
           .then((updatedJob) => {
+            pollingJobIds.current.delete(job.id)
             clearRefreshError(job.id)
             setJobs((current) => current.map((candidate) => (
               candidate.id === updatedJob.id ? updatedJob : candidate
             )))
           })
-          .catch((pollError) => handleRefreshFailure(job.id, pollError))
+          .catch((pollError) => {
+            pollingJobIds.current.delete(job.id)
+            handleRefreshFailure(job.id, pollError)
+          })
       }, 1500)
       pollTimers.push(timer)
     })
@@ -151,16 +165,23 @@ export function Workspace({ config }: { config: PublicConfig }) {
     accesses.forEach((access) => {
       if (
         initiallyRestoringIds.current.has(access.id)
+        || pollingJobIds.current.has(access.id)
         || scheduledJobIds.has(access.id)
         || jobs.some((job) => job.id === access.id)
       ) return
       const timer = window.setTimeout(() => {
+        if (pollingJobIds.current.has(access.id)) return
+        pollingJobIds.current.add(access.id)
         void loadJob(access.id, access.token)
           .then((restoredJob) => {
+            pollingJobIds.current.delete(access.id)
             clearRefreshError(access.id)
             setJobs((current) => orderJobsByAccess([...current, restoredJob], accesses))
           })
-          .catch((restoreError) => handleRefreshFailure(access.id, restoreError))
+          .catch((restoreError) => {
+            pollingJobIds.current.delete(access.id)
+            handleRefreshFailure(access.id, restoreError)
+          })
       }, 1500)
       pollTimers.push(timer)
     })
@@ -328,6 +349,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
             <button className="primary-button" type="submit" disabled={!canSubmit}><Play />{submitting ? 'Uploading' : mode === 'sync' ? 'Start sync' : 'Generate SRT'}</button>
           </div>
           {!config.jobs_available && <div className="service-notice" role="status">Job intake is temporarily unavailable. Contact <a href="mailto:rey@feelslocal.com">rey@feelslocal.com</a>.</div>}
+          {storageUnavailable && <div className="service-notice" role="status">Your browser could not save job access. Keep this tab open and download your results before refreshing or closing it.</div>}
           {selectionTouched && selectionError && <div className="form-error" role="alert">{selectionError}</div>}
           {error && <div className="form-error" role="alert">{error}</div>}
           {Object.entries(refreshErrors).map(([jobId, message]) => (
@@ -378,8 +400,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
 }
 
 function persistAccesses(accesses: readonly ActiveJobAccess[]) {
-  if (accesses.length > 0) writeActiveJobs(accesses)
-  else clearActiveJobs()
+  return accesses.length > 0 ? writeActiveJobs(accesses) : clearActiveJobs()
 }
 
 function orderJobsByAccess(jobs: readonly JobResponse[], accesses: readonly ActiveJobAccess[]) {

@@ -62,6 +62,13 @@ export interface JobResult {
   fps?: number
   fps_source?: 'detected' | 'fallback' | 'explicit'
   fps_detection_confident?: boolean
+  qc_summary?: {
+    flags: number
+    style_violations: number
+    error_count?: number
+    warning_count?: number
+    info_count?: number
+  }
 }
 
 export interface JobResponse {

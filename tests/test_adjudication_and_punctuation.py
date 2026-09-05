@@ -239,7 +239,7 @@ def test_adjudication_passes_audio_snippets_to_snippet_aware_adapter(tmp_path):
     assert flags == []
 
 
-def test_adjudication_uses_audio_text_and_flags_low_confidence():
+def test_adjudication_preserves_source_and_reports_low_confidence_proposal():
     span = DivergenceSpan(
         case_id="case-1",
         cue_ids=[3],
@@ -266,9 +266,10 @@ def test_adjudication_uses_audio_text_and_flags_low_confidence():
 
     decisions, flags = AdjudicationEngine(llm, confidence_gate=0.7).adjudicate([span])
 
-    assert decisions[0].verdict == "use_audio"
-    assert decisions[0].final_text == "new line"
+    assert decisions[0].verdict == "keep_srt"
+    assert decisions[0].final_text == "old line"
     assert flags[0].kind == "low_confidence_adjudication"
+    assert flags[0].new_text == "new line"
 
 
 def test_punctuation_only_diff_keeps_srt_without_llm_call():
@@ -293,7 +294,7 @@ def test_punctuation_only_diff_keeps_srt_without_llm_call():
     assert flags == []
 
 
-def test_tiny_asr_noise_keeps_srt_without_llm_call():
+def test_similar_spelling_is_reviewed_and_can_preserve_source():
     span = DivergenceSpan(
         case_id="case-noise",
         cue_ids=[8],
@@ -304,14 +305,20 @@ def test_tiny_asr_noise_keeps_srt_without_llm_call():
         confidence=0.91,
         speaker_ids=[],
     )
-    llm = CountingLLMAdapter()
+    llm = SequencedLLMAdapter([[{
+        "case_id": "case-noise",
+        "verdict": "keep_srt",
+        "final_text": "general kenobi",
+        "confidence": 0.95,
+        "reason": "audio confirms the source spelling",
+    }]])
 
     decisions, flags = AdjudicationEngine(llm).adjudicate([span])
 
-    assert llm.calls == 0
+    assert llm.calls == 1
     assert decisions[0].verdict == "keep_srt"
     assert decisions[0].final_text == "general kenobi"
-    assert decisions[0].reason == "Tiny ASR spelling/noise difference; preserved source SRT."
+    assert decisions[0].reason == "audio confirms the source spelling"
     assert flags == []
 
 

@@ -5,6 +5,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from .cache import write_json_atomic, write_text_atomic
 from .models import Cue, CueScore, QCFlag, StyleIssue
 from .srt_io import format_timestamp, write_srt
 
@@ -38,8 +39,8 @@ def write_qc_report(
         "flags": [flag.model_dump() for flag in ordered_flags],
         "style_issues": [issue.model_dump() for issue in ordered_issues],
     }
-    report_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    report_html_path.write_text(_render_html(payload), encoding="utf-8")
+    write_json_atomic(report_json_path, payload)
+    write_text_atomic(report_html_path, _render_html(payload))
     return payload
 
 
@@ -62,7 +63,7 @@ def write_changes_diff(path: Path, flags: list[QCFlag]) -> None:
                 lines=lines,
             )
         )
-    path.write_text(write_srt(cues, renumber=True) if cues else "", encoding="utf-8")
+    write_text_atomic(path, write_srt(cues, renumber=True) if cues else "")
 
 
 def _render_html(payload: dict[str, object]) -> str:

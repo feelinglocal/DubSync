@@ -33,6 +33,12 @@ export default defineConfig({
       DUBSYNC_WORKER_THREADS: '2',
       DUBSYNC_REQUIRE_JOB_ACCESS_CODE: '0',
       DUBSYNC_JOB_ACCESS_CODE: 'fixture-access-code',
+      // Keep the entire browser suite offline even on a developer machine with keys.
+      ELEVENLABS_API_KEY: '',
+      GEMINI_API_KEY: '',
+      OPENAI_API_KEY: '',
+      ANTHROPIC_API_KEY: '',
+      ASSEMBLYAI_API_KEY: '',
     },
   },
 })

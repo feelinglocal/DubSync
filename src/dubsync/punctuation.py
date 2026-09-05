@@ -4,6 +4,7 @@ import re
 import unicodedata
 from typing import Protocol
 
+from .editorial_guard import EditorialGuardError, validate_editorial_text
 from .models import Cue, QCFlag
 from .providers import ProviderError
 from .subtitle_annotations import cue_has_bracketed_screen_text
@@ -41,6 +42,10 @@ def validate_punctuation_only(before: str, after: str) -> str:
         raise PunctuationValidationError("alphanumeric content changed during punctuation pass")
     if _quotation_mark_signature(before) != _quotation_mark_signature(after):
         raise PunctuationValidationError("quotation mark signature changed during punctuation pass")
+    try:
+        validate_editorial_text(before, after, allow_word_change=True)
+    except EditorialGuardError as exc:
+        raise PunctuationValidationError(str(exc).replace("adjudication", "punctuation pass")) from exc
     return after
 
 

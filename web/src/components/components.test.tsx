@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -212,9 +212,83 @@ describe('shared components', () => {
 
     render(<WaveformPreview file={new File(['audio'], 'decoded.wav', { type: 'audio/wav' })} />)
 
+    const player = screen.getByLabelText('Audio preview player')
+    expect(decodeAudioData).not.toHaveBeenCalled()
+    Object.defineProperty(player, 'duration', { value: 65.2 })
+    fireEvent.loadedMetadata(player)
+
     expect(await screen.findByText('1:05 audio')).toBeVisible()
     expect(decodeAudioData).toHaveBeenCalledOnce()
     expect(context.lineTo.mock.calls.length).toBeGreaterThan(2)
     await waitFor(() => expect(close).toHaveBeenCalled())
+  })
+
+  it('makes QC warnings visible and distinguishes informational notes from review findings', () => {
+    const completed = job({ status: 'complete', result: {
+      cue_count: 18, cost_usd: 0,
+      qc_summary: { flags: 4, style_violations: 2, error_count: 1, warning_count: 3, info_count: 2 },
+    }, downloads: ['srt', 'qc-html'] })
+    const { rerender } = render(<JobPanel job={completed} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('18 cues processed · QC review needed')).toBeVisible()
+    expect(screen.getByText('1 QC error · 3 QC warnings. Review the QC report before using this SRT.')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'QC report' })).toBeEnabled()
+
+    rerender(<JobPanel job={{ ...completed, result: {
+      cue_count: 18, cost_usd: 0,
+      qc_summary: { flags: 2, style_violations: 0, error_count: 0, warning_count: 0, info_count: 2 },
+    } }} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('18 cues ready')).toBeVisible()
+    expect(screen.getByText('No automated QC warnings or errors · 2 informational notes.')).toBeVisible()
+  })
+
+  it('shows unavailable or legacy QC summaries without claiming an automated clean result', () => {
+    const completed = job({ status: 'complete', result: { cue_count: 1, cost_usd: 0 }, downloads: ['srt', 'qc-html'] })
+    const { rerender } = render(<JobPanel job={completed} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('QC summary unavailable. Review the QC report.')).toBeVisible()
+    rerender(<JobPanel job={{ ...completed, result: {
+      cue_count: 1, cost_usd: 0, qc_summary: { flags: 2, style_violations: 1 },
+    } }} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('2 QC flags · 1 style issue. Review the QC report.')).toBeVisible()
+  })
+
+  it('keeps long audio playable without reading or decoding the whole recording for its waveform', async () => {
+    const arrayBuffer = vi.spyOn(File.prototype, 'arrayBuffer').mockResolvedValue(new ArrayBuffer(16))
+    const decodeAudioData = vi.fn().mockResolvedValue({
+      duration: 2700,
+      getChannelData: () => new Float32Array([0, 0.5]),
+    })
+    class FakeAudioContext {
+      decodeAudioData = decodeAudioData
+      close = vi.fn().mockResolvedValue(undefined)
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+    render(<WaveformPreview file={new File(['compressed audio'], 'episode.mp3', { type: 'audio/mpeg' })} />)
+    const player = screen.getByLabelText('Audio preview player')
+    Object.defineProperty(player, 'duration', { value: 2700 })
+    fireEvent.loadedMetadata(player)
+
+    expect(await screen.findByText(/Waveform preview is limited to audio up to 5 minutes and 16 MB/)).toBeVisible()
+    expect(player).toHaveAttribute('controls')
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(decodeAudioData).not.toHaveBeenCalled()
+  })
+
+  it('skips oversized waveform files before allocating an audio context', async () => {
+    const file = new File(['audio'], 'large.wav', { type: 'audio/wav' })
+    Object.defineProperty(file, 'size', { value: 17 * 1024 * 1024 })
+    const arrayBuffer = vi.spyOn(File.prototype, 'arrayBuffer').mockResolvedValue(new ArrayBuffer(16))
+    const createContext = vi.fn()
+    class FakeAudioContext {
+      constructor() { createContext() }
+      decodeAudioData = vi.fn().mockRejectedValue(new Error('Should not decode'))
+      close = vi.fn().mockResolvedValue(undefined)
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+    render(<WaveformPreview file={file} />)
+
+    expect(await screen.findByText(/Waveform preview is limited to audio up to 5 minutes and 16 MB/)).toBeVisible()
+    expect(screen.getByLabelText('Audio preview player')).toHaveAttribute('controls')
+    expect(createContext).not.toHaveBeenCalled()
+    expect(arrayBuffer).not.toHaveBeenCalled()
   })
 })

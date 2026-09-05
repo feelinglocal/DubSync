@@ -102,6 +102,11 @@ def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
 
     assert result == dest
     ffmpeg_call = next(call for call in calls if call[0] == "ffmpeg")
+    partial = Path(ffmpeg_call[-1])
+    assert partial.parent == dest.parent
+    assert partial.name.startswith(f".{dest.name}.")
+    assert partial.suffix == ".partial"
+    assert not partial.exists()
     assert ffmpeg_call == [
         "ffmpeg",
         "-nostdin",
@@ -128,7 +133,7 @@ def test_normalize_audio_uses_ffmpeg_16khz_mono(tmp_path, monkeypatch):
         "1080576",
         "-f",
         "wav",
-        str(dest.with_name(f"{dest.name}.partial")),
+        str(partial),
     ]
     assert all(isinstance(timeout, float) for timeout in timeouts)
     assert all(0 < timeout < float("inf") for timeout in timeouts)

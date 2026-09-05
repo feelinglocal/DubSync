@@ -4,6 +4,8 @@ DubSync is a Windows-friendly Python 3.11+ CLI for retiming a customer-supplied 
 
 Timing comes from acoustic data only: ASR word timestamps and optional forced alignment. LLM adapters are used only for language decisions such as improv adjudication and punctuation, never for timestamps.
 
+Automatic processing produces reviewable subtitles, not a guarantee of perfect transcription or phoneme timing. Low-confidence proposed edits remain in QC while their source wording and cue timing are held; independently approved edits elsewhere in that cue are retained. Real speech overlaps and readability pressure are reported instead of moving acoustic boundaries. Completed web jobs show the QC review state next to their downloads. See [the September 2026 quality audit](docs/testing/app-quality-audit-2026-09-05.md) for verified fixes, corpus evidence, and remaining limitations.
+
 ## Commercial Web MVP
 
 DubSync also includes a responsive React/FastAPI application with two customer workflows:
@@ -118,6 +120,8 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 `--no-llm` runs timing-only mode. It still emits full QC for divergences, unmatched cues, style issues, and overlaps.
 
 `--resume asr` reloads persisted ingest/style artifacts before rerunning ASR. `--resume align` and later stages reuse `workdir/<episode>/asr.json` instead of calling ASR again. `--resume adjudicate` reloads persisted ingest and alignment artifacts before rerunning adjudication. `--resume rebuild` reloads persisted ingest, alignment, and adjudication artifacts before re-cueing. `--resume verify` reloads `align.json` and `rebuild.json`, so verification/report generation starts from the persisted rebuilt subtitle artifact instead of recomputing earlier stages from the source SRT.
+
+New ASR checkpoints record source and normalized-audio hashes. A timing-stage resume rejects changed/missing audio before overwriting existing artifacts; use `--resume asr` to regenerate acoustic evidence. Legacy checkpoints remain readable with an explicit unverified-provenance QC warning. Rebuild checkpoints predating the current text/timing safeguards must resume from `rebuild`; `verify` also rejects decisions that no longer satisfy the configured confidence gate. These policies reuse the saved source snapshot intentionally. Normalized audio, caches, and result artifacts replace existing files only after a complete new file has been written.
 
 `--local` disables LLM calls and selects the WhisperX local-test ASR path. Normal cloud processing continues to use the configured ElevenLabs Scribe v2 adapter.
 

@@ -93,24 +93,26 @@ class SecurityAndIntakeMiddleware:
         *,
         settings: WebSettings,
         limiter: SlidingWindowRateLimiter,
-        storage_usage_bytes: Callable[[], int],
+        storage_snapshot_bytes: Callable[[], tuple[int, int]],
     ) -> None:
         self.app = app
         self.settings = settings
         self.limiter = limiter
-        self.storage_usage_bytes = storage_usage_bytes
+        self.storage_snapshot_bytes = storage_snapshot_bytes
         self.intake_reservation_lock = threading.Lock()
         self.active_intake_reservation_bytes = 0
 
     def _reserve_intake_storage(self, reservation: int) -> bool:
         with self.intake_reservation_lock:
-            retained_bytes = self.storage_usage_bytes()
+            retained_bytes, unmaterialized_bytes = self.storage_snapshot_bytes()
             active_bytes = self.active_intake_reservation_bytes
             if retained_bytes + active_bytes + reservation > self.settings.max_retained_storage_bytes:
                 return False
 
             free_bytes = shutil.disk_usage(self.settings.data_dir).free
-            if free_bytes < active_bytes + reservation + self.settings.min_free_storage_bytes:
+            if free_bytes < (
+                unmaterialized_bytes + active_bytes + reservation + self.settings.min_free_storage_bytes
+            ):
                 return False
 
             self.active_intake_reservation_bytes = active_bytes + reservation

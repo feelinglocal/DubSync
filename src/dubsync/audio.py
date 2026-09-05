@@ -5,6 +5,7 @@ import os
 import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,6 +88,10 @@ def normalize_audio(
     ffprobe: str = "ffprobe",
     limits: AudioNormalizationLimits | None = None,
 ) -> Path:
+    if source.resolve() == dest.resolve() or (
+        source.exists() and dest.exists() and source.samefile(dest)
+    ):
+        raise AudioNormalizeError("Normalized output must use a different path from the source audio.")
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         resolved_timeout = resolve_ffmpeg_timeout_seconds(timeout_seconds)
@@ -118,9 +123,10 @@ def normalize_audio(
         if free_bytes < predicted_bytes + resolved_limits.min_free_storage_bytes:
             raise AudioNormalizeError("Not enough free storage is available to process this audio.")
 
-    partial = dest.with_name(f"{dest.name}.partial")
-    partial.unlink(missing_ok=True)
-    dest.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=dest.parent, prefix=f".{dest.name}.", suffix=".partial", delete=False,
+    ) as temporary:
+        partial = Path(temporary.name)
     cmd = [
         ffmpeg,
         "-nostdin",

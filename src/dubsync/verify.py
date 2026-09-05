@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .forced_alignment import usable_forced_alignments_by_cue
 from .models import AlignmentResult, Cue, CueScore, ForcedAlignmentCue, QCFlag, StyleIssue, Word
 from .style_profile import StyleProfile
 from .subtitle_annotations import cue_has_spoken_text, speech_text_for_alignment
@@ -14,6 +15,8 @@ def lint_cues(cues: list[Cue], profile: StyleProfile) -> list[StyleIssue]:
     for cue in cues:
         if cue.start_ms > cue.end_ms:
             issues.append(StyleIssue(kind="negative_duration", cue_id=cue.index, message="Cue start is after end.", severity="error"))
+        elif cue.start_ms == cue.end_ms:
+            issues.append(StyleIssue(kind="zero_duration", cue_id=cue.index, message="Cue has no display duration.", severity="error"))
         if cue.duration_ms < min_duration_ms:
             issues.append(StyleIssue(kind="min_duration", cue_id=cue.index, message="Cue is shorter than minimum duration."))
         if not profile.is_frame_aligned(cue.start_ms) or not profile.is_frame_aligned(cue.end_ms):
@@ -35,8 +38,13 @@ def score_cues(
     words: list[Word],
     alignment: AlignmentResult,
     forced_alignments: list[ForcedAlignmentCue] | None = None,
+    *,
+    protected_cue_ids: set[int] | None = None,
 ) -> list[CueScore]:
-    forced_by_cue = {item.cue_id: item for item in forced_alignments or []}
+    protected = set(alignment.diagnostics.missing_audio_cue_ids) | (protected_cue_ids or set())
+    forced_by_cue = usable_forced_alignments_by_cue(
+        cues, forced_alignments or [], protected_cue_ids=protected
+    )
     scores: list[CueScore] = []
 
     for cue in cues:
@@ -91,6 +99,19 @@ def cps_sanity_flags(cues: list[Cue], *, max_cps: float = 30.0, min_cps: float =
     flags: list[QCFlag] = []
     for cue in cues:
         if not cue_has_spoken_text(cue):
+            continue
+        if cue.duration_ms <= 0:
+            flags.append(
+                QCFlag(
+                    kind="invalid_cue_duration",
+                    cue_ids=[cue.index],
+                    message="Spoken text has no positive display duration and cannot be read.",
+                    severity="error",
+                    old_text=cue.text,
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
             continue
         cps = _cue_cps(cue)
         if cps > max_cps:

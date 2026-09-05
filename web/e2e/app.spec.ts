@@ -56,8 +56,8 @@ test('two browser contexts share one access code without sharing job state', asy
       secondPage.getByRole('button', { name: 'Generate SRT' }).click(),
     ])
     await Promise.all([
-      expect(firstPage.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 }),
-      expect(secondPage.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 }),
+      expect(firstPage.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 }),
+      expect(secondPage.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 }),
     ])
 
     const [firstAccess, secondAccess] = await Promise.all([
@@ -93,7 +93,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   const submit = page.getByRole('button', { name: 'Generate SRT' })
   await expect(submit).toBeEnabled()
   await submit.click()
-  await expect(page.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 })
 
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
@@ -124,7 +124,7 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
   await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Generate SRT' }).click()
-  await expect(page.getByText(/cues ready/)).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText(/cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 })
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
@@ -154,7 +154,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
   await page.getByLabel('Job access code').fill('fixture-access-code')
 
   await page.getByRole('button', { name: 'Start sync' }).click()
-  await expect(page.getByText('2 cues ready')).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 })
   const access = await page.evaluate(() => (JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)[0])
   expect(access.id).toBeTruthy()
   expect(access.token).toBeTruthy()
@@ -166,7 +166,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
   })).status()).toBe(200)
 
   await page.reload()
-  await expect(page.getByText('2 cues ready')).toBeVisible()
+  await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible()
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
@@ -205,7 +205,7 @@ test('matched files submit as one sequential batch and keep per-source download 
   await expect(batchResults).toBeVisible()
   await expect(batchResults.getByText('001', { exact: true })).toBeVisible()
   await expect(batchResults.getByText('002', { exact: true })).toBeVisible()
-  await expect(batchResults.getByText(/cues ready/)).toHaveCount(2, { timeout: 30_000 })
+  await expect(batchResults.getByText(/cues (?:ready|processed)/)).toHaveCount(2, { timeout: 30_000 })
 
   const accesses = await page.evaluate(() => JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || '[]') as Array<{ id: string; token: string }>)
   expect(accesses).toHaveLength(2)

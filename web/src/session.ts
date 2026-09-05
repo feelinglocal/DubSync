@@ -10,23 +10,29 @@ export function readActiveJob(): ActiveJobAccess | null {
   try {
     const raw = sessionStorage.getItem(ACTIVE_JOB_KEY)
     if (!raw) return null
-    const value = JSON.parse(raw) as Partial<ActiveJobAccess>
-    return value.id && value.token ? { id: value.id, token: value.token } : null
+    const value = JSON.parse(raw) as unknown
+    return isActiveJobAccess(value) ? { id: value.id, token: value.token } : null
   } catch {
     return null
   }
 }
 
-export function writeActiveJob(access: ActiveJobAccess): void {
-  sessionStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify(access))
+export function writeActiveJob(access: ActiveJobAccess): boolean {
+  return updateStorage(() => sessionStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify(access)))
 }
 
-export function clearActiveJob(): void {
-  sessionStorage.removeItem(ACTIVE_JOB_KEY)
+export function clearActiveJob(): boolean {
+  return updateStorage(() => sessionStorage.removeItem(ACTIVE_JOB_KEY))
 }
 
-export function readActiveJobs(): ActiveJobAccess[] {
-  const raw = sessionStorage.getItem(ACTIVE_JOBS_KEY)
+export function readActiveJobs(onStorageError?: () => void): ActiveJobAccess[] {
+  let raw: string | null
+  try {
+    raw = sessionStorage.getItem(ACTIVE_JOBS_KEY)
+  } catch {
+    onStorageError?.()
+    return []
+  }
   if (raw) {
     try {
       const value = JSON.parse(raw) as unknown
@@ -38,17 +44,25 @@ export function readActiveJobs(): ActiveJobAccess[] {
 
   const legacy = readActiveJob()
   if (!legacy) return []
-  writeActiveJobs([legacy])
-  clearActiveJob()
+  if (writeActiveJobs([legacy])) clearActiveJob()
   return [legacy]
 }
 
-export function writeActiveJobs(accesses: readonly ActiveJobAccess[]): void {
-  sessionStorage.setItem(ACTIVE_JOBS_KEY, JSON.stringify(accesses))
+export function writeActiveJobs(accesses: readonly ActiveJobAccess[]): boolean {
+  return updateStorage(() => sessionStorage.setItem(ACTIVE_JOBS_KEY, JSON.stringify(accesses)))
 }
 
-export function clearActiveJobs(): void {
-  sessionStorage.removeItem(ACTIVE_JOBS_KEY)
+export function clearActiveJobs(): boolean {
+  return updateStorage(() => sessionStorage.removeItem(ACTIVE_JOBS_KEY))
+}
+
+function updateStorage(update: () => void): boolean {
+  try {
+    update()
+    return true
+  } catch {
+    return false
+  }
 }
 
 function isActiveJobAccessArray(value: unknown): value is ActiveJobAccess[] {

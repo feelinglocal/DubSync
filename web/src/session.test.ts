@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   clearActiveJob,
@@ -8,6 +8,8 @@ import {
   writeActiveJob,
   writeActiveJobs,
 } from './session'
+
+afterEach(() => vi.restoreAllMocks())
 
 describe('tab-scoped job access', () => {
   beforeEach(() => sessionStorage.clear())
@@ -64,5 +66,28 @@ describe('tab-scoped batch job access', () => {
     expect(readActiveJobs()).toEqual([legacyAccess])
     expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([legacyAccess])
     expect(sessionStorage.getItem('dubsync:active-job')).toBeNull()
+  })
+
+  it('handles unavailable browser storage without throwing', () => {
+    const onReadError = vi.fn()
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('Full', 'QuotaExceededError') })
+    vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+
+    expect(readActiveJobs(onReadError)).toEqual([])
+    expect(onReadError).toHaveBeenCalledOnce()
+    expect(writeActiveJobs([{ id: 'job-1', token: 'token-1' }])).toBe(false)
+    expect(clearActiveJobs()).toBe(false)
+    expect(writeActiveJob({ id: 'job-1', token: 'token-1' })).toBe(false)
+    expect(clearActiveJob()).toBe(false)
+  })
+
+  it('keeps legacy access recoverable when migration cannot be saved', () => {
+    const legacy = { id: 'legacy-job', token: 'legacy-token' }
+    sessionStorage.setItem('dubsync:active-job', JSON.stringify(legacy))
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('Full', 'QuotaExceededError') })
+
+    expect(readActiveJobs()).toEqual([legacy])
+    expect(readActiveJob()).toEqual(legacy)
   })
 })

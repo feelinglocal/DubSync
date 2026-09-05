@@ -1122,7 +1122,7 @@ def test_cli_sync_writes_overlap_detection_fixture_report(tmp_path):
     assert overlap_flags[0]["confidence"] == 0.88
 
 
-def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
+def test_cli_sync_holds_source_text_and_timing_below_adjudication_confidence_gate(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
@@ -1199,23 +1199,17 @@ def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
 
     assert result.exit_code == 0, result.output
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
-    assert synced[1].text == "new spoken line"
+    assert synced[1].text == "old line"
     assert synced[1].start_ms == 1000
-    assert synced[1].end_ms == 1875
+    assert synced[1].end_ms == 2000
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     verify = json.loads((workdir / "episode" / "verify.json").read_text(encoding="utf-8"))
-    assert any(flag["kind"] == "text_changed" for flag in report["flags"])
-    change_flag = next(flag for flag in report["flags"] if flag["kind"] == "text_changed")
-    assert change_flag["old_text"] == "old line"
-    assert change_flag["new_text"] == "new spoken line"
-    assert change_flag["confidence"] == 0.93
-    verify_change_flag = next(flag for flag in verify["flags"] if flag["kind"] == "text_changed")
-    assert verify_change_flag == change_flag
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
     low_confidence_flag = next(flag for flag in report["flags"] if flag["kind"] == "low_confidence_adjudication")
     assert low_confidence_flag["confidence"] == 0.93
     assert low_confidence_flag["old_text"] == "old"
     assert low_confidence_flag["new_text"] == "new spoken line"
-    assert not any(flag["kind"] == "unmatched_cue" for flag in report["flags"])
+    assert low_confidence_flag in verify["flags"]
 
 
 def test_cli_sync_keeps_german_profanity_mask_without_llm_rewrite(tmp_path):
@@ -1754,7 +1748,7 @@ def test_cli_sync_reuses_cached_llm_adjudication_without_resume(tmp_path):
                             "case_id": "case-1",
                             "verdict": "use_audio",
                             "final_text": "new spoken line",
-                            "confidence": 0.93,
+                            "confidence": 0.96,
                             "speaker": "A",
                             "character": "unknown",
                             "reason": "actor improvised",
@@ -3386,6 +3380,17 @@ def test_cli_sync_resume_adjudicate_uses_normalized_audio_artifact_for_verify(tm
     assert first.exit_code == 0, first.output
     normalized_audio = workdir / "episode" / "audio.16k.wav"
     normalized_audio.write_bytes(b"RIFFnormalizedWAVEfmt ")
+    # This checkpoint explicitly records that ASR used this normalized artifact.
+    # An unrelated leftover normalized WAV must never override the source audio.
+    from dubsync.cache import _sha256_file
+    asr_artifact = workdir / "episode" / "asr.json"
+    asr_payload = json.loads(asr_artifact.read_text(encoding="utf-8"))
+    asr_payload["metadata"]["audio_provenance"] = {
+        "source_sha256": _sha256_file(audio_path),
+        "asr_input_sha256": _sha256_file(normalized_audio),
+        "normalized": True,
+    }
+    asr_artifact.write_text(json.dumps(asr_payload), encoding="utf-8")
 
     resumed = CliRunner().invoke(
         app,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from .region_index import SpeechRegionIndex
@@ -20,6 +21,49 @@ class BoundaryRefinementConfig:
     max_leading_silence_ms: int = 150
     max_trailing_silence_ms: int = 300
     max_word_duration_ms: int = 2000
+
+
+def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
+    """Read the same acoustic-boundary policy for synchronization and generation."""
+    vad_config = provider_config.get("vad", {}) if isinstance(provider_config, dict) else {}
+    if not isinstance(vad_config, dict):
+        return BoundaryRefinementConfig(enabled=False)
+    value = vad_config.get("boundary_refinement", False)
+    if value in (False, None):
+        return BoundaryRefinementConfig(enabled=False)
+    if value is not True and not isinstance(value, dict):
+        raise ValueError("vad.boundary_refinement must be a mapping or boolean")
+    options = {} if value is True else value
+    enabled = options.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("vad.boundary_refinement.enabled must be boolean")
+    timing_config = provider_config.get("timing", {})
+    max_word_duration = timing_config.get("max_word_duration", 2.0) if isinstance(timing_config, dict) else 2.0
+    try:
+        max_word_duration = float(max_word_duration)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timing.max_word_duration must be numeric") from exc
+    if not isfinite(max_word_duration) or max_word_duration <= 0:
+        raise ValueError("timing.max_word_duration must be finite and positive")
+    return BoundaryRefinementConfig(
+        enabled=enabled,
+        start_pad_ms=_boundary_milliseconds(options, "start_pad_ms", 40),
+        end_pad_ms=_boundary_milliseconds(options, "end_pad_ms", 40),
+        max_end_extension_ms=_boundary_milliseconds(options, "max_end_extension_ms", 300),
+        max_leading_silence_ms=_boundary_milliseconds(options, "max_leading_silence_ms", 150),
+        max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
+        max_word_duration_ms=int(max_word_duration * 1000),
+    )
+
+
+def _boundary_milliseconds(options: dict[str, object], key: str, default: int) -> int:
+    try:
+        number = int(options.get(key, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"vad.boundary_refinement.{key} must be an integer") from exc
+    if number < 0:
+        raise ValueError(f"vad.boundary_refinement.{key} must be non-negative")
+    return number
 
 
 def refine_cues_to_speech_activity(
@@ -74,9 +118,28 @@ def refine_cues_to_speech_activity(
         )
         end_cap_ms = None
         if index + 1 < len(dialogue_cues):
-            end_cap_ms = dialogue_cues[index + 1].start_ms
+            # The following cue can limit display padding, but cannot erase
+            # speech from a simultaneous speaker or collapse an inverted source
+            # cue to zero length. Output policy handles real overlaps separately.
+            acoustic_floor_ms = min(cue.end_ms, end_ms)
+            if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
+                acoustic_floor_ms = profile.snap_ceil(word_window[-1].end * 1000)
+            end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
-        end_ms = max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
+        # Minimum display duration cannot add a silence tail beyond the
+        # acoustic endpoint. Preserve already accepted short tails, but do not
+        # manufacture more silence merely to reach the readability floor.
+        acoustic_end = end_region.end
+        if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
+            acoustic_end = min(acoustic_end, word_window[-1].end)
+        duration_extension_cap = max(
+            end_ms,
+            profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms),
+        )
+        end_ms = min(
+            max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)),
+            duration_extension_cap,
+        )
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
@@ -120,7 +183,7 @@ def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfil
         cue_ids=[cue.index],
         message=(
             f"Cue could not reach the {profile.min_cue_dur:.3f}s minimum display duration "
-            "without crossing the following cue boundary."
+            "without exceeding the speech envelope or crossing the following cue boundary."
         ),
         severity="error",
         old_text=f"{old_cue.start_ms / 1000.0:.3f} --> {old_cue.end_ms / 1000.0:.3f}",

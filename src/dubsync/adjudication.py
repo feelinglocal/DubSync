@@ -4,7 +4,6 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Protocol
 
-from rapidfuzz import fuzz
 from pydantic import ValidationError
 
 from .models import AdjudicationDecision, AudioSnippet, DivergenceSpan, QCFlag
@@ -152,19 +151,11 @@ class AdjudicationEngine:
                     )
                 )
 
-            if decision.confidence < self.confidence_gate:
-                flags.append(
-                    QCFlag(
-                        kind="low_confidence_adjudication",
-                        cue_ids=span.cue_ids,
-                        message="Adjudication confidence is below the configured gate.",
-                        confidence=decision.confidence,
-                        old_text=span.srt_text,
-                        new_text=decision.final_text,
-                        start=span.start,
-                        end=span.end,
-                    )
-                )
+            decision, confidence_flag = confidence_gated_decision(
+                span, decision, self.confidence_gate
+            )
+            if confidence_flag is not None:
+                flags.append(confidence_flag)
             decisions.append(decision)
 
         return decisions, flags
@@ -273,6 +264,36 @@ class AdjudicationEngine:
         return None
 
 
+def confidence_gated_decision(
+    span: DivergenceSpan,
+    decision: AdjudicationDecision,
+    confidence_gate: float,
+) -> tuple[AdjudicationDecision, QCFlag | None]:
+    """Keep uncertain proposed wording reviewable without applying it to the SRT."""
+    if decision.confidence >= confidence_gate:
+        return decision, None
+    flag = QCFlag(
+        kind="low_confidence_adjudication",
+        cue_ids=span.cue_ids,
+        message=(
+            "Adjudication confidence is below the configured gate; source SRT was preserved. "
+            f"Proposed verdict: {decision.verdict}. Reason: {decision.reason}"
+        ),
+        confidence=decision.confidence,
+        old_text=span.srt_text,
+        new_text=decision.final_text,
+        start=span.start,
+        end=span.end,
+    )
+    if decision.verdict == "keep_srt":
+        return decision, flag
+    return decision.model_copy(update={
+        "verdict": "keep_srt",
+        "final_text": span.srt_text,
+        "reason": "Adjudication confidence is below the configured gate; preserved source SRT for review.",
+    }), flag
+
+
 def _pack_scene_chunks(
     scene_chunks: list[list[DivergenceSpan]],
     max_size: int,
@@ -295,12 +316,6 @@ def _heuristic_decision(span: DivergenceSpan) -> AdjudicationDecision | None:
 
     if srt_signature == asr_signature:
         return _keep_srt_decision(span, "Punctuation/casing-only difference; preserved source SRT.")
-
-    if len(srt_signature) == len(asr_signature):
-        srt_joined = " ".join(srt_signature)
-        asr_joined = " ".join(asr_signature)
-        if fuzz.ratio(srt_joined, asr_joined) >= 92:
-            return _keep_srt_decision(span, "Tiny ASR spelling/noise difference; preserved source SRT.")
 
     return None
 

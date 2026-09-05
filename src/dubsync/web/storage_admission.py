@@ -62,13 +62,12 @@ async def reserve_processing_storage(
         additional_bytes += predicted_bytes
 
     try:
-        reservation = store.reserve_job_storage(
+        store.reserve_job_storage(
             directory,
             additional_bytes=additional_bytes,
             max_job_storage_bytes=settings.max_job_storage_bytes,
         )
-        committed = store.storage_usage_bytes()
-        actual = store.job_storage_bytes(directory)
+        committed, unmaterialized_bytes = store.storage_snapshot_bytes()
     except (JobStorageLimitError, OSError) as exc:
         raise HTTPException(
             status_code=413,
@@ -81,6 +80,5 @@ async def reserve_processing_storage(
         free_bytes = shutil.disk_usage(settings.data_dir).free
     except OSError as exc:
         raise HTTPException(status_code=503, detail="Storage capacity could not be verified.") from exc
-    unmaterialized_bytes = max(0, reservation - actual)
     if free_bytes < unmaterialized_bytes + settings.min_free_storage_bytes:
         raise HTTPException(status_code=507, detail=STORAGE_CAPACITY_DETAIL)

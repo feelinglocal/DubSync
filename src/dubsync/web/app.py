@@ -20,6 +20,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -115,8 +116,10 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         service.start()
-        yield
-        service.shutdown()
+        try:
+            yield
+        finally:
+            service.shutdown()
 
     app = FastAPI(
         title="DubSync",
@@ -131,7 +134,7 @@ def create_app(
         SecurityAndIntakeMiddleware,
         settings=resolved_settings,
         limiter=limiter,
-        storage_usage_bytes=service.store.storage_usage_bytes,
+        storage_snapshot_bytes=service.store.storage_snapshot_bytes,
     )
 
     def _rollback_intake(job_ids: list[str], directories: list[Path]) -> None:
@@ -537,13 +540,14 @@ def create_app(
             mode="w+b",
         )
         try:
-            _write_batch_srt_archive(
+            await run_in_threadpool(
+                _write_batch_srt_archive,
                 archive,
                 sources,
                 max_source_bytes=resolved_settings.max_batch_upload_bytes,
             )
             archive.seek(0)
-        except Exception:
+        except BaseException:
             archive.close()
             raise
 
@@ -1081,6 +1085,16 @@ def _qc_result_metadata(qc_json: Path | None) -> dict[str, object]:
         return {}
 
     summary = payload["summary"]
+    metadata: dict[str, object] = {}
+    qc_summary = {
+        key: value
+        for key in ("flags", "style_violations", "error_count", "warning_count", "info_count")
+        if isinstance(value := summary.get(key), int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 9_007_199_254_740_991
+    }
+    if "flags" in qc_summary and "style_violations" in qc_summary:
+        metadata["qc_summary"] = qc_summary
     raw_fps = summary.get("fps")
     raw_source = summary.get("fps_source")
     raw_confidence = summary.get("fps_detection_confident")
@@ -1092,8 +1106,9 @@ def _qc_result_metadata(qc_json: Path | None) -> dict[str, object]:
         or raw_source not in FPS_RESULT_SOURCES
         or not isinstance(raw_confidence, bool)
     ):
-        return {}
+        return metadata
     return {
+        **metadata,
         "fps": float(raw_fps),
         "fps_source": raw_source,
         "fps_detection_confident": raw_confidence,

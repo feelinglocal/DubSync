@@ -212,7 +212,8 @@ def test_generate_srt_applies_per_job_profile_and_reading_speed_constraints(tmp_
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
     assert all(len(cue.lines) <= 1 for cue in cues)
     assert all(len(line) <= 18 for cue in cues for line in cue.lines)
-    assert cues[-1].end_ms >= 1600
+    assert cues[-1].end_ms == 400
+    assert any(flag["kind"] == "impossible_cps_fast" for flag in result.report["flags"])
     assert result.report["summary"]["style_violations"] == 0
     generated = json.loads((result.episode_workdir / "generate.json").read_text(encoding="utf-8"))
     assert generated["profile"]["max_chars_per_line"] == 18

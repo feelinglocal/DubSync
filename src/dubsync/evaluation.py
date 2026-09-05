@@ -44,10 +44,16 @@ def evaluate_against_golden(
     deltas = [
         abs(match.predicted.start_ms - match.golden.start_ms) for match in matched_pairs
     ]
+    end_deltas = [
+        abs(match.predicted.end_ms - match.golden.end_ms) for match in matched_pairs
+    ]
     matched_count = len(deltas)
     start_mae_ms = round(sum(deltas) / matched_count, 3) if matched_count else None
     within_1 = _ratio(sum(1 for delta in deltas if delta <= frame_ms), matched_count)
     within_3 = _ratio(sum(1 for delta in deltas if delta <= frame_ms * 3), matched_count)
+    end_mae_ms = round(sum(end_deltas) / matched_count, 3) if matched_count else None
+    ends_within_1 = _ratio(sum(1 for delta in end_deltas if delta <= frame_ms), matched_count)
+    ends_within_3 = _ratio(sum(1 for delta in end_deltas if delta <= frame_ms * 3), matched_count)
     review_burden = _review_burden_ratio(predicted, flags or [])
     improv_metrics = _improv_detection_metrics(
         predicted,
@@ -62,18 +68,28 @@ def evaluate_against_golden(
         "cue_count_predicted": len(predicted),
         "cue_count_golden": len(golden),
         "matched_cues": matched_count,
+        "golden_match_coverage": _ratio(matched_count, len(golden)),
+        "predicted_match_coverage": _ratio(matched_count, len(predicted)),
         "start_mae_ms": start_mae_ms,
+        "end_mae_ms": end_mae_ms,
         "starts_within_1_frame_ratio": within_1,
         "starts_within_3_frames_ratio": within_3,
+        "ends_within_1_frame_ratio": ends_within_1,
+        "ends_within_3_frames_ratio": ends_within_3,
         "review_burden_ratio": review_burden,
         "style_violations": style_violations,
         **improv_metrics,
         "meets_timing_target": bool(
             matched_count
+            and matched_count == len(golden) == len(predicted)
             and within_1 >= 0.9
             and within_3 >= 0.98
             and start_mae_ms is not None
             and start_mae_ms < 50.0
+            and ends_within_1 >= 0.9
+            and ends_within_3 >= 0.98
+            and end_mae_ms is not None
+            and end_mae_ms < 50.0
         ),
         "meets_structure_target": len(predicted) == len(golden) and style_violations == 0,
         "meets_review_burden_target": review_burden <= 0.1,
@@ -393,7 +409,8 @@ def _signature_similarity(predicted_signature: tuple[str, ...], golden_signature
 def _review_burden_ratio(cues: list[Cue], flags: list[QCFlag]) -> float:
     if not cues:
         return 0.0
-    flagged_cues = {cue_id for flag in flags for cue_id in flag.cue_ids}
+    existing_cue_ids = {cue.index for cue in cues}
+    flagged_cues = {cue_id for flag in flags for cue_id in flag.cue_ids if cue_id in existing_cue_ids}
     return len(flagged_cues) / len(cues)
 
 

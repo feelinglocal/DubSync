@@ -952,6 +952,47 @@ describe('DubSync workspace', () => {
     }
   })
 
+  it('keeps only one refresh in flight per child while faster batch jobs keep polling', async () => {
+    vi.useFakeTimers()
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([
+      { id: 'fast-child', token: 'fast-token' },
+      { id: 'slow-child', token: 'slow-token' },
+    ]))
+    const loads: Record<string, number> = {}
+    let resolveSlow!: (response: Response) => void
+    const slowResponse = new Promise<Response>((resolve) => { resolveSlow = resolve })
+    function response(id: string, complete = false) {
+      return new Response(JSON.stringify({
+        id, mode: 'sync', status: complete ? 'complete' : 'processing',
+        progress: complete ? 100 : 50,
+        result: complete ? { cue_count: 7, cost_usd: 0.01 } : null,
+        downloads: complete ? ['srt'] : [], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 200 })
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      const id = String(input).split('/').at(-1)!
+      loads[id] = (loads[id] || 0) + 1
+      if (id === 'slow-child' && loads[id] > 1) return slowResponse
+      return response(id)
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 2, 'slow-child': 2 })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 3, 'slow-child': 2 })
+      await act(async () => { resolveSlow(response('slow-child', true)) })
+      expect(screen.getByText('7 cues ready')).toBeVisible()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 4, 'slow-child': 2 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('shows API validation errors and permits another submission', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
@@ -966,6 +1007,63 @@ describe('DubSync workspace', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Audio could not be decoded.')
     expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeEnabled()
+  })
+
+  it('keeps completed results downloadable and warns when browser job storage is blocked', async () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      if (String(input).includes('/downloads/')) return new Response('subtitle', { status: 200 })
+      return new Response(JSON.stringify({
+        id: 'memory-job', token: 'memory-token', mode: 'generate', status: 'complete', progress: 100,
+        result: { cue_count: 5, cost_usd: 0 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 202 })
+    })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByText(/Your browser could not save job access/)).toBeVisible()
+    expect(removeItem).not.toHaveBeenCalledWith('dubsync:active-jobs')
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+    expect(await screen.findByText('5 cues ready')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Download SRT' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/jobs/memory-job/downloads/srt', {
+      headers: { Authorization: 'Bearer memory-token' },
+    }))
+  })
+
+  it('preserves unread saved tokens if storage recovers after the initial restore failed', async () => {
+    const savedAccesses = [{ id: 'prior-job', token: 'prior-token' }]
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify(savedAccesses))
+    const originalGetItem = Storage.prototype.getItem
+    let readsBlocked = true
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      if (readsBlocked && key === 'dubsync:active-jobs') throw new DOMException('Temporarily blocked', 'SecurityError')
+      return originalGetItem.call(this, key)
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      return new Response(JSON.stringify({
+        id: 'new-job', token: 'new-token', mode: 'generate', status: 'complete', progress: 100,
+        result: { cue_count: 5, cost_usd: 0 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 202 })
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByText(/Your browser could not save job access/)).toBeVisible()
+    readsBlocked = false
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(await screen.findByText('5 cues ready')).toBeVisible()
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual(savedAccesses)
+    expect(screen.getByText(/Your browser could not save job access/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Download SRT' })).toBeEnabled()
   })
 
   it('downloads a completed SRT with its bearer token', async () => {

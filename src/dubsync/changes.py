@@ -33,6 +33,7 @@ def apply_adjudication_decisions(
     by_case = {decision.case_id: decision for decision in decisions}
     cues_by_id = {cue.index: cue for cue in cues}
     cue_token_offsets = _cue_token_offsets(cues)
+    prefix_replacement_targets = single_token_prefix_replacement_targets(cues, spans, decisions)
     adlib_cue_ids_by_case = adlib_cue_ids_by_case or {}
     replacements_by_cue: dict[int, list[str]] = {}
     token_edits_by_cue: dict[int, list[tuple[int, int, str]]] = {}
@@ -246,7 +247,8 @@ def apply_adjudication_decisions(
 
         if len(cue_ids) > 1 and span.srt_token_indices and len(alphanumeric_signature(decision.final_text)) == 1:
             applied_multi_cue_edit = False
-            for position, cue_id in enumerate(cue_ids):
+            replacement_target = prefix_replacement_targets.get(span.case_id, cue_ids[0])
+            for cue_id in cue_ids:
                 cue = cues_by_id[cue_id]
                 bounds = _span_token_bounds_for_cue(
                     cue,
@@ -256,7 +258,7 @@ def apply_adjudication_decisions(
                 if bounds is None:
                     continue
                 token_edits_by_cue.setdefault(cue_id, []).append(
-                    (bounds[0], bounds[1], decision.final_text if position == 0 else "")
+                    (bounds[0], bounds[1], decision.final_text if cue_id == replacement_target else "")
                 )
                 applied_multi_cue_edit = True
             if applied_multi_cue_edit:
@@ -357,6 +359,56 @@ def apply_adjudication_decisions(
         changed_cue_ids=set(replacements_by_cue),
     )
     return _merge_adlibs_positionally(updated, adlib_cues), flags
+
+
+def single_token_prefix_replacement_targets(
+    cues: list[Cue],
+    spans: list[DivergenceSpan],
+    decisions: list[AdjudicationDecision],
+) -> dict[str, int]:
+    """Keep a collapsed source span with its surviving sentence continuation.
+
+    This only applies when explicit contiguous token indices consume complete
+    preceding cues and the prefix of the final cue. The same target must own
+    the replacement's ASR words and text; proportional cue assignment cannot
+    represent this case without producing a one-word orphan.
+    """
+    cues_by_id = {cue.index: cue for cue in cues}
+    offsets = _cue_token_offsets(cues)
+    by_case = {decision.case_id: decision for decision in decisions}
+    targets: dict[str, int] = {}
+    for span in spans:
+        decision = by_case.get(span.case_id)
+        cue_ids = list(dict.fromkeys(span.cue_ids))
+        indices = sorted(set(span.srt_token_indices))
+        if (
+            decision is None
+            or decision.verdict not in {"use_audio", "hybrid"}
+            or len(alphanumeric_signature(decision.final_text)) != 1
+            or len(cue_ids) < 2
+            or not indices
+            or indices != list(range(indices[0], indices[-1] + 1))
+            or any(cue_id not in cues_by_id for cue_id in cue_ids)
+            or any(cue_has_bracketed_screen_text(cues_by_id[cue_id]) for cue_id in cue_ids)
+        ):
+            continue
+        covered_tokens: list[str] = []
+        for position, cue_id in enumerate(cue_ids):
+            cue = cues_by_id[cue_id]
+            signature = alphanumeric_signature(speech_text_for_alignment(cue))
+            bounds = _span_token_bounds_for_cue(cue, span, offsets[cue_id])
+            if bounds is None or bounds[0] != 0:
+                break
+            if position < len(cue_ids) - 1:
+                if bounds[1] != len(signature):
+                    break
+            elif bounds[1] >= len(signature):
+                break
+            covered_tokens.extend(signature[:bounds[1]])
+        else:
+            if covered_tokens == alphanumeric_signature(span.srt_text):
+                targets[span.case_id] = cue_ids[-1]
+    return targets
 
 
 def _editorial_guard_rejection(

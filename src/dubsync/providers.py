@@ -60,10 +60,12 @@ class CachedASRAdapter:
         self.cost_provider = cost_provider or model
         self.dollars_per_hour = dollars_per_hour
         self.last_repair_flags: list[QCFlag] = []
+        self.last_cache_key: CacheKey | None = None
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         self.last_repair_flags = []
         key = CacheKey.from_audio(audio_path, self.model, self.params)
+        self.last_cache_key = key
         cached = self.cache.read(key)
         if cached is not None:
             cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached

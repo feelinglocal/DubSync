@@ -50,6 +50,12 @@ describe('web API client', () => {
     expect(body.has('access_code')).toBe(false)
   })
 
+  it('shows actionable upload failures when a proxy returns HTML instead of JSON', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('<html>Bad gateway</html>', { status: 502 }))
+    await expect(createJob(new FormData())).rejects.toThrow('Could not start the job. The service returned an unreadable response (HTTP 502).')
+    await expect(createBatch(new FormData())).rejects.toThrow('Could not start the batch. The service returned an unreadable response (HTTP 502).')
+  })
+
   it('loads a protected job and rejects an unavailable one', async () => {
     const job = { id: 'job-2', status: 'processing' }
     const fetchMock = vi.spyOn(globalThis, 'fetch')
@@ -59,8 +65,28 @@ describe('web API client', () => {
     await expect(loadJob('job-2', 'secret')).resolves.toEqual(job)
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/jobs/job-2', {
       headers: { Authorization: 'Bearer secret' },
+      signal: expect.any(AbortSignal),
     })
     await expect(loadJob('missing', 'secret')).rejects.toThrow('Could not refresh the job.')
+  })
+
+  it('aborts a stalled status refresh so recovery can retry', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, options) => (
+      new Promise<Response>((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+      })
+    ))
+    try {
+      const request = loadJob('stalled-job', 'secret')
+      const outcome = expect(request).rejects.toThrow('Job refresh timed out. Retrying automatically.')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true)
+      await outcome
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('downloads a protected artifact with the server filename', async () => {

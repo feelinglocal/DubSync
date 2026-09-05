@@ -9,14 +9,14 @@ from typing import Any
 
 from rapidfuzz import fuzz
 
-from .adjudication import AdjudicationEngine, KeepSRTAdapter
+from .adjudication import AdjudicationEngine, KeepSRTAdapter, confidence_gated_decision
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
 from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import extract_audio_snippets
-from .cache import CacheKey, JsonDiskCache
-from .changes import apply_adjudication_decisions
+from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
+from .changes import apply_adjudication_decisions, single_token_prefix_replacement_targets
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
 from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues
@@ -55,7 +55,10 @@ from .source_order import sort_cues_chronologically
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
 from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text
-from .timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
+from .timing_refinement import (
+    BoundaryRefinementConfig, boundary_refinement_config_from_config,
+    refine_cues_to_speech_activity,
+)
 from .tokenize import alphanumeric_signature
 from .vad import (
     dropped_line_flags_for_unmatched_cues,
@@ -77,9 +80,15 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "adlib_removed_without_speech_activity",
         "duplicate_cue_merged",
         "forced_alignment_refined",
+        "forced_alignment_unresolved",
         "impossible_cps_fast",
         "impossible_cps_slow",
+        "invalid_cue_duration",
         "output_overlap_resolved",
+        "output_overlap_unresolved",
+        "media_boundary_clamped",
+        "cue_outside_media",
+        "min_duration_unattainable",
         "overlap_detected",
         "speaker_transition_gap_inserted",
         "timing_refined",
@@ -96,6 +105,10 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 )
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
+
+_REBUILD_POLICY_VERSION = 1
+_ADJUDICATION_POLICY_VERSION = 1
+_PUNCTUATION_POLICY_VERSION = 1
 
 
 class PipelineResult:
@@ -126,6 +139,13 @@ def sync_episode(
     resume_stage = _normalize_resume_stage(resume)
     episode_workdir = workdir / srt_path.stem
     episode_workdir.mkdir(parents=True, exist_ok=True)
+    provenance_flags = (
+        _validate_resume_audio_provenance(audio_path, episode_workdir)
+        if _should_load_asr_artifact(resume_stage)
+        else []
+    )
+    if resume_stage == "verify":
+        _validate_rebuild_policy(episode_workdir / "rebuild.json")
     cost_meter = CostMeter()
     cues = _source_cues_for_run(srt_path, episode_workdir, resume_stage)
     cues, source_order_flags = sort_cues_chronologically(cues)
@@ -168,10 +188,13 @@ def sync_episode(
     if _should_load_asr_artifact(resume_stage):
         asr_artifact_path = episode_workdir / "asr.json"
         words, asr_repair_flags = _load_asr_artifact_with_repair(asr_artifact_path)
+        asr_repair_flags.extend(provenance_flags)
         audio_for_asr = _resume_audio_for_verify(audio_path, episode_workdir)
     else:
         asr_config = provider_config.get("asr", {}) if isinstance(provider_config, dict) else {}
+        source_audio_sha256 = None
         if isinstance(asr_config, dict) and not asr_config.get("fixture_path"):
+            source_audio_sha256 = _sha256_file(audio_path)
             audio_for_asr = normalize_audio(
                 audio_path,
                 episode_workdir / "audio.16k.wav",
@@ -209,6 +232,11 @@ def sync_episode(
                 "metadata": {
                     "provider": asr_provider,
                     "model": model_name,
+                    "audio_provenance": {
+                        "source_sha256": source_audio_sha256 or adapter.last_cache_key.audio_sha256,
+                        "asr_input_sha256": adapter.last_cache_key.audio_sha256,
+                        "normalized": audio_for_asr != audio_path,
+                    },
                     "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
                 },
             },
@@ -222,6 +250,15 @@ def sync_episode(
         resume_decisions = _load_adjudication_artifact(
             episode_workdir / "adjudicate.json"
         )[0]
+        selected, confidence_flags = _confidence_gate_decisions(
+            resume_alignment.divergence_spans, resume_decisions, provider_config,
+            _load_report_flags(episode_workdir / "qc_report.json"),
+        )
+        if selected != resume_decisions or confidence_flags:
+            raise ValueError(
+                "Cannot resume verify with decisions below the current confidence gate; "
+                "resume from rebuild to preserve uncertain source text and timing."
+            )
         rebuilt = _load_rebuild_artifact(episode_workdir / "rebuild.json")
         unsafe_cases = _unsafe_incomplete_source_resume_case_ids(
             resume_alignment.divergence_spans,
@@ -415,6 +452,18 @@ def sync_episode(
     else:
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", [], [])
 
+    selected_decisions, confidence_flags = _confidence_gate_decisions(
+        alignment.divergence_spans, decisions, provider_config, flags,
+    )
+    if selected_decisions != decisions or confidence_flags:
+        decisions = selected_decisions
+        flags.extend(confidence_flags)
+        _write_adjudication_artifact(
+            episode_workdir / "adjudicate.json", decisions,
+            _unique_flags([*_load_adjudication_artifact(episode_workdir / "adjudicate.json")[1], *confidence_flags]),
+        )
+    confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
+
     adlib_cue_ids_by_case, adlib_reconciliation_flags = _adlib_cue_ids_by_case(
         cues,
         alignment.divergence_spans,
@@ -433,6 +482,7 @@ def sync_episode(
         decisions,
         alignment.divergence_spans,
         adlib_cue_ids_by_case,
+        source_cues=cues,
     )
     adjudicated_cues, change_flags = apply_adjudication_decisions(
         cues,
@@ -467,7 +517,7 @@ def sync_episode(
             words,
             alignment,
             profile,
-            source_cue_ids={cue.index for cue in cues},
+            source_cue_ids={cue.index for cue in cues} - confidence_held_cue_ids,
             max_gap_seconds=_generation_float_config(provider_config, "max_gap_seconds", 0.8),
             max_cue_duration_seconds=_generation_float_config(
                 provider_config,
@@ -488,7 +538,7 @@ def sync_episode(
     rebuilt, overlap_flags = apply_overlap_policy(
         rebuilt,
         profile.overlap_policy,
-        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids) | confidence_held_cue_ids,
     )
     flags.extend(overlap_flags)
     speaker_mapping_uses_llm = _speaker_mapping_uses_llm(provider_config)
@@ -585,7 +635,80 @@ def sync_episode(
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_json_atomic(path, payload)
+
+
+def _validate_rebuild_policy(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("policy_version") != _REBUILD_POLICY_VERSION:
+        raise ValueError(
+            "Cannot resume verify from an older rebuild policy; resume from rebuild "
+            "to apply current spoken-text and acoustic timing safeguards."
+        )
+
+
+def _confidence_gate_decisions(
+    spans: list[DivergenceSpan], decisions: list[AdjudicationDecision],
+    provider_config: dict[str, object], existing_flags: list[QCFlag],
+) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
+    spans_by_id = {span.case_id: span for span in spans}
+    selected: list[AdjudicationDecision] = []
+    flags: list[QCFlag] = []
+    already_held = _confidence_held_source_cue_ids(existing_flags)
+    for decision in decisions:
+        span = spans_by_id.get(decision.case_id)
+        if span is None:
+            selected.append(decision)
+            continue
+        gated, flag = confidence_gated_decision(
+            span, decision, _adjudication_confidence_gate(provider_config),
+        )
+        selected.append(gated)
+        # Do not replace an engine's reviewable proposal with the held source text.
+        if flag is not None and (decision.verdict != "keep_srt" or not set(span.cue_ids).issubset(already_held)):
+            flags.append(flag)
+    return selected, flags
+
+
+def _confidence_held_source_cue_ids(flags: list[QCFlag]) -> set[int]:
+    return {cue_id for flag in flags if flag.kind == "low_confidence_adjudication" for cue_id in flag.cue_ids}
+
+
+def _validate_resume_audio_provenance(audio_path: Path, episode_workdir: Path) -> list[QCFlag]:
+    """Check audio identity before a resumed stage can overwrite any artifacts.
+
+    Legacy checkpoints remain readable, but their missing identity is visible in QC.
+    Resume intentionally uses the persisted source/ASR configuration; changing the
+    current provider settings never silently changes the cached word stream.
+    """
+    path = episode_workdir / "asr.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot resume without ASR artifact: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    provenance = metadata.get("audio_provenance") if isinstance(metadata, dict) else None
+    if provenance is None:
+        return [QCFlag(
+            kind="asr_audio_provenance_unverified",
+            message=("Legacy ASR checkpoint has no audio identity hash. Its word timings "
+                     "could not be verified against this audio; resume from asr to record provenance."),
+            severity="warning",
+        )]
+    if not isinstance(provenance, dict) or any(
+        not isinstance(provenance.get(key), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance[key]) is None
+        for key in ("source_sha256", "asr_input_sha256")
+    ) or not isinstance(provenance.get("normalized"), bool):
+        raise ValueError("Invalid ASR audio provenance; resume from asr to rebuild acoustic evidence.")
+    if _sha256_file(audio_path) != provenance["source_sha256"]:
+        raise ValueError("Cannot resume: source audio has changed. Resume from asr to rebuild acoustic evidence.")
+    if not provenance["normalized"] and provenance["asr_input_sha256"] != provenance["source_sha256"]:
+        raise ValueError("Invalid ASR audio provenance: unnormalized input differs from source audio; resume from asr.")
+    if provenance["normalized"]:
+        normalized = episode_workdir / "audio.16k.wav"
+        if not normalized.exists() or _sha256_file(normalized) != provenance["asr_input_sha256"]:
+            raise ValueError("Cannot resume: normalized audio is missing or changed. Resume from asr to rebuild acoustic evidence.")
+    return []
 
 
 def _normalize_resume_stage(resume: str | None) -> str | None:
@@ -1001,6 +1124,7 @@ def _adjudication_cache_key(
     payload = {
         "pass": "adjudication",
         "prompt_version": _ADJUDICATION_PROMPT_VERSION,
+        "policy_version": _ADJUDICATION_POLICY_VERSION,
         "confidence_gate": _adjudication_confidence_gate(provider_config),
         "scene_gap_seconds": _adjudication_scene_gap_seconds(provider_config),
         "spans": [span.model_dump(mode="json") for span in spans],
@@ -1029,6 +1153,7 @@ def _punctuation_cache_key(
     payload = {
         "pass": "punctuation",
         "prompt_version": _PUNCTUATION_PROMPT_VERSION,
+        "policy_version": _PUNCTUATION_POLICY_VERSION,
         "scene_gap_seconds": _punctuation_scene_gap_seconds(provider_config),
         "line_constraints": {
             "max_chars_per_line": max_chars_per_line,
@@ -1181,47 +1306,7 @@ def _output_no_overlaps(provider_config: dict[str, object]) -> bool:
 
 
 def _boundary_refinement_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
-    vad_config = provider_config.get("vad", {}) if isinstance(provider_config, dict) else {}
-    if not isinstance(vad_config, dict):
-        return BoundaryRefinementConfig(enabled=False)
-    value = vad_config.get("boundary_refinement", False)
-    if value in (False, None):
-        return BoundaryRefinementConfig(enabled=False)
-    if value is True:
-        return BoundaryRefinementConfig(
-            max_word_duration_ms=int(_timing_float_config(provider_config, "max_word_duration", 2.0) * 1000)
-        )
-    if not isinstance(value, dict):
-        raise ValueError("vad.boundary_refinement must be a mapping or boolean")
-    enabled = value.get("enabled", True)
-    if not isinstance(enabled, bool):
-        raise ValueError("vad.boundary_refinement.enabled must be boolean")
-    return BoundaryRefinementConfig(
-        enabled=enabled,
-        start_pad_ms=_int_config(value, "start_pad_ms", 40, "vad.boundary_refinement.start_pad_ms"),
-        end_pad_ms=_int_config(value, "end_pad_ms", 40, "vad.boundary_refinement.end_pad_ms"),
-        max_end_extension_ms=_int_config(
-            value,
-            "max_end_extension_ms",
-            300,
-            "vad.boundary_refinement.max_end_extension_ms",
-        ),
-        max_leading_silence_ms=_int_config(
-            value,
-            "max_leading_silence_ms",
-            150,
-            "vad.boundary_refinement.max_leading_silence_ms",
-        ),
-        max_trailing_silence_ms=_int_config(
-            value,
-            "max_trailing_silence_ms",
-            300,
-            "vad.boundary_refinement.max_trailing_silence_ms",
-        ),
-        max_word_duration_ms=int(
-            _timing_float_config(provider_config, "max_word_duration", 2.0) * 1000
-        ),
-    )
+    return boundary_refinement_config_from_config(provider_config)
 
 
 def _int_config(source: dict[str, object], key: str, default: int, label: str) -> int:
@@ -1268,6 +1353,13 @@ def _load_report_flags(path: Path) -> list[QCFlag]:
 
 
 def _resume_audio_for_verify(audio_path: Path, episode_workdir: Path) -> Path:
+    asr_path = episode_workdir / "asr.json"
+    if asr_path.exists():
+        payload = json.loads(asr_path.read_text(encoding="utf-8"))
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        provenance = metadata.get("audio_provenance") if isinstance(metadata, dict) else None
+        if isinstance(provenance, dict) and provenance.get("normalized") is False:
+            return audio_path
     normalized_audio = episode_workdir / "audio.16k.wav"
     return normalized_audio if normalized_audio.exists() else audio_path
 
@@ -1298,10 +1390,12 @@ def _run_verify_stage(
     min_coverage = min_coverage_from_config(provider_config)
     boundary_refinement = _boundary_refinement_config(provider_config)
     missing_audio_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
+    confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
+    protected_cue_ids = missing_audio_cue_ids | confidence_held_cue_ids
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
         forced_alignment_input = [
-            cue for cue in rebuilt if cue.index not in missing_audio_cue_ids
+            cue for cue in rebuilt if cue.index not in protected_cue_ids
         ]
         forced_alignments = forced_alignment_adapter.align(
             audio_for_asr,
@@ -1312,7 +1406,7 @@ def _run_verify_stage(
             rebuilt,
             forced_alignments,
             profile,
-            protected_cue_ids=missing_audio_cue_ids,
+            protected_cue_ids=protected_cue_ids,
         )
         flags.extend(forced_alignment_flags)
     overlap_detection_adapter = overlap_detection_adapter_from_config(provider_config)
@@ -1364,11 +1458,18 @@ def _run_verify_stage(
         missing_audio_cue_ids,
     )
     flags.extend(missing_audio_restore_flags)
+    rebuilt, confidence_restore_flags = _restore_missing_audio_source_cues(
+        rebuilt, source_cues, confidence_held_cue_ids,
+        reason="low_confidence",
+    )
+    flags.extend(confidence_restore_flags)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
         no_overlaps=_output_no_overlaps(provider_config),
-        protected_cue_ids=missing_audio_cue_ids,
+        protected_cue_ids=protected_cue_ids,
+        preserve_timing=bool(effective_words or forced_alignments or speech_regions),
+        media_duration_ms=_known_audio_duration_ms(audio_for_asr),
     )
     flags.extend(final_order_flags)
     if speech_regions:
@@ -1394,7 +1495,10 @@ def _run_verify_stage(
             min_cps=_timing_float_config(provider_config, "min_cps", 2.0),
         )
     )
-    cue_scores = score_cues(rebuilt, effective_words, alignment, forced_alignments)
+    cue_scores = score_cues(
+        rebuilt, effective_words, alignment, forced_alignments,
+        protected_cue_ids=protected_cue_ids,
+    )
     if audio_for_asr != audio_path:
         flags.extend(silence_flags_for_cues(audio_for_asr, rebuilt))
 
@@ -1412,8 +1516,11 @@ def _run_verify_stage(
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(flags)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(write_srt(rebuilt, renumber=True), encoding="utf-8")
-    _write_json(episode_workdir / "rebuild.json", {"cues": [cue.model_dump() for cue in rebuilt]})
+    write_text_atomic(output_path, write_srt(rebuilt, renumber=True))
+    _write_json(episode_workdir / "rebuild.json", {
+        "policy_version": _REBUILD_POLICY_VERSION,
+        "cues": [cue.model_dump() for cue in rebuilt],
+    })
 
     report = write_qc_report(
         episode_workdir / "qc_report.json",
@@ -1444,6 +1551,11 @@ def _run_verify_stage(
     _write_json(episode_workdir / "cost.json", cost_meter.as_dict())
 
     return PipelineResult(output_path, episode_workdir, cost_meter, report)
+
+
+def _known_audio_duration_ms(audio_path: Path) -> int | None:
+    duration = audio_seconds(audio_path)
+    return int(round(duration * 1000)) if isfinite(duration) and duration > 0 else None
 
 
 def _remove_silent_generated_adlibs(
@@ -1796,6 +1908,8 @@ def _restore_missing_audio_source_cues(
     rebuilt: list[Cue],
     source_cues: list[Cue],
     protected_cue_ids: set[int],
+    *,
+    reason: str = "missing_audio",
 ) -> tuple[list[Cue], list[QCFlag]]:
     if not protected_cue_ids:
         return list(rebuilt), []
@@ -1812,11 +1926,16 @@ def _restore_missing_audio_source_cues(
         if source is None:
             restored.append(cue)
             continue
-        exact_source = source.model_copy(
-            update={
+        # A low-confidence decision already preserves its own source token span.
+        # Holding its timing must not erase an independently approved insertion
+        # elsewhere in the same cue. Missing-audio holds remain fully verbatim.
+        exact_source = (
+            cue.with_timing(source.start_ms, source.end_ms)
+            if reason == "low_confidence"
+            else source.model_copy(update={
                 "speaker_id": cue.speaker_id,
                 "character": cue.character,
-            }
+            })
         )
         restored.append(exact_source)
         if (
@@ -1837,11 +1956,14 @@ def _restore_missing_audio_source_cues(
         return restored, []
     return restored, [
         QCFlag(
-            kind="missing_audio_source_cue_restored",
+            kind=f"{reason}_source_cue_restored",
             cue_ids=sorted(restored_ids),
             message=(
-                "A missing-audio source cue was restored to its exact editorial text and "
-                "timing after downstream processing attempted to alter it."
+                "An uncertain source cue was restored to its original timing; "
+                "independently approved text edits were retained."
+                if reason == "low_confidence"
+                else "An uncertain source cue was restored to its exact editorial text and "
+                     "timing after downstream processing attempted to alter it."
             ),
             severity="error",
         )
@@ -2282,7 +2404,7 @@ def _span_overlaps_cue_with_pad(span: DivergenceSpan, cue: Cue, pad_seconds: flo
     return span_end >= cue.start_ms / 1000.0 and span_start <= cue.end_ms / 1000.0
 
 
-def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by_case=None):
+def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by_case=None, *, source_cues=None):
     timed_decisions = {
         decision.case_id: decision
         for decision in decisions
@@ -2292,6 +2414,9 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
         return alignment
 
     adlib_cue_ids_by_case = adlib_cue_ids_by_case or {}
+    prefix_replacement_targets = single_token_prefix_replacement_targets(
+        source_cues or [], spans, decisions
+    )
     protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     for span in spans:
@@ -2304,7 +2429,9 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
                 set(cue_word_indices.get(adlib_cue_id, []) + span.asr_word_indices)
             )
             continue
-        for cue_id, spoken_indices in _span_word_indices_by_cue(span).items():
+        for cue_id, spoken_indices in _span_word_indices_by_cue(
+            span, replacement_target=prefix_replacement_targets.get(span.case_id)
+        ).items():
             if cue_id in protected_cue_ids:
                 continue
             if decision.verdict == "keep_srt":
@@ -2317,10 +2444,16 @@ def _alignment_with_decision_words(alignment, decisions, spans, adlib_cue_ids_by
     return alignment.model_copy(update={"cue_word_indices": cue_word_indices})
 
 
-def _span_word_indices_by_cue(span: DivergenceSpan) -> dict[int, list[int]]:
+def _span_word_indices_by_cue(
+    span: DivergenceSpan,
+    *,
+    replacement_target: int | None = None,
+) -> dict[int, list[int]]:
     cue_ids = list(dict.fromkeys(span.cue_ids))
     if not cue_ids:
         return {}
+    if replacement_target in cue_ids:
+        return {replacement_target: list(span.asr_word_indices)}
     partitions = _partition_contiguous(span.asr_word_indices, len(cue_ids))
     return {
         cue_id: partition

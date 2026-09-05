@@ -114,6 +114,7 @@ def segment_generated_adlib_cues(
             cue.plain_text,
             word_groups,
             profile,
+            words=words,
         )
         if len(word_groups) <= 1 or len(text_chunks) <= 1:
             segmented.append(cue)
@@ -278,7 +279,9 @@ def split_overlong_existing_cues(
                 max_gap_seconds=max_gap_seconds,
                 max_cue_duration_seconds=max_cue_duration_seconds,
             )
-            word_groups, text_chunks = _text_chunks_for_word_groups(cue.plain_text, word_groups, profile)
+            word_groups, text_chunks = _text_chunks_for_word_groups(
+                cue.plain_text, word_groups, profile, words=words
+            )
         if len(word_groups) <= 1 or len(text_chunks) <= 1:
             split_cues.append(cue)
             flags.append(
@@ -426,7 +429,15 @@ def _starts_new_source_line_cue(
     nxt = words[next_words[0]]
     if nxt.start - previous.end > max_gap_seconds:
         return True
-    if previous.speaker_id and nxt.speaker_id and previous.speaker_id != nxt.speaker_id:
+    previous_speaker = next(
+        (words[index].speaker_id for index in reversed(current_words) if words[index].speaker_id),
+        None,
+    )
+    next_speaker = next(
+        (words[index].speaker_id for index in next_words if words[index].speaker_id),
+        None,
+    )
+    if previous_speaker and next_speaker and previous_speaker != next_speaker:
         return True
     if _ends_sentence(_text_without_subtitle_markup(current_lines[-1])):
         return True
@@ -648,7 +659,11 @@ def _starts_new_cue(
     word = words[word_index]
     if word.start - previous.end > max_gap_seconds:
         return True
-    if previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id:
+    previous_speaker = next(
+        (words[index].speaker_id for index in reversed(current) if words[index].speaker_id),
+        None,
+    )
+    if previous_speaker and word.speaker_id and previous_speaker != word.speaker_id:
         return True
     if _snapped_duration_ms(words[current[0]], word, profile) > max_cue_duration_seconds * 1000:
         return True
@@ -670,17 +685,22 @@ def _text_chunks_for_word_groups(
     text: str,
     word_groups: list[list[int]],
     profile: StyleProfile,
+    *,
+    words: list[Word],
 ) -> tuple[list[list[int]], list[str]]:
     units, separator = _split_units(text)
     if not units or not word_groups:
         return word_groups, [text.strip()] if text.strip() else []
 
     effective_groups = _merge_groups_to_count(word_groups, min(len(word_groups), len(units)))
-    text_chunks = _partition_units_by_weights(
-        units,
-        [len(group) for group in effective_groups],
-        separator,
-    )
+    text_chunks = _exact_text_chunks_for_word_groups(units, separator, effective_groups, words)
+    exact_mapping = text_chunks is not None
+    if text_chunks is None:
+        text_chunks = _partition_units_by_weights(
+            units,
+            [len(group) for group in effective_groups],
+            separator,
+        )
     refined_groups: list[list[int]] = []
     refined_text: list[str] = []
     for word_group, text_chunk in zip(effective_groups, text_chunks, strict=True):
@@ -694,13 +714,54 @@ def _text_chunks_for_word_groups(
             min(len(capacity_chunks), len(word_group)),
             separator,
         )
-        word_partitions = _partition_sequence_by_weights(
-            word_group,
-            [max(1, len(_split_units(chunk)[0])) for chunk in capacity_chunks],
-        )
+        if exact_mapping:
+            word_partitions = _word_groups_for_source_lines(capacity_chunks, word_group, words)
+            if word_partitions is None:
+                # A provider word can contain several lexical tokens. Keep its
+                # acoustic window intact when wrapping would split that word.
+                refined_groups.append(word_group)
+                refined_text.append(text_chunk)
+                continue
+        else:
+            word_partitions = _partition_sequence_by_weights(
+                word_group,
+                [max(1, len(_split_units(chunk)[0])) for chunk in capacity_chunks],
+            )
         refined_groups.extend(word_partitions)
         refined_text.extend(capacity_chunks)
     return refined_groups, refined_text
+
+
+def _exact_text_chunks_for_word_groups(
+    units: list[str],
+    separator: str,
+    word_groups: list[list[int]],
+    words: list[Word],
+) -> list[str] | None:
+    """Use lexical boundaries instead of assuming one ASR word per text unit."""
+    text_tokens: list[str] = []
+    unit_end_by_token_count: dict[int, int] = {}
+    for position, unit in enumerate(units, start=1):
+        text_tokens.extend(alphanumeric_signature(unit))
+        unit_end_by_token_count[len(text_tokens)] = position
+
+    group_tokens = [
+        [token for index in group for token in alphanumeric_signature(words[index].text)]
+        for group in word_groups
+    ]
+    if text_tokens != [token for group in group_tokens for token in group]:
+        return None
+    chunks: list[str] = []
+    token_count = 0
+    unit_start = 0
+    for tokens in group_tokens:
+        token_count += len(tokens)
+        unit_end = unit_end_by_token_count.get(token_count)
+        if unit_end is None or unit_end <= unit_start:
+            return None
+        chunks.append(separator.join(units[unit_start:unit_end]))
+        unit_start = unit_end
+    return chunks if unit_start == len(units) else None
 
 
 def _split_units(text: str) -> tuple[list[str], str]:

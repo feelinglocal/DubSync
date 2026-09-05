@@ -156,14 +156,21 @@ class JobStore:
             return connection.execute("SELECT 1").fetchone()[0] == 1
 
     def storage_usage_bytes(self) -> int:
+        return self.storage_snapshot_bytes()[0]
+
+    def storage_snapshot_bytes(self) -> tuple[int, int]:
+        """Return committed storage and reserved bytes not yet written to disk."""
         total = 0
+        unmaterialized = 0
         for directory in self.data_dir.glob("job-*"):
             resolved = self._managed_job_directory(directory)
             if resolved is None:
                 continue
             actual = self.job_storage_bytes(resolved)
-            total += max(actual, self._storage_reservation_bytes(resolved))
-        return total
+            reserved = self._storage_reservation_bytes(resolved)
+            total += max(actual, reserved)
+            unmaterialized += max(0, reserved - actual)
+        return total, unmaterialized
 
     def job_storage_bytes(self, directory: Path) -> int:
         resolved = self._managed_job_directory(directory)
@@ -544,11 +551,17 @@ class JobService:
         self.executor = ThreadPoolExecutor(max_workers=settings.worker_threads, thread_name_prefix="dubsync-job")
         self.process_lock = ProcessLock(self.store.data_dir / ".dubsync-process.lock")
         self.cleanup_stop = threading.Event()
+        self._processing_gate = threading.Lock()
         self.cleanup_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.process_lock.acquire()
         try:
+            if self.cleanup_stop.is_set():
+                self.executor = ThreadPoolExecutor(
+                    max_workers=self.settings.worker_threads, thread_name_prefix="dubsync-job"
+                )
+                self.cleanup_stop.clear()
             self._run_maintenance()
             requeued_count = self.store.requeue_interrupted_processing()
             if requeued_count:
@@ -590,11 +603,13 @@ class JobService:
         self.executor.submit(self._process_batch, ordered_jobs)
 
     def shutdown(self) -> None:
-        self.cleanup_stop.set()
+        with self._processing_gate:
+            self.cleanup_stop.set()
         try:
             if self.cleanup_thread is not None and self.cleanup_thread.is_alive():
                 self.cleanup_thread.join()
-            self.executor.shutdown(wait=True, cancel_futures=False)
+            # Queued work remains in SQLite for the next process to recover.
+            self.executor.shutdown(wait=True, cancel_futures=True)
         finally:
             self.process_lock.release()
 
@@ -620,7 +635,10 @@ class JobService:
     def _process(self, job: JobRecord) -> None:
         terminal_expiry = lambda: datetime.now(UTC) + timedelta(hours=self.settings.retention_hours)
         try:
-            processing = self.store.claim_processing(job.id)
+            with self._processing_gate:
+                if self.cleanup_stop.is_set():
+                    return
+                processing = self.store.claim_processing(job.id)
         except Exception:
             logger.exception("Could not claim DubSync job %s", job.id)
             return
@@ -642,6 +660,8 @@ class JobService:
 
     def _process_batch(self, jobs: tuple[JobRecord, ...]) -> None:
         for job in jobs:
+            if self.cleanup_stop.is_set():
+                break
             self._process(job)
 
 

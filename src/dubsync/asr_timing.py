@@ -20,7 +20,7 @@ def clamp_asr_word_durations(
     clamped: list[Word] = []
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
-    for index, word in enumerate(words):
+    for word in words:
         duration = word.end - word.start
         region_end = _speech_envelope_end(word, region_index, max_region_gap)
         duration_is_outlier = duration > max_word_duration
@@ -67,7 +67,10 @@ def _speech_envelope_end(
 
     containing_index, containing_region = containing
     envelope_end = containing_region.end
-    for region in region_index.regions[containing_index + 1 :]:
+    # Index the bounded neighborhood without copying the rest of the episode
+    # for every word. Most probes stop at the immediately following region.
+    for index in range(containing_index + 1, len(region_index.regions)):
+        region = region_index.regions[index]
         if region.start > word.end or region.start - envelope_end > max_region_gap:
             break
         envelope_end = max(envelope_end, region.end)

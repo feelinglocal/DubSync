@@ -15,24 +15,42 @@ export async function loadConfig(): Promise<PublicConfig> {
 
 export async function createJob(body: FormData, accessCode = ''): Promise<JobResponse> {
   const response = await fetch('/api/jobs', createRequestOptions(body, accessCode))
-  const payload = (await response.json()) as JobResponse & { detail?: string }
-  if (!response.ok) throw new Error(payload.detail || 'Could not start the job.')
-  return payload
+  return readSubmissionResponse<JobResponse>(response, 'Could not start the job.')
 }
 
 export async function createBatch(body: FormData, accessCode = ''): Promise<BatchResponse> {
   const response = await fetch('/api/batches', createRequestOptions(body, accessCode))
-  const payload = (await response.json()) as BatchResponse & { detail?: string }
-  if (!response.ok) throw new Error(payload.detail || 'Could not start the batch.')
+  return readSubmissionResponse<BatchResponse>(response, 'Could not start the batch.')
+}
+
+async function readSubmissionResponse<T>(response: Response, fallback: string): Promise<T> {
+  let payload: T & { detail?: unknown }
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ApiError(`${fallback} The service returned an unreadable response (HTTP ${response.status}).`, response.status)
+  }
+  if (!response.ok) {
+    throw new ApiError(typeof payload?.detail === 'string' ? payload.detail : fallback, response.status)
+  }
   return payload
 }
 
 export async function loadJob(jobId: string, token: string): Promise<JobResponse> {
-  const response = await fetch(`/api/jobs/${jobId}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!response.ok) throw new ApiError('Could not refresh the job.', response.status)
-  return response.json() as Promise<JobResponse>
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => {
+    controller.abort(new Error('Job refresh timed out. Retrying automatically.'))
+  }, 30_000)
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new ApiError('Could not refresh the job.', response.status)
+    return await response.json() as JobResponse
+  } finally {
+    window.clearTimeout(timeout)
+  }
 }
 
 export async function downloadJobArtifact(jobId: string, token: string, kind: string): Promise<void> {
