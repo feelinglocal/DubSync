@@ -563,6 +563,11 @@ p {
   min-width: 0;
 }
 
+.workspace-options .transcription-model-field {
+  grid-column: 1 / -1;
+  width: min(100%, 380px);
+}
+
 .workspace-options select,
 .workspace-options input {
   width: 100%;
@@ -1625,6 +1630,25 @@ button:active:not(:disabled),
   .workspace-options.has-access-code,
   .workspace-options.is-sync.has-access-code {
     grid-template-columns: 1fr;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .workspace-options .field-label,
+  .upload-label {
+    margin-bottom: 4px;
+  }
+
+  .upload-stack {
+    gap: 8px;
+  }
+
+  .batch-naming-help {
+    margin-top: 8px;
+  }
+
+  .retention-note {
+    margin-top: 4px;
   }
 
   .style-custom-grid {

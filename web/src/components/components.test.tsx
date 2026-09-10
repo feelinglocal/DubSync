@@ -46,6 +46,15 @@ function job(overrides: Partial<JobResponse> = {}): JobResponse {
 }
 
 describe('shared components', () => {
+  it.each([
+    ['microsoft/mai-transcribe-2', 'MAI-Transcribe 2'],
+    ['scribe_v2', 'Scribe v2'],
+    ['default', 'Scribe v2'],
+  ] as const)('shows the recorded transcription model for %s jobs', (provider, label) => {
+    render(<JobPanel job={job({ transcription_provider: provider })} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText(`Transcription: ${label}`)).toBeVisible()
+  })
+
   it('opens and closes the compact navigation', async () => {
     useSystemTheme('light')
     const user = userEvent.setup()
@@ -89,6 +98,7 @@ describe('shared components', () => {
     rerender(<LegalPage kind="privacy" />)
     expect(screen.getByRole('heading', { name: 'Privacy Policy' })).toBeVisible()
     expect(screen.getByRole('heading', { name: /Service providers/ })).toBeVisible()
+    expect(screen.getByText(/ElevenLabs Scribe v2 by default/)).toBeVisible()
     expect(screen.getByText(/Google Gemini for audio-aware adjudication and bounded punctuation/)).toBeVisible()
     expect(screen.getByText(/OpenAI for speaker mapping/)).toBeVisible()
     rerender(<LegalPage kind="payments" />)

@@ -179,7 +179,7 @@ def test_public_config_hides_gemini_transcribe_testing_when_key_is_missing(tmp_p
     assert "GEMINI_API_KEY" not in response.text
 
 
-def test_single_job_defaults_transcription_provider_to_default(tmp_path):
+def test_single_job_defaults_transcription_provider_to_scribe(tmp_path):
     captured: list[JobRecord] = []
 
     def capture(job: JobRecord, settings: WebSettings) -> ProcessedArtifacts:
@@ -198,9 +198,9 @@ def test_single_job_defaults_transcription_provider_to_default(tmp_path):
         )
 
     assert response.status_code == 202
-    assert response.json()["transcription_provider"] == "default"
-    assert captured[0].transcription_provider == "default"
-    assert app.state.jobs.store.get(response.json()["id"]).transcription_provider == "default"
+    assert response.json()["transcription_provider"] == "scribe_v2"
+    assert captured[0].transcription_provider == "scribe_v2"
+    assert app.state.jobs.store.get(response.json()["id"]).transcription_provider == "scribe_v2"
 
 
 def test_single_job_rejects_gemini_transcribe_when_testing_is_disabled(tmp_path):

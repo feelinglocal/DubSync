@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 
+from .asr_timing import clamp_asr_word_durations
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
@@ -74,6 +75,7 @@ def refine_cues_to_speech_activity(
     *,
     words: list[Word] | None = None,
     alignment: AlignmentResult | None = None,
+    protected_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     options = config or BoundaryRefinementConfig()
     if not options.enabled or not regions:
@@ -83,7 +85,7 @@ def refine_cues_to_speech_activity(
         set(alignment.diagnostics.missing_audio_cue_ids)
         if alignment is not None
         else set()
-    )
+    ) | (protected_cue_ids or set())
     dialogue_cues = [
         cue
         for cue in cues
@@ -91,6 +93,27 @@ def refine_cues_to_speech_activity(
     ]
     refined: list[Cue] = []
     flags: list[QCFlag] = []
+    word_repair_flags: list[QCFlag] = []
+    if words and any(_is_word_duration_outlier(word, options) for word in words):
+        # Repair a corrupt endpoint before choosing a lexical word cluster;
+        # otherwise a real final word can be discarded as a separate cluster.
+        clamped_words, word_repair_flags = clamp_asr_word_durations(
+            words, regions, max_word_duration=options.max_word_duration_ms / 1000.0,
+        )
+        # A duration-only fallback is still uncertain. Only adopt a shortened
+        # word when the speech region supplies a tighter endpoint. Compare the
+        # exact rounded fallback used by the clamp, not float subtraction:
+        # arbitrary sub-millisecond starts can otherwise appear shorter.
+        words = [
+            clamped
+            if clamped.end < round(original.start + options.max_word_duration_ms / 1000.0, 3)
+            else original
+            for original, clamped in zip(words, clamped_words)
+        ]
+        retained_repairs = {(word.start, word.end) for word in words}
+        word_repair_flags = [
+            flag for flag in word_repair_flags if (flag.start, flag.end) in retained_repairs
+        ]
     region_index = SpeechRegionIndex(regions)
 
     for index, cue in enumerate(dialogue_cues):
@@ -143,6 +166,29 @@ def refine_cues_to_speech_activity(
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
+        if end_ms <= start_ms:
+            # Conflicting cue order or word ownership must be repaired upstream.
+            # A speech cap is not permission to export reversed/zero duration or
+            # to manufacture a new endpoint merely to satisfy readability.
+            refined.append(cue)
+            flags.append(
+                QCFlag(
+                    kind="timing_refinement_held",
+                    cue_ids=[cue.index],
+                    severity="error",
+                    message=(
+                        "Speech evidence conflicts with this cue's placement; "
+                        "kept its prior timing instead of creating a non-positive duration. "
+                        "Review the cue's word ownership and neighboring dialogue."
+                    ),
+                    old_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
+                    new_text=f"{start_ms / 1000.0:.3f} --> {end_ms / 1000.0:.3f}",
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
+            continue
+
         minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000
 
         if start_ms == cue.start_ms and end_ms == cue.end_ms:
@@ -174,7 +220,7 @@ def refine_cues_to_speech_activity(
         else refined_by_id[cue.index]
         for cue in cues
     ]
-    return merged, flags
+    return merged, [*flags, *word_repair_flags]
 
 
 def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfile) -> QCFlag:
@@ -340,6 +386,8 @@ def _word_refined_end_ms(
         return padded_region_end_ms
 
     if cue.end_ms - word_end_ms > config.max_trailing_silence_ms:
-        return max(word_end_ms, min(cue.end_ms, padded_region_end_ms))
+        # VAD can remain active for another speaker or background sound. Its
+        # envelope cannot extend this cue beyond its own last reliable word.
+        return word_end_ms
 
     return cue.end_ms

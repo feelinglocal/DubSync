@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .models import Cue, QCFlag
+from .srt_io import validate_cue_timings_for_export
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
 from .text_metrics import display_width
@@ -29,6 +30,9 @@ def finalize_cues_for_output(
     """
     if media_duration_ms is not None and media_duration_ms < 0:
         raise ValueError("media_duration_ms must be non-negative")
+    # Validate before readability extension or merging can conceal an invalid
+    # upstream boundary. Only the creating stage has evidence to repair it.
+    validate_cue_timings_for_export(cues)
     protected = protected_cue_ids or set()
     untouched_cues = [
         cue
@@ -82,6 +86,7 @@ def finalize_cues_for_output(
             )
         )
     _assert_monotonic_starts(combined)
+    validate_cue_timings_for_export(combined)
     return combined, flags
 
 
@@ -152,6 +157,26 @@ def _outside_media_flag(cue: Cue, media_duration_ms: int) -> QCFlag:
         start=cue.start_ms / 1000.0,
         end=cue.end_ms / 1000.0,
     )
+
+
+def source_order_inversion_flags(
+    cues: list[Cue],
+    *,
+    source_cue_ids: set[int],
+    protected_cue_ids: set[int] | None = None,
+) -> list[QCFlag]:
+    """Capture source narrative conflicts before acoustic sorting erases order.
+
+    Generated insertions and newly split speaker children have acoustic order,
+    not independent source positions. Source holds and screen annotations do
+    not claim an acoustic boundary and are excluded as in final ordering.
+    """
+    protected = protected_cue_ids or set()
+    return _source_order_inversion_flags([
+        cue for cue in cues
+        if cue.index in source_cue_ids and cue.index not in protected
+        and not is_bracketed_screen_text_cue(cue)
+    ])
 
 
 def _source_order_inversion_flags(cues: list[Cue]) -> list[QCFlag]:

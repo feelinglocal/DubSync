@@ -25,10 +25,13 @@ from starlette.datastructures import FormData, UploadFile as StarletteUploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..audio import probe_audio_duration
+from ..config import load_yaml
 from ..providers import (
     GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
     GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
     GEMINI_TRANSCRIBE_MODEL,
+    MAI_TRANSCRIBE_MODEL,
+    SCRIBE_TRANSCRIBE_MODEL,
 )
 from .batch_uploads import (
     AUDIO_EXTENSIONS,
@@ -97,8 +100,10 @@ MAX_SINGLE_PARSER_FILES = 3
 MAX_SINGLE_PARSER_FIELDS = 6
 MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
 FPS_RESULT_SOURCES = frozenset({"detected", "fallback", "explicit"})
-DEFAULT_TRANSCRIPTION_PROVIDER = "default"
-TRANSCRIPTION_PROVIDER_VALUES = frozenset({DEFAULT_TRANSCRIPTION_PROVIDER, GEMINI_TRANSCRIBE_MODEL})
+DEFAULT_TRANSCRIPTION_PROVIDER = SCRIBE_TRANSCRIBE_MODEL
+TRANSCRIPTION_PROVIDER_VALUES = frozenset({
+    "default", MAI_TRANSCRIBE_MODEL, SCRIBE_TRANSCRIBE_MODEL, GEMINI_TRANSCRIBE_MODEL,
+})
 
 
 def create_app(
@@ -168,6 +173,22 @@ def create_app(
     def public_config() -> dict[str, object]:
         access_code_required = resolved_settings.require_job_access_code or bool(resolved_settings.job_access_code)
         jobs_available = not resolved_settings.require_job_access_code or bool(resolved_settings.job_access_code)
+        asr_config = load_yaml(resolved_settings.providers_path).get("asr", {})
+        asr_config = asr_config if isinstance(asr_config, dict) else {}
+        fixture_available = bool(asr_config.get("fixture_path"))
+        configured_provider = str(asr_config.get("provider", "")).strip().lower()
+        configured_key = asr_config.get("api_key")
+        configured_key_available = isinstance(configured_key, str) and bool(configured_key.strip())
+        mai_available = (
+            fixture_available
+            or bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+            or (configured_provider in {"openrouter", MAI_TRANSCRIBE_MODEL} and configured_key_available)
+        )
+        scribe_available = (
+            fixture_available
+            or bool(os.getenv("ELEVENLABS_API_KEY", "").strip())
+            or (configured_provider == "elevenlabs" and configured_key_available)
+        )
         return {
             "retention_hours": resolved_settings.retention_hours,
             "max_upload_bytes": resolved_settings.max_upload_bytes,
@@ -184,6 +205,19 @@ def create_app(
             "billing_enabled": False,
             "access_code_required": access_code_required,
             "jobs_available": jobs_available,
+            "default_transcription_provider": DEFAULT_TRANSCRIPTION_PROVIDER,
+            "transcription_models": [
+                {
+                    "id": SCRIBE_TRANSCRIBE_MODEL,
+                    "label": "Scribe v2",
+                    "available": scribe_available,
+                },
+                {
+                    "id": MAI_TRANSCRIBE_MODEL,
+                    "label": "MAI-Transcribe 2",
+                    "available": mai_available,
+                },
+            ],
             "gemini_transcribe_testing_available": _gemini_transcribe_web_available(resolved_settings),
             "gemini_transcribe_max_audio_seconds": int(GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS),
             "generation_styles": public_generation_styles(),
@@ -1013,7 +1047,7 @@ def _validate_transcription_provider(value: str, *, settings: WebSettings) -> st
             status_code=422,
             detail=GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
         )
-    return normalized
+    return DEFAULT_TRANSCRIPTION_PROVIDER if normalized == "default" else normalized
 
 
 def _gemini_transcribe_web_available(settings: WebSettings) -> bool:

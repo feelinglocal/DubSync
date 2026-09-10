@@ -1,6 +1,9 @@
 asr:
   provider: elevenlabs
   model_id: scribe_v2
+  # ELEVENLABS_API_KEY is read from the environment.
+  # Optional alternative: provider: openrouter, model: microsoft/mai-transcribe-2
+  # MAI uses OPENROUTER_API_KEY and remains available in the web model picker.
   diarize: true
 
 llm:
@@ -12,10 +15,19 @@ llm:
   max_retries: 2
   adjudication:
     provider: gemini
-    model: gemini-3.7-flash
+    model: gemini-3.8-flash
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
-    thinking_level: high
+    max_batch_spans: 8
+    max_concurrent_batches: 4
+    retry_timed_out_batches: true
+    thinking_level: medium
+    audio_context:
+      enabled: true
+      compress_long_audio: true
+      cache_enabled: true
+      cache_ttl_seconds: 900
+      max_uncached_audio_tokens: 256000
     audio_snippet_double_check:
       enabled: true
       pad_seconds: 2.0

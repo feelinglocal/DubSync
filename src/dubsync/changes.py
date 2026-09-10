@@ -245,36 +245,37 @@ def apply_adjudication_decisions(
             flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
             continue
 
-        if len(cue_ids) > 1 and span.srt_token_indices and len(alphanumeric_signature(decision.final_text)) == 1:
-            applied_multi_cue_edit = False
-            replacement_target = prefix_replacement_targets.get(span.case_id, cue_ids[0])
-            for cue_id in cue_ids:
-                cue = cues_by_id[cue_id]
-                bounds = _span_token_bounds_for_cue(
-                    cue,
-                    span,
-                    cue_token_offsets[cue_id],
-                )
-                if bounds is None:
-                    continue
-                token_edits_by_cue.setdefault(cue_id, []).append(
-                    (bounds[0], bounds[1], decision.final_text if cue_id == replacement_target else "")
-                )
-                applied_multi_cue_edit = True
-            if applied_multi_cue_edit:
-                flags.append(
-                    QCFlag(
-                        kind="text_changed",
-                        cue_ids=cue_ids,
-                        message=f"Adjudication verdict {decision.verdict}: {decision.reason}",
-                        confidence=decision.confidence,
-                        old_text="\n".join(cues_by_id[cue_id].text for cue_id in cue_ids),
-                        new_text=decision.final_text,
-                        start=span.start,
-                        end=span.end,
-                    )
-                )
+        if len(cue_ids) > 1 and span.srt_token_indices:
+            edits = indexed_multi_cue_replacements(
+                cues, span, decision.final_text,
+                replacement_target=prefix_replacement_targets.get(span.case_id),
+            )
+            if edits is None:
+                flags.append(QCFlag(
+                    kind="adjudication_span_edit_held",
+                    cue_ids=cue_ids,
+                    message="The indexed source span could not be reconstructed; preserving source cues for review.",
+                    severity="error",
+                    confidence=decision.confidence,
+                    old_text=span.srt_text,
+                    new_text=decision.final_text,
+                    start=span.start,
+                    end=span.end,
+                ))
                 continue
+            for cue_id, edit in edits.items():
+                token_edits_by_cue.setdefault(cue_id, []).append(edit)
+            flags.append(QCFlag(
+                kind="text_changed",
+                cue_ids=cue_ids,
+                message=f"Adjudication verdict {decision.verdict}: {decision.reason}",
+                confidence=decision.confidence,
+                old_text="\n".join(cues_by_id[cue_id].text for cue_id in cue_ids),
+                new_text=decision.final_text,
+                start=span.start,
+                end=span.end,
+            ))
+            continue
 
         replacement_texts = (
             [_cue_text_with_span_replacement(cues_by_id[cue_ids[0]], span, decision.final_text)]
@@ -314,6 +315,16 @@ def apply_adjudication_decisions(
         changed_text = _apply_cue_token_edits(cues_by_id[cue_id], edits)
         if changed_text is None:
             continue
+        if any(start < end and not text.strip() for start, end, text in edits):
+            changed_text = _remove_deleted_dialogue_turn_markers(cues_by_id[cue_id], changed_text)
+        if (
+            any(start == 0 and end > 0 and not text.strip() for start, end, text in edits)
+            and not cue_has_bracketed_screen_text(cues_by_id[cue_id])
+            and cues_by_id[cue_id].text.lstrip()[:1].isalnum()
+        ):
+            # A removed opening word can leave its separator before the next
+            # spoken word. Preserve authored leading punctuation and markup.
+            changed_text = re.sub(r"^[,;:]+\s*", "", changed_text.lstrip())
         final_token_edit_text_by_cue[cue_id] = changed_text
         if not alphanumeric_signature(changed_text):
             removed_cue_ids.add(cue_id)
@@ -331,12 +342,12 @@ def apply_adjudication_decisions(
 
     flags = [
         flag.model_copy(
-            update={"new_text": final_token_edit_text_by_cue[flag.cue_ids[0]]}
+            update={"new_text": "\n".join(final_token_edit_text_by_cue[cue_id] for cue_id in flag.cue_ids)}
         )
         if (
             flag.kind == "text_changed"
-            and len(flag.cue_ids) == 1
-            and flag.cue_ids[0] in final_token_edit_text_by_cue
+            and flag.cue_ids
+            and all(cue_id in final_token_edit_text_by_cue for cue_id in flag.cue_ids)
         )
         else flag
         for flag in flags
@@ -359,6 +370,261 @@ def apply_adjudication_decisions(
         changed_cue_ids=set(replacements_by_cue),
     )
     return _merge_adlibs_positionally(updated, adlib_cues), flags
+
+
+def _remove_deleted_dialogue_turn_markers(source: Cue, text: str) -> str:
+    """Remove presentation residue only after a confirmed whole-turn deletion."""
+    marker = re.compile(r"(?<!\S)[-–—](?=[\s.!?,;:…])")
+    original_markers = list(marker.finditer(source.text))
+    current_markers = list(marker.finditer(text))
+    if (
+        cue_has_bracketed_screen_text(source)
+        or len(original_markers) < 2 or len(current_markers) < 2
+        or source.text[:original_markers[0].start()].strip()
+        or text[:current_markers[0].start()].strip()
+    ):
+        return text
+    turns = [
+        (match.group(), text[match.end():current_markers[i + 1].start() if i + 1 < len(current_markers) else len(text)].strip())
+        for i, match in enumerate(current_markers)
+    ]
+    retained = [(dash, content) for dash, content in turns if not re.fullmatch(r"[\s.!?,;:…]*", content)]
+    if len(retained) == len(turns):
+        return text
+    separator = "\n" if "\n" in source.text else " "
+    candidate = (retained[0][1] if len(retained) == 1 else
+                 separator.join(f"{dash} {content}" for dash, content in retained))
+    return candidate if alphanumeric_signature(candidate) == alphanumeric_signature(text) else text
+
+
+def indexed_multi_cue_replacements(
+    cues: list[Cue],
+    span: DivergenceSpan,
+    final_text: str,
+    *,
+    replacement_target: int | None = None,
+) -> dict[int, tuple[int, int, str]] | None:
+    """Partition one exact source-token edit without consuming its cue residue.
+
+    Replacement tokens follow the source span's contribution to each cue,
+    preferring nearby corroborated sentence boundaries where available.
+    The pipeline uses these same pieces to assign acoustic evidence, so text
+    and timing cannot independently choose different cue boundaries.
+    """
+    cue_ids = list(dict.fromkeys(span.cue_ids))
+    indices = sorted(set(span.srt_token_indices))
+    cues_by_id = {cue.index: cue for cue in cues}
+    if (
+        len(cue_ids) < 2
+        or not indices
+        or indices != list(range(indices[0], indices[-1] + 1))
+        or any(cue_id not in cues_by_id for cue_id in cue_ids)
+        or any(cue_has_bracketed_screen_text(cues_by_id[cue_id]) for cue_id in cue_ids)
+    ):
+        return None
+    offsets = _cue_token_offsets(cues)
+    bounds_by_cue: dict[int, tuple[int, int]] = {}
+    covered_indices: list[int] = []
+    covered_tokens: list[str] = []
+    for cue_id in cue_ids:
+        signature = alphanumeric_signature(speech_text_for_alignment(cues_by_id[cue_id]))
+        local_indices = [index - offsets[cue_id] for index in indices
+                         if offsets[cue_id] <= index < offsets[cue_id] + len(signature)]
+        if not local_indices:
+            return None
+        start, end = local_indices[0], local_indices[-1] + 1
+        bounds_by_cue[cue_id] = (start, end)
+        covered_indices.extend(range(offsets[cue_id] + start, offsets[cue_id] + end))
+        covered_tokens.extend(signature[start:end])
+    if covered_indices != indices or covered_tokens != alphanumeric_signature(span.srt_text):
+        return None
+
+    token_spans = _token_character_spans(final_text)
+    if len(token_spans) != len(alphanumeric_signature(final_text)):
+        return None
+    # Alignment tokens split apostrophes and numeric punctuation. Keep such
+    # lexical units together so "aren't" cannot become "aren'" / "t".
+    unit_spans: list[tuple[int, int]] = []
+    for start, end in token_spans:
+        if (
+            unit_spans
+            and not any(character.isspace() for character in final_text[unit_spans[-1][1]:start])
+            and not contains_character_level_script(final_text[unit_spans[-1][0]:end])
+        ):
+            unit_spans[-1] = (unit_spans[-1][0], end)
+        else:
+            unit_spans.append((start, end))
+    sentence_boundaries = _replacement_sentence_boundaries(final_text, unit_spans)
+    if replacement_target is None:
+        replacement_target = _contained_sentence_replacement_target(
+            cues_by_id, bounds_by_cue, span, final_text, sentence_boundaries,
+        )
+    if replacement_target is None and len(unit_spans) > 1:
+        replacement_target = _continuation_prefix_replacement_target(
+            cues_by_id, bounds_by_cue, span, final_text,
+        )
+    if len(unit_spans) == 1:
+        replacement_target = replacement_target or cue_ids[0]
+    if replacement_target in cue_ids:
+        return {cue_id: (*bounds, final_text if cue_id == replacement_target else "")
+                for cue_id, bounds in bounds_by_cue.items()}
+
+    total_weight = len(covered_tokens)
+    cumulative_weight = 0
+    boundaries: list[int] = []
+    for start, end in bounds_by_cue.values():
+        cumulative_weight += end - start
+        boundaries.append((len(unit_spans) * cumulative_weight * 2 + total_weight) // (2 * total_weight))
+
+    previous_boundary = 0
+    previous_character = 0
+    result: dict[int, tuple[int, int, str]] = {}
+    for position, (cue_id, (start, end)) in enumerate(bounds_by_cue.items()):
+        boundary = boundaries[position]
+        if position < len(boundaries) - 1 and _has_sentence_terminal(cues_by_id[cue_id].plain_text):
+            # Do not move a cut more than two complete lexical units, cross
+            # another cut, or resolve equally near sentence breaks arbitrarily.
+            candidates = [
+                candidate for candidate in sentence_boundaries
+                if previous_boundary < candidate < boundaries[position + 1]
+                and abs(candidate - boundary) <= 2
+                and not _is_preserved_source_internal_boundary(
+                    cues_by_id, bounds_by_cue, covered_tokens,
+                    final_text, unit_spans[candidate][0],
+                )
+            ]
+            if candidates:
+                distance = min(abs(candidate - boundary) for candidate in candidates)
+                nearest = [candidate for candidate in candidates if abs(candidate - boundary) == distance]
+                if len(nearest) == 1:
+                    boundary = nearest[0]
+        end_character = unit_spans[boundary][0] if boundary < len(unit_spans) else len(final_text)
+        result[cue_id] = (start, end, final_text[previous_character:end_character].strip())
+        previous_boundary = boundary
+        previous_character = end_character
+    return result
+
+
+def _has_sentence_terminal(text: str) -> bool:
+    return bool(re.search(r"[.!?\u2026\u3002\uff01\uff1f]+[\"'\u201d\u2019\u00bb)\]]*\s*$", text))
+
+
+def _replacement_sentence_boundaries(
+    text: str,
+    unit_spans: list[tuple[int, int]],
+) -> list[int]:
+    return [
+        position for position in range(1, len(unit_spans))
+        if re.fullmatch(
+            r"[.!?\u2026\u3002\uff01\uff1f]+[\"'\u201d\u2019\u00bb)\]]*\s*",
+            text[unit_spans[position - 1][1]:unit_spans[position][0]],
+        )
+    ]
+
+
+def _is_preserved_source_internal_boundary(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    source_tokens: list[str],
+    final_text: str,
+    character_boundary: int,
+) -> bool:
+    """Do not promote unchanged internal punctuation, such as a title's dot."""
+    prefix = alphanumeric_signature(final_text[:character_boundary])
+    suffix = alphanumeric_signature(final_text[character_boundary:])
+    source_offset = len(prefix)
+    if (
+        not suffix
+        or source_tokens[:source_offset + 1] != [*prefix, suffix[0]]
+    ):
+        return False
+    for cue_id, (start, end) in bounds_by_cue.items():
+        if source_offset < end - start:
+            local_boundary = start + source_offset
+            text = cues_by_id[cue_id].plain_text
+            token_spans = _token_character_spans(text)
+            return (
+                start < local_boundary < end
+                and _has_sentence_terminal(text[:token_spans[local_boundary][0]])
+            )
+        source_offset -= end - start
+    return False
+
+
+def _contained_sentence_replacement_target(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+    sentence_boundaries: list[int],
+) -> int | None:
+    """Keep one confirmed sentence in the complete cue containing its audio.
+
+    A replaced tail in the preceding cue must leave a source prefix. Requiring
+    exact time containment and complete sentence endings avoids collapsing
+    ambiguous speech or consuming another source cue to infer a new timing.
+    """
+    if (
+        len(bounds_by_cue) != 2
+        or sentence_boundaries
+        or not _has_sentence_terminal(final_text)
+        or span.start is None
+        or span.end is None
+        or span.start >= span.end
+    ):
+        return None
+    prefix_id, target_id = bounds_by_cue
+    prefix, target = cues_by_id[prefix_id], cues_by_id[target_id]
+    prefix_count = len(alphanumeric_signature(prefix.plain_text))
+    target_count = len(alphanumeric_signature(target.plain_text))
+    prefix_start, prefix_end = bounds_by_cue[prefix_id]
+    if (
+        not (0 < prefix_start < prefix_end == prefix_count)
+        or bounds_by_cue[target_id] != (0, target_count)
+        or not _has_sentence_terminal(prefix.plain_text)
+        or not _has_sentence_terminal(target.plain_text)
+        or prefix.end_ms / 1000.0 > span.start
+        or not (target.start_ms / 1000.0 <= span.start < span.end <= target.end_ms / 1000.0)
+    ):
+        return None
+    return target_id
+
+
+def _continuation_prefix_replacement_target(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+) -> int | None:
+    """Keep an unfinished single-speaker phrase with its retained continuation."""
+    if (
+        len(set(span.speaker_ids)) != 1
+        or not span.speaker_ids[0]
+        or re.search(r"[.!?\u2026\u3002\uff01\uff1f]", final_text)
+    ):
+        return None
+    cue_ids = list(bounds_by_cue)
+    for cue_id in cue_ids[:-1]:
+        signature = alphanumeric_signature(cues_by_id[cue_id].plain_text)
+        if bounds_by_cue[cue_id] != (0, len(signature)):
+            return None
+    target_id = cue_ids[-1]
+    text = cues_by_id[target_id].plain_text
+    signature = alphanumeric_signature(text)
+    start, end = bounds_by_cue[target_id]
+    final_signature = alphanumeric_signature(final_text)
+    if (
+        start != 0
+        or not (0 < end < len(signature))
+        or final_signature[-end:] != signature[:end]
+    ):
+        return None
+    # A retained suffix after a sentence end is another sentence, not the
+    # continuation that provides ownership for this unfinished phrase.
+    token_spans = _token_character_spans(text)
+    if re.search(r"[.!?\u2026\u3002\uff01\uff1f]", text[token_spans[end - 1][1]:token_spans[end][0]]):
+        return None
+    return target_id
 
 
 def single_token_prefix_replacement_targets(

@@ -129,7 +129,29 @@ def parse_srt_text(text: str, *, limits: SRTParseLimits | None = None) -> list[C
     return cues
 
 
+def validate_cue_timings_for_export(cues: list[Cue]) -> None:
+    """Reject unusable display intervals without guessing speech or losing text.
+
+    Input parsing remains permissive for inspection and evidence-based repair.
+    All SRT exports, including resumed runs, must satisfy this hard contract;
+    recording a QC error alone cannot make a malformed cue importable.
+    """
+    for cue in cues:
+        if cue.start_ms < 0:
+            raise ValueError(
+                f"cue {cue.index} has a negative start ({cue.start_ms} ms); "
+                "review its timing before exporting subtitles"
+            )
+        if cue.end_ms <= cue.start_ms:
+            raise ValueError(
+                f"cue {cue.index} has a non-positive duration "
+                f"({cue.start_ms} --> {cue.end_ms} ms); "
+                "review its timing before exporting subtitles"
+            )
+
+
 def write_srt(cues: list[Cue], *, renumber: bool = False) -> str:
+    validate_cue_timings_for_export(cues)
     blocks: list[str] = []
     for output_index, cue in enumerate(cues, start=1):
         if not cue.plain_text:

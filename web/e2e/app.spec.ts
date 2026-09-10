@@ -82,6 +82,7 @@ test('two browser contexts share one access code without sharing job state', asy
 
 test('audio-only job uploads, processes, and downloads an SRT', async ({ page }) => {
   await page.goto('/')
+  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
   await page.getByRole('button', { name: 'Generate from audio' }).click()
   await page.getByLabel('Dialogue audio').setInputFiles({
     name: 'dialogue.wav',
@@ -94,6 +95,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   await expect(submit).toBeEnabled()
   await submit.click()
   await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText('Transcription: Scribe v2', { exact: true })).toBeVisible()
 
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
@@ -136,8 +138,11 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
   expect(cueLines.flat().every((line) => line.length <= 12)).toBe(true)
 })
 
-test('sync mode survives refresh and protects job artifacts', async ({ page, request }) => {
+test('explicit MAI sync survives refresh and protects job artifacts', async ({ page, request }) => {
   await page.goto('/')
+  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
+  await expect(page.getByRole('option', { name: 'MAI-Transcribe 2', exact: true })).toBeEnabled()
+  await page.getByRole('combobox', { name: 'Transcription model' }).selectOption('microsoft/mai-transcribe-2')
   await page.getByLabel('Dialogue audio').setInputFiles({
     name: 'original.wav',
     mimeType: 'audio/wav',
@@ -167,6 +172,7 @@ test('sync mode survives refresh and protects job artifacts', async ({ page, req
 
   await page.reload()
   await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible()
+  await expect(page.getByText('Transcription: MAI-Transcribe 2', { exact: true })).toBeVisible()
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()
   const download = await downloadPromise
@@ -333,7 +339,7 @@ test('workspace selects and feature rows use consistent alignment', async ({ pag
       iconCentered: iconBox ? Math.abs((controlBox.top + controlBox.height / 2) - (iconBox.top + iconBox.height / 2)) : 999,
     }
   }))
-  expect(selectGeometry).toHaveLength(3)
+  expect(selectGeometry).toHaveLength(4)
   for (const geometry of selectGeometry) {
     expect(geometry.iconInset).toBeGreaterThanOrEqual(12)
     expect(geometry.iconCentered).toBeLessThanOrEqual(1)
@@ -399,7 +405,7 @@ for (const viewport of [
     const modeOverlapWidth = Math.min(layout.modeControls[0].right, layout.modeControls[1].right) - Math.max(layout.modeControls[0].left, layout.modeControls[1].left)
     const modeOverlapHeight = Math.min(layout.modeControls[0].bottom, layout.modeControls[1].bottom) - Math.max(layout.modeControls[0].top, layout.modeControls[1].top)
     expect(modeOverlapWidth > 0.5 && modeOverlapHeight > 0.5).toBe(false)
-    expect(layout.controls).toHaveLength(5)
+    expect(layout.controls).toHaveLength(6)
     for (const control of layout.controls) {
       expect(control.left).toBeGreaterThanOrEqual(0)
       expect(control.right).toBeLessThanOrEqual(layout.clientWidth + 0.5)

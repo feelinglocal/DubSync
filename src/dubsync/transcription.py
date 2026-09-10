@@ -146,11 +146,22 @@ def generate_srt_from_audio(
         cost_provider=model,
         dollars_per_hour=asr_dollars_per_hour(provider, asr_config),
     )
-    words = adapter.transcribe(audio_for_asr)
+    try:
+        words = adapter.transcribe(audio_for_asr)
+    except Exception:
+        _write_json(episode_workdir / "asr_failure.json", {
+            "provider": provider, "model": model,
+            "usage": adapter.last_usage, "cost": cost_meter.as_dict(),
+        })
+        if not (episode_workdir / "cost.json").exists():
+            write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
+        raise
     flags: list[QCFlag] = list(adapter.last_repair_flags)
     asr_metadata = {
         "provider": provider,
         "model": model,
+        "usage": adapter.last_usage,
+        "cache_hit": adapter.last_cache_hit,
         "repair_flags": [flag.model_dump() for flag in adapter.last_repair_flags],
     }
     _write_json(

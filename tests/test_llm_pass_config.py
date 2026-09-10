@@ -55,7 +55,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert speaker_mapping.reasoning_effort == "medium"
 
 
-def test_production_config_routes_audio_adjudication_and_punctuation_to_gemini_37(monkeypatch):
+def test_production_config_routes_audio_adjudication_to_gemini_38_medium(monkeypatch):
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -65,8 +65,8 @@ def test_production_config_routes_audio_adjudication_and_punctuation_to_gemini_3
     speaker_mapping = llm_adapter_from_config(config, pass_name="speaker_mapping")
 
     assert isinstance(adjudication, GeminiLLMAdapter)
-    assert adjudication.model == "gemini-3.7-flash"
-    assert adjudication.thinking_level == "high"
+    assert adjudication.model == "gemini-3.8-flash"
+    assert adjudication.thinking_level == "medium"
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
     assert isinstance(punctuation, GeminiLLMAdapter)
     assert punctuation.model == "gemini-3.7-flash"
@@ -100,17 +100,18 @@ def test_gemini_thinking_level_can_be_configured_per_pass():
     assert speaker_mapping.thinking_level == "minimal"
 
 
-def test_gemini_37_flash_rejects_minimal_thinking_level():
+@pytest.mark.parametrize("model", ["gemini-3.7-flash", "gemini-3.8-flash", "models/gemini-3.8-flash"])
+def test_recent_gemini_flash_rejects_minimal_thinking_level(model):
     config = {
         "llm": {
             "provider": "gemini",
-            "model": "gemini-3.7-flash",
+            "model": model,
             "api_key": "gemini-key",
             "punctuation": {"thinking_level": "minimal"},
         }
     }
 
-    with pytest.raises(RuntimeError, match="gemini-3.7-flash thinking_level"):
+    with pytest.raises(RuntimeError, match="thinking_level"):
         punctuation_adapter_from_config(config)
 
 

@@ -1,7 +1,7 @@
 import { CheckCircle2, Download, FileJson, FileText, LoaderCircle, TriangleAlert } from 'lucide-react'
 import { useId } from 'react'
 
-import type { JobResponse } from '../types'
+import { transcriptionModelLabels, type JobResponse } from '../types'
 
 interface JobPanelProps {
   job: JobResponse
@@ -17,6 +17,9 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
   const fpsStatus = complete ? formatFpsStatus(job.result) : null
   const qcStatus = complete ? formatQcStatus(job.result) : null
   const needsReview = Boolean(qcStatus?.needsReview)
+  const transcriptionLabel = job.transcription_provider
+    ? transcriptionModelLabels[job.transcription_provider === 'default' ? 'scribe_v2' : job.transcription_provider]
+    : null
   return (
     <section className="job-panel" aria-live="polite" aria-labelledby={titleId}>
       <div className="job-summary">
@@ -28,6 +31,7 @@ export function JobPanel({ job, onDownload, downloading, sourceName }: JobPanelP
           {sourceName && <span className="job-source-name" id={titleId}>{sourceName}</span>}
           <strong>{complete ? `${job.result?.cue_count ?? 0} cues ${needsReview ? 'processed · QC review needed' : 'ready'}` : failed ? 'Job failed' : job.status === 'processing' ? 'Processing dialogue' : 'Waiting to start'}</strong>
           <span className={failed ? 'job-message is-error' : 'job-message'}>{job.error || (complete ? 'Your result and QC files are ready.' : 'You can keep this page open while DubSync works.')}</span>
+          {transcriptionLabel && <span className="job-detail">Transcription: {transcriptionLabel}</span>}
           {fpsStatus && <span className="job-detail">{fpsStatus}</span>}
           {qcStatus && <span className={needsReview ? 'job-message is-error' : 'job-detail'}>{qcStatus.text}</span>}
         </div>

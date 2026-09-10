@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from pydantic import BaseModel
 
 from .adjudication import LLMAdapter, StaticLLMAdapter
-from .models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan
+from .gemini_audio_context import (
+    GeminiAudioContext,
+    GeminiSnippetUploads,
+    validate_audio_context_config,
+)
+from .models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan, Word
 from .punctuation import PunctuationAdapter, StaticPunctuationAdapter
 from .providers import ProviderError
 from .subtitle_annotations import (
@@ -49,10 +56,14 @@ _LLM_PASS_NAMES = {"adjudication", "punctuation", "speaker_mapping"}
 _LLM_PASS_CONFIG_KEYS = {
     "api_key",
     "audio_snippet_double_check",
+    "audio_context",
     "cached_content",
     "confidence_gate",
     "input_per_million",
     "max_retries",
+    "max_batch_spans",
+    "max_concurrent_batches",
+    "retry_timed_out_batches",
     "model",
     "output_per_million",
     "provider",
@@ -66,12 +77,14 @@ _LLM_PASS_CONFIG_KEYS = {
 _GEMINI_THINKING_LEVELS = {"minimal", "low", "medium", "high"}
 _GEMINI_37_THINKING_LEVELS = {"low", "medium", "high"}
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
-_ADJUDICATION_PROMPT_VERSION = "adjudication-v9-explicit-scene-isolation"
+_ADJUDICATION_PROMPT_VERSION = "adjudication-v10-audible-span-ownership"
 _PUNCTUATION_PROMPT_VERSION = "punctuation-v8-explicit-scene-isolation"
 _SPEAKER_MAPPING_PROMPT_VERSION = "speaker-mapping-v3-spoken-residue-only"
 _ANTHROPIC_MAX_OUTPUT_TOKENS = 8_192
 _ANTHROPIC_ADJUDICATION_TOKENS_PER_CASE = 320
 _ANTHROPIC_PUNCTUATION_TOKENS_PER_CUE = 160
+_GEMINI_INLINE_REQUEST_BYTES = 18_000_000
+_GEMINI_SOURCE_CONTEXT_VERSION = "dubsync.source-context.v2"
 
 
 class GeminiLLMAdapter:  # pragma: no cover - live provider path
@@ -94,9 +107,50 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
         self.max_retries = max_retries
         self.usage_events: list[object] = []
         self.episode_context: list[Cue] = []
+        self.episode_words: list[Word] | None = None
+        self.audio_context: GeminiAudioContext | None = None
+        self._usage_lock = RLock()
 
     def set_episode_context(self, cues: list[Cue]) -> None:
         self.episode_context = [cue.model_copy(deep=True) for cue in cues]
+        if self.audio_context:
+            self.audio_context.set_source_context(_gemini_source_context(self.episode_context))
+
+    def set_episode_words(self, words: list[Word]) -> None:
+        self.episode_words = [word.model_copy(deep=True) for word in words]
+
+    def set_audio_context(self, path: str | Path, *, duration_seconds: float,
+                          config: dict[str, Any] | None = None) -> None:
+        options = validate_audio_context_config(config)
+        if not options.get("enabled", True):
+            return
+        if self.cached_content:
+            raise ProviderError("A job-owned full audio context cannot replace user-supplied cached_content.")
+        if self.audio_context is not None:
+            raise ProviderError("Full audio context is already configured for this job.")
+        self.audio_context = GeminiAudioContext(
+            api_key=self.api_key, model=self.model, path=path,
+            duration_seconds=duration_seconds, config=options,
+            source_context=_gemini_source_context(self.episode_context),
+        )
+
+    def audio_context_report(self) -> dict[str, Any]:
+        return self.audio_context.report() if self.audio_context else {"enabled": False}
+
+    def close(self) -> None:
+        if self.audio_context:
+            self.audio_context.close()
+
+    def _record_usage(self, response: object) -> None:
+        event = _usage_event(response)
+        with self._usage_lock:
+            self.usage_events.append(event)
+
+    def drain_usage_events(self) -> list[object]:
+        with self._usage_lock:
+            events = list(self.usage_events)
+            self.usage_events.clear()
+            return events
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> list[dict[str, object]]:
         if not self.api_key:
@@ -108,14 +162,16 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
                 spans,
                 confidence_gate=self.confidence_gate,
                 episode_context=self.episode_context,
+                episode_words=self.episode_words,
             ),
             response_schema=AdjudicationBatch,
             thinking_level=self.thinking_level,
             cached_content=self.cached_content,
             timeout_seconds=self.timeout_seconds,
             max_retries=self.max_retries,
+            audio_context=self.audio_context,
         )
-        self.usage_events.append(_usage_event(response))
+        self._record_usage(response)
         return _validated_gemini_response(response, AdjudicationBatch).model_dump()["decisions"]
 
     def adjudicate_with_audio(
@@ -133,6 +189,7 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
                 confidence_gate=self.confidence_gate,
                 audio_snippets=audio_snippets,
                 episode_context=self.episode_context,
+                episode_words=self.episode_words,
             ),
             response_schema=AdjudicationBatch,
             thinking_level=self.thinking_level,
@@ -140,8 +197,9 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             audio_snippets=audio_snippets,
             timeout_seconds=self.timeout_seconds,
             max_retries=self.max_retries,
+            audio_context=self.audio_context,
         )
-        self.usage_events.append(_usage_event(response))
+        self._record_usage(response)
         return _validated_gemini_response(response, AdjudicationBatch).model_dump()["decisions"]
 
     def punctuate(self, cues: list[Cue]) -> dict[int, str]:
@@ -160,7 +218,7 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             timeout_seconds=self.timeout_seconds,
             max_retries=self.max_retries,
         )
-        self.usage_events.append(_usage_event(response))
+        self._record_usage(response)
         batch = _validated_gemini_response(response, PunctuationBatch)
         editable_ids = {cue.index for cue in cues}
         return {
@@ -182,7 +240,7 @@ class GeminiLLMAdapter:  # pragma: no cover - live provider path
             timeout_seconds=self.timeout_seconds,
             max_retries=self.max_retries,
         )
-        self.usage_events.append(_usage_event(response))
+        self._record_usage(response)
         return _speaker_mapping_dict(_validated_gemini_response(response, SpeakerMappingBatch))
 
 
@@ -377,6 +435,9 @@ def _anthropic_output_tokens(item_count: int, *, per_item: int) -> int:
 
 
 def drain_usage_events(adapter: object) -> list[object]:
+    drain = getattr(adapter, "drain_usage_events", None)
+    if callable(drain):
+        return drain()
     events = getattr(adapter, "usage_events", None)
     if not isinstance(events, list):
         return []
@@ -538,8 +599,8 @@ def _normalize_gemini_thinking_level(value: object, model: str) -> str | None:
     if thinking_level not in _GEMINI_THINKING_LEVELS:
         raise ProviderError("llm.thinking_level must be one of: minimal, low, medium, high")
     normalized_model = model.strip().lower().removeprefix("models/")
-    if normalized_model == "gemini-3.7-flash" and thinking_level not in _GEMINI_37_THINKING_LEVELS:
-        raise ProviderError("gemini-3.7-flash thinking_level must be one of: low, medium, high")
+    if normalized_model in {"gemini-3.7-flash", "gemini-3.8-flash"} and thinking_level not in _GEMINI_37_THINKING_LEVELS:
+        raise ProviderError(f"{normalized_model} thinking_level must be one of: low, medium, high")
     return thinking_level
 
 
@@ -600,16 +661,20 @@ def _adjudication_prompt(
     confidence_gate: float = 0.7,
     audio_snippets: dict[str, AudioSnippet] | None = None,
     episode_context: list[Cue] | None = None,
+    episode_words: list[Word] | None = None,
 ) -> str:
     instructions = [
         "Listen to each attached audio snippet when one is provided; use it only to determine the literal words spoken in that case.",
         "Weigh the original SRT span, ASR hypothesis, neighboring cue context, speaker IDs, and character labels. Audio and ASR word timing are acoustic evidence; matched neighboring SRT text is editorial context.",
-        "Treat context_before, context_after, anchor cue IDs, anchor times, speaker IDs, and character labels as read-only context. Never copy neighboring text into final_text.",
+        "Treat context_before, context_after, anchor cue IDs, anchor times, speaker IDs, and character labels as read-only context. Never copy neighboring text into final_text unless those exact words are independently audible inside this case's supplied ASR span.",
         "Treat scene_id as a hard scene boundary. Decide each case independently; never carry dialogue, speaker assumptions, or evidence between different scene IDs.",
         "Context can disambiguate meaning, spelling, speaker continuity, and sentence boundaries. Context cannot prove unheard words. Do not change the source solely because an ASR hypothesis is different or more fluent.",
-        "Prefer the source SRT when the audio is ambiguous, noisy, overlapped, musical, or when ASR appears to mistranscribe a plausible source word.",
-        "Treat divergence start/end times, source cue times, and audio snippet boundaries as a strict locality check. If a partial audio window would compress, omit, or absorb dialogue outside its evidence, choose keep_srt or report below-gate confidence; never rewrite a whole cue from partial audio.",
+        "Prefer the source SRT when the words cannot be resolved because the audio is ambiguous, noisy, musical, or obscured by overlap, or when ASR appears to mistranscribe a plausible source word. Overlap alone does not invalidate clearly audible words from either actor.",
+        "Use divergence start/end times and ASR word evidence to locate the editable audio span inside each padded snippet and the full episode. Source cue times may be displaced. If a partial audio window would compress, omit, or absorb dialogue outside its evidence, choose keep_srt or report below-gate confidence; never rewrite a whole cue from partial audio.",
         "final_text is the replacement for only the divergent span. Never include timestamps, neighboring cue text, explanations in final_text, or a full-cue rewrite.",
+        "Account for every audible word inside the supplied ASR span, including consecutive contributions from different actors. Use per-word speaker IDs as evidence, confirm against audio, and keep their spoken order; do not select only the main sentence and discard adjacent reactions within this span.",
+        "Do not omit audible short reactions, pronouns, hesitations, or improvised words merely because polished subtitles might omit them. For an empty source span with clearly heard 'Eu', return use_audio with 'Eu'. Reject a hallucinated or inaudible ASR insertion with keep_srt or below-gate confidence.",
+        "Cue allocation and speaker splitting happen downstream using acoustic word ownership. Do not choose keep_srt merely because a confirmed spoken correction changes the old cue allocation, appears in a displaced neighboring source cue, or crosses a speaker turn. Evaluate each supplied fragment at its own acoustic position; never invent a new time or copy an unheard phrase to repair layout.",
         "Do not drop matched cue words outside the divergent span. Example: for divergent 'Drachen Evolutionssystem' within 'Drachen- / Evolutionssystem besitze.', return 'Drachenevolutionssystem'; downstream text remains 'Drachenevolutionssystem besitze.'.",
         "Preserve source line breaks and quotation marks exactly. Never add decorative dialogue quotes; alter a mark only when it is inside the divergent span and the evidence makes that bounded change necessary.",
         "Preserve source spellings of character and proper names unless acoustic evidence clearly supports a different spoken name; lower confidence for a near-homophone.",
@@ -620,18 +685,20 @@ def _adjudication_prompt(
         f"Return the best bounded answer for every case. If confidence is below {confidence_gate:.2f}, report that lower confidence so QC can hold it for review.",
     ]
     payload = {
-        "task": "Adjudicate dubbed-dialogue text divergence spans without changing timing or cue structure.",
+        "task": "Adjudicate bounded dubbed-dialogue text divergences from literal audio evidence for downstream cue timing and speaker separation.",
         "prompt_version": _ADJUDICATION_PROMPT_VERSION,
         "instructions": instructions,
         "allowed_verdicts": ["keep_srt", "use_audio", "hybrid"],
         "confidence_gate": confidence_gate,
         "episode_context_role": "read_only ordered source subtitle context; never copy unrelated text into final_text",
         "episode_context": _episode_context_payload(episode_context or []),
-        "spans": [_adjudication_span_payload(span) for span in spans],
+        "spans": [_adjudication_span_payload(span, episode_words=episode_words) for span in spans],
         "audio_snippets": [
             {
                 "case_id": snippet.case_id,
                 "mime_type": snippet.mime_type,
+                "start_seconds": round(snippet.start, 3),
+                "end_seconds": round(snippet.end, 3),
                 "duration_seconds": round(snippet.duration_seconds, 3),
             }
             for snippet in (audio_snippets or {}).values()
@@ -690,8 +757,22 @@ def _punctuation_prompt(cues: list[Cue], *, episode_context: list[Cue] | None = 
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _adjudication_span_payload(span: DivergenceSpan) -> dict[str, object]:
+def _adjudication_span_payload(
+    span: DivergenceSpan, episode_words: list[Word] | None = None,
+) -> dict[str, object]:
     payload = span.model_dump()
+    if episode_words is not None:
+        payload["asr_word_evidence"] = [
+            {
+                "word_index": index,
+                "text": episode_words[index].text,
+                "start_seconds": episode_words[index].start,
+                "end_seconds": episode_words[index].end,
+                "speaker_id": episode_words[index].speaker_id,
+            }
+            for index in span.asr_word_indices
+            if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(episode_words)
+        ]
     if span.prompt_scene_id is None:
         return payload
     return {
@@ -703,6 +784,37 @@ def _adjudication_span_payload(span: DivergenceSpan) -> dict[str, object]:
 
 def _punctuation_eligible_cues(cues: list[Cue]) -> list[Cue]:
     return [cue for cue in cues if not cue_has_bracketed_screen_text(cue)]
+
+
+def _gemini_source_context(cues: list[Cue]) -> str:
+    """Lossless owned-cache table; ordinary prompt payloads keep their schema."""
+    aliases: dict[str, list[str]] = {"speaker_alias": [], "character_alias": []}
+    lookups: dict[str, dict[str, int]] = {name: {} for name in aliases}
+
+    def reference(name: str, value: str | None) -> int | None:
+        if value is None:
+            return None
+        if value not in lookups[name]:
+            lookups[name][value] = len(aliases[name])
+            aliases[name].append(value)
+        return lookups[name][value]
+
+    rows = []
+    for cue in cues:
+        row = [cue.index, cue.start_ms, cue.end_ms, list(cue.lines),
+               reference("speaker_alias", cue.speaker_id), reference("character_alias", cue.character)]
+        while len(row) > 4 and row[-1] is None:
+            row.pop()
+        rows.append(row)
+    return json.dumps({
+        "format": _GEMINI_SOURCE_CONTEXT_VERSION,
+        "columns": ["cue_id", "start_ms", "end_ms", "source_lines", "speaker_alias", "character_alias"],
+        "sequence_position": "1-based row number in source order",
+        "missing_trailing_cells": None,
+        "alias_index_base": 0,
+        "aliases": aliases,
+        "rows": rows,
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def _episode_context_payload(cues: list[Cue]) -> list[dict[str, object]]:
@@ -812,6 +924,7 @@ def _gemini_generate_json(
     audio_snippets: dict[str, AudioSnippet] | None = None,
     timeout_seconds: float = 90.0,
     max_retries: int = 2,
+    audio_context: GeminiAudioContext | None = None,
 ) -> object:
     try:
         from google import genai
@@ -819,10 +932,56 @@ def _gemini_generate_json(
         raise ProviderError("Install dubsync[cloud] to use Gemini.") from exc
 
     client = None
+    snippet_uploads = None
+    request_audio = None
+    response_received = False
+    request_started = time.monotonic()
+    generation_started = None
+    generation_finished = None
     try:
+        if audio_context:
+            audio_context.ensure_available()
+        # Prepare all focused clips before acquiring a full-context cache lease
+        # or reserving paid input; slow uploads must not make that lease stale.
+        snippet_parts: list[object] = []
+        if audio_snippets:
+            try:
+                from google.genai import types
+            except ImportError as exc:
+                raise ProviderError("Install dubsync[cloud] to use Gemini audio snippets.") from exc
+            snippets = list(audio_snippets.values())
+            encoded_size = len(prompt.encode("utf-8")) + sum(
+                4 * ((Path(snippet.path).stat().st_size + 2) // 3) + 2048 for snippet in snippets
+            )
+            if encoded_size > _GEMINI_INLINE_REQUEST_BYTES:
+                snippet_uploads = GeminiSnippetUploads(api_key=api_key, timeout_seconds=timeout_seconds)
+            for snippet in snippets:
+                snippet_parts.append(json.dumps({
+                    "audio_role": "focused_case_evidence", "case_id": snippet.case_id,
+                    "episode_start_seconds": snippet.start, "episode_end_seconds": snippet.end,
+                    "local_time_zero_is_episode_seconds": snippet.start,
+                }))
+                if snippet_uploads:
+                    uploaded = snippet_uploads.upload(Path(snippet.path), snippet.mime_type)
+                    snippet_parts.append(types.Part.from_uri(file_uri=uploaded.file_uri, mime_type=uploaded.mime_type))
+                else:
+                    snippet_parts.append(types.Part.from_bytes(
+                        data=Path(snippet.path).read_bytes(), mime_type=snippet.mime_type,
+                    ))
+        request_audio = audio_context.acquire_request() if audio_context else None
+        if request_audio and request_audio.cached_content and audio_context.source_context:
+            # The owned cache already contains the full ordered source. Avoid
+            # resending and charging for that same long transcript each batch.
+            payload = json.loads(prompt)
+            if isinstance(payload, dict) and "episode_context" in payload:
+                payload["episode_context"] = []
+                payload["episode_context_role"] = "read_only ordered source subtitle context supplied in the job-owned cached prefix"
+                prompt = json.dumps(payload, ensure_ascii=False)
         client = genai.Client(
             api_key=api_key,
-            http_options=_gemini_http_options(timeout_seconds, max_retries),
+            # Retrying a full episode hides both paid attempts and wall time.
+            # The job-level circuit permits only bounded subsequent attempts.
+            http_options=_gemini_http_options(timeout_seconds, 0 if request_audio else max_retries),
         )
         config: dict[str, object] = {
             "response_mime_type": "application/json",
@@ -830,10 +989,12 @@ def _gemini_generate_json(
         }
         if thinking_level:
             config["thinking_config"] = {"thinking_level": thinking_level}
-        if cached_content:
+        if request_audio and request_audio.cached_content:
+            config["cached_content"] = request_audio.cached_content
+        elif cached_content:
             config["cached_content"] = cached_content
         contents: object = prompt
-        if audio_snippets:
+        if snippet_parts or request_audio:
             try:
                 from google.genai import types
             except ImportError as exc:
@@ -841,29 +1002,46 @@ def _gemini_generate_json(
                     "Install dubsync[cloud] to use Gemini audio snippets."
                 ) from exc
             contents = [prompt]
-            for snippet in audio_snippets.values():
-                contents.append(
-                    types.Part.from_bytes(
-                        data=Path(snippet.path).read_bytes(),
-                        mime_type=snippet.mime_type,
-                    )
-                )
-        return client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
+            if request_audio:
+                contents.append(request_audio.label)
+                if request_audio.file_uri:
+                    contents.append(types.Part.from_uri(file_uri=request_audio.file_uri, mime_type=request_audio.mime_type))
+            contents.extend(snippet_parts)
+        generation_started = time.monotonic()
+        try:
+            response = client.models.generate_content(model=model, contents=contents, config=config)
+        finally:
+            generation_finished = time.monotonic()
+        response_received = True
+        if request_audio and audio_context:
+            audio_context.record_usage(_usage_event(response), cached=bool(request_audio.cached_content))
+        return response
     except ProviderError:
         raise
     except Exception as exc:
         raise ProviderError("Gemini request failed.") from exc
     finally:
-        close = getattr(client, "close", None) if client is not None else None
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                logger.warning("Gemini client cleanup failed after request completion.", exc_info=True)
+        try:
+            if request_audio and generation_started is not None and audio_context:
+                audio_context.record_generation_result(success=response_received, cached=bool(request_audio.cached_content))
+            if audio_context:
+                finished = time.monotonic()
+                audio_context.record_request_metrics(
+                    elapsed_seconds=finished - request_started,
+                    generation_seconds=generation_finished - generation_started if generation_finished is not None else 0.0,
+                )
+            if snippet_uploads:
+                if not snippet_uploads.close() and audio_context:
+                    audio_context.record_warning("snippet_cleanup_failed")
+            close = getattr(client, "close", None) if client is not None else None
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.warning("Gemini client cleanup failed after request completion.")
+        finally:
+            if request_audio and request_audio.lease_acquired and audio_context:
+                audio_context.release_request()
 
 
 def _gemini_http_options(timeout_seconds: float, max_retries: int) -> dict[str, object]:

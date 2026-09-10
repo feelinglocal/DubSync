@@ -9,7 +9,7 @@ import {
   writeActiveJobs,
   type ActiveJobAccess,
 } from '../session'
-import type { GenerationStyleValues, JobMode, JobResponse, PublicConfig } from '../types'
+import { defaultTranscriptionProvider, transcriptionModelLabels, unavailableTranscriptionModels, type GenerationStyleValues, type JobMode, type JobResponse, type PublicConfig, type TranscriptionProvider } from '../types'
 import { BatchUploadField } from './BatchUploadField'
 import {
   GenerationStylePanel,
@@ -26,6 +26,7 @@ interface DownloadState {
 
 export function Workspace({ config }: { config: PublicConfig }) {
   const batchNamingHelpId = useId()
+  const transcriptionHelpId = useId()
   const storageReadFailed = useRef(false)
   const [accesses, setAccesses] = useState<ActiveJobAccess[]>(() => readActiveJobs(() => {
     storageReadFailed.current = true
@@ -40,6 +41,10 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const [subtitleFiles, setSubtitleFiles] = useState<File[]>([])
   const [fps, setFps] = useState('auto')
   const [language, setLanguage] = useState('auto')
+  const [selectedTranscriptionProvider, setTranscriptionProvider] = useState<TranscriptionProvider | null>(null)
+  const transcriptionProvider = selectedTranscriptionProvider ?? config.default_transcription_provider ?? defaultTranscriptionProvider
+  const transcriptionModels = config.transcription_models ?? unavailableTranscriptionModels
+  const selectedModelAvailable = transcriptionModels.some((model) => model.id === transcriptionProvider && model.available)
   const [syncMaxLines, setSyncMaxLines] = useState('source')
   const [styleSource, setStyleSource] = useState<'preset' | 'custom' | 'sample'>('preset')
   const [stylePreset, setStylePreset] = useState(config.generation_styles.default_preset)
@@ -73,6 +78,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const canSubmit = useMemo(
     () => Boolean(
       config.jobs_available
+      && selectedModelAvailable
       && !selectionError
       && (mode !== 'generate' || styleSource !== 'sample' || styleSample)
       && (mode !== 'generate' || styleSource !== 'custom' || customStyleValidation.valid)
@@ -80,7 +86,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
       && !hasBlockingJob
       && !submitting
     ),
-    [accessCode, config.access_code_required, config.jobs_available, customStyleValidation.valid, hasBlockingJob, mode, selectionError, styleSample, styleSource, submitting],
+    [accessCode, config.access_code_required, config.jobs_available, customStyleValidation.valid, hasBlockingJob, mode, selectedModelAvailable, selectionError, styleSample, styleSource, submitting],
   )
   const downloadableBatch = useMemo(
     () => resolveDownloadableBatch(jobs, accesses),
@@ -225,6 +231,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
     }
     if (fps !== 'auto') body.set('fps', fps)
     body.set('language', language)
+    body.set('transcription_provider', transcriptionProvider)
     if (mode === 'generate') {
       const style = styleSource === 'preset'
         ? { source: 'preset', preset: stylePreset }
@@ -338,6 +345,19 @@ export function Workspace({ config }: { config: PublicConfig }) {
             mode === 'sync' ? 'is-sync' : 'is-generate',
             config.access_code_required ? 'has-access-code' : '',
           ].filter(Boolean).join(' ')}>
+            <label className="transcription-model-field">
+              <span className="field-label">Transcription model</span>
+              <span className="select-control">
+                <select value={transcriptionProvider} onChange={(event) => setTranscriptionProvider(event.target.value as TranscriptionProvider)} aria-describedby={config.jobs_available && !selectedModelAvailable ? transcriptionHelpId : undefined}>
+                  {transcriptionModels.map((model) => (
+                    <option key={model.id} value={model.id} disabled={!model.available}>
+                      {model.label}{model.id === (config.default_transcription_provider ?? defaultTranscriptionProvider) ? ' (default)' : ''}{!model.available ? ' (unavailable)' : ''}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown aria-hidden="true" />
+              </span>
+            </label>
             <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{mode === 'sync' && <option value="auto">Auto (detect from SRT)</option>}{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
             {mode === 'sync' && (
               <label><span className="field-label">Maximum lines per cue</span><span className="select-control"><select value={syncMaxLines} onChange={(event) => setSyncMaxLines(event.target.value)}><option value="source">Keep source style (default)</option>{syncLineOptions(config).map((value) => <option key={value} value={value}>{value} {value === 1 ? 'line' : 'lines'}</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
@@ -349,6 +369,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
             <button className="primary-button" type="submit" disabled={!canSubmit}><Play />{submitting ? 'Uploading' : mode === 'sync' ? 'Start sync' : 'Generate SRT'}</button>
           </div>
           {!config.jobs_available && <div className="service-notice" role="status">Job intake is temporarily unavailable. Contact <a href="mailto:rey@feelslocal.com">rey@feelslocal.com</a>.</div>}
+          {config.jobs_available && !selectedModelAvailable && <div className="service-notice" role="status" id={transcriptionHelpId}>{transcriptionModelLabels[transcriptionProvider]} is currently unavailable. Choose an available model to continue.</div>}
           {storageUnavailable && <div className="service-notice" role="status">Your browser could not save job access. Keep this tab open and download your results before refreshing or closing it.</div>}
           {selectionTouched && selectionError && <div className="form-error" role="alert">{selectionError}</div>}
           {error && <div className="form-error" role="alert">{error}</div>}

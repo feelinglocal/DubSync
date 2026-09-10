@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -16,13 +17,17 @@ from .models import QCFlag, Word
 
 GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS = 30 * 60.0
 GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+MAI_TRANSCRIBE_MODEL = "microsoft/mai-transcribe-2"
+SCRIBE_TRANSCRIBE_MODEL = "scribe_v2"
 GEMINI_TRANSCRIBE_DISABLED_MESSAGE = (
     "Gemini 3.5 Transcribe ASR is disabled; use ElevenLabs Scribe v2."
 )
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class ASRAdapter(Protocol):
@@ -61,45 +66,98 @@ class CachedASRAdapter:
         self.dollars_per_hour = dollars_per_hour
         self.last_repair_flags: list[QCFlag] = []
         self.last_cache_key: CacheKey | None = None
+        self.last_usage: dict[str, object] = {}
+        self.last_cache_hit = False
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         self.last_repair_flags = []
+        self.last_usage = {}
+        self.last_cache_hit = False
         key = CacheKey.from_audio(audio_path, self.model, self.params)
         self.last_cache_key = key
         cached = self.cache.read(key)
         if cached is not None:
+            self.last_cache_hit = True
+            if isinstance(cached, dict):
+                self.last_usage = _safe_asr_usage(cached.get("usage"))
             cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
             words, cache_repair_flags = repair_word_stream(cached_words, source="ASR cache")
             persisted_flags = _cached_repair_flags(cached)
             self.last_repair_flags = [*persisted_flags, *cache_repair_flags]
             if _is_raw_provider_cache(cached):
-                self.cache.write(key, _validated_word_cache_payload(words, self.last_repair_flags))
+                self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
             return words
 
-        provider_words = self.inner.transcribe(audio_path)
-        if (
-            self.cost_meter is not None
-            and self.dollars_per_hour is not None
-            and self.dollars_per_hour > 0
-        ):
-            self.cost_meter.add_audio(self.cost_provider, audio_seconds(audio_path), self.dollars_per_hour)
+        succeeded = False
+        try:
+            provider_words = self.inner.transcribe(audio_path)
+            succeeded = True
+        finally:
+            self.last_usage = _safe_asr_usage(getattr(self.inner, "last_usage", None))
+            self._record_cost(audio_path, succeeded=succeeded)
+        provider_flags = list(getattr(self.inner, "last_repair_flags", []))
         cacheable_words = _cacheable_word_items(provider_words)
         if cacheable_words is None:
             words, repair_flags = repair_word_stream(provider_words, source="ASR provider")
-            self.last_repair_flags = repair_flags
-            self.cache.write(key, _validated_word_cache_payload(words, repair_flags))
+            self.last_repair_flags = [*provider_flags, *repair_flags]
+            self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
             return words
         self.cache.write(
             key,
             {
                 "words": cacheable_words,
-                "metadata": {"raw_provider_response": True},
+                "metadata": {"raw_provider_response": True, "repair_flags": [flag.model_dump() for flag in provider_flags]},
+                "usage": self.last_usage,
             },
         )
         words, repair_flags = repair_word_stream(cacheable_words, source="ASR provider")
-        self.last_repair_flags = repair_flags
-        self.cache.write(key, _validated_word_cache_payload(words, repair_flags))
+        self.last_repair_flags = [*provider_flags, *repair_flags]
+        self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
         return words
+
+    def _cache_payload(self, words: list[Word], flags: list[QCFlag]) -> dict[str, object]:
+        return {**_validated_word_cache_payload(words, flags), "usage": self.last_usage}
+
+    def _record_cost(self, audio_path: Path, *, succeeded: bool) -> None:
+        if self.cost_meter is None:
+            return
+        billed_cost = self.last_usage.get("cost")
+        seconds = self.last_usage.get("seconds")
+        if isinstance(billed_cost, (int, float)):
+            self.cost_meter.add_audio_billed(
+                self.cost_provider,
+                float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
+                float(billed_cost),
+            )
+        elif not succeeded and isinstance(self.last_usage.get("reported_cost"), (int, float)):
+            self.cost_meter.add_audio_billed(
+                self.cost_provider,
+                float(self.last_usage.get("reported_seconds", 0)),
+                float(self.last_usage["reported_cost"]),
+                partial=True,
+            )
+        elif succeeded and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
+            self.cost_meter.add_audio(
+                self.cost_provider,
+                float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
+                self.dollars_per_hour,
+            )
+
+
+def _safe_asr_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, object] = {}
+    for name in ("seconds", "cost", "reported_seconds", "reported_cost", "request_count"):
+        number = value.get(name)
+        if name in value and number is None:
+            result[name] = None
+        if isinstance(number, (int, float)) and not isinstance(number, bool) and math.isfinite(number) and number >= 0:
+            result[name] = number
+    identifiers = value.get("generation_ids")
+    if isinstance(identifiers, list):
+        result["generation_ids"] = [item for item in identifiers if isinstance(item, str) and item.startswith("gen-")][:10000]
+    return result
 
 
 class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
@@ -351,7 +409,21 @@ def adapter_from_config(
     fixture_path = asr_config.get("fixture_path")
     if fixture_path:
         return FixtureASRAdapter(Path(str(fixture_path)))
-    provider = str(asr_config.get("provider", "elevenlabs")).lower()
+    provider = str(asr_config.get("provider", "elevenlabs")).strip().lower()
+    if provider in {"openrouter", MAI_TRANSCRIBE_MODEL}:
+        from .mai_transcribe import MAITranscribeAdapter
+
+        model = str(asr_config.get("model", MAI_TRANSCRIBE_MODEL))
+        if model != MAI_TRANSCRIBE_MODEL:
+            raise ProviderError("OpenRouter transcription model must be microsoft/mai-transcribe-2.")
+        return MAITranscribeAdapter(
+            api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
+            diarize=bool(asr_config.get("diarize", True)),
+            keyterms=_asr_keyterms(asr_config),
+            language_code=str(asr_config["language_code"]) if asr_config.get("language_code") else None,
+            timeout_seconds=float(asr_config.get("timeout_seconds", 90)),
+            chunk_seconds=float(asr_config.get("chunk_seconds", 300)),
+        )
     if provider == "elevenlabs":
         return ElevenLabsScribeAdapter(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
@@ -411,10 +483,31 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
 def apply_transcription_provider_config(config: dict[str, object], provider: str) -> dict[str, object]:
     normalized = provider.strip().lower()
     if normalized in {"", "default"}:
-        return dict(config)
+        next_config = deepcopy(config)
+        if not next_config.get("asr"):
+            next_config["asr"] = {"provider": "elevenlabs", "model_id": SCRIBE_TRANSCRIBE_MODEL}
+        return next_config
     if normalized == GEMINI_TRANSCRIBE_MODEL:
         raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
-    raise ProviderError("Invalid transcription provider.")
+    if normalized not in {MAI_TRANSCRIBE_MODEL, SCRIBE_TRANSCRIBE_MODEL}:
+        raise ProviderError("Invalid transcription provider.")
+    next_config = deepcopy(config)
+    existing = next_config.get("asr", {})
+    if not isinstance(existing, dict):
+        raise ProviderError("providers.yaml asr section must be a mapping")
+    target = "openrouter" if normalized == MAI_TRANSCRIBE_MODEL else "elevenlabs"
+    # Provider-specific credentials and prices must never cross providers.
+    shared = {"diarize", "keyterms", "character_names", "language_code", "fixture_path", "local"}
+    original_provider = str(existing.get("provider", "")).strip().lower()
+    same_provider = original_provider == target or (target == "openrouter" and original_provider == MAI_TRANSCRIBE_MODEL)
+    asr_config = existing if same_provider else {
+        key: value for key, value in existing.items() if key in shared
+    }
+    asr_config.pop("model_id" if target == "openrouter" else "model", None)
+    asr_config["provider"] = target
+    asr_config["model" if target == "openrouter" else "model_id"] = normalized
+    next_config["asr"] = asr_config
+    return next_config
 
 
 def apply_local_asr_config(config: dict[str, object], local: bool) -> dict[str, object]:

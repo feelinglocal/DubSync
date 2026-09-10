@@ -99,12 +99,18 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     config = yaml.safe_load(Path("providers.example.yaml").read_text(encoding="utf-8"))
     example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
 
+    assert config["asr"]["provider"] == "elevenlabs"
+    assert config["asr"]["model_id"] == "scribe_v2"
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.7-flash"
-    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.8-flash"
+    assert config["llm"]["adjudication"]["thinking_level"] == "medium"
+    assert config["llm"]["adjudication"]["audio_context"] == {
+        "enabled": True, "compress_long_audio": True, "cache_enabled": True,
+        "cache_ttl_seconds": 900, "max_uncached_audio_tokens": 256000,
+    }
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
     assert config["llm"]["punctuation"]["provider"] == "gemini"
     assert config["llm"]["punctuation"]["model"] == "gemini-3.7-flash"
@@ -136,11 +142,17 @@ def test_docs_retire_gemini_transcribe_and_keep_elevenlabs_asr():
 def test_production_llm_passes_use_requested_models_and_thinking_levels():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
+    assert config["asr"]["provider"] == "elevenlabs"
+    assert config["asr"]["model_id"] == "scribe_v2"
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.7-flash"
-    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.8-flash"
+    assert config["llm"]["adjudication"]["thinking_level"] == "medium"
+    assert config["llm"]["adjudication"]["audio_context"] == {
+        "enabled": True, "compress_long_audio": True, "cache_enabled": True,
+        "cache_ttl_seconds": 900, "max_uncached_audio_tokens": 256000,
+    }
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
     assert config["llm"]["punctuation"]["provider"] == "gemini"
     assert config["llm"]["punctuation"]["model"] == "gemini-3.7-flash"
@@ -157,13 +169,17 @@ def test_documented_configuration_uses_gpt_5_6_luna_default():
     assert "Gemini " + "3.1 Flash-Lite" not in plan
 
 
-def test_commercial_runbook_names_openai_default_and_optional_gemini_secret():
+def test_commercial_runbook_names_current_models_and_provider_secrets():
     commercial_plan = Path("docs/COMMERCIAL_PLAN.md").read_text(encoding="utf-8")
 
-    assert "Gemini 3.7 Flash adjudication and punctuation passes" in commercial_plan
+    assert "Gemini 3.8 Flash adjudication (medium thinking)" in commercial_plan
+    assert "Gemini 3.7 Flash punctuation (medium thinking)" in commercial_plan
+    assert "Scribe v2 is the default transcription option; MAI remains selectable" in commercial_plan
     assert "OpenAI GPT-5.6 Luna speaker-mapping pass" in commercial_plan
     assert "`OPENAI_API_KEY`" in commercial_plan
     assert "`GEMINI_API_KEY`" in commercial_plan
+    assert "`ELEVENLABS_API_KEY`" in commercial_plan
+    assert "`OPENROUTER_API_KEY`" in commercial_plan
 
 
 def test_repository_has_no_legacy_flash_lite_model_references():
@@ -181,12 +197,15 @@ def test_repository_has_no_legacy_flash_lite_model_references():
     assert stale_references == []
 
 
-def test_readme_names_remaining_unimplemented_plan_provider_controls():
+def test_readme_documents_full_audio_transport_and_bounded_fallback():
     readme = Path("README.md").read_text(encoding="utf-8")
 
     for expected in (
-        "Audio-snippet double-checks are implemented for Gemini inline audio",
-        "Automatic Gemini context-cache creation/deletion remains unimplemented",
+        "full episode audio and ordered source subtitle context",
+        "mono 24 kHz, 64 kbps MP3",
+        "Short inputs retain the normalized WAV",
+        "cumulative 256,000 uncached audio-token budget",
+        "Upload failure or budget exhaustion holds the affected source dialogue for QC",
     ):
         assert expected in readme
 
@@ -208,9 +227,11 @@ def test_readme_documents_gemini_context_cache_reuse():
     readme = Path("README.md").read_text(encoding="utf-8")
 
     for expected in (
-        "Gemini explicit context-cache reuse",
+        "job-owned Gemini cache",
+        "TTL is capped at 900 seconds",
+        "Job completion or failure triggers cleanup of the owned cache and uploads",
         "`cached_content`",
-        "does not create or delete remote caches automatically",
+        "does not replace or delete that external cache",
     ):
         assert expected in readme
 
@@ -220,7 +241,9 @@ def test_readme_documents_adjudication_audio_snippet_double_check():
 
     for expected in (
         "audio_snippet_double_check",
-        "types.Part.from_bytes",
+        "Focused case snippets remain WAV and carry their episode offsets",
+        "estimated aggregate request, including base64 encoding, exceeds 18 MB",
+        "Files API URIs",
         "audio_snippets.json",
     ):
         assert expected in readme

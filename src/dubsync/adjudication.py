@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from typing import Protocol
 
@@ -67,12 +68,26 @@ class AdjudicationEngine:
         scene_gap_seconds: float = 4.0,
         audio_snippets: dict[str, AudioSnippet] | None = None,
         audio_snippet_batches: AudioSnippetBatchLoader | None = None,
+        max_batch_spans: int = _MAX_ADJUDICATION_BATCH_SPANS,
+        max_concurrent_batches: int = 1,
+        retry_timed_out_batches: bool = False,
     ):
         self.llm = llm
         self.confidence_gate = confidence_gate
         self.scene_gap_seconds = scene_gap_seconds
         self.audio_snippets = dict(audio_snippets or {})
         self.audio_snippet_batches = audio_snippet_batches
+        for name, value, maximum in (
+            ("max_batch_spans", max_batch_spans, _MAX_ADJUDICATION_BATCH_SPANS),
+            ("max_concurrent_batches", max_concurrent_batches, 4),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"adjudication.{name} must be an integer between 1 and {maximum}")
+        self.max_batch_spans = max_batch_spans
+        self.max_concurrent_batches = max_concurrent_batches
+        if not isinstance(retry_timed_out_batches, bool):
+            raise ValueError("adjudication.retry_timed_out_batches must be boolean")
+        self.retry_timed_out_batches = retry_timed_out_batches
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
         decisions_by_case: dict[str, AdjudicationDecision] = {}
@@ -86,22 +101,32 @@ class AdjudicationEngine:
 
         invalid_spans: list[DivergenceSpan] = []
         provider_failed_spans: list[DivergenceSpan] = []
+        timed_out_spans: list[DivergenceSpan] = []
         if llm_spans:
-            for batch in self._scene_batches(llm_spans):
-                try:
-                    raw_decisions = self._adjudicate_batch(batch)
-                except (ProviderError, OSError):
-                    provider_failed_spans.extend(batch)
+            for batch, raw_decisions, timed_out in self._adjudicate_batches(llm_spans):
+                if raw_decisions is None:
+                    if timed_out and self.retry_timed_out_batches and len(batch) > 1:
+                        timed_out_spans.extend(batch)
+                    else:
+                        provider_failed_spans.extend(batch)
                     continue
                 llm_decisions, batch_invalid_spans = self._validate_raw(raw_decisions, batch)
                 decisions_by_case = {**decisions_by_case, **llm_decisions}
                 invalid_spans.extend(batch_invalid_spans)
+            # One bounded recovery pass reduces reasoning load after a known
+            # timeout. Authentication/rate errors and singleton timeouts are
+            # never expanded into another round of provider calls.
+            for batch, raw_decisions, _ in self._adjudicate_batches(timed_out_spans, max_batch_spans=1):
+                if raw_decisions is None:
+                    provider_failed_spans.extend(batch)
+                    continue
+                recovered, batch_invalid_spans = self._validate_raw(raw_decisions, batch)
+                decisions_by_case = {**decisions_by_case, **recovered}
+                invalid_spans.extend(batch_invalid_spans)
             if invalid_spans:
                 retry_invalid_spans: list[DivergenceSpan] = []
-                for batch in self._scene_batches(invalid_spans):
-                    try:
-                        raw_retry_decisions = self._adjudicate_batch(batch)
-                    except (ProviderError, OSError):
+                for batch, raw_retry_decisions, _ in self._adjudicate_batches(invalid_spans):
+                    if raw_retry_decisions is None:
                         provider_failed_spans.extend(batch)
                         continue
                     retry_decisions, batch_invalid_spans = self._validate_raw(raw_retry_decisions, batch)
@@ -160,6 +185,42 @@ class AdjudicationEngine:
 
         return decisions, flags
 
+    def _adjudicate_batches(self, spans: list[DivergenceSpan], *, max_batch_spans: int | None = None):
+        batches = self._scene_batches(spans, max_batch_spans=max_batch_spans)
+        if self.max_concurrent_batches == 1 or len(batches) <= 1:
+            for batch in batches:
+                yield self._attempt_batch(batch)
+            return
+        # Results are consumed in stable case order. The context and snippet
+        # owners synchronize resource acquisition and keep each batch isolated.
+        # Leaving this scope waits for every in-flight call before cleanup.
+        results = {}
+        next_batch = 0
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_batches, thread_name_prefix="dubsync-adjudicate") as executor:
+            pending = {}
+            try:
+                while next_batch < len(batches) or pending:
+                    while next_batch < len(batches) and len(pending) < self.max_concurrent_batches:
+                        pending[executor.submit(self._attempt_batch, batches[next_batch])] = next_batch
+                        next_batch += 1
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    # Observe all completed failures before scheduling more paid
+                    # work, even if an earlier case is still in flight.
+                    for future in done:
+                        results[pending.pop(future)] = future.result()
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                raise
+        for index in range(len(batches)):
+            yield results[index]
+
+    def _attempt_batch(self, batch: list[DivergenceSpan]):
+        try:
+            return batch, self._adjudicate_batch(batch), False
+        except (ProviderError, OSError) as exc:
+            return batch, None, _is_request_timeout(exc)
+
     def _adjudicate_batch(self, batch: list[DivergenceSpan]) -> list[dict[str, object]]:
         snippets = {span.case_id: self.audio_snippets[span.case_id] for span in batch if span.case_id in self.audio_snippets}
         if self.audio_snippet_batches is not None:
@@ -214,10 +275,11 @@ class AdjudicationEngine:
 
         return decisions, list(invalid_spans.values())
 
-    def _scene_batches(self, spans: list[DivergenceSpan]) -> list[list[DivergenceSpan]]:
+    def _scene_batches(self, spans: list[DivergenceSpan], *, max_batch_spans: int | None = None) -> list[list[DivergenceSpan]]:
         if not spans:
             return []
 
+        batch_limit = self.max_batch_spans if max_batch_spans is None else max_batch_spans
         batches: list[list[DivergenceSpan]] = [[spans[0]]]
         previous = spans[0]
         for span in spans[1:]:
@@ -241,11 +303,11 @@ class AdjudicationEngine:
         scene_chunks = [
             chunk
             for batch in annotated_scenes
-            for chunk in _split_span_batch_by_size(batch, _MAX_ADJUDICATION_BATCH_SPANS)
+            for chunk in _split_span_batch_by_size(batch, batch_limit)
         ]
         if len(scene_chunks) <= _MAX_UNPACKED_SCENE_BATCHES:
             return scene_chunks
-        return _pack_scene_chunks(scene_chunks, _MAX_ADJUDICATION_BATCH_SPANS)
+        return _pack_scene_chunks(scene_chunks, batch_limit)
 
     @staticmethod
     def _span_for_payload(
@@ -262,6 +324,19 @@ class AdjudicationEngine:
         if index < len(spans):
             return spans[index]
         return None
+
+
+def _is_request_timeout(exc: BaseException) -> bool:
+    current = exc
+    for _ in range(4):
+        if isinstance(current, TimeoutError) or getattr(current, "code", None) == 504:
+            return True
+        if type(current).__name__ in {"ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"}:
+            return True
+        current = current.__cause__
+        if current is None:
+            break
+    return False
 
 
 def confidence_gated_decision(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import sqlite3
 import threading
@@ -14,7 +15,13 @@ from typing import Callable, Literal
 
 from dubsync.audio import AudioNormalizationLimits, tree_size_bytes
 from dubsync.pipeline import sync_episode
-from dubsync.providers import GEMINI_TRANSCRIBE_DISABLED_MESSAGE, GEMINI_TRANSCRIBE_MODEL
+from dubsync.providers import (
+    GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
+    GEMINI_TRANSCRIBE_MODEL,
+    MAI_TRANSCRIBE_MODEL,
+    ProviderError,
+    SCRIBE_TRANSCRIBE_MODEL,
+)
 from dubsync.srt_io import parse_srt_text
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import derive_style_profile
@@ -29,9 +36,27 @@ logger = logging.getLogger(__name__)
 JobMode = Literal["sync", "generate"]
 JobStatus = Literal["queued", "processing", "complete", "failed"]
 STALE_JOB_ERROR = "Processing timed out or was interrupted. Please submit the files again."
+GENERIC_JOB_ERROR = "Processing failed. Check the input files and try again."
+PROVIDER_JOB_ERRORS = {
+    "authentication": (
+        "The transcription provider rejected authentication. "
+        "Check the server API key and model access, then retry."
+    ),
+    "configuration": (
+        "The transcription provider is not configured. Set the server API key, then retry."
+    ),
+    "credits": (
+        "The transcription provider has insufficient credits. Add credits to its account, then retry."
+    ),
+    "rate_limit": "The transcription provider's rate limit was reached. Try again later.",
+}
 STORAGE_RESERVATION_FILENAME = ".storage-reservation"
 STORAGE_RESERVATION_TEMP_FILENAME = ".storage-reservation.tmp"
 AUTO_FPS_DB_SENTINEL = 0.0
+TRANSCRIPTION_PROVIDER_CHECK = (
+    "CHECK(transcription_provider IN "
+    "('default', 'gemini-3.5-transcribe', 'microsoft/mai-transcribe-2', 'scribe_v2'))"
+)
 
 
 class OutstandingJobLimitError(RuntimeError):
@@ -89,21 +114,25 @@ class JobStore:
         self._initialize()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, foreign_keys: bool = True) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=30)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
             with connection:
                 yield connection
         finally:
             connection.close()
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        # SQLite requires foreign keys disabled before the transaction to rebuild
+        # a referenced table without cascading deletes. The whole migration is
+        # atomic, checked for referential integrity, and serialized across workers.
+        with self._connect(foreign_keys=False) as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     token_hash TEXT NOT NULL,
@@ -130,7 +159,7 @@ class JobStore:
                     cue_count INTEGER,
                     error TEXT,
                     transcription_provider TEXT NOT NULL DEFAULT 'default'
-                        CHECK(transcription_provider IN ('default', 'gemini-3.5-transcribe'))
+                        {TRANSCRIPTION_PROVIDER_CHECK}
                 )
                 """
             )
@@ -144,12 +173,62 @@ class JobStore:
                 ("batch_position", "INTEGER"),
                 (
                     "transcription_provider",
-                    "TEXT NOT NULL DEFAULT 'default' "
-                    "CHECK(transcription_provider IN ('default', 'gemini-3.5-transcribe'))",
+                    f"TEXT NOT NULL DEFAULT 'default' {TRANSCRIPTION_PROVIDER_CHECK}",
                 ),
             ):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}")
+            self._migrate_transcription_provider_constraint(connection)
+
+    @staticmethod
+    def _migrate_transcription_provider_constraint(connection: sqlite3.Connection) -> None:
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+        ).fetchone()[0]
+        if MAI_TRANSCRIBE_MODEL in schema and SCRIBE_TRANSCRIBE_MODEL in schema:
+            return
+        widened_schema, changes = re.subn(
+            r"CHECK\s*\(\s*transcription_provider\s+IN\s*\([^)]*\)\s*\)",
+            TRANSCRIPTION_PROVIDER_CHECK,
+            schema,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if changes != 1:
+            raise RuntimeError("Unrecognized jobs transcription provider constraint; migration aborted")
+        rebuilt_schema, renamed = re.subn(
+            r'^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`\[]?jobs["`\]]?(?=\s*\()',
+            "CREATE TABLE jobs_transcription_migration",
+            widened_schema,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if renamed != 1:
+            raise RuntimeError("Unrecognized jobs table schema; migration aborted")
+        dependent_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'jobs' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        ).fetchall()
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()]
+        quoted_columns = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+        connection.execute(rebuilt_schema)
+        connection.execute(
+            f"INSERT INTO jobs_transcription_migration ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM jobs"
+        )
+        connection.execute("DROP TABLE jobs")
+        # Views still point to jobs during the brief table replacement. Avoid
+        # SQLite validating or rewriting those definitions while jobs is absent.
+        legacy_alter_table = connection.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        connection.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            connection.execute("ALTER TABLE jobs_transcription_migration RENAME TO jobs")
+        finally:
+            connection.execute(f"PRAGMA legacy_alter_table={int(legacy_alter_table)}")
+        for row in dependent_schema:
+            connection.execute(row[0])
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("Jobs migration failed foreign key validation")
 
     def healthcheck(self) -> bool:
         with self._connect() as connection:
@@ -399,13 +478,24 @@ class JobStore:
             **({"expires_at": _iso(expires_at)} if expires_at is not None else {}),
         )
 
-    def mark_failed(self, job_id: str, *, expires_at: datetime | None = None) -> JobRecord:
+    def mark_failed(
+        self,
+        job_id: str,
+        *,
+        failure: Exception | None = None,
+        expires_at: datetime | None = None,
+    ) -> JobRecord:
+        # Only known provider codes may select public text; exception messages can
+        # contain upstream response bodies or credentials and must stay private.
+        error = GENERIC_JOB_ERROR
+        if isinstance(failure, ProviderError):
+            error = PROVIDER_JOB_ERRORS.get(failure.code, GENERIC_JOB_ERROR)
         return self._update(
             job_id,
             expected_statuses=("queued", "processing"),
             status="failed",
             progress=100,
-            error="Processing failed. Check the input files and try again.",
+            error=error,
             **({"expires_at": _iso(expires_at)} if expires_at is not None else {}),
         )
 
@@ -651,10 +741,10 @@ class JobService:
                 max_bytes=self.settings.max_job_storage_bytes,
             )
             self.store.mark_complete(job.id, artifacts, expires_at=terminal_expiry())
-        except Exception:
+        except Exception as exc:
             logger.exception("DubSync job %s failed", job.id)
             _remove_generated_job_files(job)
-            self.store.mark_failed(job.id, expires_at=terminal_expiry())
+            self.store.mark_failed(job.id, failure=exc, expires_at=terminal_expiry())
         finally:
             self.store.release_job_storage(job.directory)
 
@@ -670,9 +760,15 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     output_path = job.directory / output_name
     workdir = job.directory / "work"
     language = None if job.language == "auto" else job.language
-    uses_gemini_transcribe = job.transcription_provider == GEMINI_TRANSCRIBE_MODEL
-    if uses_gemini_transcribe:
+    if job.transcription_provider == GEMINI_TRANSCRIBE_MODEL:
         raise ValueError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
+    if job.transcription_provider not in {"default", MAI_TRANSCRIBE_MODEL, SCRIBE_TRANSCRIBE_MODEL}:
+        raise ValueError("Invalid transcription provider.")
+    # Old queued jobs used 'default' to select Scribe. Changing the deployment
+    # default must not silently switch the provider of an already accepted job.
+    transcription_provider = (
+        SCRIBE_TRANSCRIBE_MODEL if job.transcription_provider == "default" else job.transcription_provider
+    )
     audio_limits = AudioNormalizationLimits(
         max_duration_seconds=settings.max_audio_duration_seconds,
         probe_timeout_seconds=settings.ffprobe_timeout_seconds,
@@ -689,7 +785,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "providers_path": settings.providers_path,
             "fps": job.fps,
             "language": language,
-            "transcription_provider": job.transcription_provider,
+            "transcription_provider": transcription_provider,
             "allow_gemini_transcribe_web": False,
             "audio_limits": audio_limits,
         }
@@ -719,7 +815,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "providers_path": settings.providers_path,
             "fps": job.fps,
             "language": language,
-            "transcription_provider": job.transcription_provider,
+            "transcription_provider": transcription_provider,
             "allow_gemini_transcribe_web": False,
             "audio_limits": audio_limits,
         }
@@ -794,7 +890,7 @@ def new_job_record(
     source_name: str | None = None,
     batch_id: str | None = None,
     batch_position: int | None = None,
-    transcription_provider: str = "default",
+    transcription_provider: str = SCRIBE_TRANSCRIBE_MODEL,
 ) -> JobRecord:
     now = datetime.now(UTC)
     return JobRecord(

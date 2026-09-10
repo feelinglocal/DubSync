@@ -1,6 +1,6 @@
 # DubSync Commercial MVP Plan
 
-**Status:** implemented, tested locally, and deployed to the Render default domain as of 2026-07-11
+**Status:** implemented, tested locally, and deployed to the Render default domain as of 2026-07-11. The September 10, 2026 provider and audio-context changes described below are local work; that historical deployment does not establish their release status.
 **Engine contract:** `PLAN.md` remains authoritative for subtitle timing and reconciliation behavior.  
 **Product contact:** rey@feelslocal.com
 
@@ -66,8 +66,10 @@ flowchart LR
     A --> D["Persistent disk"]
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
-    F --> E["ElevenLabs Scribe v2"]
-    W --> G["Gemini 3.7 Flash adjudication and punctuation passes"]
+    F --> E["ElevenLabs Scribe v2 (default)"]
+    F --> M["MAI-Transcribe 2 via OpenRouter (selectable)"]
+    W --> G["Gemini 3.8 Flash adjudication (medium thinking)"]
+    W --> P["Gemini 3.7 Flash punctuation (medium thinking)"]
     W --> H["OpenAI GPT-5.6 Luna speaker-mapping pass"]
     W --> C["Deterministic DubSync core"]
     C --> D
@@ -107,7 +109,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
+- Secrets: `ELEVENLABS_API_KEY` for default transcription, optional `OPENROUTER_API_KEY` for MAI, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -118,7 +120,7 @@ Current baseline infrastructure cost:
 | Render persistent SSD | $0.25/GB/month | $2.50 for 10 GB |
 | Total before bandwidth and providers |  | **$9.50/month** |
 
-Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes source audio to 16 kHz mono before provider upload, which materially reduces service-initiated bandwidth.
+Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes audio to 16 kHz mono for transcription and timing. Gemini full-episode context uses the normalized WAV for short audio; long audio is prepared once as mono 24 kHz, 64 kbps MP3 and reused through the Files API and a bounded job-owned cache. Focused case clips remain WAV. See the [README audio-context policy](../README.md#gemini-audio-context) for transport limits, cache cleanup, cost uncertainty, and source-hold behavior.
 
 Local release verification validates `render.yaml` against Render's published JSON Schema. GitHub auto-deploys the Docker service to Render. The health endpoint includes Render's injected commit SHA so a release can be verified without relying on dashboard status alone.
 
@@ -136,10 +138,12 @@ For a single-file or multi-file order, quote `max(total source-audio minutes × 
 
 Current provider price anchors:
 
+- Microsoft MAI-Transcribe 2 via OpenRouter: $0.10/hour launch catalog rate verified September 5, 2026. OpenRouter `usage.cost` takes precedence in metering; the hourly rate remains configurable. Scribe v2 is the default transcription option; MAI remains selectable.
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
-- Gemini 3.7 Flash Standard paid tier through December 31, 2026: $0.75 per million input tokens and $3.75 per million output tokens, including thinking tokens. Starting January 1, 2027, the Standard paid tier is $1.50 per million input tokens and $7.50 per million output tokens.
-- The 2026-08-14 paid `testing 4` replay measured $0.20228 for Gemini adjudication plus punctuation over 258.9 seconds of source audio with complete ordered episode context. Re-benchmark representative long-form jobs before quoting from older per-episode LLM assumptions.
-- Every job already writes measured provider cost to `cost.json`; this is the source of truth for repricing.
+- Gemini 3.7 Flash punctuation retains medium thinking. Its recorded Standard paid-tier price is $0.75 per million input tokens and $3.75 per million output tokens through December 31, 2026, including thinking tokens, then $1.50/$7.50 starting January 1, 2027. These are the recorded 3.7 price anchors, not a quote for 3.8 adjudication.
+- Gemini 3.8 Flash adjudication uses medium thinking. Meter generation, cache creation, and cache storage separately with the resolved model prices; Files API reuse alone does not remove input-token charges.
+- The August 14, 2026 paid `testing 4` replay measured $0.20228 for the historical Gemini 3.7 adjudication and punctuation route over 258.9 seconds of source audio with complete ordered episode context. This is not a cost or quality measurement of the September 10 Gemini 3.8 full-audio route. Re-benchmark representative long-form jobs before quoting from older per-episode LLM assumptions.
+- Every job writes provider cost to `cost.json`: OpenRouter-reported audio charges are marked `audio_billed`, while Scribe audio and missing-usage fallbacks use catalog estimates. Token charges use reported usage with configured token prices. Distinguish these bases when repricing.
 
 Margin rule:
 
@@ -191,7 +195,7 @@ Before accepting paid customer media:
 
 - Keep the GitHub repository connected to the Render service.
 - Validate the Blueprint against Render's published schema.
-- Set paid ElevenLabs, OpenAI, and Gemini credentials in Render.
+- Set paid ElevenLabs, OpenAI, and Gemini credentials in Render; set OpenRouter credentials when enabling selectable MAI transcription.
 - Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
 - Run one short live generate job through the web route for each provider or model change.
 - Keep fixture-backed sync and generate browser tests green on every release.
@@ -229,6 +233,7 @@ Do not log transcript text, API keys, job tokens, uploaded filenames, or raw pro
 - Render Blueprint specification: https://render.com/docs/blueprint-spec
 - ElevenLabs API pricing: https://elevenlabs.io/pricing/api
 - Gemini 3.7 Flash capabilities and stable model ID: https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+- Gemini 3.8 Flash adjudication model: https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
 - Gemini thinking levels: https://ai.google.dev/gemini-api/docs/thinking
 - Gemini audio understanding and inline audio input: https://ai.google.dev/gemini-api/docs/generate-content/audio
 - Gemini API pricing: https://ai.google.dev/gemini-api/docs/pricing

@@ -62,8 +62,11 @@ def test_keep_srt_divergence_without_existing_match_does_not_gain_asr_timing():
 
 def test_recue_ceil_snaps_end_so_last_syllable_is_not_cut():
     cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Das Ding ist mindestens Level 15."])]
-    words = [Word(text="funfzehn.", start=0.25, end=0.501, confidence=0.95)]
-    alignment = AlignmentResult(cue_word_indices={1: [0]})
+    words = [
+        Word(text=text, start=index * 0.05, end=index * 0.05 + 0.04, confidence=0.95)
+        for index, text in enumerate(["Das", "Ding", "ist", "mindestens", "Level"])
+    ] + [Word(text="funfzehn.", start=0.25, end=0.501, confidence=0.95)]
+    alignment = AlignmentResult(cue_word_indices={1: list(range(len(words)))})
     profile = StyleProfile(fps=30.0, min_cue_dur=0.1, tail_ms=0)
 
     rebuilt, flags = rebuild_cues(cues, words, alignment, profile)

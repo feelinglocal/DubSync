@@ -18,6 +18,11 @@ const configResponse = {
   billing_enabled: false,
   access_code_required: false,
   jobs_available: true,
+  default_transcription_provider: 'scribe_v2',
+  transcription_models: [
+    { id: 'microsoft/mai-transcribe-2', label: 'MAI-Transcribe 2', available: true },
+    { id: 'scribe_v2', label: 'Scribe v2', available: true },
+  ],
   gemini_transcribe_testing_available: false,
   gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {
@@ -96,7 +101,7 @@ describe('DubSync workspace', () => {
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
     expect(await screen.findByText('Files are deleted after 24 hours')).toBeVisible()
     expect(await screen.findByText(/Manual quote and invoice before paid processing/i)).toBeVisible()
-    expect(await screen.findByText(/Render, ElevenLabs, OpenAI, and Gemini processing/)).toBeVisible()
+    expect(await screen.findByText(/Render, Microsoft through OpenRouter, ElevenLabs, OpenAI, and Gemini processing/)).toBeVisible()
     expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
     expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
     expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
@@ -188,7 +193,7 @@ describe('DubSync workspace', () => {
     await user.click(screen.getByRole('button', { name: 'Start sync' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
   })
 
   it('keeps audio-to-SRT generation on the default transcription provider', async () => {
@@ -211,7 +216,7 @@ describe('DubSync workspace', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect((fetchMock.mock.calls[1][1]?.body as FormData).get('mode')).toBe('generate')
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
   })
 
   it('keeps sync batches on the default transcription provider', async () => {
@@ -237,7 +242,7 @@ describe('DubSync workspace', () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     expect(fetchMock.mock.calls[1][0]).toBe('/api/batches')
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
   })
 
   it('does not request Gemini 3.5 Transcribe when the testing toggle is left unchecked', async () => {
@@ -260,7 +265,73 @@ describe('DubSync workspace', () => {
     await user.click(screen.getByRole('button', { name: 'Start sync' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('transcription_provider')).toBe(false)
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
+  })
+
+  it.each([
+    ['sync', 1], ['sync', 2], ['generate', 1], ['generate', 2],
+  ])('offers Scribe by default and submits optional MAI for %s with %i files', async (mode, count) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(
+      count === 2 ? completedBatchResponse : completedBatchResponse.jobs[0],
+    ), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const modelSelect = screen.getByRole('combobox', { name: 'Transcription model' })
+    expect(modelSelect).toHaveValue('scribe_v2')
+    expect(within(modelSelect).getByRole('option', { name: 'Scribe v2 (default)' })).toBeEnabled()
+    await user.selectOptions(modelSelect, 'microsoft/mai-transcribe-2')
+    if (mode === 'generate') await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    expect(modelSelect).toHaveValue('microsoft/mai-transcribe-2')
+    await user.upload(screen.getByLabelText('Dialogue audio'), Array.from({ length: count }, (_, index) => (
+      new File(['audio'], `00${index + 1}.wav`, { type: 'audio/wav' })
+    )))
+    if (mode === 'sync') {
+      await user.upload(screen.getByLabelText('Original SRT'), Array.from({ length: count }, (_, index) => (
+        new File(['subtitle'], `00${index + 1}.srt`, { type: 'application/x-subrip' })
+      )))
+    }
+    await user.click(screen.getByRole('button', { name: mode === 'sync' ? 'Start sync' : 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls[1][0]).toBe(count === 2 ? '/api/batches' : '/api/jobs')
+    const body = fetchMock.mock.calls[1][1]?.body as FormData
+    expect(body.get('transcription_provider')).toBe('microsoft/mai-transcribe-2')
+    expect(body.get('mode')).toBe(mode)
+  })
+
+  it('keeps unavailable Scribe selected until the user chooses an available model', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ...configResponse,
+      transcription_models: configResponse.transcription_models.map((model) => ({
+        ...model, available: model.id === 'microsoft/mai-transcribe-2',
+      })),
+    }), { status: 200 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByText('Scribe v2 is currently unavailable. Choose an available model to continue.')
+    const modelSelect = screen.getByRole('combobox', { name: 'Transcription model' })
+    expect(modelSelect).toHaveValue('scribe_v2')
+    expect(within(modelSelect).getByRole('option', { name: 'Scribe v2 (default) (unavailable)' })).toBeDisabled()
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+
+    await user.selectOptions(modelSelect, 'microsoft/mai-transcribe-2')
+    expect(screen.queryByText(/is currently unavailable. Choose an available model/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeEnabled()
+  })
+
+  it('does not assume model availability when the server omits model configuration', async () => {
+    const { transcription_models: _models, default_transcription_provider: _default, ...legacyConfig } = configResponse
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(legacyConfig), { status: 200 }))
+    render(<App />)
+    expect(await screen.findByText('Scribe v2 is currently unavailable. Choose an available model to continue.')).toBeVisible()
+    expect(screen.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
   })
 
   it('clearly marks precision processing as coming soon', async () => {

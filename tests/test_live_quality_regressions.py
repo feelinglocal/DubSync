@@ -155,7 +155,8 @@ def test_cross_cue_full_drop_does_not_leave_punctuation_only_cues() -> None:
         end=2.4,
         confidence=0.99,
         speaker_ids=["A"],
-        srt_token_indices=list(range(11)),
+        # The four source cues contain 3 + 1 + 4 + 2 tokens: indices 0..9.
+        srt_token_indices=list(range(10)),
         asr_word_indices=[11],
     )
     decision = AdjudicationDecision(
@@ -176,6 +177,36 @@ def test_cross_cue_full_drop_does_not_leave_punctuation_only_cues() -> None:
 
     assert [cue.index for cue in transformed] == [1]
     assert transformed[0].plain_text == "Ah!"
+
+
+def test_cross_cue_full_drop_holds_when_source_indices_overrun_the_cues() -> None:
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=500, lines=["Für eine Suppe,"]),
+        Cue(index=2, start_ms=500, end_ms=1000, lines=["Idiot!"]),
+        Cue(index=3, start_ms=1000, end_ms=1500, lines=["Gib dir die Schuld,"]),
+        Cue(index=4, start_ms=1500, end_ms=2000, lines=["du Dummkopf."]),
+    ]
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1, 2, 3, 4],
+        srt_text="Für eine Suppe Idiot Gib dir die Schuld du Dummkopf",
+        asr_text="Ah",
+        # Regression for the formerly malformed fixture: token 10 is absent.
+        srt_token_indices=list(range(11)),
+        asr_word_indices=[11],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1", verdict="use_audio", final_text="Ah!",
+        confidence=0.99, reason="fixture containing an out-of-range source token",
+    )
+
+    transformed, flags = apply_adjudication_decisions(
+        cues, [span], [decision], StyleProfile(),
+    )
+
+    assert transformed == cues
+    assert [flag.kind for flag in flags] == ["adjudication_span_edit_held"]
+    assert flags[0].cue_ids == [1, 2, 3, 4]
 
 
 def test_nearby_same_speaker_insertion_moves_terminal_punctuation() -> None:

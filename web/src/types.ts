@@ -1,5 +1,17 @@
 export type JobMode = 'sync' | 'generate'
 export type JobStatus = 'queued' | 'processing' | 'complete' | 'failed'
+export type TranscriptionProvider = 'microsoft/mai-transcribe-2' | 'scribe_v2'
+
+export const transcriptionModelLabels: Record<TranscriptionProvider, string> = {
+  scribe_v2: 'Scribe v2',
+  'microsoft/mai-transcribe-2': 'MAI-Transcribe 2',
+}
+
+export const defaultTranscriptionProvider: TranscriptionProvider = 'scribe_v2'
+
+export const unavailableTranscriptionModels = Object.entries(transcriptionModelLabels).map(([id, label]) => ({
+  id: id as TranscriptionProvider, label, available: false,
+}))
 
 export interface PricingTier {
   usd_per_minute: number
@@ -50,6 +62,8 @@ export interface PublicConfig {
   billing_enabled: boolean
   access_code_required: boolean
   jobs_available: boolean
+  default_transcription_provider?: TranscriptionProvider
+  transcription_models?: { id: TranscriptionProvider; label: string; available: boolean }[]
   gemini_transcribe_testing_available?: boolean
   gemini_transcribe_max_audio_seconds?: number
   generation_styles: GenerationStylesConfig
@@ -77,7 +91,7 @@ export interface JobResponse {
   source_name?: string | null
   batch_id?: string | null
   batch_position?: number | null
-  transcription_provider?: 'default'
+  transcription_provider?: TranscriptionProvider | 'default'
   mode: JobMode
   status: JobStatus
   progress: number
@@ -106,6 +120,8 @@ export const defaultConfig: PublicConfig = {
   billing_enabled: false,
   access_code_required: false,
   jobs_available: false,
+  default_transcription_provider: defaultTranscriptionProvider,
+  transcription_models: unavailableTranscriptionModels,
   gemini_transcribe_testing_available: false,
   gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {

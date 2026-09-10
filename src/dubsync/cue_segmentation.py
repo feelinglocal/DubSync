@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from math import isfinite
 
 from .models import AlignmentResult, Cue, QCFlag, Word
+from .recue import timing_evidence_issue
 from .style_profile import StyleProfile
 from .subtitle_annotations import (
     cue_has_bracketed_screen_text,
@@ -11,6 +13,197 @@ from .subtitle_annotations import (
 )
 from .text_metrics import contains_character_level_script, wrap_visual_width
 from .tokenize import alphanumeric_signature
+
+
+def split_speaker_turn_cues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    protected_cue_ids: set[int] | None = None,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], dict[int, list[int]]]:
+    """Separate acoustically mapped actor turns independently of line limits.
+
+    This does not rewrite dialogue or infer speakers from punctuation. Every
+    retained lexical token must map exactly to a local, diarized word window.
+    Uncertain mappings stay intact for review rather than being divided by
+    token counts, which can attach improvised clauses to the wrong actor.
+    """
+    protected = protected_cue_ids or set()
+    next_cue_id = max((cue.index for cue in cues), default=0) + 1
+    cue_word_indices = {key: list(value) for key, value in alignment.cue_word_indices.items()}
+    output: list[Cue] = []
+    flags: list[QCFlag] = []
+    expansions: dict[int, list[int]] = {}
+    # Cue and word boundaries can straddle one output frame. Keep this
+    # quantization allowance capped at a 24fps frame even with a low fps
+    # setting; it must not materially widen the local evidence envelope.
+    local_padding_seconds = 1.5 + min(profile.frame_ms / 1000.0, 1.0 / 24.0)
+
+    for cue in cues:
+        if cue.index in protected or cue_has_bracketed_screen_text(cue) or any(mark in cue.text for mark in "♪♫"):
+            output.append(cue)
+            continue
+        candidate_indices = _ordered_valid_word_indices(words, cue_word_indices.get(cue.index, []))
+        if len({words[index].speaker_id for index in candidate_indices if words[index].speaker_id}) < 2:
+            output.append(cue)
+            continue
+        retained, mapping_status = _retained_word_window(cue.plain_text, words, candidate_indices)
+        reason: str | None = None
+        if mapping_status == "unavailable" or not _has_unique_exact_text_window(cue.plain_text, words, retained):
+            reason = "The dialogue does not have a unique exact lexical mapping to the candidate ASR words."
+        elif any(
+            not word.speaker_id or not isfinite(word.start) or not isfinite(word.end)
+            or word.end <= word.start or word.end - word.start > 2.0
+            for word in (words[index] for index in retained)
+        ):
+            reason = "A word has missing speaker identity or unreliable timing at the possible actor boundary."
+        elif (
+            min(words[index].start for index in retained) < cue.start_ms / 1000 - local_padding_seconds
+            or max(words[index].end for index in retained) > cue.end_ms / 1000 + local_padding_seconds
+        ):
+            reason = "The matched words lie too far outside this cue's local timing envelope."
+        elif _has_inline_subtitle_markup(cue.text):
+            reason = "Inline subtitle styling cannot safely be redistributed across actor turns."
+
+        groups = _speaker_word_runs(words, retained) if reason is None else []
+        if reason is None and len(groups) <= 1:
+            if retained != candidate_indices:
+                # An accepted fragment can retain only one actor from a wider
+                # divergence span. Its neighboring actors still must not lend
+                # their onset/end times merely because no split is necessary.
+                cue_word_indices[cue.index] = list(retained)
+                if cue.speaker_id != words[retained[0]].speaker_id:
+                    cue = cue.model_copy(update={"character": None})
+                flags.append(QCFlag(
+                    kind="speaker_turn_word_window_refined", cue_ids=[cue.index], severity="warning",
+                    message=(
+                        "Retained dialogue matched one unique local ASR word window; "
+                        f"{len(candidate_indices) - len(retained)} neighboring candidate words were "
+                        "excluded from this cue's timing. Other cue ownership was preserved."
+                    ),
+                    new_text=cue.text, start=cue.start_ms / 1000, end=cue.end_ms / 1000,
+                ))
+            output.append(cue)
+            continue
+        if reason is None and _has_unstable_speaker_runs(words, groups):
+            reason = "Speaker labels alternate inside unfinished single-word fragments; the actor boundary is ambiguous."
+
+        text = _text_without_dialogue_markers(cue.plain_text)
+        units, separator = _split_units(text)
+        text_chunks = _exact_text_chunks_for_word_groups(units, separator, groups, words) if reason is None else None
+        if reason is None and text_chunks is None:
+            reason = "A speaker boundary falls inside a text unit and cannot be split without guessing ownership."
+        if reason is not None:
+            output.append(cue)
+            flags.append(QCFlag(
+                kind="speaker_turn_split_held", cue_ids=[cue.index], severity="warning",
+                message=f"{reason} The cue was preserved for speaker review.",
+                old_text=cue.text, start=cue.start_ms / 1000, end=cue.end_ms / 1000,
+            ))
+            continue
+
+        timing_issue = None
+        for group, chunk in zip(groups, text_chunks, strict=True):
+            timing_issue = timing_evidence_issue(cue.with_lines([chunk]), [words[index] for index in group])
+            if timing_issue is not None:
+                break
+        if timing_issue is not None:
+            held = _preserve_explicit_dialogue_turn_lines(cue)
+            output.append(held)
+            flags.append(QCFlag(
+                kind="timing_evidence_held", cue_ids=[cue.index], severity="error",
+                message=(
+                    f"{timing_issue} Speaker splitting was held; the complete approved parent "
+                    "dialogue and its input timing were preserved without inventing child boundaries."
+                ),
+                old_text=cue.text, new_text=held.text, start=cue.start_ms / 1000, end=cue.end_ms / 1000,
+            ))
+            continue
+
+        replacements: list[Cue] = []
+        replacement_ids: list[int] = []
+        for position, (group, chunk) in enumerate(zip(groups, text_chunks, strict=True)):
+            cue_id = cue.index if position == 0 else next_cue_id
+            if position > 0:
+                next_cue_id += 1
+            replacement_ids.append(cue_id)
+            cue_word_indices[cue_id] = list(group)
+            group_words = [words[index] for index in group]
+            speaker_id = group_words[0].speaker_id
+            start_ms = profile.snap_floor(max(0, group_words[0].start * 1000 - profile.lead_in_ms))
+            spoken_end = max(word.end for word in group_words)
+            end_ms = profile.snap_ceil(spoken_end * 1000 + profile.tail_ms)
+            if position + 1 < len(groups):
+                following_start = words[groups[position + 1][0]].start
+                if spoken_end <= following_start:
+                    # A readability minimum must not extend one actor over the
+                    # next actor. Preserve real acoustic overlap when present.
+                    end_ms = min(end_ms, max(
+                        profile.snap_ceil(spoken_end * 1000),
+                        profile.snap_floor(following_start * 1000 - profile.lead_in_ms),
+                    ))
+            replacements.append(cue.model_copy(update={
+                "index": cue_id, "start_ms": start_ms, "end_ms": max(start_ms + 1, end_ms),
+                "lines": wrap_visual_width(chunk, profile.max_chars_per_line) or [chunk],
+                "speaker_id": speaker_id,
+                "character": cue.character if cue.speaker_id == speaker_id else None,
+            }))
+        output.extend(replacements)
+        expansions[cue.index] = replacement_ids
+        flags.append(QCFlag(
+            kind="speaker_turn_split", cue_ids=replacement_ids, severity="info",
+            message="Dialogue was separated at exact, locally timed ASR speaker turns, preserving all spoken tokens.",
+            old_text=cue.text, new_text="\n\n".join(item.text for item in replacements),
+            start=replacements[0].start_ms / 1000, end=max(item.end_ms for item in replacements) / 1000,
+        ))
+
+    return output, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, expansions
+
+
+def _speaker_word_runs(words: list[Word], word_indices: list[int]) -> list[list[int]]:
+    groups: list[list[int]] = []
+    for index in word_indices:
+        if not groups or words[groups[-1][-1]].speaker_id != words[index].speaker_id:
+            groups.append([])
+        groups[-1].append(index)
+    return groups
+
+
+def _has_unstable_speaker_runs(words: list[Word], groups: list[list[int]]) -> bool:
+    if len(groups) <= 2:
+        return False
+    token_counts = [len(alphanumeric_signature(" ".join(words[index].text for index in group))) for group in groups]
+    completed = [_ends_sentence(words[group[-1]].text) for group in groups]
+    for position, token_count in enumerate(token_counts):
+        if token_count >= 2 or completed[position]:
+            continue
+        # A complete neighboring phrase supports a short reaction at either
+        # edge. Interior unfinished singletons, and word-by-word alternation
+        # without such a phrase, still cannot establish a reliable turn.
+        neighbor = 1 if position == 0 else position - 1 if position == len(groups) - 1 else None
+        if neighbor is None or token_counts[neighbor] < 2 or not completed[neighbor]:
+            return True
+    return False
+
+
+def _text_without_dialogue_markers(text: str) -> str:
+    """Remove presentation-only dashes when rebuilding explicit actor turns."""
+    if re.match(r"^\s*[-–—](?:[.!?…])?(?=\s|$)", text):
+        text = re.sub(r"(?<!\S)[-–—](?:[.!?…])?(?=\s|$)", "", text)
+    return " ".join(text.split())
+
+
+def _preserve_explicit_dialogue_turn_lines(cue: Cue) -> Cue:
+    """Only move already authored turn markers onto separate display lines."""
+    text = cue.plain_text
+    if not re.match(r"^[-–—]\s+\S", text):
+        return cue
+    turns = re.split(r"\s+(?=[-–—]\s+\S)", text)
+    if len(turns) <= 1 or not all(alphanumeric_signature(turn) for turn in turns):
+        return cue
+    return cue.with_lines(turns)
 
 
 def group_words_for_cues(
