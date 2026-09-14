@@ -134,11 +134,15 @@ def test_cache_serialization_failure_preserves_previous_value(tmp_path):
     assert cache.read(key) == {"words": ["complete"]}
 
 
-def test_resume_verify_rejects_prior_rebuild_policy_before_overwriting(tmp_path):
+@pytest.mark.parametrize("prior_policy", [None, 4, 6])
+def test_resume_verify_rejects_prior_rebuild_policy_before_overwriting(tmp_path, prior_policy):
     options, first = _sync_fixture(tmp_path)
     path = first.episode_workdir / "rebuild.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload.pop("policy_version")
+    if prior_policy is None:
+        payload.pop("policy_version")
+    else:
+        payload["policy_version"] = prior_policy
     path.write_text(json.dumps(payload), encoding="utf-8")
     before = first.output_srt.read_bytes()
 
@@ -146,6 +150,12 @@ def test_resume_verify_rejects_prior_rebuild_policy_before_overwriting(tmp_path)
         sync_episode(**options, resume="verify")
 
     assert first.output_srt.read_bytes() == before
+
+    # Current alignment/decision artifacts can rebuild under the new ownership
+    # policy; verify must not silently reuse the old pre-repair cue assignment.
+    rebuilt = sync_episode(**options, resume="rebuild")
+    assert rebuilt.output_srt.read_bytes() == before
+    assert json.loads(path.read_text(encoding="utf-8"))["policy_version"] > 6
 
 
 def test_resume_verify_rechecks_new_confidence_gate_even_for_keep_srt(tmp_path):

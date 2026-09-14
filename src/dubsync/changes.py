@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from math import isfinite
 
+from .adjudication_regions import is_joint_region
 from .editorial_guard import (
     EditorialGuardError,
     validate_adjudication_editorial_contract,
     validate_editorial_text,
 )
-from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
+from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag, TokenMatch, Word
 from .style_profile import StyleProfile
 from .subtitle_annotations import (
     alignment_token_character_spans,
@@ -23,12 +26,187 @@ from .tokenize import alphanumeric_signature
 _TERMINAL_PUNCTUATION_RE = re.compile(r"([,.;:!?\u2026]+)\s*$")
 
 
+class ReplacementOwnershipError(ValueError):
+    """A source edit crosses speech groups without a safe ownership cut."""
+
+
+def protected_replacement_targets(span: DivergenceSpan, edits: dict[int, tuple[int, int, str]]) -> set[int]:
+    targets = set(edits) - set(span.cue_ids)
+    if is_joint_region(span):
+        # The joint region newly takes ownership of a formerly retained word
+        # in a fully consumed interior cue as well as its external destination.
+        targets.update(span.cue_ids[1:])
+    return targets
+
+
+@dataclass(frozen=True)
+class WholeCueReplacementPlan:
+    edits: dict[int, tuple[int, int, str]]
+    word_indices_by_cue: dict[int, list[int]]
+
+
+def whole_cue_replacement_plan(
+    cues: list[Cue], span: DivergenceSpan, final_text: str, words: list[Word] | None,
+    *, max_intra_cue_gap: float = 1.5, token_matches: list[TokenMatch] | None = None,
+) -> WholeCueReplacementPlan | None:
+    """Prevent dense-cluster timing from choosing unrelated replacement speech.
+
+    Only a complete indexed source replacement spanning a gap that re-cue
+    would trim needs this guard. A shortened response must identify one exact
+    whole-word window. A complete approved sequence may instead retain its
+    first group and prefix one word to a proved continuation in the next cue.
+    None leaves ordinary single-group and partial-cue edits unchanged.
+    """
+    if len(span.cue_ids) != 1 or len(span.asr_word_indices) < 2 or words is None:
+        return None
+    cue = next((cue for cue in cues if cue.index == span.cue_ids[0]), None)
+    if cue is None or cue_has_bracketed_screen_text(cue):
+        return None
+    source_tokens = alphanumeric_signature(speech_text_for_alignment(cue))
+    offset = _cue_token_offsets(cues)[cue.index]
+    if (
+        not source_tokens or span.srt_token_indices != list(range(offset, offset + len(source_tokens)))
+        or alphanumeric_signature(span.srt_text) != source_tokens
+        or any(index < 0 or index >= len(words) for index in span.asr_word_indices)
+    ):
+        return None
+    selected = [words[index] for index in span.asr_word_indices]
+    ordered = sorted(selected, key=lambda word: (word.start, word.end))
+    if not any(right.start - left.end > max_intra_cue_gap for left, right in zip(ordered, ordered[1:])):
+        return None
+    problem = (
+        "The complete cue replacement spans separate speech groups, but its approved text has no "
+        "unique exact word window within one group. Source text and timing were held for review."
+    )
+    signatures = [alphanumeric_signature(word.text) for word in selected]
+    if (
+        span.asr_word_indices != list(range(span.asr_word_indices[0], span.asr_word_indices[-1] + 1))
+        or any(not signature for signature in signatures)
+        or any(not isfinite(word.start) or not isfinite(word.end) or word.end <= word.start for word in selected)
+        or any(right.start < left.end for left, right in zip(selected, selected[1:]))
+        or [token for signature in signatures for token in signature] != alphanumeric_signature(span.asr_text)
+    ):
+        raise ReplacementOwnershipError(problem)
+    accepted = alphanumeric_signature(final_text)
+    if accepted == [token for signature in signatures for token in signature]:
+        continuation = _whole_cue_continuation_plan(
+            cues, span, final_text, words, token_matches or [], max_intra_cue_gap,
+        )
+        if continuation is not None:
+            return continuation
+    windows: list[tuple[int, int]] = []
+    for start in range(len(selected)):
+        tokens: list[str] = []
+        for end in range(start, len(selected)):
+            tokens.extend(signatures[end])
+            if tokens == accepted:
+                windows.append((start, end + 1))
+            if len(tokens) >= len(accepted):
+                break
+    if len(windows) != 1:
+        raise ReplacementOwnershipError(problem)
+    start, end = windows[0]
+    if any(
+        selected[index + 1].start - selected[index].end > max_intra_cue_gap
+        for index in range(start, end - 1)
+    ):
+        raise ReplacementOwnershipError(problem)
+    return WholeCueReplacementPlan(
+        edits={cue.index: (0, len(source_tokens), final_text)},
+        word_indices_by_cue={cue.index: span.asr_word_indices[start:end]},
+    )
+
+
+def _whole_cue_continuation_plan(
+    cues: list[Cue], span: DivergenceSpan, final_text: str, words: list[Word],
+    token_matches: list[TokenMatch], max_intra_cue_gap: float,
+) -> WholeCueReplacementPlan | None:
+    """Prove a one-word prefix using the next cue's retained acoustic group."""
+    selected = [words[index] for index in span.asr_word_indices]
+    cuts = [position for position in range(1, len(selected))
+            if selected[position].start - selected[position - 1].end > max_intra_cue_gap]
+    if len(cuts) != 1 or cuts[0] != len(selected) - 1 or cuts[0] < 2:
+        return None
+    if len(alphanumeric_signature(selected[-1].text)) != 1 or _has_sentence_terminal(selected[-1].text):
+        return None
+    source_position = next(index for index, cue in enumerate(cues) if cue.index == span.cue_ids[0])
+    if source_position + 1 >= len(cues):
+        return None
+    source, target = cues[source_position:source_position + 2]
+    if (
+        target.index != span.right_anchor_cue_id or cue_has_bracketed_screen_text(target)
+        or any(mark in source.text + target.text + final_text for mark in "♪♫")
+        or span.start != selected[0].start or span.end != selected[-1].end
+        or span.right_anchor_start is None or not isfinite(span.right_anchor_start)
+        or not 0 <= span.right_anchor_start - selected[-1].end <= 0.2
+        or (span.left_anchor_end is not None and (
+            not isfinite(span.left_anchor_end) or span.left_anchor_end > selected[0].start
+        ))
+    ):
+        return None
+    target_tokens = alphanumeric_signature(speech_text_for_alignment(target))
+    offset = _cue_token_offsets(cues)[target.index]
+    retained = sorted((match for match in token_matches if match.cue_id == target.index),
+                      key=lambda match: match.srt_token_index)
+    if (
+        len(retained) < 2 or retained[0].srt_token_index != offset
+        or retained[0].asr_word_index != span.asr_word_indices[-1] + 1
+        or any(
+            match.score != 1.0 or not offset <= match.srt_token_index < offset + len(target_tokens)
+            or not 0 <= match.asr_word_index < len(words)
+            or alphanumeric_signature(words[match.asr_word_index].text) != [target_tokens[match.srt_token_index - offset]]
+            for match in retained
+        )
+        or any(right.srt_token_index <= left.srt_token_index or right.asr_word_index <= left.asr_word_index
+               for left, right in zip(retained, retained[1:]))
+        or not any(right.srt_token_index == left.srt_token_index + 1 and right.asr_word_index == left.asr_word_index + 1
+                   for left, right in zip(retained, retained[1:]))
+    ):
+        return None
+    following = words[retained[0].asr_word_index:retained[-1].asr_word_index + 1]
+    evidence = [*selected, *following]
+    if (
+        following[0].start != span.right_anchor_start
+        or any(not isfinite(word.start) or not isfinite(word.end) or word.end <= word.start
+               or not alphanumeric_signature(word.text)
+               or (word.confidence is not None and word.confidence < 0.8) for word in evidence)
+        or any(not 0 <= right.start - left.end <= 0.2
+               for group in (selected[:-1], [selected[-1], *following])
+               for left, right in zip(group, group[1:]))
+    ):
+        return None
+    speakers = {speaker for speaker in [
+        *span.speaker_ids, source.speaker_id, target.speaker_id,
+        span.left_anchor_speaker_id, span.right_anchor_speaker_id,
+        *(word.speaker_id for word in evidence),
+    ] if speaker is not None}
+    if len(speakers) > 1:
+        return None
+    token_spans = _token_character_spans(final_text)
+    token_cut = sum(len(alphanumeric_signature(word.text)) for word in selected[:-1])
+    if len(token_spans) != len(alphanumeric_signature(final_text)) or not 0 < token_cut < len(token_spans):
+        return None
+    character_cut = token_spans[token_cut][0]
+    if not any(character.isspace() for character in final_text[token_spans[token_cut - 1][1]:character_cut]):
+        return None
+    return WholeCueReplacementPlan(
+        edits={source.index: (0, len(alphanumeric_signature(speech_text_for_alignment(source))), final_text[:character_cut].strip()),
+               target.index: (0, 0, final_text[character_cut:].strip())},
+        word_indices_by_cue={source.index: span.asr_word_indices[:-1], target.index: span.asr_word_indices[-1:]},
+    )
+
+
 def apply_adjudication_decisions(
     cues: list[Cue],
     spans: list[DivergenceSpan],
     decisions: list[AdjudicationDecision],
     profile: StyleProfile,
     adlib_cue_ids_by_case: dict[str, int] | None = None,
+    *,
+    protected_cue_ids: set[int] | None = None,
+    words: list[Word] | None = None,
+    max_intra_cue_gap: float = 1.5,
+    token_matches: list[TokenMatch] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     by_case = {decision.case_id: decision for decision in decisions}
     cues_by_id = {cue.index: cue for cue in cues}
@@ -53,7 +231,51 @@ def apply_adjudication_decisions(
             for cue_id in cue_ids
             if cue_has_bracketed_screen_text(cues_by_id[cue_id])
         ]
+        indexed_edits = None
+        if is_joint_region(span):
+            try:
+                indexed_edits = indexed_multi_cue_replacements(cues, span, decision.final_text, words=words)
+                if indexed_edits is None:
+                    raise ReplacementOwnershipError("The joint source region could not be reconstructed; source text was held for review.")
+            except ReplacementOwnershipError as exc:
+                flags.append(QCFlag(
+                    kind="adjudication_replacement_ownership_held",
+                    cue_ids=list(cue_ids),
+                    severity="warning", message=str(exc), confidence=decision.confidence,
+                    old_text=span.srt_text, new_text=decision.final_text, start=span.start, end=span.end,
+                ))
+                continue
         if not decision.final_text.strip():
+            if len(cue_ids) > 1 and span.srt_token_indices:
+                edits = indexed_multi_cue_replacements(cues, span, "")
+                if edits is None:
+                    flags.append(
+                        _screen_text_adjudication_hold(cue_ids, span, decision)
+                        if annotated_cue_ids else QCFlag(
+                            kind="adjudication_span_edit_held", cue_ids=cue_ids,
+                            message="The indexed source span could not be reconstructed; preserving source cues for review.",
+                            severity="error", confidence=decision.confidence,
+                            old_text=span.srt_text, new_text="", start=span.start, end=span.end,
+                        )
+                    )
+                    continue
+                partial_ids = [
+                    cue_id for cue_id, (start, end, _) in edits.items()
+                    if start > 0 or end < len(alphanumeric_signature(cues_by_id[cue_id].plain_text))
+                ]
+                if partial_ids:
+                    for cue_id in partial_ids:
+                        token_edits_by_cue.setdefault(cue_id, []).append(edits[cue_id])
+                    flags.append(QCFlag(
+                        kind="text_changed", cue_ids=partial_ids,
+                        message=f"Adjudication verdict {decision.verdict}: {decision.reason}",
+                        confidence=decision.confidence,
+                        old_text="\n".join(cues_by_id[cue_id].text for cue_id in partial_ids),
+                        new_text="", start=span.start, end=span.end,
+                    ))
+                    # Complete cue deletions still follow the configured drop
+                    # policy; a partial deletion must never consume residue.
+                    cue_ids = [cue_id for cue_id in cue_ids if cue_id not in partial_ids]
             if len(cue_ids) == 1:
                 cue_id = cue_ids[0]
                 cue = cues_by_id[cue_id]
@@ -200,7 +422,40 @@ def apply_adjudication_decisions(
             )
             continue
 
-        if len(cue_ids) == 1 and span.srt_token_indices:
+        try:
+            whole_plan = whole_cue_replacement_plan(
+                cues, span, decision.final_text, words, max_intra_cue_gap=max_intra_cue_gap,
+                token_matches=token_matches,
+            )
+            if whole_plan is not None:
+                indexed_edits = whole_plan.edits
+        except ReplacementOwnershipError as exc:
+            flags.append(QCFlag(
+                kind="adjudication_replacement_ownership_held", cue_ids=list(cue_ids),
+                severity="warning", message=str(exc), confidence=decision.confidence,
+                old_text=span.srt_text, new_text=decision.final_text, start=span.start, end=span.end,
+            ))
+            continue
+
+        if indexed_edits is None and span.srt_token_indices and (
+            len(cue_ids) > 1
+            or (span.right_anchor_cue_id is not None and span.right_anchor_cue_id not in cue_ids)
+        ):
+            try:
+                indexed_edits = indexed_multi_cue_replacements(
+                    cues, span, decision.final_text,
+                    replacement_target=prefix_replacement_targets.get(span.case_id), words=words,
+                )
+            except ReplacementOwnershipError as exc:
+                flags.append(QCFlag(
+                    kind="adjudication_replacement_ownership_held",
+                    cue_ids=list(cue_ids),
+                    severity="warning", message=str(exc), confidence=decision.confidence,
+                    old_text=span.srt_text, new_text=decision.final_text, start=span.start, end=span.end,
+                ))
+                continue
+
+        if len(cue_ids) == 1 and span.srt_token_indices and indexed_edits is None:
             cue_id = cue_ids[0]
             cue = cues_by_id[cue_id]
             bounds = _span_token_bounds_for_cue(
@@ -245,11 +500,8 @@ def apply_adjudication_decisions(
             flags.append(_screen_text_adjudication_hold(cue_ids, span, decision))
             continue
 
-        if len(cue_ids) > 1 and span.srt_token_indices:
-            edits = indexed_multi_cue_replacements(
-                cues, span, decision.final_text,
-                replacement_target=prefix_replacement_targets.get(span.case_id),
-            )
+        if (len(cue_ids) > 1 or indexed_edits is not None) and span.srt_token_indices:
+            edits = indexed_edits
             if edits is None:
                 flags.append(QCFlag(
                     kind="adjudication_span_edit_held",
@@ -263,14 +515,28 @@ def apply_adjudication_decisions(
                     end=span.end,
                 ))
                 continue
+            # A separate held span may share an edited cue. Only newly targeted
+            # neighbors need this guard; keep independently approved text edits.
+            if protected_replacement_targets(span, edits) & (protected_cue_ids or set()):
+                flags.append(QCFlag(
+                    kind="adjudication_replacement_ownership_held",
+                    cue_ids=list(edits), severity="warning",
+                    message=(
+                        "The replacement would change word ownership inside a protected cue. The complete "
+                        "replacement was held so its spoken word cannot be lost during source restoration."
+                    ),
+                    confidence=decision.confidence, old_text=span.srt_text,
+                    new_text=decision.final_text, start=span.start, end=span.end,
+                ))
+                continue
             for cue_id, edit in edits.items():
                 token_edits_by_cue.setdefault(cue_id, []).append(edit)
             flags.append(QCFlag(
                 kind="text_changed",
-                cue_ids=cue_ids,
+                cue_ids=list(edits),
                 message=f"Adjudication verdict {decision.verdict}: {decision.reason}",
                 confidence=decision.confidence,
-                old_text="\n".join(cues_by_id[cue_id].text for cue_id in cue_ids),
+                old_text="\n".join(cues_by_id[cue_id].text for cue_id in edits),
                 new_text=decision.final_text,
                 start=span.start,
                 end=span.end,
@@ -403,11 +669,13 @@ def indexed_multi_cue_replacements(
     final_text: str,
     *,
     replacement_target: int | None = None,
+    words: list[Word] | None = None,
 ) -> dict[int, tuple[int, int, str]] | None:
     """Partition one exact source-token edit without consuming its cue residue.
 
     Replacement tokens follow the source span's contribution to each cue,
     preferring nearby corroborated sentence boundaries where available.
+    An anchored single-cue tail can transfer its replacement to the next cue.
     The pipeline uses these same pieces to assign acoustic evidence, so text
     and timing cannot independently choose different cue boundaries.
     """
@@ -415,7 +683,7 @@ def indexed_multi_cue_replacements(
     indices = sorted(set(span.srt_token_indices))
     cues_by_id = {cue.index: cue for cue in cues}
     if (
-        len(cue_ids) < 2
+        not cue_ids
         or not indices
         or indices != list(range(indices[0], indices[-1] + 1))
         or any(cue_id not in cues_by_id for cue_id in cue_ids)
@@ -455,6 +723,28 @@ def indexed_multi_cue_replacements(
         else:
             unit_spans.append((start, end))
     sentence_boundaries = _replacement_sentence_boundaries(final_text, unit_spans)
+    if is_joint_region(span):
+        return _joint_region_replacement_edits(cues_by_id, bounds_by_cue, span, final_text, unit_spans, words)
+    if replacement_target is None:
+        acoustic_edits = _acoustic_tail_replacement_edits(
+            cues_by_id, bounds_by_cue, span, final_text, unit_spans, words,
+        )
+        if acoustic_edits is not None:
+            return acoustic_edits
+    anchored_target = _anchored_prefix_replacement_target(
+        cues_by_id, bounds_by_cue, span, final_text,
+    )
+    if replacement_target is None:
+        replacement_target = anchored_target
+    if anchored_target is not None and replacement_target == anchored_target and anchored_target not in cue_ids:
+        # A source-only tail can precede an ASR-only prefix of the next cue.
+        # Retain the next cue's text and insert before its exact right anchor.
+        return {
+            **{cue_id: (*bounds, "") for cue_id, bounds in bounds_by_cue.items()},
+            anchored_target: (0, 0, final_text),
+        }
+    if len(cue_ids) < 2:
+        return None
     if replacement_target is None:
         replacement_target = _contained_sentence_replacement_target(
             cues_by_id, bounds_by_cue, span, final_text, sentence_boundaries,
@@ -503,6 +793,204 @@ def indexed_multi_cue_replacements(
         previous_boundary = boundary
         previous_character = end_character
     return result
+
+
+def _anchored_prefix_replacement_target(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+    max_gap_seconds: float = 0.2,
+) -> int | None:
+    """Place one unchanged ASR word with its unambiguous retained continuation.
+
+    Deleting the unspoken tail of one cue and prefix of another can collapse
+    into a single spoken word. Source proportions cannot determine ownership
+    when both sides retain text; use the matched words surrounding that edit.
+    """
+    signature = alphanumeric_signature(final_text)
+    target_id = _replacement_continuation_target(cues_by_id, bounds_by_cue, span)
+    if (
+        len(signature) != 1
+        or signature != alphanumeric_signature(span.asr_text)
+        or _has_sentence_terminal(final_text)
+        or not span.asr_word_indices
+        or target_id is None
+        or len(set(span.speaker_ids)) > 1
+        or (
+            span.right_anchor_speaker_id is not None
+            and span.speaker_ids
+            and set(span.speaker_ids) != {span.right_anchor_speaker_id}
+        )
+        or not all(value is not None and isfinite(value) for value in (
+            span.start, span.end, span.left_anchor_end, span.right_anchor_start,
+        ))
+    ):
+        return None
+    if (
+        not span.left_anchor_end < span.start < span.end <= span.right_anchor_start
+        or span.start - span.left_anchor_end <= max_gap_seconds
+        or span.right_anchor_start - span.end > max_gap_seconds
+    ):
+        return None
+    return target_id
+
+
+def _replacement_continuation_target(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+) -> int | None:
+    """Require retained source tokens on both sides of one contiguous edit."""
+    cue_ids = list(bounds_by_cue)
+    first_id, last_id = cue_ids[0], cue_ids[-1]
+    target_id = span.right_anchor_cue_id
+    first_count = len(alphanumeric_signature(cues_by_id[first_id].plain_text))
+    first_start, first_end = bounds_by_cue[first_id]
+    if (
+        target_id not in cues_by_id
+        or cue_has_bracketed_screen_text(cues_by_id[target_id])
+        or span.left_anchor_cue_id != first_id
+        or not 0 < first_start < first_end == first_count
+    ):
+        return None
+    for cue_id in cue_ids[1:]:
+        start, end = bounds_by_cue[cue_id]
+        count = len(alphanumeric_signature(cues_by_id[cue_id].plain_text))
+        if start != 0 or (cue_id != last_id and end != count):
+            return None
+    last_count = len(alphanumeric_signature(cues_by_id[last_id].plain_text))
+    if target_id == last_id:
+        return target_id if bounds_by_cue[last_id][1] < last_count else None
+    ordered_ids = list(cues_by_id)
+    last_position = ordered_ids.index(last_id)
+    if (
+        bounds_by_cue[last_id][1] == last_count
+        and last_position + 1 < len(ordered_ids)
+        and ordered_ids[last_position + 1] == target_id
+    ):
+        return target_id
+    return None
+
+
+def _acoustic_tail_replacement_edits(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+    unit_spans: list[tuple[int, int]],
+    words: list[Word] | None,
+    min_phrase_gap_seconds: float = 0.8,
+    max_anchor_gap_seconds: float = 0.2,
+) -> dict[int, tuple[int, int, str]] | None:
+    """Split a rewritten tail only at one measured gap between anchored phrases.
+
+    The gap follows the default speech-grouping threshold. No cue endpoint is
+    inferred here: both resulting pieces retain complete, existing ASR words.
+    """
+    signature = alphanumeric_signature(final_text)
+    target_id = _replacement_continuation_target(cues_by_id, bounds_by_cue, span)
+    if (
+        words is None or len(bounds_by_cue) != 1 or target_id is None
+        or len(signature) < 2 or signature != alphanumeric_signature(span.asr_text)
+        or not all(value is not None and isfinite(value) for value in (
+            span.start, span.end, span.left_anchor_end, span.right_anchor_start,
+        ))
+    ):
+        return None
+    # A pause within a local rewrite does not by itself propose a transfer.
+    # Without both close retained continuations, keep the ordinary local edit.
+    if not (
+        0 <= span.start - span.left_anchor_end <= max_anchor_gap_seconds
+        and 0 <= span.right_anchor_start - span.end <= max_anchor_gap_seconds
+    ):
+        return None
+    character_cut = _acoustic_replacement_cut(
+        span, final_text, unit_spans, words, min_phrase_gap_seconds, max_anchor_gap_seconds,
+    )
+    if character_cut is None:
+        return None
+    source_id, bounds = next(iter(bounds_by_cue.items()))
+    return {
+        source_id: (*bounds, final_text[:character_cut].strip()),
+        target_id: (0, 0, final_text[character_cut:].strip()),
+    }
+
+
+def _joint_region_replacement_edits(
+    cues_by_id: dict[int, Cue], bounds_by_cue: dict[int, tuple[int, int]], span: DivergenceSpan,
+    final_text: str, unit_spans: list[tuple[int, int]], words: list[Word] | None,
+) -> dict[int, tuple[int, int, str]]:
+    target_id = _replacement_continuation_target(cues_by_id, bounds_by_cue, span)
+    if (
+        words is None or not 2 <= len(bounds_by_cue) <= 3
+        or target_id is None or target_id in bounds_by_cue
+        or not alphanumeric_signature(final_text)
+        or alphanumeric_signature(final_text) != alphanumeric_signature(span.asr_text)
+        or not all(value is not None and isfinite(value) for value in (
+            span.start, span.end, span.left_anchor_end, span.right_anchor_start,
+        ))
+        or any(any(marker in cues_by_id[cue_id].text for marker in ("♪", "♫"))
+               for cue_id in [*bounds_by_cue, target_id])
+    ):
+        raise ReplacementOwnershipError("The joint region needs exact approved words and complete source anchors; source text was held for review.")
+    character_cut = _acoustic_replacement_cut(span, final_text, unit_spans, words)
+    if character_cut is None:
+        raise ReplacementOwnershipError("The joint region has no unique measured phrase boundary; source text was held for review.")
+    middle_id = list(bounds_by_cue)[1]
+    return {
+        **{cue_id: (*bounds, final_text[:character_cut].strip() if cue_id == middle_id else "")
+           for cue_id, bounds in bounds_by_cue.items()},
+        target_id: (0, 0, final_text[character_cut:].strip()),
+    }
+
+
+def _acoustic_replacement_cut(
+    span: DivergenceSpan, final_text: str, unit_spans: list[tuple[int, int]], words: list[Word],
+    min_phrase_gap_seconds: float = 0.8, max_anchor_gap_seconds: float = 0.2,
+) -> int | None:
+    """Find a cut using complete actual words; both text and timing share it."""
+    signature = alphanumeric_signature(final_text)
+    indices = span.asr_word_indices
+    if (
+        not indices or indices != list(range(indices[0], indices[-1] + 1))
+        or indices[0] < 0 or indices[-1] >= len(words)
+    ):
+        raise ReplacementOwnershipError("The replacement's complete acoustic word sequence is unavailable; source text was held for review.")
+    spoken = [words[index] for index in indices]
+    if (
+        alphanumeric_signature(" ".join(word.text for word in spoken)) != signature
+        or any(not alphanumeric_signature(word.text) for word in spoken)
+        or any(not isfinite(word.start) or not isfinite(word.end) or word.start >= word.end for word in spoken)
+        or any(left.end > right.start for left, right in zip(spoken, spoken[1:]))
+        or abs(spoken[0].start - span.start) > 1e-6 or abs(spoken[-1].end - span.end) > 1e-6
+    ):
+        raise ReplacementOwnershipError("The replacement's word evidence is inconsistent; source text was held for review.")
+    cuts = [position for position in range(1, len(spoken))
+            if spoken[position].start - spoken[position - 1].end >= min_phrase_gap_seconds]
+    if not cuts:
+        return None
+    if len(cuts) != 1:
+        raise ReplacementOwnershipError("The replacement crosses several speech gaps with no unique cue boundary; source text was held for review.")
+    known_speakers = {word.speaker_id for word in spoken if word.speaker_id} | set(span.speaker_ids)
+    known_speakers.update(speaker for speaker in (
+        span.left_anchor_speaker_id, span.right_anchor_speaker_id,
+    ) if speaker)
+    if len(known_speakers) > 1:
+        raise ReplacementOwnershipError("The replacement crosses conflicting speaker evidence; source text was held for review.")
+    if not (
+        0 <= span.start - span.left_anchor_end <= max_anchor_gap_seconds
+        and 0 <= span.right_anchor_start - span.end <= max_anchor_gap_seconds
+    ):
+        raise ReplacementOwnershipError("The speech groups do not join both retained word anchors closely enough; source text was held for review.")
+    token_cut = sum(len(alphanumeric_signature(word.text)) for word in spoken[:cuts[0]])
+    token_spans = _token_character_spans(final_text)
+    if not 0 < token_cut < len(token_spans):
+        raise ReplacementOwnershipError("The acoustic cut has no complete spoken tokens on both sides; source text was held for review.")
+    character_cut = token_spans[token_cut][0]
+    if character_cut not in {start for start, _ in unit_spans}:
+        raise ReplacementOwnershipError("The proposed acoustic cut would split a lexical unit; source text was held for review.")
+    return character_cut
 
 
 def _has_sentence_terminal(text: str) -> bool:

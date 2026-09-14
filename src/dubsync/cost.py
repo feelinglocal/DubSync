@@ -332,6 +332,8 @@ def _gemini_cached_input_price(model: str, config: dict[str, object]) -> float |
         return None
     if model.lower().removeprefix("models/") in _GEMINI_INTRODUCTORY_FLASH_MODELS:
         return 0.15 if _utc_today() >= _GEMINI_FLASH_STANDARD_PRICE_CHANGE else 0.075
+    if model.lower().removeprefix("models/") == "gemini-3.5-flash-lite":
+        return 0.03
     return None
 
 
@@ -342,6 +344,9 @@ def _gemini_cache_storage_price(model: str, config: dict[str, object]) -> float 
     if model.lower().removeprefix("models/") in _GEMINI_INTRODUCTORY_FLASH_MODELS:
         # https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash
         return 1.0 if _utc_today() >= _GEMINI_FLASH_STANDARD_PRICE_CHANGE else 0.5
+    if model.lower().removeprefix("models/") == "gemini-3.5-flash-lite":
+        # https://ai.google.dev/gemini-api/docs/pricing#gemini-3.5-flash-lite
+        return 1.0
     return None
 
 

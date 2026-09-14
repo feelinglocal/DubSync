@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
+from math import isfinite
 from typing import Protocol
 
 from pydantic import ValidationError
@@ -34,6 +35,12 @@ AudioSnippetBatchLoader = Callable[
     [list[DivergenceSpan]],
     AbstractContextManager[dict[str, AudioSnippet]],
 ]
+
+
+class _RequiredAudioBatchError(ProviderError):
+    def __init__(self, unavailable_case_ids: set[str]):
+        super().__init__("Adjudication failed for the cases with available audio.")
+        self.unavailable_case_ids = unavailable_case_ids
 
 
 class StaticLLMAdapter:
@@ -71,6 +78,8 @@ class AdjudicationEngine:
         max_batch_spans: int = _MAX_ADJUDICATION_BATCH_SPANS,
         max_concurrent_batches: int = 1,
         retry_timed_out_batches: bool = False,
+        require_audio_snippets: bool = False,
+        required_audio_case_ids: set[str] | None = None,
     ):
         self.llm = llm
         self.confidence_gate = confidence_gate
@@ -88,6 +97,10 @@ class AdjudicationEngine:
         if not isinstance(retry_timed_out_batches, bool):
             raise ValueError("adjudication.retry_timed_out_batches must be boolean")
         self.retry_timed_out_batches = retry_timed_out_batches
+        if not isinstance(require_audio_snippets, bool):
+            raise ValueError("adjudication.require_audio_snippets must be boolean")
+        self.require_audio_snippets = require_audio_snippets
+        self.required_audio_case_ids = frozenset(required_audio_case_ids or ())
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
         decisions_by_case: dict[str, AdjudicationDecision] = {}
@@ -102,8 +115,10 @@ class AdjudicationEngine:
         invalid_spans: list[DivergenceSpan] = []
         provider_failed_spans: list[DivergenceSpan] = []
         timed_out_spans: list[DivergenceSpan] = []
+        audio_unavailable_case_ids: set[str] = set()
         if llm_spans:
-            for batch, raw_decisions, timed_out in self._adjudicate_batches(llm_spans):
+            for batch, raw_decisions, timed_out, unavailable_ids in self._adjudicate_batches(llm_spans):
+                audio_unavailable_case_ids.update(unavailable_ids)
                 if raw_decisions is None:
                     if timed_out and self.retry_timed_out_batches and len(batch) > 1:
                         timed_out_spans.extend(batch)
@@ -116,7 +131,8 @@ class AdjudicationEngine:
             # One bounded recovery pass reduces reasoning load after a known
             # timeout. Authentication/rate errors and singleton timeouts are
             # never expanded into another round of provider calls.
-            for batch, raw_decisions, _ in self._adjudicate_batches(timed_out_spans, max_batch_spans=1):
+            for batch, raw_decisions, _, unavailable_ids in self._adjudicate_batches(timed_out_spans, max_batch_spans=1):
+                audio_unavailable_case_ids.update(unavailable_ids)
                 if raw_decisions is None:
                     provider_failed_spans.extend(batch)
                     continue
@@ -125,7 +141,8 @@ class AdjudicationEngine:
                 invalid_spans.extend(batch_invalid_spans)
             if invalid_spans:
                 retry_invalid_spans: list[DivergenceSpan] = []
-                for batch, raw_retry_decisions, _ in self._adjudicate_batches(invalid_spans):
+                for batch, raw_retry_decisions, _, unavailable_ids in self._adjudicate_batches(invalid_spans):
+                    audio_unavailable_case_ids.update(unavailable_ids)
                     if raw_retry_decisions is None:
                         provider_failed_spans.extend(batch)
                         continue
@@ -140,6 +157,14 @@ class AdjudicationEngine:
 
         for span in spans:
             decision = decisions_by_case.get(span.case_id)
+            if span.case_id in audio_unavailable_case_ids:
+                decision = AdjudicationDecision.model_validate(_unavailable_audio_decision(span))
+                flags.append(QCFlag(
+                    kind="adjudication_audio_unavailable", cue_ids=span.cue_ids,
+                    message="Required case audio was unavailable or incomplete; source text and timing were preserved.",
+                    severity="error", confidence=0.0, old_text=span.srt_text,
+                    new_text=span.asr_text, start=span.start, end=span.end,
+                ))
             if decision is None:
                 provider_failed = span.case_id in provider_failed_case_ids
                 decision = AdjudicationDecision(
@@ -217,11 +242,13 @@ class AdjudicationEngine:
 
     def _attempt_batch(self, batch: list[DivergenceSpan]):
         try:
-            return batch, self._adjudicate_batch(batch), False
+            raw, unavailable_ids = self._adjudicate_batch(batch)
+            return batch, raw, False, unavailable_ids
         except (ProviderError, OSError) as exc:
-            return batch, None, _is_request_timeout(exc)
+            unavailable_ids = exc.unavailable_case_ids if isinstance(exc, _RequiredAudioBatchError) else set()
+            return batch, None, _is_request_timeout(exc), unavailable_ids
 
-    def _adjudicate_batch(self, batch: list[DivergenceSpan]) -> list[dict[str, object]]:
+    def _adjudicate_batch(self, batch: list[DivergenceSpan]) -> tuple[object, set[str]]:
         snippets = {span.case_id: self.audio_snippets[span.case_id] for span in batch if span.case_id in self.audio_snippets}
         if self.audio_snippet_batches is not None:
             with self.audio_snippet_batches(batch) as loaded_snippets:
@@ -235,10 +262,28 @@ class AdjudicationEngine:
         self,
         batch: list[DivergenceSpan],
         snippets: dict[str, AudioSnippet],
-    ) -> list[dict[str, object]]:
-        if snippets and hasattr(self.llm, "adjudicate_with_audio"):
-            return getattr(self.llm, "adjudicate_with_audio")(batch, snippets)
-        return self.llm.adjudicate(batch)
+    ) -> tuple[object, set[str]]:
+        audio_method = getattr(self.llm, "adjudicate_with_audio", None)
+        if self.require_audio_snippets or any(span.case_id in self.required_audio_case_ids for span in batch):
+            unavailable = [span for span in batch
+                           if (self.require_audio_snippets or span.case_id in self.required_audio_case_ids)
+                           and not (callable(audio_method) and _snippet_covers_span(snippets.get(span.case_id), span))]
+            unavailable_ids = {span.case_id for span in unavailable}
+            available = [span for span in batch if span.case_id not in unavailable_ids]
+            held = [_unavailable_audio_decision(span) for span in unavailable]
+            # Never turn failed or partial snippet extraction into a text-only
+            # approval. Each missing case remains held even with a zero gate.
+            try:
+                selected_snippets = {span.case_id: snippets[span.case_id] for span in available if span.case_id in snippets}
+                raw = (audio_method(available, selected_snippets)
+                       if selected_snippets and callable(audio_method)
+                       else self.llm.adjudicate(available)) if available else []
+            except (ProviderError, OSError) as exc:
+                raise _RequiredAudioBatchError(unavailable_ids) from exc
+            return ([*raw, *held] if isinstance(raw, list) else raw), unavailable_ids
+        if snippets and callable(audio_method):
+            return audio_method(batch, snippets), set()
+        return self.llm.adjudicate(batch), set()
 
     def _validate_raw(
         self,
@@ -324,6 +369,28 @@ class AdjudicationEngine:
         if index < len(spans):
             return spans[index]
         return None
+
+
+def _snippet_covers_span(snippet: AudioSnippet | None, span: DivergenceSpan) -> bool:
+    if not isinstance(snippet, AudioSnippet) or snippet.case_id != span.case_id:
+        return False
+    if span.start is None or span.end is None:
+        return False
+    return (
+        all(isfinite(value) for value in (snippet.start, snippet.end, span.start, span.end))
+        and 0 <= snippet.start < snippet.end
+        and span.start <= span.end
+        and snippet.start <= span.start + 0.001
+        and snippet.end >= span.end - 0.001
+    )
+
+
+def _unavailable_audio_decision(span: DivergenceSpan) -> dict[str, object]:
+    return {
+        "case_id": span.case_id, "verdict": "keep_srt", "final_text": span.srt_text,
+        "confidence": 0.0, "speaker": None, "character": "unknown",
+        "reason": "Required case audio was unavailable or incomplete; preserved source SRT for review.",
+    }
 
 
 def _is_request_timeout(exc: BaseException) -> bool:

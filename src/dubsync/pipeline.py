@@ -11,24 +11,35 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from .adjudication import AdjudicationEngine, KeepSRTAdapter, confidence_gated_decision
+from .adjudication_regions import (
+    PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, is_joint_region,
+    validated_protected_source_regions,
+)
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
 from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
-from .changes import apply_adjudication_decisions, indexed_multi_cue_replacements, single_token_prefix_replacement_targets
+from .changes import (
+    ReplacementOwnershipError, apply_adjudication_decisions, indexed_multi_cue_replacements,
+    whole_cue_replacement_plan,
+    protected_replacement_targets, single_token_prefix_replacement_targets,
+)
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_gemini_context_cost, record_llm_usage
 from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues, split_speaker_turn_cues
 from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config
 from .gemini_audio_context import validate_audio_context_config
+from .hybrid_adjudication import HYBRID_POLICY_VERSION
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
+    _ADJUDICATION_REVIEW_PROMPT_VERSION,
     _PUNCTUATION_PROMPT_VERSION,
     _SPEAKER_MAPPING_PROMPT_VERSION,
     drain_usage_events,
+    adjudication_fallback_config,
     llm_adapter_from_config,
     llm_config_for_pass,
     punctuation_adapter_from_config,
@@ -102,6 +113,7 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
 _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
     {
         "audio_snippet_unavailable",
+        "adjudication_audio_unavailable",
         "invalid_llm_response",
         "llm_provider_unavailable",
     }
@@ -109,8 +121,8 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
-_REBUILD_POLICY_VERSION = 4
-_ADJUDICATION_POLICY_VERSION = 1
+_REBUILD_POLICY_VERSION = 8
+_ADJUDICATION_POLICY_VERSION = 2
 _PUNCTUATION_POLICY_VERSION = 1
 
 
@@ -261,6 +273,7 @@ def sync_episode(
     if resume_stage == "verify":
         resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
         _validate_alignment_screen_text_provenance(resume_alignment, cues)
+        protected_source_regions = _protected_regions_for_alignment(resume_alignment, cues, words)
         resume_decisions = _load_adjudication_artifact(
             episode_workdir / "adjudicate.json"
         )[0]
@@ -282,6 +295,7 @@ def sync_episode(
             cues,
             alignment_unresolved=resume_alignment.diagnostics.unresolved,
             missing_audio_cue_ids=set(resume_alignment.diagnostics.missing_audio_cue_ids),
+            protected_source_regions=protected_source_regions,
         )
         if unsafe_cases:
             raise RuntimeError(
@@ -322,6 +336,7 @@ def sync_episode(
         alignment = _alignment_with_adjudication_context(alignment, cues)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
 
+    protected_source_regions = _protected_regions_for_alignment(alignment, cues, words)
     flags: list[QCFlag] = [
         *source_order_flags,
         *fps_override_flags,
@@ -343,6 +358,7 @@ def sync_episode(
             source_cue_count=_spoken_source_cue_count(cues),
             alignment_unresolved=alignment.diagnostics.unresolved,
             missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+            protected_source_regions=protected_source_regions,
         )
         flags.extend(adjudication_flags)
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
@@ -354,6 +370,7 @@ def sync_episode(
                 source_cue_count=_spoken_source_cue_count(cues),
                 alignment_unresolved=alignment.diagnostics.unresolved,
                 missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+                protected_source_regions=protected_source_regions,
             )
         )
         provider_decisions: list[AdjudicationDecision] = []
@@ -405,6 +422,14 @@ def sync_episode(
                         if audio_snippet_source is not None
                         else None
                     ),
+                    require_audio_snippets=(
+                        audio_snippet_source is not None
+                        and _episode_audio_options(provider_config) is None
+                    ),
+                    required_audio_case_ids={
+                        SPEECH_REPEAT_PREFIX + case_id.removeprefix(PROTECTED_SOURCE_PREFIX)
+                        for case_id in protected_source_regions
+                    },
                     max_batch_spans=llm_config_for_pass(provider_config, "adjudication").get("max_batch_spans", 25),
                     max_concurrent_batches=llm_config_for_pass(provider_config, "adjudication").get("max_concurrent_batches", 1),
                     retry_timed_out_batches=llm_config_for_pass(provider_config, "adjudication").get("retry_timed_out_batches", False),
@@ -502,6 +527,7 @@ def sync_episode(
     adlib_cue_ids_by_case, inline_speaker_flags = _validate_inline_adlib_ownership(
         cues, words, alignment, decisions, adlib_cue_ids_by_case, profile,
         protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
     )
     flags.extend(inline_speaker_flags)
     source_cue_ids = {cue.index for cue in cues}
@@ -517,6 +543,8 @@ def sync_episode(
         adlib_cue_ids_by_case,
         source_cues=cues,
         words=words,
+        protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
     )
     flags.extend(flag for flag in alignment.flags if flag.kind == "adjudication_word_mapping_held")
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
@@ -526,6 +554,10 @@ def sync_episode(
         decisions,
         profile,
         adlib_cue_ids_by_case=adlib_cue_ids_by_case,
+        protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
+        words=words,
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        token_matches=alignment.token_matches,
     )
     adjudicated_cues, alignment, segmentation_flags, cue_id_expansions = segment_generated_adlib_cues(
         adjudicated_cues,
@@ -729,13 +761,24 @@ def _confidence_gate_decisions(
 
 
 def _confidence_held_source_cue_ids(flags: list[QCFlag]) -> set[int]:
-    return {cue_id for flag in flags if flag.kind == "low_confidence_adjudication" for cue_id in flag.cue_ids}
+    return {cue_id for flag in flags
+            if flag.kind in {"low_confidence_adjudication", "adjudication_audio_unavailable"}
+            for cue_id in flag.cue_ids}
 
 
 def _timing_evidence_held_cue_ids(flags: list[QCFlag]) -> set[int]:
     return {cue_id for flag in flags
-            if flag.kind in {"timing_evidence_held", "adjudication_word_mapping_held"}
+            if flag.kind in {"timing_evidence_held", "adjudication_word_mapping_held", "protected_source_region_held"}
             for cue_id in flag.cue_ids}
+
+
+def _protected_regions_for_alignment(
+    alignment: AlignmentResult, cues: list[Cue], words: list[Word],
+) -> dict[str, set[int]]:
+    return validated_protected_source_regions(
+        alignment.divergence_spans, alignment.token_matches, cues, words,
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+    )
 
 
 def _validate_resume_audio_provenance(audio_path: Path, episode_workdir: Path) -> list[QCFlag]:
@@ -1226,7 +1269,14 @@ def _adjudication_audio_session(
     options = _episode_audio_options(provider_config)
     configure = getattr(adapter, "set_audio_context", None)
     if options is None or not callable(configure):
-        yield
+        try:
+            yield
+        finally:
+            _write_hybrid_adjudication_report(adapter, episode_workdir, flags)
+            # Focused hybrid calls also incur usage when a later batch fails.
+            if callable(getattr(adapter, "route_report", None)):
+                flags.extend(_record_llm_usage_events(cost_meter, adapter, provider_config, pass_name="adjudication"))
+                write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
         return
     config = llm_config_for_pass(provider_config, "adjudication")
     duration = audio_seconds(normalized_audio)
@@ -1238,6 +1288,7 @@ def _adjudication_audio_session(
         yield
     finally:
         adapter.close()
+        _write_hybrid_adjudication_report(adapter, episode_workdir, flags)
         report = adapter.audio_context_report()
         _write_json(episode_workdir / "gemini_audio_context.json", report)
         pricing_issue = record_gemini_context_cost(
@@ -1254,6 +1305,23 @@ def _adjudication_audio_session(
         write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
 
 
+def _write_hybrid_adjudication_report(adapter: object, episode_workdir: Path, flags: list[QCFlag]) -> None:
+    report_method = getattr(adapter, "route_report", None)
+    if not callable(report_method):
+        return
+    report = report_method()
+    _write_json(episode_workdir / "hybrid_adjudication.json", report)
+    counts = report.get("counts", {})
+    flags.append(QCFlag(
+        kind="hybrid_adjudication_summary", severity="info", cue_ids=[],
+        message=(
+            f"Primary accepted {counts.get('primary', 0)} cases; focused audio review requested for "
+            f"{counts.get('review_requested', 0)} cases, accepted {counts.get('fallback', 0)}, "
+            f"and held {counts.get('held', 0)}. See hybrid_adjudication.json for case routes."
+        ),
+    ))
+
+
 def _adjudication_cache_key(
     spans: list[DivergenceSpan],
     provider_config: dict[str, object],
@@ -1263,12 +1331,31 @@ def _adjudication_cache_key(
     source_words: list[Word] | None = None,
 ) -> CacheKey:
     llm_config = llm_config_for_pass(provider_config, "adjudication")
+    has_review = adjudication_fallback_config(llm_config) is not None
     provider = str(llm_config.get("provider", "gemini")).lower()
     model = str(llm_config.get("model") or _default_llm_model(provider))
     payload = {
         "pass": "adjudication",
         "prompt_version": _ADJUDICATION_PROMPT_VERSION,
         "policy_version": _ADJUDICATION_POLICY_VERSION,
+        "review_prompt_version": (
+            _ADJUDICATION_REVIEW_PROMPT_VERSION
+            if has_review else None
+        ),
+        "hybrid_policy_version": (
+            HYBRID_POLICY_VERSION
+            if has_review else None
+        ),
+        # Review sees neighboring ASR words as read-only ownership evidence.
+        # Hash the complete stream so changing a matched neighbor cannot reuse
+        # a decision made with different local audio/transcript context.
+        "hybrid_asr_context_sha256": (
+            hashlib.sha256(json.dumps(
+                [word.model_dump(mode="json") for word in source_words],
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            if has_review and source_words is not None else None
+        ),
         "confidence_gate": _adjudication_confidence_gate(provider_config),
         "scene_gap_seconds": _adjudication_scene_gap_seconds(provider_config),
         "spans": [span.model_dump(mode="json") for span in spans],
@@ -1548,7 +1635,9 @@ def _run_verify_stage(
     missing_audio_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
-    protected_cue_ids = missing_audio_cue_ids | confidence_held_cue_ids | timing_held_cue_ids
+    protected_source_regions = _protected_regions_for_alignment(alignment, source_cues, words)
+    protected_source_cue_ids = {cue_id for ids in protected_source_regions.values() for cue_id in ids}
+    protected_cue_ids = missing_audio_cue_ids | confidence_held_cue_ids | timing_held_cue_ids | protected_source_cue_ids
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
         forced_alignment_input = [
@@ -1626,6 +1715,10 @@ def _run_verify_stage(
         reason="timing_evidence",
     )
     flags.extend(timing_restore_flags)
+    rebuilt, protected_source_restore_flags = _restore_missing_audio_source_cues(
+        rebuilt, source_cues, protected_source_cue_ids, reason="protected_region",
+    )
+    flags.extend(protected_source_restore_flags)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
@@ -1850,7 +1943,20 @@ def _record_llm_usage_events(
     unmetered_reasons: set[str] = set()
     first_item = len(cost_meter.items)
     for event in drain_usage_events(adapter):
-        reason = record_llm_usage(cost_meter, provider, model, llm_config, event)
+        event_config, event_provider, event_model = llm_config, provider, model
+        route = event.get("adjudication_route") if isinstance(event, dict) else None
+        if route == "fallback":
+            fallback_config = adjudication_fallback_config(llm_config) if pass_name == "adjudication" else None
+            if fallback_config is None:
+                unmetered_reasons.add("fallback usage has no configured review model")
+                continue
+            event_config = fallback_config
+            event_provider = str(fallback_config["provider"])
+            event_model = str(fallback_config["model"])
+        elif route not in (None, "primary"):
+            unmetered_reasons.add("unknown adjudication usage route")
+            continue
+        reason = record_llm_usage(cost_meter, event_provider, event_model, event_config, event)
         if reason is not None:
             unmetered_reasons.add(reason)
     estimate_flags = []
@@ -2000,6 +2106,7 @@ def _hold_incomplete_source_insertions(
     source_cue_count: int | None = None,
     alignment_unresolved: bool = False,
     missing_audio_cue_ids: set[int] | None = None,
+    protected_source_regions: dict[str, set[int]] | None = None,
 ) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
     max_duration = _generation_float_config(
         provider_config,
@@ -2011,7 +2118,9 @@ def _hold_incomplete_source_insertions(
     flags: list[QCFlag] = []
     missing_audio = missing_audio_cue_ids or set()
     for span in spans:
-        hold = _missing_audio_source_hold(span, missing_audio)
+        hold = _protected_source_region_hold(span, protected_source_regions or {})
+        if hold is None:
+            hold = _missing_audio_source_hold(span, missing_audio)
         if hold is None:
             hold = (
                 _unresolved_alignment_adjudication_hold(span)
@@ -2031,15 +2140,38 @@ def _hold_incomplete_source_insertions(
     return provider_spans, held_decisions, flags
 
 
+def _protected_source_region_hold(
+    span: DivergenceSpan, validated_regions: dict[str, set[int]],
+) -> tuple[AdjudicationDecision, QCFlag] | None:
+    if span.case_id not in validated_regions:
+        return None
+    if (not span.case_id.startswith(PROTECTED_SOURCE_PREFIX)
+        or set(span.cue_ids) != validated_regions[span.case_id]
+        or not span.srt_token_indices or not span.srt_text.strip()
+        or span.asr_word_indices or span.asr_text.strip()):
+        raise ValueError("Invalid protected source branch; resume from align.")
+    return AdjudicationDecision(
+        case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text,
+        confidence=1.0, reason="Preserved the complete protected source region; earlier repeated speech has its own fresh audio question.",
+    ), QCFlag(
+        kind="protected_source_region_held", cue_ids=list(span.cue_ids), severity="info",
+        message="Preserved the later song captions at their original text and timing; the distinct earlier speech requires independent audio approval.",
+        old_text=span.srt_text, start=span.start, end=span.end,
+    )
+
+
 def _missing_audio_source_hold(
     span: DivergenceSpan,
     missing_audio_cue_ids: set[int],
 ) -> tuple[AdjudicationDecision, QCFlag] | None:
     referenced_cue_ids = set(span.cue_ids)
-    if span.left_anchor_cue_id is not None:
-        referenced_cue_ids.add(span.left_anchor_cue_id)
-    if span.right_anchor_cue_id is not None:
-        referenced_cue_ids.add(span.right_anchor_cue_id)
+    # Replacement anchors describe neighboring evidence, not additional source
+    # text being edited. Only a pure insertion may belong inside either anchor.
+    if not span.cue_ids and not span.srt_token_indices:
+        if span.left_anchor_cue_id is not None:
+            referenced_cue_ids.add(span.left_anchor_cue_id)
+        if span.right_anchor_cue_id is not None:
+            referenced_cue_ids.add(span.right_anchor_cue_id)
     protected_cue_ids = referenced_cue_ids & missing_audio_cue_ids
     if (
         not protected_cue_ids
@@ -2132,6 +2264,8 @@ def _restore_missing_audio_source_cues(
                 "An uncertain source cue was restored to its original timing; "
                 "independently approved text edits were retained."
                 if reason in {"low_confidence", "timing_evidence"}
+                else "Protected song captions were restored to their exact source text and timing."
+                if reason == "protected_region"
                 else "An uncertain source cue was restored to its exact editorial text and "
                      "timing after downstream processing attempted to alter it."
             ),
@@ -2281,6 +2415,7 @@ def _apply_incomplete_source_holds_to_decisions(
     source_cue_count: int | None = None,
     alignment_unresolved: bool = False,
     missing_audio_cue_ids: set[int] | None = None,
+    protected_source_regions: dict[str, set[int]] | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
         spans,
@@ -2288,6 +2423,7 @@ def _apply_incomplete_source_holds_to_decisions(
         source_cue_count=source_cue_count,
         alignment_unresolved=alignment_unresolved,
         missing_audio_cue_ids=missing_audio_cue_ids,
+        protected_source_regions=protected_source_regions,
     )
     if not held_decisions:
         return decisions, adjudication_flags
@@ -2309,6 +2445,7 @@ def _apply_incomplete_source_holds_to_decisions(
             "oversized_adjudication_span_held",
             "unresolved_alignment_adjudication_held",
             "missing_audio_source_cue_held",
+            "protected_source_region_held",
         }
     ]
     return ordered_decisions, [*retained_flags, *incomplete_source_flags]
@@ -2323,6 +2460,7 @@ def _unsafe_incomplete_source_resume_case_ids(
     *,
     alignment_unresolved: bool = False,
     missing_audio_cue_ids: set[int] | None = None,
+    protected_source_regions: dict[str, set[int]] | None = None,
 ) -> list[str]:
     _, held_decisions, _ = _hold_incomplete_source_insertions(
         spans,
@@ -2330,6 +2468,7 @@ def _unsafe_incomplete_source_resume_case_ids(
         source_cue_count=_spoken_source_cue_count(source_cues),
         alignment_unresolved=alignment_unresolved,
         missing_audio_cue_ids=missing_audio_cue_ids,
+        protected_source_regions=protected_source_regions,
     )
     decisions_by_case = {decision.case_id: decision for decision in decisions}
     spans_by_case = {span.case_id: span for span in spans}
@@ -2346,6 +2485,16 @@ def _unsafe_incomplete_source_resume_case_ids(
             span is not None
             and _rebuilt_contains_generated_span(rebuilt, source_ids, span)
         )
+        if held.case_id in (protected_source_regions or {}):
+            source_by_id = {cue.index: cue for cue in source_cues}
+            rebuilt_by_id = {cue.index: cue for cue in rebuilt}
+            stale_decision = stale_decision or decision.final_text != held.final_text
+            stale_rebuild = any(
+                cue_id not in rebuilt_by_id
+                or (rebuilt_by_id[cue_id].lines, rebuilt_by_id[cue_id].start_ms, rebuilt_by_id[cue_id].end_ms)
+                != (source_by_id[cue_id].lines, source_by_id[cue_id].start_ms, source_by_id[cue_id].end_ms)
+                for cue_id in protected_source_regions[held.case_id]
+            )
         if stale_decision or stale_rebuild:
             unsafe_cases.append(held.case_id)
     return unsafe_cases
@@ -2429,6 +2578,7 @@ def _validate_inline_adlib_ownership(
     profile: StyleProfile,
     *,
     protected_cue_ids: set[int] | None = None,
+    max_intra_cue_gap: float = 1.5,
 ) -> tuple[dict[str, int], list[QCFlag]]:
     """Keep cross-actor inline additions only when the complete cue can split.
 
@@ -2452,9 +2602,15 @@ def _validate_inline_adlib_ownership(
         return result, []
     probe_alignment = _alignment_with_decision_words(
         alignment, decisions, alignment.divergence_spans, result, source_cues=cues, words=words,
+        protected_cue_ids=protected_cue_ids,
+        max_intra_cue_gap=max_intra_cue_gap,
     )
     probe_cues, _ = apply_adjudication_decisions(
         cues, alignment.divergence_spans, decisions, profile, result,
+        protected_cue_ids=protected_cue_ids,
+        words=words,
+        max_intra_cue_gap=max_intra_cue_gap,
+        token_matches=alignment.token_matches,
     )
     _, _, _, expansions = split_speaker_turn_cues(
         probe_cues, words, probe_alignment, profile, protected_cue_ids=protected_cue_ids,
@@ -2682,25 +2838,59 @@ def _span_overlaps_cue_with_pad(span: DivergenceSpan, cue: Cue, pad_seconds: flo
 
 def _alignment_with_decision_words(
     alignment, decisions, spans, adlib_cue_ids_by_case=None, *, source_cues=None, words=None,
+    protected_cue_ids=None, max_intra_cue_gap=1.5,
 ):
     timed_decisions = {
         decision.case_id: decision
         for decision in decisions
         if decision.verdict in {"keep_srt", "use_audio", "hybrid"}
     }
-    if not timed_decisions:
+    if not timed_decisions and not any(is_joint_region(span) for span in spans):
         return alignment
 
     adlib_cue_ids_by_case = adlib_cue_ids_by_case or {}
     prefix_replacement_targets = single_token_prefix_replacement_targets(
         source_cues or [], spans, decisions
     )
+    external_target_protection = set(protected_cue_ids or ()) | set(alignment.diagnostics.missing_audio_cue_ids)
+    # Confidence holds apply to their own spans. Retain existing evidence for
+    # independent accepted edits while protecting new neighboring destinations.
     protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     mapping_flags = list(alignment.flags)
     for span in spans:
         decision = timed_decisions.get(span.case_id)
         if decision is None:
+            if is_joint_region(span):
+                mapping_flags.append(QCFlag(
+                    kind="adjudication_word_mapping_held", cue_ids=list(span.cue_ids), severity="warning",
+                    message="The joint region has no fresh decision; its source text and timing were preserved.",
+                    old_text=span.srt_text, new_text=span.asr_text, start=span.start, end=span.end,
+                ))
+            continue
+        if is_joint_region(span) and (
+            decision.verdict == "keep_srt" or not source_cues or words is None
+            or set(span.cue_ids) & protected_cue_ids
+        ):
+            mapping_flags.append(QCFlag(
+                kind="adjudication_word_mapping_held", cue_ids=list(span.cue_ids), severity="warning",
+                message="The joint region was not approved with complete word evidence; its source text and timing were preserved.",
+                confidence=decision.confidence, old_text=span.srt_text,
+                new_text=decision.final_text, start=span.start, end=span.end,
+            ))
+            continue
+        if decision.verdict in {"use_audio", "hybrid"} and not decision.final_text.strip() and not is_joint_region(span):
+            # Rejected acoustic words cannot time the retained source residue.
+            # Remove prior evidence only when the exact source deletion is valid.
+            edits = indexed_multi_cue_replacements(source_cues, span, "") if source_cues else None
+            if edits is not None:
+                rejected_indices = set(span.asr_word_indices)
+                for cue_id in edits:
+                    if cue_id not in protected_cue_ids:
+                        cue_word_indices[cue_id] = [
+                            index for index in cue_word_indices.get(cue_id, [])
+                            if index not in rejected_indices
+                        ]
             continue
         adlib_cue_id = adlib_cue_ids_by_case.get(span.case_id)
         if adlib_cue_id is not None:
@@ -2710,19 +2900,62 @@ def _alignment_with_decision_words(
             continue
         replacement_target = prefix_replacement_targets.get(span.case_id)
         word_indices_by_cue = _span_word_indices_by_cue(span, replacement_target=replacement_target)
+        edits = None
+        whole_plan = None
+        if source_cues and decision.verdict in {"use_audio", "hybrid"}:
+            try:
+                whole_plan = whole_cue_replacement_plan(
+                    source_cues, span, decision.final_text, words, max_intra_cue_gap=max_intra_cue_gap,
+                    token_matches=alignment.token_matches,
+                )
+            except ReplacementOwnershipError as exc:
+                mapping_flags.append(QCFlag(
+                    kind="adjudication_word_mapping_held", cue_ids=list(span.cue_ids),
+                    severity="warning", message=str(exc), confidence=decision.confidence,
+                    old_text=span.asr_text, new_text=decision.final_text, start=span.start, end=span.end,
+                ))
+                continue
+        if whole_plan is not None:
+            edits = whole_plan.edits
         if (
-            source_cues
+            whole_plan is None and source_cues
             and decision.verdict in {"use_audio", "hybrid"}
-            and decision.final_text.strip()
-            and len(set(span.cue_ids)) > 1
+            and (decision.final_text.strip() or is_joint_region(span))
+            and (
+                len(set(span.cue_ids)) > 1
+                or (span.right_anchor_cue_id is not None and span.right_anchor_cue_id not in span.cue_ids)
+            )
             and span.srt_token_indices
         ):
-            edits = indexed_multi_cue_replacements(
-                source_cues, span, decision.final_text, replacement_target=replacement_target,
-            )
-            if edits is None:
+            try:
+                edits = indexed_multi_cue_replacements(
+                    source_cues, span, decision.final_text, replacement_target=replacement_target, words=words,
+                )
+                if edits is None and is_joint_region(span):
+                    raise ReplacementOwnershipError("The joint source region could not be reconstructed; source evidence was held for review.")
+            except ReplacementOwnershipError as exc:
+                mapping_flags.append(QCFlag(
+                    kind="adjudication_word_mapping_held",
+                    cue_ids=list(span.cue_ids),
+                    severity="warning", message=str(exc), confidence=decision.confidence,
+                    old_text=span.asr_text, new_text=decision.final_text, start=span.start, end=span.end,
+                ))
                 continue
-            mapped_indices = _indexed_replacement_word_indices(span, edits, words=words)
+            if edits is None and len(set(span.cue_ids)) > 1:
+                continue
+        if edits is not None:
+            if protected_replacement_targets(span, edits) & external_target_protection:
+                mapping_flags.append(QCFlag(
+                    kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",
+                    message=(
+                        f"Adjudication {span.case_id} would transfer a word into a protected source cue. "
+                        "The complete replacement and its existing evidence ownership need review."
+                    ),
+                    confidence=decision.confidence, old_text=span.asr_text,
+                    new_text=decision.final_text, start=span.start, end=span.end,
+                ))
+                continue
+            mapped_indices = whole_plan.word_indices_by_cue if whole_plan is not None else _indexed_replacement_word_indices(span, edits, words=words)
             if mapped_indices is None:
                 mapping_flags.append(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",

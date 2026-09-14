@@ -223,6 +223,10 @@ class MAITranscribeAdapter:
         from .providers import ProviderError
 
         raw_words = payload.get("words")
+        if "words" not in payload and _explicit_empty_transcription(payload, chunk.duration):
+            # MAI can omit words for a successful no-speech response. Accept
+            # explicit empty text/segments only; never invent word timings.
+            raw_words = []
         if not isinstance(raw_words, list) or (not raw_words and str(payload.get("text", "")).strip()):
             raise ProviderError("MAI-Transcribe 2 did not return required word timestamps.")
         words = []
@@ -260,6 +264,25 @@ class MAITranscribeAdapter:
                 speaker_id = f"chunk_{index + 1}:{speaker}"
             words.append(Word(text=text, start=start, end=end, confidence=None, speaker_id=speaker_id))
         return sorted(words, key=lambda word: (word.start, word.end))
+
+
+def _explicit_empty_transcription(payload: dict, duration: float) -> bool:
+    text = payload.get("text")
+    segments = payload.get("segments")
+    if "error" in payload or not isinstance(text, str) or text.strip() or not isinstance(segments, list):
+        return False
+    for segment in segments:
+        if not isinstance(segment, dict):
+            return False
+        text = segment.get("text")
+        start, end = segment.get("start"), segment.get("end")
+        if (
+            not isinstance(text, str) or text.strip()
+            or not _nonnegative_number(start) or not _nonnegative_number(end)
+            or end < start or end > duration + _MAX_END_ROUNDING_SECONDS + 1e-9
+        ):
+            return False
+    return True
 
 
 def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Word]:

@@ -83,7 +83,7 @@ Live provider smoke tests are opt-in because they can spend API credits:
 python -m pytest --live tests/test_live_smoke.py
 ```
 
-Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. ElevenLabs Scribe v2 is the default cloud ASR for sync and audio-to-SRT work; MAI-Transcribe 2 via OpenRouter remains selectable. `GEMINI_API_KEY` powers Gemini 3.8 Flash adjudication with medium thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
+Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. ElevenLabs Scribe v2 is the default cloud ASR for sync and audio-to-SRT work; MAI-Transcribe 2 via OpenRouter remains selectable. `GEMINI_API_KEY` powers Gemini 3.5 Flash-Lite adjudication with high thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
 
 Create `.env` as needed:
 
@@ -134,7 +134,15 @@ See the [September 5, 2026 MAI/Scribe comparison](docs/testing/mai-transcribe-2-
 
 ### Gemini Audio Context
 
-Adjudication receives the full episode audio and ordered source subtitle context alongside focused case clips, so it can inspect surrounding dialogue, improvisation, speaker changes, and simultaneous speech. The full episode provides language context; ASR words and optional forced alignment remain the timing evidence. Instructions restrict edits to each case's local dialogue and prohibit moving words between scenes or returning replacement timestamps.
+Flash-Lite adjudication receives focused case audio clips and the full ordered source subtitle text. The September 14 comparison found that removing the full-audio cache corrected a batch of improvisations Lite had left unchanged. ASR words and optional forced alignment remain the timing evidence. Instructions restrict edits to each case's local dialogue and prohibit moving words between scenes or returning replacement timestamps.
+
+The default hybrid uses Lite at HIGH thinking first. Deterministic checks escalate invalid or uncertain replies, retained source text that conflicts with ASR, and proposed wording that differs from the case's owned ASR words. Gemini 3.8 Flash at MEDIUM thinking then reviews only those cases, with their padded clips, nearby source cues, word ownership, and the reason for review. It receives no full episode audio or shared episode cache. Audio is the judge of wording; agreement with ASR is a routing signal, not proof of correctness. Confident errors can still pass both models.
+
+Missing, invalid, or uncertain review replies preserve the source and produce QC findings. `hybrid_adjudication.json` records each route and reason; costs retain the actual model for each call. Set `llm.adjudication.fallback.enabled: false` for the Lite-only route. The [September 14 comparison](docs/testing/flash-lite-adjudication-2026-09-14.md) records measured quality and cost limits; these measurements were recorded locally; verify the deployed commit separately.
+
+If a required focused clip is unavailable or does not cover its case, that case retains its source text and timing with a QC flag. Other cases with complete audio can still proceed; the affected case is never approved from text alone.
+
+The optional `llm.adjudication.audio_context.enabled: true` route supplies full episode audio and ordered source subtitle context alongside those clips. It remains available for configurable alternatives such as Gemini 3.8 Flash. The transport and fallback rules below apply when this route is enabled.
 
 For audio longer than 180 seconds, DubSync prepares one mono 24 kHz, 64 kbps MP3 and uploads it once through Gemini's Files API; already compact MP3s can be reused. Short inputs retain the normalized WAV. Focused case snippets remain WAV and carry their episode offsets. They are sent inline unless the estimated aggregate request, including base64 encoding, exceeds 18 MB, in which case their Files API URIs are used.
 
@@ -154,7 +162,8 @@ On September 10, 2026, local preparation of the supplied long audio reduced the 
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
 | LLM text default | OpenAI GPT-5.6 Luna | Implemented adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
-| LLM adjudication default | Gemini 3.8 Flash | Full episode context, focused audio clips, structured language decisions | `llm.adjudication.provider: gemini`, `model: gemini-3.8-flash`, `thinking_level: medium` |
+| LLM adjudication default | Gemini 3.5 Flash-Lite | Full source text, focused audio clips, structured language decisions | `llm.adjudication.provider: gemini`, `model: gemini-3.5-flash-lite`, `thinking_level: high` |
+| LLM adjudication review | Gemini 3.8 Flash | Flagged cases only, focused clips and local context | `llm.adjudication.fallback.enabled: true`, `model: gemini-3.8-flash`, `thinking_level: medium` |
 | LLM punctuation default | Gemini 3.7 Flash | Word-preserving punctuation pass | `llm.punctuation.provider: gemini`, `model: gemini-3.7-flash`, `thinking_level: medium` |
 | LLM alt | Anthropic | Implemented optional adapter | `llm.provider: anthropic` |
 | Test/offline | Fixture decisions | Implemented | `llm.provider: fixture` |
@@ -203,12 +212,12 @@ llm:
   # Per-pass overrides inherit the base settings unless provider/model changes:
   adjudication:
     provider: gemini
-    model: gemini-3.8-flash
+    model: gemini-3.5-flash-lite
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
-    thinking_level: medium
+    thinking_level: high
     audio_context:
-      enabled: true
+      enabled: false
       compress_long_audio: true
       cache_enabled: true
       cache_ttl_seconds: 900
@@ -319,7 +328,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Opt-in `--live` pytest smoke tests for OpenAI GPT-5.6 Luna, Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
 - OpenAI LLM calls use the Responses API `responses.parse` structured-output path with `store: false`, bounded SDK retries/timeouts, refusal and incomplete-response handling, and explicit `reasoning.effort`. The production base text model is `gpt-5.6-luna`; speaker mapping uses `reasoning_effort: medium`. Gemini 3.7 Flash punctuation uses `thinking_level: medium`.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
-- Gemini thinking-level controls use `thinking_config.thinking_level`; adjudication defaults to Gemini 3.8 Flash medium, while punctuation remains Gemini 3.7 Flash medium.
+- Gemini thinking-level controls use `thinking_config.thinking_level`; adjudication defaults to Gemini 3.5 Flash-Lite high, its highest supported thinking level, with Gemini 3.8 Flash medium for selected reviews. Punctuation remains Gemini 3.7 Flash medium.
 - Gemini episode context uses a bounded job-owned Files API upload and explicit cache with cleanup. Externally supplied `cached_content` remains available when automatic episode context is disabled; DubSync does not replace or delete that external cache.
 - Long-audio context is compressed once, and the complete source transcript is serialized losslessly for the shared cache. Batches contain at most eight cases with four concurrent requests; timed-out multi-case batches have one bounded individual-case recovery pass. See [the September 10 subtitle audit](docs/testing/subtitle-quality-fixes-2026-09-10.md) for measured evidence and limits.
 - Default adjudication checks extract padded WAV snippets, persist `audio_snippets.json`, include source/snippet hashes and context settings in the LLM cache key, and use inline audio or Files API URIs according to the aggregate request size.
@@ -347,7 +356,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Uncached cloud ASR calls add audio-duration cost items to the cost meter; ElevenLabs keyterm/character-name prompting includes the plan's `$0.05/hr` surcharge; AssemblyAI uses the plan's Universal-3 Pro / Universal-2 rates plus the default speaker-label surcharge unless `speaker_labels: false`; cache hits remain free.
 - Live LLM adapters retain provider usage metadata and add token cost items for Gemini defaults or configured model prices.
 - LLM provider/model config can be overridden per pass for adjudication, punctuation, and speaker mapping, and cost items use the resolved pass model.
-- The adjudication confidence gate defaults to `0.7` and can be raised or lowered with `llm.adjudication.confidence_gate`.
+- The adjudication confidence gate defaults to `0.7` and can be raised or lowered with `llm.adjudication.confidence_gate`. Hybrid mode requires a finite value greater than zero and at most one; model confidence is not an accuracy guarantee.
 - Live adjudication prompts receive the resolved confidence gate, so provider-side reasoning and local QC flagging use the same threshold.
 - Adjudication sends LLM cases in scene batches split by `llm.adjudication.scene_gap_seconds` instead of one episode-wide batch.
 - Punctuation sends cue batches split by `llm.punctuation.scene_gap_seconds`, with the same word-freeze validator applied after each proposed change.
@@ -388,7 +397,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## Readiness Report
 
-The CLI and commercial web MVP are implemented, with fixture-backed tests for both customer workflows. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks. The September 10, 2026 defaults and audio-context changes are local work; the historical results below do not establish their deployed state or quality.
+The CLI and commercial web MVP are implemented, with fixture-backed tests for both customer workflows. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks. Historical results below do not establish the deployed state or quality of later changes; verify the exact Render commit for each release.
 
 Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 

@@ -55,7 +55,7 @@ def test_punctuation_cache_key_includes_line_constraints():
 
 @pytest.mark.parametrize(
     "flag_kind",
-    ["audio_snippet_unavailable", "invalid_llm_response", "llm_provider_unavailable"],
+    ["audio_snippet_unavailable", "adjudication_audio_unavailable", "invalid_llm_response", "llm_provider_unavailable"],
 )
 def test_load_cached_adjudication_ignores_transient_degraded_artifact(tmp_path, flag_kind):
     span = DivergenceSpan(
@@ -1512,7 +1512,7 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
     assert any(flag["new_text"] == "new spoken line" for flag in report["flags"] if flag["kind"] == "text_changed")
 
 
-def test_cli_sync_continues_when_audio_snippet_budget_is_exhausted(tmp_path, monkeypatch):
+def test_cli_sync_preserves_source_when_required_audio_budget_is_exhausted(tmp_path, monkeypatch):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
@@ -1524,27 +1524,18 @@ def test_cli_sync_continues_when_audio_snippet_budget_is_exhausted(tmp_path, mon
     class FallbackLLMAdapter:
         def adjudicate(self, spans):
             calls.append("text")
-            span = spans[0]
-            return [
-                {
-                    "case_id": span.case_id,
-                    "verdict": "use_audio",
-                    "final_text": "new spoken line",
-                    "confidence": 0.91,
-                    "speaker": "A",
-                    "character": "unknown",
-                    "reason": "text evidence is enough when snippets are unavailable",
-                }
-            ]
+            raise AssertionError("required case audio cannot fall back to a text-only decision")
 
         def adjudicate_with_audio(self, spans, audio_snippets):
             calls.append("audio")
-            raise AssertionError("snippet budget exhaustion should fall back to text adjudication")
+            raise AssertionError("no case audio exists after snippet budget exhaustion")
 
     def fake_extract_audio_snippets(*_args, **_kwargs):
         raise AudioSnippetError("Audio snippets would exceed the job storage budget")
 
     monkeypatch.setattr("dubsync.pipeline.llm_adapter_from_config", lambda _config, pass_name=None: FallbackLLMAdapter())
+    monkeypatch.setattr("dubsync.pipeline.punctuation_adapter_from_config", lambda _config: None)
+    monkeypatch.setattr("dubsync.pipeline.speaker_mapping_adapter_from_config", lambda _config: None)
     monkeypatch.setattr("dubsync.pipeline.extract_audio_snippets", fake_extract_audio_snippets, raising=False)
     srt_path.write_text(
         "1\n00:00:00,000 --> 00:00:01,000\nhello there\n\n"
@@ -1601,7 +1592,9 @@ def test_cli_sync_continues_when_audio_snippet_budget_is_exhausted(tmp_path, mon
     )
 
     assert result.exit_code == 0, result.output
-    assert calls == ["text"]
+    assert calls == []
+    held_cue = parse_srt_text(out_path.read_text(encoding="utf-8"))[1]
+    assert (held_cue.plain_text, held_cue.start_ms, held_cue.end_ms) == ("old line", 1000, 2000)
     artifact = json.loads((workdir / "episode" / "audio_snippets.json").read_text(encoding="utf-8"))
     assert artifact["storage_mode"] == "bounded_batches"
     assert artifact["candidate_count"] == 1
@@ -1610,8 +1603,9 @@ def test_cli_sync_continues_when_audio_snippet_budget_is_exhausted(tmp_path, mon
     assert artifact["fallback_case_ids"] == ["case-1"]
     assert artifact["snippets"] == []
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
-    assert any(flag["new_text"] == "new spoken line" for flag in report["flags"] if flag["kind"] == "text_changed")
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
     assert any(flag["kind"] == "audio_snippet_unavailable" for flag in report["flags"])
+    assert any(flag["kind"] == "adjudication_audio_unavailable" and flag["cue_ids"] == [2] for flag in report["flags"])
 
     rerun = CliRunner().invoke(
         app,
@@ -1629,7 +1623,7 @@ def test_cli_sync_continues_when_audio_snippet_budget_is_exhausted(tmp_path, mon
     )
 
     assert rerun.exit_code == 0, rerun.output
-    assert calls == ["text", "text"]
+    assert calls == []
 
 
 def test_cli_sync_skips_live_punctuation_for_long_episode_audio(tmp_path, monkeypatch):

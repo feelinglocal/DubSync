@@ -96,6 +96,33 @@ def test_full_audio_uri_is_reused_with_case_offsets_and_no_automatic_paid_retrie
     assert all(client.closed for client in sdk.clients)
 
 
+def test_configured_adjudication_sends_flash_lite_with_highest_thinking(gemini_audio_sdk, monkeypatch, tmp_path):
+    from dubsync.config import load_yaml
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    adapter = llm_adapter_from_config(load_yaml(Path("provider.yaml")), pass_name="adjudication")
+    clip = tmp_path / "spoken-change.wav"
+    clip.write_bytes(b"focused WAV")
+    span = DivergenceSpan(
+        case_id="spoken-change", cue_ids=[1], srt_text="Wait here.", asr_text="Come with me.",
+        start=1.0, end=2.0,
+    )
+    adapter.adjudicate_with_audio([span], {
+        span.case_id: AudioSnippet(case_id=span.case_id, path=str(clip), start=0.0, end=3.0),
+    })
+    request = gemini_audio_sdk.calls[0]
+    assert request["model"] == "gemini-3.5-flash-lite"
+    assert request["config"]["thinking_config"] == {"thinking_level": "high"}
+    # The fake primary omits its decision, so the configured reviewer must run.
+    assert len(gemini_audio_sdk.calls) == 2
+    review = gemini_audio_sdk.calls[1]
+    assert review["model"] == "gemini-3.8-flash"
+    assert review["config"]["thinking_config"] == {"thinking_level": "medium"}
+    assert all("cached_content" not in call["config"] for call in gemini_audio_sdk.calls)
+    assert not gemini_audio_sdk.uploads
+    assert not gemini_audio_sdk.cache_creates
+
+
 def test_owned_audio_cache_applies_only_to_adjudication_and_cleans_after_generation_failure(gemini_audio_sdk, tmp_path):
     sdk = gemini_audio_sdk
     original = tmp_path / "episode.mp3"
@@ -763,8 +790,8 @@ def test_adjudication_prompt_instructs_audio_literal_check_and_no_word_drops(tmp
     span = DivergenceSpan(
         case_id="case-1",
         cue_ids=[11],
-        srt_text="Drachen Evolutionssystem",
-        asr_text="Drachenevolutionssystem",
+        srt_text="einen",
+        asr_text="zwei",
         context_after=[],
     )
     snippet = AudioSnippet(
@@ -781,7 +808,6 @@ def test_adjudication_prompt_instructs_audio_literal_check_and_no_word_drops(tmp
     assert "Listen to each attached audio snippet" in instructions
     assert "final_text is the replacement for only the divergent span" in instructions
     assert "Do not drop matched cue words outside the divergent span" in instructions
-    assert "Drachenevolutionssystem besitze" in instructions
     assert prompt["spans"][0]["cue_ids"] == [11]
     assert prompt["audio_snippets"][0]["duration_seconds"] == 5.0
 
@@ -858,7 +884,7 @@ def test_adjudication_prompt_keeps_shared_context_before_batch_specific_payload(
     prompt = json.loads(raw_prompt)
     keys = list(prompt)
 
-    assert prompt["prompt_version"] == "adjudication-v10-audible-span-ownership"
+    assert prompt["prompt_version"] == "adjudication-v11-literal-audio-decision-workflow"
     assert prompt["spans"][0]["scene_id"] == 7
     assert prompt["spans"][0]["scene_position"] == 2
     assert keys.index("episode_context") < keys.index("spans")

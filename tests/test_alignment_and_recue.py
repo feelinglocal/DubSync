@@ -204,7 +204,7 @@ def test_alignment_rejects_an_implausibly_overlong_single_word_match():
     assert result.cue_word_indices == {}
     assert result.unmatched_cue_ids == [771]
     assert result.diagnostics.missing_audio_cue_ids == [771]
-    assert result.diagnostics.missing_audio_guard_version == 3
+    assert result.diagnostics.missing_audio_guard_version == 6
     duration_flag = next(
         flag for flag in result.flags if flag.kind == "implausible_matched_word_duration"
     )

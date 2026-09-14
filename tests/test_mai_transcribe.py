@@ -136,6 +136,42 @@ def test_empty_silence_transcript_is_valid(monkeypatch, tmp_path):
     assert MAITranscribeAdapter(api_key="test-key").transcribe(_audio(tmp_path)) == []
 
 
+@pytest.mark.parametrize("segments", [[], [{"id": 0, "start": 0, "end": 18, "text": ""}]])
+def test_observed_empty_transcription_without_words_preserves_usage(monkeypatch, tmp_path, segments):
+    # The actual opening-song response omitted words and contained an empty segment.
+    _transport(monkeypatch, [{
+        "text": "", "language": "por", "duration": 18, "segments": segments,
+        "usage": {"seconds": 18, "cost": 0.0005},
+    }])
+    adapter = MAITranscribeAdapter(api_key="test-key")
+
+    assert adapter.transcribe(_audio(tmp_path, seconds=18)) == []
+    assert adapter.last_usage["cost"] == 0.0005
+    assert adapter.last_usage["seconds"] == 18
+    assert adapter.last_usage["request_count"] == 1
+    assert adapter.last_repair_flags == []
+
+
+@pytest.mark.parametrize("payload", [
+    {},
+    {"text": ""},
+    {"text": "", "segments": None},
+    {"text": "", "segments": ["invalid"]},
+    {"text": "", "segments": [{"start": 0, "end": 3}]},
+    {"text": "", "segments": [{"text": "heard speech", "start": 0, "end": 3}]},
+    {"text": "", "segments": [{"text": "", "start": 0, "end": 4}]},
+    {"text": "", "segments": [{"text": "", "start": 2, "end": 1}]},
+    {"text": "", "segments": [{"text": "", "start": 0, "end": float("nan")}]},
+    {"text": "", "segments": [], "words": None},
+    {"text": "", "segments": [], "error": {"message": "failed"}},
+    {"text": "heard speech", "segments": []},
+])
+def test_missing_words_requires_explicit_valid_empty_transcription(monkeypatch, tmp_path, payload):
+    _transport(monkeypatch, [payload])
+    with pytest.raises(ProviderError, match="word|timing"):
+        MAITranscribeAdapter(api_key="test-key").transcribe(_audio(tmp_path))
+
+
 def test_observed_ten_millisecond_end_rounding_is_clamped_and_auditable(monkeypatch, tmp_path):
     _transport(monkeypatch, [{"words": [{"word": "para.", "start": 29.52, "end": 29.68}]}])
     adapter = MAITranscribeAdapter(api_key="test-key")

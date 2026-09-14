@@ -8,6 +8,7 @@ from typing import Literal
 
 from rapidfuzz import fuzz
 
+from .adjudication_regions import join_isolated_anchor_regions, split_protected_source_repetitions
 from .alignment_windows import (
     RETRY_MARGINS as ALIGNMENT_RETRY_MARGINS,
     band_cell_count as _band_cell_count,
@@ -43,7 +44,7 @@ NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-MISSING_AUDIO_GUARD_VERSION = 3
+MISSING_AUDIO_GUARD_VERSION = 6
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 
 @dataclass(frozen=True)
@@ -556,17 +557,18 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         pure_insertion = bool(asr_indices) and not srt_indices
         left_anchor_cue_id = (
             tokens[previous_match.srt_index].cue_id
-            if pure_insertion and previous_match is not None and previous_match.srt_index is not None
+            if previous_match is not None and previous_match.srt_index is not None
             else None
         )
         right_anchor_cue_id = (
             tokens[next_match.srt_index].cue_id
-            if pure_insertion and next_match is not None and next_match.srt_index is not None
+            if next_match is not None and next_match.srt_index is not None
             else None
         )
         insertion_token_offset = None
         if (
-            left_anchor_cue_id is not None
+            pure_insertion
+            and left_anchor_cue_id is not None
             and left_anchor_cue_id == right_anchor_cue_id
             and next_match is not None
             and next_match.srt_index is not None
@@ -578,12 +580,12 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
             )
         left_anchor_word = (
             words[previous_match.asr_index]
-            if pure_insertion and previous_match is not None and previous_match.asr_index is not None
+            if previous_match is not None and previous_match.asr_index is not None
             else None
         )
         right_anchor_word = (
             words[next_match.asr_index]
-            if pure_insertion and next_match is not None and next_match.asr_index is not None
+            if next_match is not None and next_match.asr_index is not None
             else None
         )
         case_number = len(spans) + 1
@@ -727,7 +729,9 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     for match in matches:
         cue_word_indices.setdefault(match.cue_id, []).append(match.asr_word_index)
 
-    divergence_spans = _build_divergences(ops, tokens, words)
+    divergence_spans = _source_omissions_with_local_context(
+        _build_divergences(ops, tokens, words), matches, cues, tokens, words,
+    )
     anchor_regions = _build_anchor_regions(ops, tokens, words)
     unmatched_cue_ids = [
         cue.index
@@ -792,6 +796,15 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             )
         )
 
+    if not unresolved:
+        divergence_spans = join_isolated_anchor_regions(
+            divergence_spans, matches, cues, tokens, words,
+            protected_cue_ids=set(missing_audio_cue_ids),
+        )
+        divergence_spans = split_protected_source_repetitions(
+            divergence_spans, matches, cues, tokens, words,
+            protected_cue_ids=set(missing_audio_cue_ids),
+        )
     return AlignmentResult(
         token_matches=matches,
         anchor_regions=anchor_regions,
@@ -895,6 +908,73 @@ def _source_only_unmatched_cue_ids(
     return locked
 
 
+def _source_omissions_with_local_context(
+    spans: list[DivergenceSpan],
+    matches: list[TokenMatch],
+    cues: list[Cue],
+    tokens: list[SRTToken],
+    words: list[Word],
+) -> list[DivergenceSpan]:
+    """Give a strongly anchored internal omission real audio context for review.
+
+    ASR words commonly touch. A zero gap between them does not establish that
+    an otherwise supported source cue has no audio. Two consecutive exact
+    words on either side can bound a snippet without inventing word timing.
+    Sparse phrases, source edges, unsafe timestamps and annotations stay held.
+    This changes only the adjudication window, never text or word ownership.
+    """
+    cues_by_id = {cue.index: cue for cue in cues}
+    word_index_by_token = {match.srt_token_index: match.asr_word_index for match in matches}
+    matched_counts = Counter(match.cue_id for match in matches)
+    token_counts = Counter(token.cue_id for token in tokens)
+    contextualized: list[DivergenceSpan] = []
+    for span in spans:
+        contextualized.append(span)
+        if (
+            len(span.cue_ids) != 1 or not span.srt_token_indices
+            or span.asr_word_indices or span.asr_text.strip()
+            or span.start is None or span.end is None
+            or not math.isfinite(span.start) or span.start != span.end
+        ):
+            continue
+        cue_id = span.cue_ids[0]
+        cue = cues_by_id.get(cue_id)
+        if (
+            cue is None or cue_has_bracketed_screen_text(cue)
+            or matched_counts[cue_id] * 4 < token_counts[cue_id] * 3
+        ):
+            continue
+        first, last = span.srt_token_indices[0], span.srt_token_indices[-1]
+        if span.srt_token_indices != list(range(first, last + 1)):
+            continue
+        flank_tokens = [first - 2, first - 1, last + 1, last + 2]
+        if any(
+            index not in word_index_by_token or tokens[index].cue_id != cue_id
+            for index in flank_tokens
+        ):
+            continue
+        flank_indices = [word_index_by_token[index] for index in flank_tokens]
+        if any(right != left + 1 for left, right in zip(flank_indices, flank_indices[1:])):
+            continue
+        flanks = [words[index] for index in flank_indices]
+        if any(
+            not math.isfinite(word.start) or not math.isfinite(word.end)
+            or word.start < 0
+            or not 0.020 + 1e-9 < word.end - word.start <= IMPLAUSIBLE_MATCHED_WORD_SECONDS
+            or word.confidence is not None and word.confidence < 0.8
+            for word in flanks
+        ):
+            continue
+        if (
+            any(not -1e-9 <= right.start - left.end <= 0.5
+                for left, right in zip(flanks, flanks[1:]))
+            or len({word.speaker_id for word in flanks if word.speaker_id}) > 1
+        ):
+            continue
+        contextualized[-1] = span.model_copy(update={"start": flanks[0].start, "end": flanks[-1].end})
+    return contextualized
+
+
 def _source_only_zero_window_cue_ids(spans: list[DivergenceSpan]) -> set[int]:
     locked: set[int] = set()
     for span in spans:
@@ -937,8 +1017,32 @@ def _prefer_unique_full_cue_windows(
         and op.srt_index is not None
         and op.asr_index is not None
     }
-    desired_pairs = _monotonic_exact_pair_map(matched_pairs, exact_pairs)
-    if desired_pairs == matched_pairs:
+    pairs_by_cue: dict[int, set[tuple[int, int]]] = {}
+    for token_index, word_index in exact_pairs:
+        pairs_by_cue.setdefault(tokens[token_index].cue_id, set()).add((token_index, word_index))
+    matched_counts = Counter(tokens[token_index].cue_id for token_index, _ in matched_pairs)
+    token_counts = Counter(token.cue_id for token in tokens)
+    complete_cue_ids = {cue_id for cue_id, count in matched_counts.items() if count == token_counts[cue_id]}
+    supported_pairs: set[tuple[int, int]] = set()
+    for cue_id, cue_pairs in pairs_by_cue.items():
+        # A short source phrase can recur later inside an improvised sentence.
+        # Its exact window must not erase stronger neighboring lexical anchors.
+        # Check each cue separately so an unrelated repair cannot hide that loss.
+        if cue_pairs <= matched_pairs:
+            supported_pairs.update(cue_pairs)
+            continue
+        candidate_pairs = _monotonic_exact_pair_map(matched_pairs, cue_pairs)
+        # A repeated prefix in the next source cue must not consume an already
+        # complete cue merely to keep the same total number of matched words.
+        removes_complete_neighbor = any(
+            tokens[token_index].cue_id != cue_id
+            and tokens[token_index].cue_id in complete_cue_ids
+            for token_index, _ in matched_pairs - candidate_pairs
+        )
+        if len(candidate_pairs) >= len(matched_pairs) and not removes_complete_neighbor:
+            supported_pairs.update(cue_pairs)
+    desired_pairs = _monotonic_exact_pair_map(matched_pairs, supported_pairs)
+    if desired_pairs == matched_pairs or len(desired_pairs) < len(matched_pairs):
         return ops
     return _ops_from_exact_pairs(len(tokens), len(words_norm), desired_pairs)
 

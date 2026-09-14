@@ -105,10 +105,14 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.8-flash"
-    assert config["llm"]["adjudication"]["thinking_level"] == "medium"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["fallback"] == {
+        "enabled": True, "provider": "gemini", "model": "gemini-3.8-flash",
+        "thinking_level": "medium",
+    }
     assert config["llm"]["adjudication"]["audio_context"] == {
-        "enabled": True, "compress_long_audio": True, "cache_enabled": True,
+        "enabled": False, "compress_long_audio": True, "cache_enabled": True,
         "cache_ttl_seconds": 900, "max_uncached_audio_tokens": 256000,
     }
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
@@ -147,10 +151,14 @@ def test_production_llm_passes_use_requested_models_and_thinking_levels():
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["provider"] == "gemini"
-    assert config["llm"]["adjudication"]["model"] == "gemini-3.8-flash"
-    assert config["llm"]["adjudication"]["thinking_level"] == "medium"
+    assert config["llm"]["adjudication"]["model"] == "gemini-3.5-flash-lite"
+    assert config["llm"]["adjudication"]["thinking_level"] == "high"
+    assert config["llm"]["adjudication"]["fallback"] == {
+        "enabled": True, "provider": "gemini", "model": "gemini-3.8-flash",
+        "thinking_level": "medium",
+    }
     assert config["llm"]["adjudication"]["audio_context"] == {
-        "enabled": True, "compress_long_audio": True, "cache_enabled": True,
+        "enabled": False, "compress_long_audio": True, "cache_enabled": True,
         "cache_ttl_seconds": 900, "max_uncached_audio_tokens": 256000,
     }
     assert config["llm"]["adjudication"]["audio_snippet_double_check"]["enabled"] is True
@@ -172,7 +180,7 @@ def test_documented_configuration_uses_gpt_5_6_luna_default():
 def test_commercial_runbook_names_current_models_and_provider_secrets():
     commercial_plan = Path("docs/COMMERCIAL_PLAN.md").read_text(encoding="utf-8")
 
-    assert "Gemini 3.8 Flash adjudication (medium thinking)" in commercial_plan
+    assert "Gemini 3.5 Flash-Lite adjudication (high thinking)" in commercial_plan
     assert "Gemini 3.7 Flash punctuation (medium thinking)" in commercial_plan
     assert "Scribe v2 is the default transcription option; MAI remains selectable" in commercial_plan
     assert "OpenAI GPT-5.6 Luna speaker-mapping pass" in commercial_plan

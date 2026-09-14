@@ -8,6 +8,28 @@ import pytest
 
 import dubsync.cost as cost
 
+def test_flash_lite_native_cache_reads_and_thinking_use_its_published_rates():
+    meter = cost.CostMeter()
+    response = {"usage_metadata": {
+        "prompt_token_count": 100_000,
+        "cached_content_token_count": 96_000,
+        "candidates_token_count": 200,
+        "thoughts_token_count": 800,
+    }}
+    assert cost.record_llm_usage(meter, "gemini", "gemini-3.5-flash-lite", {}, response) is None
+    assert meter.total_usd == 0.00658
+
+
+def test_flash_lite_full_audio_context_accounts_for_creation_and_storage():
+    meter = cost.CostMeter()
+    report = {
+        "cache_create_input_tokens_reserved": 96_000,
+        "cache_storage_token_seconds": 96_000 * 180,
+    }
+    assert cost.record_gemini_context_cost(meter, "models/gemini-3.5-flash-lite", {}, report) is None
+    assert [(item.kind, item.usd) for item in meter.items] == [
+        ("cache_create_estimate", 0.0288), ("cache_storage_estimate", 0.0048),
+    ]
 
 @pytest.fixture(autouse=True)
 def introductory_prices(monkeypatch):
