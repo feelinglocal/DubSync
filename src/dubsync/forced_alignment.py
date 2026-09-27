@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import Cue, ForcedAlignmentCue, QCFlag
+from .providers import normalize_language_code
 from .style_profile import StyleProfile
 from .tokenize import alphanumeric_signature
 
@@ -33,13 +34,15 @@ class MMSForcedAlignmentAdapter:
         batch_size: int = 4,
         device: str | None = None,
     ):
-        self.language = language or "eng"
+        normalized_language = normalize_language_code(language)
+        self.language = "jpn" if normalized_language == "ja" else normalized_language or "eng"
         self.romanize = romanize
         self.batch_size = batch_size
         self.device = device
 
     def align(self, audio_path: Path, cues: list[Cue]) -> list[ForcedAlignmentCue]:
-        transcript = " ".join(cue.plain_text for cue in cues).strip()
+        nonempty_cues = [cue for cue in cues if cue.plain_text]
+        transcript = " ".join(cue.plain_text for cue in nonempty_cues)
         if not transcript:
             return []
         try:
@@ -65,7 +68,7 @@ class MMSForcedAlignmentAdapter:
         segments, scores, blank_token = get_alignments(emissions, tokens_starred, alignment_tokenizer)
         spans = get_spans(tokens_starred, segments, blank_token)
         word_timestamps = postprocess_results(text_starred, spans, stride, scores)
-        return _cue_alignments_from_word_timestamps(cues, list(word_timestamps))
+        return _cue_alignments_from_word_timestamps(nonempty_cues, list(word_timestamps), language=self.language)
 
 
 def forced_alignment_adapter_from_config(config: dict[str, object]) -> ForcedAlignmentAdapter | None:
@@ -132,7 +135,11 @@ def apply_forced_alignment(
     return updated, flags
 
 
-def _cue_alignments_from_word_timestamps(cues: list[Cue], word_timestamps: list[object]) -> list[ForcedAlignmentCue]:
+def _cue_alignments_from_word_timestamps(
+    cues: list[Cue], word_timestamps: list[object], *, language: str | None = None,
+) -> list[ForcedAlignmentCue]:
+    if normalize_language_code(language) == "ja":
+        return _japanese_cue_alignments(cues, word_timestamps)
     alignments: list[ForcedAlignmentCue] = []
     cursor = 0
     for cue in cues:
@@ -149,6 +156,40 @@ def _cue_alignments_from_word_timestamps(cues: list[Cue], word_timestamps: list[
                 start=_float_field(chunk[0], "start"),
                 end=_float_field(chunk[-1], "end"),
                 score=_mean_score(chunk),
+            )
+        )
+    return alignments
+
+
+def _japanese_cue_alignments(cues: list[Cue], character_timestamps: list[object]) -> list[ForcedAlignmentCue]:
+    """Map MMS's jpn character rows using the exact submitted transcript.
+
+    The aligner's Japanese preprocessing keeps punctuation and whitespace in
+    the returned text rows, including our inter-cue separator. Counting lexical
+    tokens here would shift every later cue and could borrow a neighbour's audio.
+    Incomplete/mismatched rows leave the existing timings available for review.
+    """
+    nonempty_cues = [cue for cue in cues if cue.plain_text]
+    transcript = " ".join(cue.plain_text for cue in nonempty_cues)
+    if len(character_timestamps) != len(transcript) or any(
+        _field(row, "text") != char for row, char in zip(character_timestamps, transcript)
+    ):
+        return []
+    alignments: list[ForcedAlignmentCue] = []
+    cursor = 0
+    for cue in nonempty_cues:
+        text = cue.plain_text
+        chunk = character_timestamps[cursor : cursor + len(text)]
+        cursor += len(text) + 1
+        speech_rows = [row for row, char in zip(chunk, text) if char.isalnum()]
+        if not speech_rows:
+            continue
+        alignments.append(
+            ForcedAlignmentCue(
+                cue_id=cue.index,
+                start=_float_field(speech_rows[0], "start"),
+                end=_float_field(speech_rows[-1], "end"),
+                score=_mean_score(speech_rows),
             )
         )
     return alignments

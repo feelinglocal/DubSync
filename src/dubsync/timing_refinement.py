@@ -25,6 +25,8 @@ def refine_cues_to_speech_activity(
     *,
     words: list[Word] | None = None,
     alignment: AlignmentResult | None = None,
+    protected_cue_ids: set[int] | None = None,
+    fixed_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     options = config or BoundaryRefinementConfig()
     if not options.enabled or not regions:
@@ -33,8 +35,21 @@ def refine_cues_to_speech_activity(
     refined: list[Cue] = []
     flags: list[QCFlag] = []
     sorted_regions = sorted(regions, key=lambda region: (region.start, region.end))
+    protected = protected_cue_ids or set()
+    fixed = protected | (fixed_cue_ids or set())
+    next_start_by_cue: dict[int, int] = {}
+    next_start: int | None = None
+    for cue in reversed(cues):
+        if cue.index in protected:
+            continue
+        if next_start is not None:
+            next_start_by_cue[cue.index] = next_start
+        next_start = cue.start_ms
 
-    for index, cue in enumerate(cues):
+    for cue in cues:
+        if cue.index in fixed:
+            refined.append(cue)
+            continue
         word_window = _word_window_for_cue(cue, words, alignment)
         cue_regions = (
             _regions_from_word_window(word_window, sorted_regions, options)
@@ -52,9 +67,9 @@ def refine_cues_to_speech_activity(
             if word_window is not None
             else _refined_end_ms(cue, end_region, profile, options)
         )
-        end_cap_ms = None
-        if index + 1 < len(cues):
-            end_cap_ms = cues[index + 1].start_ms
+        # Uncertain source boundaries are not evidence for shortening nearby speech.
+        end_cap_ms = next_start_by_cue.get(cue.index)
+        if end_cap_ms is not None:
             end_ms = min(end_ms, end_cap_ms)
         end_ms = max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
         if end_cap_ms is not None and end_ms > end_cap_ms:

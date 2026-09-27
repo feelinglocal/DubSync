@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from rapidfuzz import fuzz
 
 from .models import AlignmentResult, AnchorRegion, Cue, DivergenceSpan, TokenMatch, Word
-from .tokenize import SRTToken, normalized_words, tokenize_cues
+from .text_metrics import contains_character_level_script, join_word_texts, token_texts
+from .tokenize import SRTToken, normalize_token, normalized_words, tokenize_cues
 
 MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
@@ -43,6 +44,8 @@ def _band_window(row: int, token_count: int, word_count: int, margin: int) -> tu
 def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: int = BAND_MARGIN) -> list[_Op]:
     n = len(tokens)
     m = len(words_norm)
+    if n == m and all(token.normalized == word for token, word in zip(tokens, words_norm)):
+        return [_Op("match", index, index, 1.0) for index in range(n)]
     gap = -0.75
     dp: list[dict[int, float]] = [{0: 0.0}]
     back: list[dict[int, str]] = [{0: ""}]
@@ -106,11 +109,11 @@ def _align_tokens(tokens: list[SRTToken], words_norm: list[str], band_margin: in
 
 
 def _span_text_from_tokens(tokens: list[SRTToken], indices: list[int]) -> str:
-    return " ".join(tokens[index].text for index in indices)
+    return join_word_texts(tokens[index].text for index in indices)
 
 
 def _span_text_from_words(words: list[Word], indices: list[int]) -> str:
-    return " ".join(words[index].text for index in indices)
+    return join_word_texts(words[index].text for index in indices)
 
 
 def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]) -> list[DivergenceSpan]:
@@ -145,6 +148,16 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         speaker_ids = sorted({words[index].speaker_id for index in asr_indices if words[index].speaker_id})
         start = boundary_start(next_match)
         end = boundary_end(next_match)
+        if start is not None and end is not None and end < start:
+            # Adjacent comparison units can belong to the same provider word.
+            # Its full acoustic envelope is the only supported time window.
+            neighbors = [
+                words[op.asr_index]
+                for op in (previous_match, next_match)
+                if op is not None and op.asr_index is not None
+            ]
+            start = min(word.start for word in neighbors)
+            end = max(word.end for word in neighbors)
         case_number = len(spans) + 1
         spans.append(
             DivergenceSpan(
@@ -219,11 +232,33 @@ def _build_anchor_regions(
     return regions
 
 
+def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int]]:
+    """Compare unspaced scripts in shared units, retaining provider word ownership.
+
+    Unit timestamps are the complete original word envelope. They are never
+    interpolated into invented character timestamps or persisted as ASR words.
+    """
+    units: list[Word] = []
+    word_indices: list[int] = []
+    for index, word in enumerate(words):
+        if not normalize_token(word.text):
+            continue
+        parts = token_texts(word.text)
+        if any(contains_character_level_script(part) for part in parts):
+            units.extend(word.model_copy(update={"text": part}) for part in parts)
+            word_indices.extend([index] * len(parts))
+        else:
+            units.append(word)
+            word_indices.append(index)
+    return units, word_indices
+
+
 def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     tokens = tokenize_cues(cues)
-    words_norm = normalized_words(words)
     if not tokens:
         return AlignmentResult()
+    units, original_indices = _alignment_word_units(words)
+    words_norm = normalized_words(units)
 
     ops = _align_tokens(tokens, words_norm)
     matches: list[TokenMatch] = []
@@ -237,14 +272,20 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             TokenMatch(
                 cue_id=token.cue_id,
                 srt_token_index=op.srt_index,
-                asr_word_index=op.asr_index,
+                asr_word_index=original_indices[op.asr_index],
                 score=round(op.score, 4),
             )
         )
-        cue_word_indices.setdefault(token.cue_id, []).append(op.asr_index)
+        cue_word_indices.setdefault(token.cue_id, []).append(original_indices[op.asr_index])
 
-    divergence_spans = _build_divergences(ops, tokens, words)
-    anchor_regions = _build_anchor_regions(ops, tokens, words)
+    divergence_spans = [
+        span.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in span.asr_word_indices})})
+        for span in _build_divergences(ops, tokens, units)
+    ]
+    anchor_regions = [
+        region.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in region.asr_word_indices})})
+        for region in _build_anchor_regions(ops, tokens, units)
+    ]
     unmatched_cue_ids = [cue.index for cue in cues if not cue_word_indices.get(cue.index)]
     anchor_coverage = len(matches) / len(tokens)
 

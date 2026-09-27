@@ -15,6 +15,40 @@ class _CueTiming:
     speaker_id: str | None
 
 
+def shared_word_cue_ids(alignment: AlignmentResult) -> set[int]:
+    """Find cues whose boundary falls inside one indivisible ASR timestamp."""
+    owners: dict[int, set[int]] = {}
+    for cue_id, word_indices in alignment.cue_word_indices.items():
+        for word_index in word_indices:
+            owners.setdefault(word_index, set()).add(cue_id)
+    return {cue_id for cue_ids in owners.values() if len(cue_ids) > 1 for cue_id in cue_ids}
+
+
+def preserve_source_timings(cues: list[Cue], source_cues: list[Cue], cue_ids: set[int]) -> list[Cue]:
+    sources = {cue.index: cue for cue in source_cues if cue.index in cue_ids}
+    return [
+        cue.with_timing(sources[cue.index].start_ms, sources[cue.index].end_ms)
+        if cue.index in sources else cue
+        for cue in cues
+    ]
+
+
+def shared_word_timing_flags(cues: list[Cue], cue_ids: set[int]) -> list[QCFlag]:
+    return [
+        QCFlag(
+            kind="shared_word_timing_preserved",
+            cue_ids=[cue.index],
+            message=(
+                "One ASR timestamp spans multiple cues, so their internal speech boundary is uncertain. "
+                "Source timing was preserved for review."
+            ),
+            start=cue.start_ms / 1000.0,
+            end=cue.end_ms / 1000.0,
+        )
+        for cue in cues if cue.index in cue_ids
+    ]
+
+
 def rebuild_cues(
     cues: list[Cue],
     words: list[Word],
@@ -26,6 +60,7 @@ def rebuild_cues(
 ) -> tuple[list[Cue], list[QCFlag]]:
     rebuilt: list[Cue] = []
     flags: list[QCFlag] = []
+    protected_cue_ids = shared_word_cue_ids(alignment)
     timings, timing_flags = _cue_timings(
         cues,
         words,
@@ -38,6 +73,9 @@ def rebuild_cues(
     next_start_by_cue = _next_start_by_same_speaker(cues, timings)
 
     for cue_position, cue in enumerate(cues):
+        if cue.index in protected_cue_ids:
+            rebuilt.append(cue)
+            continue
         timing = timings.get(cue.index)
         if timing is None:
             should_remove = profile.drop_policy == "remove"
@@ -76,7 +114,8 @@ def rebuild_cues(
         end_ms = _extend_into_available_gap(timing, next_start_by_cue.get(cue.index), profile)
         rebuilt.append(cue.with_timing(timing.start_ms, end_ms).model_copy(update={"speaker_id": timing.speaker_id}))
 
-    return _enforce_monotonic(rebuilt, profile), flags
+    flags.extend(shared_word_timing_flags(cues, protected_cue_ids))
+    return _enforce_monotonic(rebuilt, profile, protected_cue_ids), flags
 
 
 def _interpolated_timing(
@@ -144,7 +183,11 @@ def _cue_timings(
 ) -> tuple[dict[int, _CueTiming], list[QCFlag]]:
     timings: dict[int, _CueTiming] = {}
     flags: list[QCFlag] = []
+    protected_cue_ids = shared_word_cue_ids(alignment)
     for cue in cues:
+        if cue.index in protected_cue_ids:
+            timings[cue.index] = _CueTiming(cue.start_ms, cue.end_ms, cue.end_ms, cue.speaker_id)
+            continue
         word_indices = alignment.cue_word_indices.get(cue.index, [])
         if not word_indices:
             continue
@@ -261,7 +304,7 @@ def _dominant_speaker(words: list[Word]) -> str | None:
     return Counter(speakers).most_common(1)[0][0]
 
 
-def _enforce_monotonic(cues: list[Cue], profile: StyleProfile) -> list[Cue]:
+def _enforce_monotonic(cues: list[Cue], profile: StyleProfile, protected_cue_ids: set[int]) -> list[Cue]:
     if not cues:
         return []
     adjusted: list[Cue] = []
@@ -269,7 +312,12 @@ def _enforce_monotonic(cues: list[Cue], profile: StyleProfile) -> list[Cue]:
     for cue in cues:
         speaker_key = _speaker_key(cue.speaker_id)
         previous = previous_by_speaker.get(speaker_key)
-        if previous is not None and cue.start_ms < previous.end_ms:
+        if (
+            previous is not None
+            and cue.start_ms < previous.end_ms
+            and cue.index not in protected_cue_ids
+            and previous.index not in protected_cue_ids
+        ):
             start_ms = previous.end_ms if profile.allow_zero_gap else profile.snap_ceil(previous.end_ms + 1)
             end_ms = max(cue.end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
             next_cue = cue.with_timing(start_ms, end_ms)

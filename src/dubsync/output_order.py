@@ -15,15 +15,18 @@ def finalize_cues_for_output(
     no_overlaps: bool = True,
     max_cps: float | None = None,
     max_cue_duration_seconds: float | None = None,
+    protected_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
+    protected = protected_cue_ids or set()
     ordered = sorted(cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
-    merged, flags = _merge_duplicate_overlaps(ordered)
+    merged, flags = _merge_duplicate_overlaps(ordered, protected)
     if max_cps is not None:
         merged, readability_flags = _extend_fast_cues_into_following_gap(
             merged,
             profile,
             max_cps,
             max_cue_duration_seconds,
+            protected,
         )
         flags.extend(readability_flags)
         merged, merge_flags = _merge_fast_cues_with_following(
@@ -31,12 +34,16 @@ def finalize_cues_for_output(
             profile,
             max_cps,
             max_cue_duration_seconds,
+            protected,
         )
         flags.extend(merge_flags)
     finalized = merged
     if no_overlaps:
-        finalized, overlap_flags = _resolve_residual_overlaps(merged, profile)
+        finalized, overlap_flags = _resolve_residual_overlaps(merged, profile, protected)
         flags.extend(overlap_flags)
+    if protected:
+        # An earlier unprotected cue may move past a preserved source boundary.
+        finalized = sorted(finalized, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
     _assert_monotonic_starts(finalized)
     return finalized, flags
 
@@ -46,6 +53,7 @@ def _extend_fast_cues_into_following_gap(
     profile: StyleProfile,
     max_cps: float,
     max_cue_duration_seconds: float | None,
+    protected_cue_ids: set[int],
 ) -> tuple[list[Cue], list[QCFlag]]:
     if max_cps <= 0 or not cues:
         return cues, []
@@ -53,6 +61,8 @@ def _extend_fast_cues_into_following_gap(
     flags: list[QCFlag] = []
     for index in range(len(adjusted)):
         cue = adjusted[index]
+        if cue.index in protected_cue_ids:
+            continue
         needed_end_ms = _end_for_cps(cue, profile, max_cps, max_cue_duration_seconds)
         if needed_end_ms <= cue.end_ms:
             continue
@@ -75,18 +85,19 @@ def _merge_fast_cues_with_following(
     profile: StyleProfile,
     max_cps: float,
     max_cue_duration_seconds: float | None,
+    protected_cue_ids: set[int],
 ) -> tuple[list[Cue], list[QCFlag]]:
     merged: list[Cue] = []
     flags: list[QCFlag] = []
     index = 0
     while index < len(cues):
         current = cues[index]
-        if _cue_cps(current) <= max_cps or index + 1 >= len(cues):
+        if current.index in protected_cue_ids or _cue_cps(current) <= max_cps or index + 1 >= len(cues):
             merged.append(current)
             index += 1
             continue
         following = cues[index + 1]
-        if _known_different_speakers(current, following):
+        if following.index in protected_cue_ids or _known_different_speakers(current, following):
             merged.append(current)
             index += 1
             continue
@@ -174,7 +185,7 @@ def _cue_cps(cue: Cue) -> float:
     return display_width(cue.plain_text) / (cue.duration_ms / 1000.0)
 
 
-def _merge_duplicate_overlaps(cues: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
+def _merge_duplicate_overlaps(cues: list[Cue], protected_cue_ids: set[int]) -> tuple[list[Cue], list[QCFlag]]:
     merged: list[Cue] = []
     flags: list[QCFlag] = []
     index = 0
@@ -183,7 +194,12 @@ def _merge_duplicate_overlaps(cues: list[Cue]) -> tuple[list[Cue], list[QCFlag]]
         duplicate_ids = [current.index]
         old_texts = [current.text]
         cursor = index + 1
-        while cursor < len(cues) and _is_duplicate_overlap(current, cues[cursor]):
+        while (
+            cursor < len(cues)
+            and current.index not in protected_cue_ids
+            and cues[cursor].index not in protected_cue_ids
+            and _is_duplicate_overlap(current, cues[cursor])
+        ):
             duplicate = cues[cursor]
             duplicate_ids.append(duplicate.index)
             old_texts.append(duplicate.text)
@@ -240,13 +256,25 @@ def _preferred_duplicate_text(left: Cue, right: Cue) -> Cue:
     return left
 
 
-def _resolve_residual_overlaps(cues: list[Cue], profile: StyleProfile) -> tuple[list[Cue], list[QCFlag]]:
+def _resolve_residual_overlaps(
+    cues: list[Cue], profile: StyleProfile, protected_cue_ids: set[int],
+) -> tuple[list[Cue], list[QCFlag]]:
     adjusted: list[Cue] = []
     flags: list[QCFlag] = []
     min_duration_ms = int(profile.min_cue_dur * 1000)
     for cue in cues:
         if adjusted and _needs_final_timing_separation(adjusted[-1], cue):
             previous = adjusted[-1]
+            if cue.index in protected_cue_ids or previous.index in protected_cue_ids:
+                flags.append(QCFlag(
+                    kind="output_overlap_preserved",
+                    cue_ids=[previous.index, cue.index],
+                    message="Uncertain source timing was preserved; this overlap or speaker transition needs review.",
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                ))
+                adjusted.append(cue)
+                continue
             was_overlap = cue.start_ms < previous.end_ms
             start_ms = _separated_start_ms(previous, cue, profile)
             end_ms = max(cue.end_ms, profile.snap_ceil(start_ms + min_duration_ms))

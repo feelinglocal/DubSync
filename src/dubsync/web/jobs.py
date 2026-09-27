@@ -263,7 +263,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     output_name = "generated.srt" if job.mode == "generate" else "synced.srt"
     output_path = job.directory / output_name
     workdir = job.directory / "work"
-    language = None if job.language == "auto" else job.language
+    language = job.language
     if job.mode == "sync":
         if job.srt_path is None:
             raise ValueError("Sync job is missing its SRT input")

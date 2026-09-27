@@ -11,7 +11,24 @@ DubSync also includes a responsive React/FastAPI application with two customer w
 - **Sync existing SRT:** upload dubbed dialogue audio plus the target-language SRT, then download a synchronized SRT and QC artifacts. Cue presentation rules are derived from that uploaded SRT.
 - **Audio to SRT:** upload dubbed dialogue audio without an SRT, choose a built-in subtitle preset, enter custom line/timing/CPS rules, or upload an example SRT to derive them, then generate an acoustically timed SRT and QC artifacts.
 
-The language selector defaults to provider auto-detection. An explicit language is forwarded to ElevenLabs Scribe and becomes part of the cached ASR configuration.
+The language selector defaults to provider auto-detection and includes **Japanese 日本語** for both workflows. An explicit language is forwarded to the configured ASR provider and becomes part of the cached ASR configuration. Selecting Auto-detect clears a configured ASR language hint for that job.
+
+### Japanese subtitles
+
+Japanese processing handles unspaced kanji/kana and mixed Latin text in both sync and generation. Comparison normalizes full-width/half-width variants while preserving voiced kana distinctions; authored subtitle text retains its original Unicode representation. Grouped ASR words are compared in the same character units as the source, with every match linked back to the original acoustic word timestamps. Exact matching transcripts use a linear alignment shortcut.
+
+If one ASR timestamp spans multiple source cues, their internal boundary remains uncertain. DubSync preserves those source timings with a QC warning, including on verification resume; usable per-cue forced alignment can resolve them. Repeated characters and multiple accepted corrections are applied to their exact original text positions. Uncertainty does not prevent the job from completing or the SRT from being downloaded.
+
+Generated subtitles join Japanese fragments without extra spaces and recognize Japanese sentence punctuation and closing quotes. Line wrapping follows best-effort [Japanese line-breaking conventions](https://www.w3.org/TR/jlreq/#line_breaking_rules). If a narrow custom width cannot fit an unbreakable cluster, output remains available and the existing style report identifies the overflow. Japanese requires no extra dictionary, mandatory language selection, or language-specific job gate; these text improvements also apply under Auto-detect. Custom profiles and SRT-derived styles remain available.
+
+CLI `sync`, `batch`, and `generate` accept `--language ja` (also `jpn` or `ja-JP`) or `--language auto`. Omitting the option preserves the provider configuration. For example:
+
+```powershell
+dubsync sync episode.srt episode.wav -o episode.synced.srt --providers provider.yaml --language ja
+dubsync generate episode.wav -o episode.generated.srt --providers provider.yaml --language ja
+```
+
+Language hints reach ElevenLabs, OpenAI Whisper, AssemblyAI, and WhisperX. AssemblyAI's default model selection includes its documented multilingual fallback for Japanese or auto-detection. An explicit Japanese selection also sets an already configured MMS aligner to `jpn`; it does not enable or install that optional model. Automated tests use provider fixtures and mocked SDK calls; real Japanese audio transcription and optional model quality still need listening-based evaluation.
 
 The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Manual quotes issue a rotating job access code before paid processing, and every accepted job receives a separate secret browser-held result token. Uploads and results expire after 24 hours, and the API limits job creation per source IP. Production job intake fails closed when the access code is not configured. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
 
@@ -339,7 +356,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - `report` refuses a parent workdir containing multiple episode reports unless a specific episode workdir is provided, avoiding silent selection of the wrong QC report.
 - `report` rejects malformed `qc_report.json` and malformed comparison SRTs with clear CLI errors instead of raw parser exceptions.
 - `drop_policy: remove` drops unmatched source cues while QC-flagging the removed text; `keep_flagged` remains the default.
-- CJK/Thai/Hangul/Japanese tokenization falls back to character-level units, and style profile/lint/reflow use visual display width for full-width text.
+- CJK/Thai/Hangul/Japanese tokenization uses character-level comparison units, with Japanese width normalization, kana-voicing preservation, and natural fragment joining. Style profile/lint/reflow use visual display width for full-width text.
 - Changed-text reflow hyphen-splits over-wide unspaced compounds so replacements can satisfy the two-line house style when possible.
 
 ## Readiness Report
@@ -373,7 +390,7 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 
 1. Live-provider drift: the ElevenLabs plus Gemini generate path has one production smoke result; OpenAI, Anthropic, AssemblyAI, WhisperX, pyannote, and MMS still rely on deterministic coverage until separately authorized live tests are run.
 2. Real-episode quality: synthetic fixtures prove timing, improv replacement, overlap, dropped-line, and source-error paths, but the PLAN targets need a golden episode set to measure cue-start MAE, improv precision/recall, and review burden on actual delivered material.
-3. Language quality beyond generic handling: CJK/full-width behavior is covered, but production quality for Japanese/Thai/Chinese/Korean and code-switching will benefit from language-specific tokenization and per-language house-style samples.
+3. Language quality beyond automated checks: Japanese text handling and fixture-backed workflows are covered, but real provider accuracy for Japanese/Thai/Chinese/Korean and code-switching still needs representative audio, per-language house-style samples, and listening review.
 
 ## Known Gaps
 
@@ -382,7 +399,7 @@ On 2026-07-11, the single approved paid web smoke ran through `https://dubsync.o
 - Live pyannote execution was not smoke-tested; it requires `dubsync[diarize-local]`, accepted model terms, and a Hugging Face token or local model path.
 - MMS forced alignment is implemented behind `dubsync[precision]`, but real model execution was not smoke-tested in this workspace.
 - Deterministic energy VAD is wired; optional Silero VAD is available with energy fallback, but production quality should be validated on a golden set.
-- CJK/Thai/Hangul/Japanese text now uses character-level tokenization and visual-width line checks; language-specific morphological tokenizers remain a future quality upgrade.
+- CJK/Thai/Hangul/Japanese text uses character-level comparison and visual-width line checks. Japanese additionally supports kana-safe normalization, grouped ASR word matching, punctuation-aware generation, and best-effort line breaking; language-specific morphological tokenizers remain a possible future upgrade.
 - Live LLM speaker-to-character inference is implemented through the configured LLM adapter, but was not smoke-tested against real provider responses in this workspace.
 - Live Gemini punctuation completed in the production web smoke; OpenAI and Anthropic usage metering remains covered only by deterministic response-shape tests.
 - Audio-snippet double-checks are implemented for Gemini inline audio, but were not live-smoke-tested against the real Gemini API in this workspace. Automatic Gemini context-cache creation/deletion remains unimplemented because it creates third-party resources and can incur storage billing; provide `cached_content` to reuse a cache created outside DubSync.

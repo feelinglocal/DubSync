@@ -60,6 +60,40 @@ afterEach(() => {
 })
 
 describe('DubSync workspace', () => {
+  it.each(['sync', 'generate'] as const)('submits Japanese %s jobs without an additional language gate', async (mode) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'japanese-job', token: 'japanese-token', mode, status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z',
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    const language = screen.getByRole('combobox', { name: 'Language' })
+    expect(language).toHaveValue('auto')
+    await user.selectOptions(language, screen.getByRole('option', { name: 'Japanese 日本語' }))
+    if (mode === 'generate') await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], '日本語.wav', { type: 'audio/wav' }))
+    if (mode === 'sync') {
+      await user.upload(screen.getByLabelText('Original SRT'), new File(
+        ['1\n00:00:00,000 --> 00:00:01,000\nこんにちは。\n'], '日本語.srt', { type: 'application/x-subrip' },
+      ))
+    }
+
+    const submit = screen.getByRole('button', { name: mode === 'sync' ? 'Start sync' : 'Generate SRT' })
+    expect(language).toHaveValue('ja')
+    expect(submit).toBeEnabled()
+    await user.click(submit)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const body = fetchMock.mock.calls[1][1]?.body as FormData
+    expect(body.get('language')).toBe('ja')
+    expect(body.get('mode')).toBe(mode)
+    expect(await screen.findByText('2 cues ready')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Download SRT' })).toBeEnabled()
+  })
+
   it('shows the real sync workflow and requires both source files by default', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
     render(<App />)

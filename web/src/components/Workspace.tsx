@@ -170,9 +170,9 @@ export function Workspace({ config }: { config: PublicConfig }) {
               onSampleChange={setStyleSample}
             />
           )}
-          <div className={config.access_code_required ? 'workspace-options has-access-code' : 'workspace-options'}>
+          <div className={`workspace-options${config.access_code_required ? ' has-access-code' : ''}${language === 'ja' ? ' has-japanese-language' : ''}`}>
             <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
-            <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
+            <label><span className="field-label">Language</span><span className="select-control"><select value={language} onChange={(event) => setLanguage(event.target.value)}><option value="auto">Auto-detect</option><option value="de">German</option><option value="fr">French</option><option value="en">English</option><option value="id">Indonesian</option><option value="ja">Japanese 日本語</option><option value="es">Spanish</option></select><ChevronDown aria-hidden="true" /></span></label>
             {config.access_code_required && config.jobs_available && (
               <label><span className="field-label">Job access code</span><input type="password" value={accessCode} onChange={(event) => setAccessCode(event.target.value)} autoComplete="one-time-code" required /></label>
             )}

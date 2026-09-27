@@ -25,6 +25,7 @@ RESUME_STAGE_HELP = "Resume from asr, align, adjudicate, rebuild, or verify."
 RESUME_STAGES = {"asr", "align", "adjudicate", "rebuild", "verify"}
 GENERATED_SRT_NAMES = {"changes.diff.srt"}
 GENERATED_SRT_SUFFIXES = (".synced.srt", ".changes.diff.srt")
+LANGUAGE_HELP = "Optional audio language code, e.g. ja for Japanese; auto detects the language."
 
 
 @app.command()
@@ -39,6 +40,7 @@ def sync(
     no_llm: bool = typer.Option(False, "--no-llm", help="Timing-only mode with full QC."),
     fps: Optional[float] = typer.Option(None, "--fps", help="Override detected frame rate."),
     resume: Optional[str] = typer.Option(None, "--resume", help=RESUME_STAGE_HELP),
+    language: Optional[str] = typer.Option(None, "--language", help=LANGUAGE_HELP),
 ) -> None:
     _load_dotenv()
     output_path = output or srt.with_name(f"{srt.stem}.synced.srt")
@@ -53,6 +55,7 @@ def sync(
         fps=fps,
         resume=_validate_resume_stage(resume),
         local=local,
+        language=language,
     )
     console.print(f"[green]Wrote[/green] {result.output_srt}")
     console.print(f"[green]Artifacts[/green] {result.episode_workdir}")
@@ -70,6 +73,7 @@ def batch(
     no_llm: bool = typer.Option(False, "--no-llm"),
     fps: Optional[float] = typer.Option(None, "--fps", help="Override detected frame rate."),
     resume: Optional[str] = typer.Option(None, "--resume", help=RESUME_STAGE_HELP),
+    language: Optional[str] = typer.Option(None, "--language", help=LANGUAGE_HELP),
 ) -> None:
     _load_dotenv()
     resume_stage = _validate_resume_stage(resume)
@@ -83,7 +87,7 @@ def batch(
             console.print(f"[yellow]Skipping[/yellow] {srt_path}: no matching WAV/MP3")
             continue
         output = srt_path.with_name(f"{srt_path.stem}.synced.srt")
-        result = _sync_episode_or_exit(srt_path, audio, output, workdir, style, providers, no_llm=no_llm, fps=fps, resume=resume_stage, local=local)
+        result = _sync_episode_or_exit(srt_path, audio, output, workdir, style, providers, no_llm=no_llm, fps=fps, resume=resume_stage, local=local, language=language)
         console.print(f"[green]Wrote[/green] {result.output_srt}")
         console.print(f"[green]Artifacts[/green] {result.episode_workdir}")
         console.print("Cost meter")
@@ -103,6 +107,7 @@ def generate(
     local: bool = typer.Option(False, "--local", help="Use local ASR and disable cloud language passes."),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip the punctuation language pass."),
     fps: Optional[float] = typer.Option(None, "--fps", help="Output frame rate."),
+    language: Optional[str] = typer.Option(None, "--language", help=LANGUAGE_HELP),
 ) -> None:
     _load_dotenv()
     output_path = output or audio.with_name(f"{audio.stem}.generated.srt")
@@ -116,6 +121,7 @@ def generate(
             no_llm=no_llm,
             fps=fps,
             local=local,
+            language=language,
         )
     except (RuntimeError, ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc

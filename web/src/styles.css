@@ -1458,6 +1458,10 @@ button:active:not(:disabled),
 }
 
 @media (max-width: 480px) {
+  .workspace-options.has-japanese-language {
+    grid-template-columns: 1fr;
+  }
+
   .style-custom-grid {
     grid-template-columns: 1fr;
   }

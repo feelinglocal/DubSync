@@ -5,7 +5,7 @@ import unicodedata
 from typing import Protocol
 
 from .models import Cue, QCFlag
-from .text_metrics import display_width, wrap_visual_width
+from .text_metrics import display_width, join_word_texts, token_texts, wrap_visual_width
 
 
 class PunctuationValidationError(ValueError):
@@ -52,7 +52,7 @@ def apply_punctuation_pass(
             updated.append(cue)
             continue
         try:
-            validate_punctuation_only(cue.plain_text, next_text.replace("\n", " "))
+            validate_punctuation_only(cue.plain_text, next_text)
         except PunctuationValidationError as exc:
             updated.append(cue)
             flags.append(
@@ -75,7 +75,7 @@ def apply_punctuation_pass(
         )
         line_count_exceeded = max_lines_per_cue is not None and len(lines) > max_lines_per_cue
         if width_exceeded or line_count_exceeded:
-            plain_text = next_text.replace("\n", " ")
+            plain_text = join_word_texts(next_text.splitlines())
             lines = [plain_text]
             if max_chars_per_line is not None:
                 lines = wrap_visual_width(plain_text, max_chars_per_line) or [plain_text]
@@ -99,7 +99,10 @@ def _scene_batches(cues: list[Cue], scene_gap_seconds: float) -> list[list[Cue]]
 
 
 def _word_freeze_signature(text: str) -> list[str]:
+    # Normalize before extracting words so decomposed kana voicing is retained.
+    # Japanese punctuation can split an unspaced phrase without changing speech.
     return [
-        unicodedata.normalize("NFC", token).casefold()
-        for token in re.findall(r"[\w]+", text, re.UNICODE)
+        token.casefold()
+        for word in re.findall(r"[\w\u3099\u309a]+", unicodedata.normalize("NFKC", text), re.UNICODE)
+        for token in token_texts(word)
     ]

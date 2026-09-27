@@ -165,3 +165,40 @@ def test_mms_forced_alignment_adapter_uses_ctc_python_api(tmp_path, monkeypatch)
         (1, 0.10, 0.40, pytest.approx(0.85)),
         (2, 1.00, 1.50, pytest.approx(0.65)),
     ]
+
+
+def test_mms_japanese_maps_character_rows_without_crossing_cue_boundaries(tmp_path, monkeypatch):
+    calls = {}
+
+    def preprocess_text(text, romanize, language):
+        calls["preprocess"] = (text, romanize, language)
+        # The upstream jpn preprocessing contract splits every character,
+        # including punctuation and the spaces inserted between cues.
+        return list(text), list(text)
+
+    def postprocess_results(text, *args):
+        return [{"text": char, "start": index / 10, "end": (index + 1) / 10, "score": 0.9} for index, char in enumerate(text)]
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(float16="float16", float32="float32", cuda=SimpleNamespace(is_available=lambda: False)))
+    monkeypatch.setitem(sys.modules, "ctc_forced_aligner", SimpleNamespace(
+        load_alignment_model=lambda *args, **kwargs: (SimpleNamespace(dtype="float32", device="cpu"), "tokenizer"),
+        load_audio=lambda *args: "audio", generate_emissions=lambda *args, **kwargs: ("emissions", 20),
+        preprocess_text=preprocess_text, get_alignments=lambda *args: ("segments", [0.9], "blank"),
+        get_spans=lambda *args: "spans", postprocess_results=postprocess_results,
+    ))
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["「AIだ。」"]), Cue(index=2, start_ms=1000, end_ms=2000, lines=["はい。"])]
+
+    alignments = MMSForcedAlignmentAdapter(language="ja-JP").align(tmp_path / "audio.wav", cues)
+
+    assert calls["preprocess"] == ("「AIだ。」 はい。", True, "jpn")
+    # Quote/punctuation and injected whitespace do not become speech edges.
+    assert [(row.cue_id, row.start, row.end) for row in alignments] == [(1, 0.1, 0.4), (2, 0.7, 0.9)]
+
+
+def test_mms_japanese_does_not_borrow_rows_when_character_output_is_incomplete():
+    from dubsync.forced_alignment import _cue_alignments_from_word_timestamps
+
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["はい。"]), Cue(index=2, start_ms=1000, end_ms=2000, lines=["いいえ。"])]
+    rows = [{"text": char, "start": index / 10, "end": (index + 1) / 10} for index, char in enumerate("は。 いいえ。")]
+
+    assert _cue_alignments_from_word_timestamps(cues, rows, language="jpn") == []

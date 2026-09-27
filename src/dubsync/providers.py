@@ -80,7 +80,7 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
         self.model_id = model_id
         self.diarize = diarize
         self.keyterms = list(keyterms or [])
-        self.language_code = language_code
+        self.language_code = normalize_language_code(language_code)
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         if not self.api_key:
@@ -125,9 +125,10 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
 
 
 class OpenAIWhisperAdapter:  # pragma: no cover - live provider path
-    def __init__(self, api_key: str | None = None, model: str = "whisper-1"):
+    def __init__(self, api_key: str | None = None, model: str = "whisper-1", language: str | None = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.model = model
+        self.language = normalize_language_code(language)
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         if not self.api_key:
@@ -138,12 +139,14 @@ class OpenAIWhisperAdapter:  # pragma: no cover - live provider path
             raise ProviderError("Install dubsync[cloud] to use OpenAI Whisper.") from exc
 
         client = OpenAI(api_key=self.api_key)
+        language_kwargs = {"language": self.language} if self.language else {}
         with audio_path.open("rb") as audio_file:
             response = client.audio.transcriptions.create(
                 file=audio_file,
                 model=self.model,
                 response_format="verbose_json",
                 timestamp_granularities=["word"],
+                **language_kwargs,
             )
         raw_words = _field(response, "words", [])
         return [
@@ -160,10 +163,17 @@ class OpenAIWhisperAdapter:  # pragma: no cover - live provider path
 
 
 class AssemblyAIAdapter:  # pragma: no cover - live provider path
-    def __init__(self, api_key: str | None = None, model: str = "universal-3-pro", speaker_labels: bool = True):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "universal-3-pro",
+        speaker_labels: bool = True,
+        language_code: str | None = None,
+    ):
         self.api_key = api_key or os.getenv("ASSEMBLYAI_API_KEY")
         self.model = model
         self.speaker_labels = speaker_labels
+        self.language_code = normalize_language_code(language_code)
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         if not self.api_key:
@@ -174,12 +184,22 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
             raise ProviderError("Install dubsync[cloud] to use AssemblyAI.") from exc
 
         aai.settings.api_key = self.api_key
+        speech_models = [self.model]
+        # Universal-3 Pro does not cover Japanese. Preserve it as the first
+        # choice while allowing Japanese (including auto-detected audio) to use
+        # AssemblyAI's documented multilingual fallback.
+        if self.model == "universal-3-pro" and self.language_code in {None, "ja"}:
+            speech_models.append("universal-2")
+        language_kwargs = {"language_code": self.language_code} if self.language_code else {}
         config = aai.TranscriptionConfig(
-            speech_models=[self.model],
-            language_detection=True,
+            speech_models=speech_models,
+            language_detection=self.language_code is None,
             speaker_labels=self.speaker_labels,
+            **language_kwargs,
         )
         transcript = aai.Transcriber().transcribe(str(audio_path), config=config)
+        if _field(transcript, "error"):
+            raise ProviderError(f"AssemblyAI transcription failed: {_field(transcript, 'error')}")
         raw_words = _field(transcript, "words", [])
         return [
             Word(
@@ -211,7 +231,7 @@ class WhisperXAdapter:
         self.device = device
         self.compute_type = compute_type
         self.batch_size = batch_size
-        self.language = language
+        self.language = normalize_language_code(language)
         self.diarize = diarize
         self.hf_token = hf_token or os.getenv("HUGGINGFACE_ACCESS_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
         self.min_speakers = min_speakers
@@ -226,7 +246,8 @@ class WhisperXAdapter:
         try:
             audio = whisperx.load_audio(str(audio_path))
             model = whisperx.load_model(self.model, self.device, compute_type=self.compute_type)
-            result = model.transcribe(audio, batch_size=self.batch_size)
+            language_kwargs = {"language": self.language} if self.language else {}
+            result = model.transcribe(audio, batch_size=self.batch_size, **language_kwargs)
             language_code = self.language or result.get("language")
             if language_code:
                 align_model, metadata = whisperx.load_align_model(language_code=language_code, device=self.device)
@@ -283,12 +304,14 @@ def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
         return OpenAIWhisperAdapter(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
             model=str(asr_config.get("model", "whisper-1")),
+            language=_configured_asr_language(asr_config),
         )
     if provider == "assemblyai":
         return AssemblyAIAdapter(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
             model=str(asr_config.get("model", "universal-3-pro")),
             speaker_labels=bool(asr_config.get("speaker_labels", True)),
+            language_code=_configured_asr_language(asr_config),
         )
     if provider == "whisperx":
         return WhisperXAdapter(
@@ -307,20 +330,43 @@ def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
 
 def apply_asr_language(config: dict[str, object], language: str | None) -> dict[str, object]:
     next_config = dict(config)
-    normalized = (language or "").strip().lower()
-    if not normalized or normalized == "auto":
+    if not language or not language.strip():
         return next_config
+    normalized = normalize_language_code(language)
     existing = next_config.get("asr", {})
     if not isinstance(existing, dict):
         return next_config
     asr_config = dict(existing)
     provider = str(asr_config.get("provider", "elevenlabs")).lower()
-    if provider == "whisperx":
+    asr_config.pop("language", None)
+    asr_config.pop("language_code", None)
+    if normalized is None:
+        next_config["asr"] = asr_config
+        return next_config
+    if provider in {"whisperx", "openai"}:
         asr_config["language"] = normalized
     else:
         asr_config["language_code"] = normalized
     next_config["asr"] = asr_config
+    forced_alignment = next_config.get("forced_alignment")
+    if normalized == "ja" and isinstance(forced_alignment, dict) and forced_alignment and forced_alignment.get("provider", "mms") == "mms":
+        next_config["forced_alignment"] = {**forced_alignment, "language": "jpn"}
     return next_config
+
+
+def normalize_language_code(language: str | None) -> str | None:
+    """Normalize Japanese aliases without restricting other provider languages."""
+    normalized = (language or "").strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    if normalized.replace("_", "-").split("-", 1)[0] in {"ja", "jpn"}:
+        return "ja"
+    return normalized
+
+
+def _configured_asr_language(asr_config: dict[str, object]) -> str | None:
+    value = asr_config.get("language", asr_config.get("language_code"))
+    return str(value) if value else None
 
 
 def _field(item: object, name: str, default: object = None) -> object:

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from .models import Cue, Word
 from .text_metrics import token_texts
 
-TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
+TOKEN_RE = re.compile(r"[\w\u3099\u309a]+", re.UNICODE)
 _NUMBER_WORDS = {
     "zero": "0",
     "null": "0",
@@ -118,7 +118,7 @@ class SRTToken:
 
 
 def normalize_token(value: str) -> str:
-    value = _fold_latin_number_text(unicodedata.normalize("NFC", value).lower())
+    value = _fold_latin_number_text(unicodedata.normalize("NFKC", value).lower())
     parts = TOKEN_RE.findall(value)
     normalized = "".join(_NUMBER_WORDS.get(part, part) for part in parts)
     return _NUMBER_WORDS.get(normalized, normalized)
@@ -141,7 +141,17 @@ def _fold_latin_number_text(value: str) -> str:
             }
         )
     )
-    return "".join(char for char in unicodedata.normalize("NFKD", value) if not unicodedata.combining(char))
+    folded: list[str] = []
+    latin_base = False
+    for char in unicodedata.normalize("NFKD", value):
+        if unicodedata.combining(char):
+            # Accents can be folded for Latin matching, but kana voicing is lexical.
+            if not latin_base:
+                folded.append(char)
+        else:
+            latin_base = "LATIN" in unicodedata.name(char, "")
+            folded.append(char)
+    return unicodedata.normalize("NFC", "".join(folded))
 
 
 def tokenize_cues(cues: list[Cue]) -> list[SRTToken]:
@@ -160,4 +170,4 @@ def normalized_words(words: list[Word]) -> list[str]:
 
 
 def alphanumeric_signature(text: str) -> list[str]:
-    return [normalize_token(part) for part in token_texts(text) if normalize_token(part)]
+    return [normalized for part in token_texts(text) if (normalized := normalize_token(part))]

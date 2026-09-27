@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 
 from .audio import normalize_audio
@@ -15,7 +16,7 @@ from .punctuation import apply_punctuation_pass
 from .reports import write_qc_report
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
-from .text_metrics import wrap_visual_width
+from .text_metrics import join_word_texts, wrap_visual_width
 from .verify import cps_sanity_flags, lint_cues, score_cues
 
 
@@ -170,46 +171,73 @@ def _word_groups(
 ) -> list[list[Word]]:
     groups: list[list[Word]] = []
     current: list[Word] = []
-    for word in words:
+    for unit in _word_units(words, max_gap_seconds=max_gap_seconds):
         if current and _starts_new_cue(
             current,
-            word,
+            unit,
             profile,
             max_gap_seconds=max_gap_seconds,
             max_cue_duration_seconds=max_cue_duration_seconds,
         ):
             groups.append(current)
             current = []
-        current.append(word)
-        if _ends_sentence(word.text) and word.end - current[0].start >= profile.min_cue_dur:
-            groups.append(current)
-            current = []
+        current.extend(unit)
     if current:
         groups.append(current)
     return groups
 
 
+def _word_units(words: list[Word], *, max_gap_seconds: float) -> list[list[Word]]:
+    """Keep separately timestamped punctuation beside the word it belongs to."""
+    units: list[list[Word]] = []
+    pending_openers = False
+    for word in words:
+        is_opener = _only_punctuation(word.text, _SENTENCE_OPENERS)
+        if units:
+            previous = units[-1][-1]
+            same_speaker = not (previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id)
+            close_in_time = word.start - previous.end <= max_gap_seconds
+            if same_speaker and close_in_time and (
+                pending_openers or _only_punctuation(word.text, _SENTENCE_CLOSERS + ".?!…。、,;:")
+            ):
+                units[-1].append(word)
+                pending_openers = pending_openers and is_opener
+                continue
+        units.append([word])
+        pending_openers = is_opener
+    return units
+
+
 def _starts_new_cue(
     current: list[Word],
-    word: Word,
+    unit: list[Word],
     profile: StyleProfile,
     *,
     max_gap_seconds: float,
     max_cue_duration_seconds: float,
 ) -> bool:
     previous = current[-1]
+    word = unit[0]
     if word.start - previous.end > max_gap_seconds:
         return True
     if previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id:
         return True
-    if word.end - current[0].start > max_cue_duration_seconds:
+    if unit[-1].end - current[0].start > max_cue_duration_seconds:
         return True
-    candidate = " ".join(item.text.strip() for item in [*current, word])
+    current_text = join_word_texts(item.text for item in current)
+    # ASR can emit a closing quote separately; keep it with the sentence it closes.
+    if (
+        _ends_sentence(current_text)
+        and previous.end - current[0].start >= profile.min_cue_dur
+        and not _only_sentence_closers(word.text)
+    ):
+        return True
+    candidate = join_word_texts([current_text, *(item.text for item in unit)])
     return len(wrap_visual_width(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
 
 
 def _cue_from_group(index: int, group: list[Word], profile: StyleProfile) -> Cue:
-    text = " ".join(word.text.strip() for word in group)
+    text = join_word_texts(word.text for word in group)
     lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
     start_ms = profile.snap_floor(max(0, group[0].start * 1000 - profile.lead_in_ms))
     spoken_end_ms = profile.snap_ceil(group[-1].end * 1000 + profile.tail_ms)
@@ -306,8 +334,22 @@ def _nonnegative_float(source: dict[str, object], key: str, default: float) -> f
     return value
 
 
+_SENTENCE_CLOSERS = "\"'’”»›)]}」』）］｝】〕〉》〗〙〛"
+_SENTENCE_OPENERS = "‘“«‹([{「『（［｛【〔〈《〖〘〚"
+
+
 def _ends_sentence(text: str) -> bool:
-    return text.rstrip().endswith((".", "?", "!", "...", "…"))
+    normalized = unicodedata.normalize("NFKC", text)
+    return normalized.rstrip().rstrip(_SENTENCE_CLOSERS).rstrip().endswith((".", "?", "!", "…", "。"))
+
+
+def _only_sentence_closers(text: str) -> bool:
+    return _only_punctuation(text, _SENTENCE_CLOSERS)
+
+
+def _only_punctuation(text: str, punctuation: str) -> bool:
+    stripped = unicodedata.normalize("NFKC", text).strip()
+    return bool(stripped) and all(character in punctuation for character in stripped)
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:

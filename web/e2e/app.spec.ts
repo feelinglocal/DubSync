@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises'
 
 import { expect, test } from '@playwright/test'
 
+import { defaultConfig } from '../src/types'
+
 function sineWaveWav(durationSeconds = 1, sampleRate = 8_000) {
   const sampleCount = durationSeconds * sampleRate
   const output = Buffer.alloc(44 + sampleCount * 2)
@@ -21,6 +23,75 @@ function sineWaveWav(durationSeconds = 1, sampleRate = 8_000) {
     output.writeInt16LE(Math.round(Math.sin((index / sampleRate) * Math.PI * 2 * 220) * 18_000), 44 + index * 2)
   }
   return output
+}
+
+for (const width of [320, 390, 1440]) {
+  for (const mode of ['sync', 'generate'] as const) {
+    test(`Japanese ${mode} fixture submits and downloads at ${width}px`, async ({ page }, testInfo) => {
+      const japaneseSrt = '1\n00:00:00,200 --> 00:00:01,200\n「今日は晴れです。」\n\n2\n00:00:01,400 --> 00:00:02,400\nOpenAI APIを使います。\n'
+      const job = {
+        id: `japanese-${mode}`, token: 'japanese-fixture-token', mode, status: 'complete', progress: 100,
+        result: { cue_count: 2, cost_usd: 0 }, downloads: ['srt'], expires_at: '2099-01-01T00:00:00Z', error: null,
+      }
+      await page.route('**/api/config', (route) => route.fulfill({ json: { ...defaultConfig, jobs_available: true } }))
+      await page.route('**/api/jobs', async (route) => {
+        const request = route.request()
+        expect(request.method()).toBe('POST')
+        expect(request.postData()).toMatch(/name="language"\r\n\r\nja\r\n/)
+        expect(request.postData()).toContain(`name="mode"\r\n\r\n${mode}\r\n`)
+        await route.fulfill({ status: 202, json: job })
+      })
+      await page.route(`**/api/jobs/${job.id}/downloads/srt`, async (route) => {
+        expect(route.request().headers().authorization).toBe(`Bearer ${job.token}`)
+        await route.fulfill({
+          contentType: 'application/x-subrip; charset=utf-8',
+          headers: { 'content-disposition': `attachment; filename="japanese.${mode}.srt"` },
+          body: japaneseSrt,
+        })
+      })
+      await page.setViewportSize({ width, height: 900 })
+      await page.goto('/')
+      const language = page.getByRole('combobox', { name: 'Language' })
+      await expect(language).toHaveValue('auto')
+      await language.selectOption({ label: 'Japanese 日本語' })
+      if (mode === 'generate') await page.getByRole('button', { name: 'Generate from audio' }).click()
+      await page.getByLabel('Dialogue audio').setInputFiles({ name: '日本語.wav', mimeType: 'audio/wav', buffer: sineWaveWav() })
+      if (mode === 'sync') {
+        await page.getByLabel('Original SRT').setInputFiles({
+          name: '日本語.srt', mimeType: 'application/x-subrip', buffer: Buffer.from(japaneseSrt),
+        })
+      }
+      await expect(language).toHaveValue('ja')
+      const selectedLabel = await language.evaluate(async (select: HTMLSelectElement) => {
+        await document.fonts.ready
+        const style = getComputedStyle(select)
+        const context = document.createElement('canvas').getContext('2d')!
+        context.font = style.font
+        const label = select.selectedOptions[0].text
+        const letterSpacing = Number.parseFloat(style.letterSpacing) || 0
+        return {
+          textWidth: context.measureText(label).width + letterSpacing * Math.max(label.length - 1, 0),
+          availableWidth: select.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight),
+        }
+      })
+      expect(selectedLabel.textWidth).toBeLessThanOrEqual(selectedLabel.availableWidth)
+      const submit = page.getByRole('button', { name: mode === 'sync' ? 'Start sync' : 'Generate SRT' })
+      await expect(submit).toBeEnabled()
+      await submit.click()
+      await expect(page.getByText('2 cues ready')).toBeVisible()
+      const downloadPromise = page.waitForEvent('download')
+      await page.getByRole('button', { name: 'Download SRT' }).click()
+      const download = await downloadPromise
+      expect(download.suggestedFilename()).toBe(`japanese.${mode}.srt`)
+      expect(await readFile(await download.path(), 'utf-8')).toBe(japaneseSrt)
+      const dimensions = await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      }))
+      expect(dimensions.scrollWidth).toBe(dimensions.clientWidth)
+      await page.locator('#workspace').screenshot({ path: testInfo.outputPath(`japanese-${mode}-${width}.png`) })
+    })
+  }
 }
 
 test('audio-only job uploads, processes, and downloads an SRT', async ({ page }) => {

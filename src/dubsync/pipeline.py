@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+from itertools import groupby
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ from .overlap import apply_overlap_policy
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
 from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
 from .punctuation import apply_punctuation_pass
-from .recue import rebuild_cues
+from .recue import preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
 from .reports import write_changes_diff, write_qc_report
 from .srt_io import parse_srt_text, write_srt
 from .silence import silence_flags_for_cues
@@ -57,11 +59,14 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "cue_without_speech_activity",
         "duplicate_cue_merged",
         "forced_alignment_refined",
+        "forced_alignment_unavailable",
         "impossible_cps_fast",
         "impossible_cps_slow",
         "output_overlap_resolved",
+        "output_overlap_preserved",
         "overlap_detected",
         "speaker_transition_gap_inserted",
+        "shared_word_timing_preserved",
         "timing_refined",
     }
 )
@@ -255,7 +260,9 @@ def sync_episode(
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
     )
     flags.extend(recue_flags)
-    rebuilt, overlap_flags = apply_overlap_policy(rebuilt, profile.overlap_policy)
+    rebuilt, overlap_flags = _apply_overlap_policy_preserving_timing(
+        rebuilt, profile.overlap_policy, shared_word_cue_ids(alignment),
+    )
     flags.extend(overlap_flags)
     speaker_mapping_uses_llm = _speaker_mapping_uses_llm(provider_config)
     speaker_mapping_adapter = None if no_llm and speaker_mapping_uses_llm else speaker_mapping_adapter_from_config(provider_config)
@@ -324,6 +331,21 @@ def sync_episode(
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _apply_overlap_policy_preserving_timing(
+    cues: list[Cue], policy: str, protected_cue_ids: set[int],
+) -> tuple[list[Cue], list[QCFlag]]:
+    if policy != "dash" or not protected_cue_ids:
+        return apply_overlap_policy(cues, policy)
+    adjusted: list[Cue] = []
+    flags: list[QCFlag] = []
+    for protected, group in groupby(cues, key=lambda cue: cue.index in protected_cue_ids):
+        processed, group_flags = apply_overlap_policy(list(group), "flag_only" if protected else policy)
+        adjusted.extend(processed)
+        flags.extend(group_flags)
+    _, boundary_flags = apply_overlap_policy(adjusted, "flag_only")
+    return adjusted, [*flags, *boundary_flags]
 
 
 def _normalize_resume_stage(resume: str | None) -> str | None:
@@ -786,15 +808,36 @@ def _run_verify_stage(
     cost_meter: CostMeter,
     include_dropped_line_flags: bool,
 ) -> PipelineResult:
+    # A phrase-level ASR timestamp cannot establish its internal cue boundary.
+    # Retain the source boundary on fresh runs and when resuming older artifacts.
+    shared_cue_ids = shared_word_cue_ids(alignment) | {
+        cue_id for flag in flags if flag.kind == "shared_word_timing_preserved" for cue_id in flag.cue_ids
+    }
+    protected_cue_ids = shared_cue_ids & {cue.index for cue in source_cues}
     flags = _without_stale_verify_flags(flags)
+    rebuilt = preserve_source_timings(rebuilt, source_cues, protected_cue_ids)
     forced_alignments: list[ForcedAlignmentCue] = []
     effective_words = words
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
         forced_alignments = forced_alignment_adapter.align(audio_for_asr, rebuilt)
+        # Only actual, positive per-cue intervals can resolve a shared word.
+        forced_alignments = [
+            item for item in forced_alignments
+            if item.cue_id not in shared_cue_ids
+            or (isfinite(item.start) and isfinite(item.end) and 0 <= item.start < item.end)
+        ]
         _write_json(episode_workdir / "forced_align.json", {"cues": [alignment.model_dump() for alignment in forced_alignments]})
         rebuilt, forced_alignment_flags = apply_forced_alignment(rebuilt, forced_alignments, profile)
         flags.extend(forced_alignment_flags)
+        protected_cue_ids -= {item.cue_id for item in forced_alignments}
+        if rebuilt and not forced_alignments:
+            flags.append(QCFlag(
+                kind="forced_alignment_unavailable",
+                cue_ids=[cue.index for cue in rebuilt],
+                message="Forced alignment returned no usable cue timings; existing timings were retained for review.",
+            ))
+    flags.extend(shared_word_timing_flags(rebuilt, protected_cue_ids))
     overlap_detection_adapter = overlap_detection_adapter_from_config(provider_config)
     if overlap_detection_adapter is not None:
         overlap_regions = overlap_detection_adapter.detect(audio_for_asr)
@@ -818,6 +861,8 @@ def _run_verify_stage(
             _boundary_refinement_config(provider_config),
             words=effective_words,
             alignment=alignment,
+            protected_cue_ids=protected_cue_ids,
+            fixed_cue_ids=shared_cue_ids - protected_cue_ids,
         )
         flags.extend(timing_flags)
         if include_dropped_line_flags:
@@ -835,6 +880,7 @@ def _run_verify_stage(
         profile,
         no_overlaps=_output_no_overlaps(provider_config),
         max_cps=_timing_float_config(provider_config, "max_cps", 30.0),
+        protected_cue_ids=protected_cue_ids,
     )
     flags.extend(final_order_flags)
     style_issues = lint_cues(rebuilt, profile)
