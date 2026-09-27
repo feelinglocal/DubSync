@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from rapidfuzz import fuzz
-
 from .models import Cue, QCFlag
+from .srt_io import validate_cue_timings_for_export
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue
 from .text_metrics import display_width
 from .tokenize import alphanumeric_signature
 
@@ -16,17 +16,44 @@ def finalize_cues_for_output(
     max_cps: float | None = None,
     max_cue_duration_seconds: float | None = None,
     protected_cue_ids: set[int] | None = None,
+    preserve_timing: bool = False,
+    media_duration_ms: int | None = None,
+    merge_duplicates: bool = True,
 ) -> tuple[list[Cue], list[QCFlag]]:
+    """Finalize display order without replacing acoustic evidence with reading-time guesses.
+
+    With ``preserve_timing``, physical speech overlaps remain visible review errors;
+    reading speed and speaker gaps never shift the spoken boundaries. Source holds
+    and screen annotations are always kept verbatim, including outside the media.
+    Audio generation disables ``merge_duplicates`` because each word occurrence
+    has known ownership even when repeated utterances snap to the same onset.
+    """
+    if media_duration_ms is not None and media_duration_ms < 0:
+        raise ValueError("media_duration_ms must be non-negative")
+    # Validate before readability extension or merging can conceal an invalid
+    # upstream boundary. Only the creating stage has evidence to repair it.
+    validate_cue_timings_for_export(cues)
     protected = protected_cue_ids or set()
-    ordered = sorted(cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
-    merged, flags = _merge_duplicate_overlaps(ordered, protected)
-    if max_cps is not None:
+    untouched_cues = [
+        cue
+        for cue in cues
+        if cue.index in protected or is_bracketed_screen_text_cue(cue)
+    ]
+    dialogue_cues = [
+        cue
+        for cue in cues
+        if cue.index not in protected and not is_bracketed_screen_text_cue(cue)
+    ]
+    flags = _source_order_inversion_flags(dialogue_cues)
+    ordered = sorted(dialogue_cues, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
+    merged, merge_flags = _merge_duplicate_overlaps(ordered) if merge_duplicates else (ordered, [])
+    flags.extend(merge_flags)
+    if max_cps is not None and not preserve_timing:
         merged, readability_flags = _extend_fast_cues_into_following_gap(
             merged,
             profile,
             max_cps,
             max_cue_duration_seconds,
-            protected,
         )
         flags.extend(readability_flags)
         merged, merge_flags = _merge_fast_cues_with_following(
@@ -34,18 +61,156 @@ def finalize_cues_for_output(
             profile,
             max_cps,
             max_cue_duration_seconds,
-            protected,
         )
         flags.extend(merge_flags)
     finalized = merged
-    if no_overlaps:
-        finalized, overlap_flags = _resolve_residual_overlaps(merged, profile, protected)
+    if no_overlaps and not preserve_timing:
+        finalized, overlap_flags = _resolve_residual_overlaps(merged, profile)
         flags.extend(overlap_flags)
-    if protected:
-        # An earlier unprotected cue may move past a preserved source boundary.
-        finalized = sorted(finalized, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
-    _assert_monotonic_starts(finalized)
-    return finalized, flags
+    if media_duration_ms is not None:
+        finalized, boundary_flags = _cap_cues_at_media_end(finalized, media_duration_ms)
+        flags.extend(boundary_flags)
+        flags.extend(
+            _outside_media_flag(cue, media_duration_ms)
+            for cue in untouched_cues
+            if cue.end_ms > media_duration_ms
+        )
+    combined = sorted(
+        [*finalized, *untouched_cues],
+        key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
+    )
+    if no_overlaps and protected:
+        # Source holds are excluded from retiming, but overlaps with them still
+        # need a visible advisory even when other dialogue is adjusted.
+        for flag in _unresolved_acoustic_overlap_flags(
+            [cue for cue in combined if not is_bracketed_screen_text_cue(cue)]
+        ):
+            if protected.intersection(flag.cue_ids):
+                flags.append(flag.model_copy(update={
+                    "kind": "output_overlap_preserved",
+                    "severity": "warning",
+                    "message": "Uncertain source timing was preserved; this overlap needs review.",
+                }))
+    if no_overlaps and preserve_timing:
+        flags.extend(
+            _unresolved_acoustic_overlap_flags(
+                [cue for cue in combined if not is_bracketed_screen_text_cue(cue)]
+            )
+        )
+    _assert_monotonic_starts(combined)
+    validate_cue_timings_for_export(combined)
+    return combined, flags
+
+
+def _unresolved_acoustic_overlap_flags(cues: list[Cue]) -> list[QCFlag]:
+    flags: list[QCFlag] = []
+    latest_ending: Cue | None = None
+    for cue in cues:
+        if latest_ending is not None and cue.start_ms < latest_ending.end_ms:
+            flags.append(
+                QCFlag(
+                    kind="output_overlap_unresolved",
+                    cue_ids=[latest_ending.index, cue.index],
+                    message=(
+                        "Acoustically timed cues overlap. Their speech boundaries were preserved; "
+                        "review the simultaneous dialogue instead of delaying an utterance."
+                    ),
+                    severity="error",
+                    start=cue.start_ms / 1000.0,
+                    end=min(latest_ending.end_ms, cue.end_ms) / 1000.0,
+                )
+            )
+        if latest_ending is None or cue.end_ms > latest_ending.end_ms:
+            latest_ending = cue
+    return flags
+
+
+def _cap_cues_at_media_end(cues: list[Cue], media_duration_ms: int) -> tuple[list[Cue], list[QCFlag]]:
+    bounded: list[Cue] = []
+    flags: list[QCFlag] = []
+    for cue in cues:
+        if cue.end_ms <= media_duration_ms:
+            bounded.append(cue)
+            continue
+        if cue.start_ms >= media_duration_ms:
+            # No supported timestamp exists: retain reviewable text instead of
+            # silently dropping it or inventing speech inside the recording.
+            bounded.append(cue)
+            flags.append(_outside_media_flag(cue, media_duration_ms))
+            continue
+        # EOF may lie between video frames. Flooring it could cut the last
+        # phoneme; the real recording boundary takes precedence over the grid.
+        updated = cue.with_timing(cue.start_ms, media_duration_ms)
+        bounded.append(updated)
+        flags.append(
+            QCFlag(
+                kind="media_boundary_clamped",
+                cue_ids=[cue.index],
+                message="Cue display tail exceeded the recording and was capped at the media boundary.",
+                old_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
+                new_text=f"{updated.start_ms / 1000.0:.3f} --> {updated.end_ms / 1000.0:.3f}",
+                start=updated.start_ms / 1000.0,
+                end=updated.end_ms / 1000.0,
+            )
+        )
+    return bounded, flags
+
+
+def _outside_media_flag(cue: Cue, media_duration_ms: int) -> QCFlag:
+    return QCFlag(
+        kind="cue_outside_media",
+        cue_ids=[cue.index],
+        message=(
+            f"Cue extends outside the {media_duration_ms / 1000.0:.3f}s recording. "
+            "Its text and timing were retained for review because no safe acoustic correction is available."
+        ),
+        severity="error",
+        old_text=cue.text,
+        start=cue.start_ms / 1000.0,
+        end=cue.end_ms / 1000.0,
+    )
+
+
+def source_order_inversion_flags(
+    cues: list[Cue],
+    *,
+    source_cue_ids: set[int],
+    protected_cue_ids: set[int] | None = None,
+) -> list[QCFlag]:
+    """Capture source narrative conflicts before acoustic sorting erases order.
+
+    Generated insertions and newly split speaker children have acoustic order,
+    not independent source positions. Source holds and screen annotations do
+    not claim an acoustic boundary and are excluded as in final ordering.
+    """
+    protected = protected_cue_ids or set()
+    return _source_order_inversion_flags([
+        cue for cue in cues
+        if cue.index in source_cue_ids and cue.index not in protected
+        and not is_bracketed_screen_text_cue(cue)
+    ])
+
+
+def _source_order_inversion_flags(cues: list[Cue]) -> list[QCFlag]:
+    flags: list[QCFlag] = []
+    for left, right in zip(cues, cues[1:]):
+        if right.start_ms >= left.start_ms:
+            continue
+        flags.append(
+            QCFlag(
+                kind="output_order_inversion",
+                cue_ids=[left.index, right.index],
+                message=(
+                    "Source cue order conflicts with chronological timing; final time sorting would "
+                    "reverse this narrative sequence. Acoustic timing review is required."
+                ),
+                severity="error",
+                old_text=f"{left.index}: {left.text}\n{right.index}: {right.text}",
+                start=min(left.start_ms, right.start_ms) / 1000.0,
+                end=max(left.end_ms, right.end_ms) / 1000.0,
+            )
+        )
+    return flags
 
 
 def _extend_fast_cues_into_following_gap(
@@ -53,7 +218,6 @@ def _extend_fast_cues_into_following_gap(
     profile: StyleProfile,
     max_cps: float,
     max_cue_duration_seconds: float | None,
-    protected_cue_ids: set[int],
 ) -> tuple[list[Cue], list[QCFlag]]:
     if max_cps <= 0 or not cues:
         return cues, []
@@ -61,8 +225,6 @@ def _extend_fast_cues_into_following_gap(
     flags: list[QCFlag] = []
     for index in range(len(adjusted)):
         cue = adjusted[index]
-        if cue.index in protected_cue_ids:
-            continue
         needed_end_ms = _end_for_cps(cue, profile, max_cps, max_cue_duration_seconds)
         if needed_end_ms <= cue.end_ms:
             continue
@@ -85,19 +247,18 @@ def _merge_fast_cues_with_following(
     profile: StyleProfile,
     max_cps: float,
     max_cue_duration_seconds: float | None,
-    protected_cue_ids: set[int],
 ) -> tuple[list[Cue], list[QCFlag]]:
     merged: list[Cue] = []
     flags: list[QCFlag] = []
     index = 0
     while index < len(cues):
         current = cues[index]
-        if current.index in protected_cue_ids or _cue_cps(current) <= max_cps or index + 1 >= len(cues):
+        if _cue_cps(current) <= max_cps or index + 1 >= len(cues):
             merged.append(current)
             index += 1
             continue
         following = cues[index + 1]
-        if following.index in protected_cue_ids or _known_different_speakers(current, following):
+        if _known_different_speakers(current, following):
             merged.append(current)
             index += 1
             continue
@@ -185,7 +346,7 @@ def _cue_cps(cue: Cue) -> float:
     return display_width(cue.plain_text) / (cue.duration_ms / 1000.0)
 
 
-def _merge_duplicate_overlaps(cues: list[Cue], protected_cue_ids: set[int]) -> tuple[list[Cue], list[QCFlag]]:
+def _merge_duplicate_overlaps(cues: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
     merged: list[Cue] = []
     flags: list[QCFlag] = []
     index = 0
@@ -194,12 +355,7 @@ def _merge_duplicate_overlaps(cues: list[Cue], protected_cue_ids: set[int]) -> t
         duplicate_ids = [current.index]
         old_texts = [current.text]
         cursor = index + 1
-        while (
-            cursor < len(cues)
-            and current.index not in protected_cue_ids
-            and cues[cursor].index not in protected_cue_ids
-            and _is_duplicate_overlap(current, cues[cursor])
-        ):
+        while cursor < len(cues) and _is_duplicate_overlap(current, cues[cursor]):
             duplicate = cues[cursor]
             duplicate_ids.append(duplicate.index)
             old_texts.append(duplicate.text)
@@ -224,15 +380,19 @@ def _merge_duplicate_overlaps(cues: list[Cue], protected_cue_ids: set[int]) -> t
 
 
 def _is_duplicate_overlap(left: Cue, right: Cue) -> bool:
-    if right.start_ms >= left.end_ms:
+    if (
+        right.start_ms >= left.end_ms
+        or left.start_ms != right.start_ms
+        or _known_different_speakers(left, right)
+    ):
         return False
     left_signature = " ".join(alphanumeric_signature(left.plain_text))
     right_signature = " ".join(alphanumeric_signature(right.plain_text))
     if not left_signature or not right_signature:
         return False
-    if left_signature == right_signature:
-        return True
-    return fuzz.ratio(left_signature, right_signature) >= 90
+    # Similar words may reverse meaning ("can" / "can't"); separate onsets may
+    # be an intentional repetition. Only exact words at the same onset dedupe.
+    return left_signature == right_signature
 
 
 def _merged_duplicate_cue(left: Cue, right: Cue) -> Cue:
@@ -256,25 +416,13 @@ def _preferred_duplicate_text(left: Cue, right: Cue) -> Cue:
     return left
 
 
-def _resolve_residual_overlaps(
-    cues: list[Cue], profile: StyleProfile, protected_cue_ids: set[int],
-) -> tuple[list[Cue], list[QCFlag]]:
+def _resolve_residual_overlaps(cues: list[Cue], profile: StyleProfile) -> tuple[list[Cue], list[QCFlag]]:
     adjusted: list[Cue] = []
     flags: list[QCFlag] = []
     min_duration_ms = int(profile.min_cue_dur * 1000)
     for cue in cues:
         if adjusted and _needs_final_timing_separation(adjusted[-1], cue):
             previous = adjusted[-1]
-            if cue.index in protected_cue_ids or previous.index in protected_cue_ids:
-                flags.append(QCFlag(
-                    kind="output_overlap_preserved",
-                    cue_ids=[previous.index, cue.index],
-                    message="Uncertain source timing was preserved; this overlap or speaker transition needs review.",
-                    start=cue.start_ms / 1000.0,
-                    end=cue.end_ms / 1000.0,
-                ))
-                adjusted.append(cue)
-                continue
             was_overlap = cue.start_ms < previous.end_ms
             start_ms = _separated_start_ms(previous, cue, profile)
             end_ms = max(cue.end_ms, profile.snap_ceil(start_ms + min_duration_ms))

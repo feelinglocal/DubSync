@@ -1,8 +1,8 @@
 # DubSync Commercial MVP Plan
 
-**Status:** implemented, tested locally, and deployed to the Render default domain as of 2026-07-11
+**Status:** implemented, tested locally, and deployed to the Render default domain. The September 14, 2026 hybrid adjudication and alignment changes have local benchmark evidence; each release requires verification of its exact Render commit.
 **Engine contract:** `PLAN.md` remains authoritative for subtitle timing and reconciliation behavior.  
-**Product contact:** reyhanputraph@gmail.com
+**Product contact:** rey@feelslocal.com
 
 ## 1. Product decision
 
@@ -23,12 +23,13 @@ The first commercial version intentionally has no accounts, subscriptions, colla
 ### Customer workflows
 
 1. **Sync existing SRT**
-   - Upload dialogue audio and an original SRT.
+   - Upload one dialogue-audio/SRT pair or up to 10 matched pairs in one batch.
+   - Match pairs by filename, process every child one by one, and keep later children running when one fails.
    - Preserve unchanged cue text and segmentation.
    - Re-time cues from word timestamps.
    - Reconcile spoken differences and improvised lines.
    - Keep speaker changes separate.
-   - Download the synced SRT, QC JSON, QC HTML, and text-change SRT when available.
+   - Download the synced SRT, QC JSON, QC HTML, and text-change SRT when available. SRT downloads preserve the source stem and add `-dubsync-synced.srt`.
 
 2. **Generate from audio**
    - Upload dialogue audio without an SRT.
@@ -44,11 +45,15 @@ The first commercial version intentionally has no accounts, subscriptions, colla
 - Manual quote access code required before paid provider processing.
 - Job status and protected downloads.
 - Secret 256-bit job tokens; only token hashes are stored.
-- Tab-scoped job recovery after refresh.
+- Tab-scoped recovery of every child job after refresh.
+- Atomic batch validation for up to 10 inputs, with aggregate upload limits and isolated child tokens.
 - Strict extension, content-type, empty-file, and byte-limit validation.
-- Five jobs per source IP per hour by default.
+- Five batch or single-file submissions per source IP per hour by default, with at most 10 outstanding child jobs.
+- Serialized upload intake, a 512 MiB request cap, predicted PCM reservations, a four-hour duration cap, a 1 GiB per-job ceiling, a 4 GiB retained commitment quota, and 2 GiB minimum free space protect the 10 GB persistent disk.
 - Production intake fails closed when the job access code is missing.
 - Files and metadata expire after 24 hours, with an independent cleanup timer.
+- Queued or processing jobs idle for 24 hours are dead-lettered during startup or cleanup and receive a fresh terminal retention window.
+- FFmpeg normalization and snippet extraction use a finite 30-minute subprocess timeout.
 - Security headers and a strict Content Security Policy.
 - No advertising analytics, account cookies, or billing integration.
 
@@ -61,8 +66,12 @@ flowchart LR
     A --> D["Persistent disk"]
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
-    F --> E["ElevenLabs Scribe v2"]
-    W --> G["Gemini language passes"]
+    F --> E["ElevenLabs Scribe v2 (default)"]
+    F --> M["MAI-Transcribe 2 via OpenRouter (selectable)"]
+    W --> G["Gemini 3.5 Flash-Lite adjudication (high thinking)"]
+    G --> R["Flagged cases: Gemini 3.8 Flash review (medium thinking, selected clips)"]
+    W --> P["Gemini 3.7 Flash punctuation (medium thinking)"]
+    W --> H["OpenAI GPT-5.6 Luna speaker-mapping pass"]
     W --> C["Deterministic DubSync core"]
     C --> D
     D -->|"token-protected result"| B
@@ -101,7 +110,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
+- Secrets: `ELEVENLABS_API_KEY` for default transcription, optional `OPENROUTER_API_KEY` for MAI, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -112,7 +121,7 @@ Current baseline infrastructure cost:
 | Render persistent SSD | $0.25/GB/month | $2.50 for 10 GB |
 | Total before bandwidth and providers |  | **$9.50/month** |
 
-Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes source audio to 16 kHz mono before provider upload, which materially reduces service-initiated bandwidth.
+Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes audio to 16 kHz mono for transcription and timing. Default Flash-Lite adjudication uses focused WAV clips and full source text. Optional Gemini full-episode context uses the normalized WAV for short audio; long audio is prepared once as mono 24 kHz, 64 kbps MP3 and reused through the Files API and a bounded job-owned cache. See the [README audio-context policy](../README.md#gemini-audio-context) for transport limits, cache cleanup, cost uncertainty, and source-hold behavior.
 
 Local release verification validates `render.yaml` against Render's published JSON Schema. GitHub auto-deploys the Docker service to Render. The health endpoint includes Render's injected commit SHA so a release can be verified without relying on dashboard status alone.
 
@@ -120,17 +129,23 @@ Local release verification validates `render.yaml` against Render's published JS
 
 Published early-access prices:
 
-| Workflow | Customer price | Minimum | Availability |
+| Workflow | Customer price | Minimum per quoted order | Availability |
 |---|---:|---:|---|
-| Audio to SRT | $0.12/min | $3 | Available |
-| Sync existing SRT | $0.18/min | $5 | Available |
-| Precision processing | $0.25/min | $10 | Sell only after live forced-alignment validation |
+| Audio to SRT | $0.40/min | $20 | Available |
+| Sync existing SRT | $0.60/min | $30 | Available |
+| Precision processing | $0.90/min | $50 | Sell only after live forced-alignment validation |
+
+For a single-file or multi-file order, quote `max(total source-audio minutes × workflow rate, order minimum)`. Apply one minimum to the whole quoted order, not one minimum per uploaded file. The published rates include standard setup, file handling, and delivery support; any manual subtitle editing or non-standard service must be quoted separately.
 
 Current provider price anchors:
 
+- Microsoft MAI-Transcribe 2 via OpenRouter: $0.10/hour launch catalog rate verified September 5, 2026. OpenRouter `usage.cost` takes precedence in metering; the hourly rate remains configurable. Scribe v2 is the default transcription option; MAI remains selectable.
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
-- Gemini 3.5 Flash paid tier: $1.50 per million input tokens and $9 per million output tokens.
-- Every job already writes measured provider cost to `cost.json`; this is the source of truth for repricing.
+- Gemini 3.7 Flash punctuation retains medium thinking. Its recorded Standard paid-tier price is $0.75 per million input tokens and $3.75 per million output tokens through December 31, 2026, including thinking tokens, then $1.50/$7.50 starting January 1, 2027. These are the recorded 3.7 price anchors, not a quote for 3.8 adjudication.
+- Gemini 3.5 Flash-Lite adjudication uses high thinking. Standard paid-tier prices verified September 14, 2026 are $0.30 per million input tokens, $2.50 per million output tokens including thinking, $0.03 per million cached-input tokens, and $1.00 per million cached tokens per hour of storage. Meter generation, cache creation, and cache storage separately; Files API reuse alone does not remove input-token charges.
+- The enabled hybrid reviewer uses Gemini 3.8 Flash medium only for flagged cases. It receives selected audio clips and nearby source/ASR context, with no full episode audio or episode cache. Its generation uses the recorded $0.75/M input and $3.75/M output rates through December 31, 2026; thinking tokens count as output. Per-model costs and review routes are recorded separately. See the [September 14 comparison](testing/flash-lite-adjudication-2026-09-14.md) for observed reference differences and cost estimates; those local measurements do not establish live deployment status.
+- The August 14, 2026 paid `testing 4` replay measured $0.20228 for the historical Gemini 3.7 adjudication and punctuation route over 258.9 seconds of source audio with complete ordered episode context. This is not a cost or quality measurement of the September 10 Gemini 3.8 full-audio route. Re-benchmark representative long-form jobs before quoting from older per-episode LLM assumptions.
+- Every job writes provider cost to `cost.json`: OpenRouter-reported audio charges are marked `audio_billed`, while Scribe audio and missing-usage fallbacks use catalog estimates. Token charges use reported usage with configured token prices. Distinguish these bases when repricing.
 
 Margin rule:
 
@@ -138,7 +153,7 @@ Margin rule:
 job contribution = quoted price - measured provider cost - allocated Render cost - payment fee - refund/support reserve
 ```
 
-Target at least 70% gross margin after variable provider and infrastructure allocation. Review prices after the first 50 paid jobs and then quarterly. Minimum charges are important because setup, upload, support, and failure handling are mostly per job rather than per minute.
+Target at least 70% gross margin after variable provider and infrastructure allocation. Review prices after the first 50 paid jobs and then quarterly. Minimum charges are important because setup, upload, support, and failure handling are mostly per order rather than per minute.
 
 Do not introduce subscriptions yet. Start with manual quotes or one-time payment links once payments are enabled. Add subscriptions only after recurring use proves that customers prefer monthly commitments over per-job pricing.
 
@@ -163,10 +178,9 @@ Do not introduce subscriptions yet. Start with manual quotes or one-time payment
    - Expose a retry command for failed jobs.
    - Resume from the last complete stage instead of repeating paid provider calls.
 
-5. **Batch delivery**
-   - Upload multiple matched SRT/audio pairs.
-   - Return one ZIP with results and a batch summary.
-   - Keep each episode isolated so one failure does not discard successful jobs.
+5. **Batch archive delivery**
+   - Package the already isolated per-file results into one ZIP.
+   - Include a machine-readable batch summary without removing individual downloads.
 
 ### Later: only after revenue validates demand
 
@@ -183,7 +197,7 @@ Before accepting paid customer media:
 
 - Keep the GitHub repository connected to the Render service.
 - Validate the Blueprint against Render's published schema.
-- Set paid ElevenLabs and Gemini credentials in Render.
+- Set paid ElevenLabs, OpenAI, and Gemini credentials in Render; set OpenRouter credentials when enabling selectable MAI transcription.
 - Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
 - Run one short live generate job through the web route for each provider or model change.
 - Keep fixture-backed sync and generate browser tests green on every release.
@@ -220,5 +234,9 @@ Do not log transcript text, API keys, job tokens, uploaded filenames, or raw pro
 - Render persistent disks: https://render.com/docs/disks
 - Render Blueprint specification: https://render.com/docs/blueprint-spec
 - ElevenLabs API pricing: https://elevenlabs.io/pricing/api
+- Gemini 3.7 Flash capabilities and stable model ID: https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+- Gemini 3.5 Flash-Lite adjudication model: https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite
+- Gemini thinking levels: https://ai.google.dev/gemini-api/docs/thinking
+- Gemini audio understanding and inline audio input: https://ai.google.dev/gemini-api/docs/generate-content/audio
 - Gemini API pricing: https://ai.google.dev/gemini-api/docs/pricing
 - Gemini data retention: https://ai.google.dev/gemini-api/docs/zdr

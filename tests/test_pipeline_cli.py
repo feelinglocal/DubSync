@@ -4,13 +4,34 @@ import json
 import os
 import wave
 
+import pytest
 import yaml
 from typer.testing import CliRunner
 
 from dubsync.cli import app
-from dubsync.models import AudioSnippet, Cue
-from dubsync.pipeline import _punctuation_cache_key
+from dubsync.audio_snippets import AudioSnippetError
+from dubsync.cache import JsonDiskCache
+from dubsync.models import (
+    AdjudicationDecision,
+    AlignmentResult,
+    AudioSnippet,
+    Cue,
+    DivergenceSpan,
+)
+import dubsync.pipeline as pipeline_module
+from dubsync.pipeline import (
+    _adjudication_cache_key,
+    _alignment_health_flags,
+    _alignment_summary_metadata,
+    _load_cached_adjudication,
+    _load_cached_punctuation,
+    _punctuation_cache_key,
+    _speaker_mapping_cache_key,
+)
+from dubsync.providers import ProviderError
 from dubsync.srt_io import parse_srt_text
+from dubsync.text_metrics import display_width
+from dubsync.tokenize import alphanumeric_signature
 
 
 def test_cli_profile_writes_style_profile(tmp_path, sample_srt_path):
@@ -30,6 +51,545 @@ def test_punctuation_cache_key_includes_line_constraints():
     wider_style = _punctuation_cache_key(cues, config, max_chars_per_line=42, max_lines_per_cue=2)
 
     assert house_style.digest != wider_style.digest
+
+
+@pytest.mark.parametrize(
+    "flag_kind",
+    ["audio_snippet_unavailable", "adjudication_audio_unavailable", "invalid_llm_response", "llm_provider_unavailable"],
+)
+def test_load_cached_adjudication_ignores_transient_degraded_artifact(tmp_path, flag_kind):
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="source line",
+        asr_text="spoken line",
+    )
+    config = {"llm": {"provider": "fixture", "model": "fixture-adjudicator"}}
+    key = _adjudication_cache_key([span], config)
+    JsonDiskCache(tmp_path / "llm-cache").write(
+        key,
+        {
+            "decisions": [
+                AdjudicationDecision(
+                    case_id="case-1",
+                    verdict="keep_srt",
+                    final_text="source line",
+                    confidence=0.0,
+                    reason="transient degraded result",
+                ).model_dump()
+            ],
+            "flags": [
+                {
+                    "kind": flag_kind,
+                    "cue_ids": [1],
+                    "message": "transient degraded result",
+                }
+            ],
+        },
+    )
+
+    assert _load_cached_adjudication(tmp_path, [span], config) is None
+
+
+def test_load_cached_punctuation_ignores_provider_unavailable_artifact(tmp_path):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello there"])]
+    config = {"llm": {"provider": "fixture", "model": "fixture-punctuation"}}
+    key = _punctuation_cache_key(
+        cues,
+        config,
+        max_chars_per_line=26,
+        max_lines_per_cue=2,
+    )
+    JsonDiskCache(tmp_path / "llm-cache").write(
+        key,
+        {
+            "cues": [cue.model_dump() for cue in cues],
+            "flags": [
+                {
+                    "kind": "punctuation_provider_unavailable",
+                    "cue_ids": [1],
+                    "message": "temporary provider outage",
+                    "severity": "error",
+                }
+            ],
+        },
+    )
+
+    assert (
+        _load_cached_punctuation(
+            tmp_path,
+            cues,
+            config,
+            max_chars_per_line=26,
+            max_lines_per_cue=2,
+        )
+        is None
+    )
+
+
+def test_incomplete_source_guard_leaves_source_backed_and_short_adlib_spans_unchanged():
+    source_backed = DivergenceSpan(
+        case_id="case-source",
+        cue_ids=[1],
+        srt_text="customer subtitle text",
+        asr_text="spoken replacement text",
+        start=10.0,
+        end=70.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1, 2],
+    )
+    short_adlib = DivergenceSpan(
+        case_id="case-adlib",
+        cue_ids=[],
+        srt_text="",
+        asr_text="short spoken aside",
+        start=71.0,
+        end=74.0,
+        asr_word_indices=[3, 4, 5],
+    )
+    source_free_without_asr_words = DivergenceSpan(
+        case_id="case-empty",
+        cue_ids=[],
+        srt_text="",
+        asr_text="",
+        start=None,
+        end=None,
+        asr_word_indices=[],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [source_backed, short_adlib, source_free_without_asr_words],
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+    )
+
+    assert provider_spans == [source_backed, short_adlib, source_free_without_asr_words]
+    assert held_decisions == []
+    assert flags == []
+
+
+def test_missing_audio_guard_holds_source_cue_out_of_adjudication():
+    missing = DivergenceSpan(
+        case_id="case-missing-audio",
+        cue_ids=[2],
+        srt_text="customer sentence that was not recorded",
+        asr_text="",
+        srt_token_indices=[3, 4, 5, 6, 7, 8],
+        asr_word_indices=[],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [missing],
+        {},
+        missing_audio_cue_ids={2},
+    )
+
+    assert provider_spans == []
+    assert [(decision.verdict, decision.final_text) for decision in held_decisions] == [
+        ("keep_srt", missing.srt_text)
+    ]
+    assert [flag.kind for flag in flags] == ["missing_audio_source_cue_held"]
+
+
+def test_missing_audio_guard_holds_asr_insertion_anchored_inside_locked_cue():
+    insertion = DivergenceSpan(
+        case_id="case-insertion",
+        cue_ids=[],
+        srt_text="",
+        asr_text="unrelated word",
+        start=2.2,
+        end=2.4,
+        asr_word_indices=[4],
+        left_anchor_cue_id=2,
+        right_anchor_cue_id=2,
+        left_anchor_end=2.1,
+        right_anchor_start=2.5,
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [insertion],
+        {},
+        missing_audio_cue_ids={2},
+    )
+
+    assert provider_spans == []
+    assert [(decision.verdict, decision.final_text) for decision in held_decisions] == [
+        ("keep_srt", "")
+    ]
+    assert [flag.kind for flag in flags] == ["missing_audio_source_cue_held"]
+
+
+def test_restore_missing_audio_cues_reinstates_exact_source_text_and_timing():
+    source = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nlocked source\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nnormal cue\n\n"
+    )
+    rebuilt = [
+        source[0].model_copy(
+            update={
+                "start_ms": 1_250,
+                "end_ms": 2_250,
+                "lines": ["wrong borrowed words"],
+            }
+        ),
+        source[1].model_copy(update={"start_ms": 3_100, "end_ms": 4_100}),
+    ]
+
+    restored, flags = pipeline_module._restore_missing_audio_source_cues(
+        rebuilt,
+        source,
+        {1},
+    )
+
+    assert restored[0] == source[0]
+    assert restored[1] == rebuilt[1]
+    assert [flag.kind for flag in flags] == ["missing_audio_source_cue_restored"]
+
+
+def test_incomplete_source_guard_holds_oversized_source_backed_span():
+    spans = [
+        DivergenceSpan(
+            case_id="case-small",
+            cue_ids=[1, 2, 3, 4, 5],
+            srt_text="small source span",
+            asr_text="small replacement span",
+            start=1.0,
+            end=6.0,
+            srt_token_indices=[0, 1, 2],
+            asr_word_indices=[0, 1, 2],
+        ),
+        DivergenceSpan(
+            case_id="case-huge",
+            cue_ids=list(range(1, 9)),
+            srt_text="huge source span",
+            asr_text="huge replacement span",
+            start=10.0,
+            end=70.0,
+            srt_token_indices=list(range(16)),
+            asr_word_indices=list(range(20)),
+        ),
+    ]
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        spans,
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+        source_cue_count=30,
+    )
+
+    assert provider_spans == [spans[0]]
+    assert [decision.case_id for decision in held_decisions] == ["case-huge"]
+    assert held_decisions[0].verdict == "keep_srt"
+    assert [flag.kind for flag in flags] == ["oversized_adjudication_span_held"]
+    assert flags[0].severity == "error"
+    assert flags[0].old_text is None
+    assert flags[0].new_text is None
+
+
+def test_unresolved_alignment_guard_holds_short_source_backed_span():
+    span = DivergenceSpan(
+        case_id="case-unresolved",
+        cue_ids=[1, 2],
+        srt_text="source text stays",
+        asr_text="audio text must not replace it",
+        start=1.0,
+        end=4.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1, 2, 3],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [span],
+        {},
+        source_cue_count=2,
+        alignment_unresolved=True,
+    )
+
+    assert provider_spans == []
+    assert [decision.verdict for decision in held_decisions] == ["keep_srt"]
+    assert held_decisions[0].final_text == span.srt_text
+    assert [flag.kind for flag in flags] == ["unresolved_alignment_adjudication_held"]
+    assert flags[0].severity == "error"
+
+
+def test_unresolved_alignment_guard_overrides_stale_resume_decision():
+    span = DivergenceSpan(
+        case_id="case-unresolved",
+        cue_ids=[1],
+        srt_text="source text stays",
+        asr_text="stale replacement",
+        start=1.0,
+        end=2.0,
+        srt_token_indices=[0, 1, 2],
+        asr_word_indices=[0, 1],
+    )
+    stale_decision = AdjudicationDecision(
+        case_id=span.case_id,
+        verdict="use_audio",
+        final_text=span.asr_text,
+        confidence=0.99,
+        reason="stale pre-guard decision",
+    )
+
+    decisions, flags = pipeline_module._apply_incomplete_source_holds_to_decisions(
+        [span],
+        {},
+        [stale_decision],
+        [],
+        source_cue_count=1,
+        alignment_unresolved=True,
+    )
+
+    assert [decision.verdict for decision in decisions] == ["keep_srt"]
+    assert decisions[0].final_text == span.srt_text
+    assert [flag.kind for flag in flags] == ["unresolved_alignment_adjudication_held"]
+
+
+def test_alignment_summary_metadata_and_health_flags_surface_low_coverage():
+    alignment = AlignmentResult(anchor_coverage=0.4, unmatched_cue_ids=[2, 3])
+
+    metadata = _alignment_summary_metadata(alignment, source_cue_count=4)
+    flags = _alignment_health_flags(alignment, source_cue_count=4)
+
+    assert metadata["alignment_anchor_coverage"] == 0.4
+    assert metadata["alignment_unmatched_cue_ratio"] == 0.5
+    assert flags[0].kind == "alignment_anchor_coverage_low"
+    assert flags[0].severity == "error"
+
+
+def test_incomplete_source_guard_holds_source_free_spans_with_invalid_timing():
+    missing_start = DivergenceSpan(
+        case_id="case-missing-start",
+        cue_ids=[],
+        srt_text="",
+        asr_text="unbounded spoken section",
+        start=None,
+        end=70.0,
+        asr_word_indices=[0, 1, 2],
+    )
+    reversed_timing = DivergenceSpan(
+        case_id="case-reversed",
+        cue_ids=[],
+        srt_text="",
+        asr_text="invalid spoken section",
+        start=70.0,
+        end=10.0,
+        asr_word_indices=[3, 4, 5],
+    )
+    negative_timing = DivergenceSpan(
+        case_id="case-negative",
+        cue_ids=[],
+        srt_text="",
+        asr_text="negative spoken section",
+        start=-70.0,
+        end=-10.0,
+        asr_word_indices=[6, 7, 8],
+    )
+    missing_word_indices = DivergenceSpan(
+        case_id="case-missing-indices",
+        cue_ids=[],
+        srt_text="",
+        asr_text="long ASR evidence without recoverable word indices",
+        start=10.0,
+        end=70.0,
+        asr_word_indices=[],
+    )
+
+    provider_spans, held_decisions, flags = pipeline_module._hold_incomplete_source_insertions(
+        [missing_start, reversed_timing, negative_timing, missing_word_indices],
+        {"generation": {"max_generated_adlib_duration_seconds": 20.0}},
+    )
+
+    assert provider_spans == []
+    assert [decision.case_id for decision in held_decisions] == [
+        "case-missing-start",
+        "case-reversed",
+        "case-negative",
+        "case-missing-indices",
+    ]
+    assert [flag.kind for flag in flags] == [
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+        "generated_adlib_rejected_incomplete_source",
+    ]
+    assert all("valid timing" in flag.message for flag in flags[:3])
+    assert "above the 20s" in flags[3].message
+
+
+@pytest.mark.parametrize("invalid_limit", [float("inf"), float("nan"), 0.0, -1.0])
+def test_incomplete_source_guard_rejects_invalid_safety_limits(invalid_limit):
+    with pytest.raises(ValueError, match="max_generated_adlib_duration_seconds"):
+        pipeline_module._hold_incomplete_source_insertions(
+            [],
+            {"generation": {"max_generated_adlib_duration_seconds": invalid_limit}},
+        )
+
+
+def test_adapter_episode_context_hook_receives_complete_ordered_cues():
+    seen: list[list[Cue]] = []
+
+    class ContextAdapter:
+        def set_episode_context(self, cues: list[Cue]) -> None:
+            seen.append(list(cues))
+
+    episode = [
+        Cue(index=4, start_ms=0, end_ms=700, lines=["Vorher."]),
+        Cue(index=5, start_ms=800, end_ms=1_500, lines=["Bleib hier."]),
+        Cue(index=6, start_ms=1_600, end_ms=2_300, lines=["Nachher."]),
+    ]
+
+    pipeline_module._set_adapter_episode_context(ContextAdapter(), episode)
+
+    assert seen == [episode]
+
+
+def test_cli_sync_flags_explicit_fps_that_disagrees_with_source_grid(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    providers_path = tmp_path / "providers.yaml"
+    output_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n00:00:05,250 --> 00:00:06,625\nalpha\n\n"
+        "2\n00:00:06,833 --> 00:00:09,083\nbeta\n\n"
+        "3\n00:00:09,416 --> 00:00:11,291\ngamma\n\n"
+        "4\n00:00:11,625 --> 00:00:13,000\ndelta\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "alpha", "start": 5.25, "end": 6.625},
+                    {"text": "beta", "start": 6.833, "end": 9.083},
+                    {"text": "gamma", "start": 9.416, "end": 11.291},
+                    {"text": "delta", "start": 11.625, "end": 13.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "--providers",
+            str(providers_path),
+            "--fps",
+            "30",
+            "--no-llm",
+            "--output",
+            str(output_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    mismatch = [flag for flag in report["flags"] if flag["kind"] == "fps_override_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["severity"] == "warning"
+    assert "24" in mismatch[0]["message"]
+    assert "30" in mismatch[0]["message"]
+
+
+def test_punctuation_cache_key_changes_with_prompt_version(monkeypatch):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello there"])]
+    config = {"llm": {"provider": "fixture", "model": "fixture-punctuation", "punctuation": {}}}
+    monkeypatch.setattr(pipeline_module, "_PUNCTUATION_PROMPT_VERSION", "punctuation-a", raising=False)
+    first = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
+    monkeypatch.setattr(pipeline_module, "_PUNCTUATION_PROMPT_VERSION", "punctuation-b", raising=False)
+    second = _punctuation_cache_key(cues, config, max_chars_per_line=26, max_lines_per_cue=2)
+
+    assert first.digest != second.digest
+
+
+def test_cli_sync_splits_overlong_source_cue_when_style_limits_lines(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    providers_path = tmp_path / "providers.yaml"
+    style_path = tmp_path / "style.yaml"
+    output_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n"
+        "00:00:01,000 --> 00:00:03,000\n"
+        "Team Falcon hat eigenmächtig die Position verraten.\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Team", "start": 1.00, "end": 1.18, "speaker_id": "A"},
+                    {"text": "Falcon", "start": 1.20, "end": 1.48, "speaker_id": "A"},
+                    {"text": "hat", "start": 1.50, "end": 1.62, "speaker_id": "A"},
+                    {"text": "eigenmächtig", "start": 1.64, "end": 2.05, "speaker_id": "A"},
+                    {"text": "die", "start": 2.07, "end": 2.20, "speaker_id": "A"},
+                    {"text": "Position", "start": 2.22, "end": 2.55, "speaker_id": "A"},
+                    {"text": "verraten.", "start": 2.57, "end": 2.95, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}),
+        encoding="utf-8",
+    )
+    style_path.write_text(
+        "fps: 30\nmax_lines_per_cue: 2\nmax_chars_per_line: 18\nmin_cue_dur: 0.4\ntail_ms: 0\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "--providers",
+            str(providers_path),
+            "--style",
+            str(style_path),
+            "--no-llm",
+            "--output",
+            str(output_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(output_path.read_text(encoding="utf-8"))
+    assert len(synced) == 2
+    assert " ".join(cue.plain_text for cue in synced) == "Team Falcon hat eigenmächtig die Position verraten."
+    assert all(len(cue.lines) <= 2 for cue in synced)
+    assert synced[0].end_ms <= synced[1].start_ms
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "sync_cue_line_limit_split" for flag in report["flags"])
+
+
+def test_speaker_mapping_cache_key_changes_with_prompt_version(monkeypatch):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["hello"], speaker_id="A")]
+    config = {"llm": {"provider": "fixture", "model": "fixture-speakers"}}
+    monkeypatch.setattr(pipeline_module, "_SPEAKER_MAPPING_PROMPT_VERSION", "speakers-a", raising=False)
+    first = _speaker_mapping_cache_key(cues, config)
+    monkeypatch.setattr(pipeline_module, "_SPEAKER_MAPPING_PROMPT_VERSION", "speakers-b", raising=False)
+    second = _speaker_mapping_cache_key(cues, config)
+
+    assert first.digest != second.digest
 
 
 def test_cli_profile_rejects_malformed_sample_with_clear_message(tmp_path):
@@ -53,7 +613,7 @@ def test_cli_help_runs():
 
 def test_cli_sync_help_documents_resume_stages():
     result = CliRunner().invoke(app, ["sync", "--help"])
-    rendered_help = " ".join(result.output.replace("│", " ").split())
+    rendered_help = " ".join(result.output.replace("\u2502", " ").split())
 
     assert result.exit_code == 0, result.output
     assert "Resume from asr, align, adjudicate, rebuild, or verify" in rendered_help
@@ -309,6 +869,189 @@ def test_cli_sync_offline_fixture_outputs_reports(tmp_path, shifted_srt_text, sh
     assert "Cost meter" in result.output
 
 
+def test_cli_sync_unfinished_audio_holds_missing_middle_cue_and_skips_llm(
+    tmp_path,
+    monkeypatch,
+):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nalpha one\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nmissing middle\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\nomega three\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "alpha", "start": 0.1, "end": 0.3, "confidence": 0.99},
+                    {"text": "one", "start": 0.32, "end": 0.5, "confidence": 0.99},
+                    {"text": "omega", "start": 4.1, "end": 4.3, "confidence": 0.99},
+                    {"text": "three", "start": 4.32, "end": 4.5, "confidence": 0.99},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {"provider": "fixture", "responses": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "llm_adapter_from_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("missing-audio source span reached adjudication")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    missing = next(cue for cue in synced if cue.plain_text == "missing middle")
+    assert (missing.start_ms, missing.end_ms) == (2000, 3000)
+    alignment = json.loads((workdir / "episode" / "align.json").read_text(encoding="utf-8"))
+    assert alignment["diagnostics"]["missing_audio_cue_ids"] == [2]
+    adjudication = json.loads(
+        (workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8")
+    )
+    assert adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert adjudication["flags"][0]["kind"] == "missing_audio_source_cue_held"
+
+
+def test_cli_sync_unresolved_alignment_never_calls_adjudication_for_short_source(
+    tmp_path,
+    monkeypatch,
+):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nalpha beta\n\n"
+        "2\n00:00:01,100 --> 00:00:02,000\ngamma delta\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "replace", "start": 0.1, "end": 0.3},
+                    {"text": "all", "start": 0.4, "end": 0.6},
+                    {"text": "source", "start": 1.2, "end": 1.4},
+                    {"text": "text", "start": 1.5, "end": 1.7},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "replace all source text",
+                            "confidence": 0.99,
+                            "reason": "fixture decision must never be requested",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    unresolved_alignment = AlignmentResult(
+        divergence_spans=[
+            DivergenceSpan(
+                case_id="case-1",
+                cue_ids=[1, 2],
+                srt_text="alpha beta gamma delta",
+                asr_text="replace all source text",
+                start=0.1,
+                end=1.7,
+                srt_token_indices=[0, 1, 2, 3],
+                asr_word_indices=[0, 1, 2, 3],
+            )
+        ],
+        unmatched_cue_ids=[1, 2],
+        diagnostics={"band_limited": True, "unresolved": True},
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "align_cues_to_words",
+        lambda _cues, _words: unresolved_alignment,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "llm_adapter_from_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unresolved source-backed alignment must not reach adjudication")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [cue.plain_text for cue in parse_srt_text(out_path.read_text(encoding="utf-8"))] == [
+        "alpha beta",
+        "gamma delta",
+    ]
+    adjudication = json.loads(
+        (workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8")
+    )
+    assert adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert any(
+        flag["kind"] == "unresolved_alignment_adjudication_held"
+        for flag in adjudication["flags"]
+    )
+
+
 def test_cli_sync_writes_overlap_detection_fixture_report(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
@@ -379,7 +1122,7 @@ def test_cli_sync_writes_overlap_detection_fixture_report(tmp_path):
     assert overlap_flags[0]["confidence"] == 0.88
 
 
-def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
+def test_cli_sync_holds_source_text_and_timing_below_adjudication_confidence_gate(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
@@ -449,28 +1192,103 @@ def test_cli_sync_fixture_llm_replaces_improvised_span(tmp_path):
             str(providers_path),
             "--workdir",
             str(workdir),
+            "--fps",
+            "24",
         ],
     )
 
     assert result.exit_code == 0, result.output
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
-    assert synced[1].text == "new spoken line"
+    assert synced[1].text == "old line"
     assert synced[1].start_ms == 1000
-    assert synced[1].end_ms == 1875
+    assert synced[1].end_ms == 2000
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     verify = json.loads((workdir / "episode" / "verify.json").read_text(encoding="utf-8"))
-    assert any(flag["kind"] == "text_changed" for flag in report["flags"])
-    change_flag = next(flag for flag in report["flags"] if flag["kind"] == "text_changed")
-    assert change_flag["old_text"] == "old line"
-    assert change_flag["new_text"] == "new spoken line"
-    assert change_flag["confidence"] == 0.93
-    verify_change_flag = next(flag for flag in verify["flags"] if flag["kind"] == "text_changed")
-    assert verify_change_flag == change_flag
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
     low_confidence_flag = next(flag for flag in report["flags"] if flag["kind"] == "low_confidence_adjudication")
     assert low_confidence_flag["confidence"] == 0.93
     assert low_confidence_flag["old_text"] == "old"
     assert low_confidence_flag["new_text"] == "new spoken line"
-    assert not any(flag["kind"] == "unmatched_cue" for flag in report["flags"])
+    assert low_confidence_flag in verify["flags"]
+
+
+def test_cli_sync_keeps_german_profanity_mask_without_llm_rewrite(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Das ist verd*mmt knapp.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Das", "start": 0.00, "end": 0.12, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "ist", "start": 0.14, "end": 0.25, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "verdammt", "start": 0.27, "end": 0.55, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "knapp", "start": 0.57, "end": 0.80, "confidence": 0.98, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "Das ist verdammt knapp.",
+                            "confidence": 0.97,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "ASR expanded censored German profanity",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "24",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert synced[0].plain_text == "Das ist verd*mmt knapp."
+    assert synced[0].start_ms == 0
+    assert synced[0].end_ms == 875
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
+    assert "verdammt" not in json.dumps(report, ensure_ascii=False)
 
 
 def test_cli_sync_empty_adjudication_text_preserves_parseable_cue(tmp_path):
@@ -589,7 +1407,14 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
 
     snippet_adapter = SnippetAwareLLMAdapter()
 
-    def fake_extract_audio_snippets(audio_path_arg, spans, output_dir, pad_seconds, max_duration_seconds):
+    def fake_extract_audio_snippets(
+        audio_path_arg,
+        spans,
+        output_dir,
+        pad_seconds,
+        max_duration_seconds,
+        **_kwargs,
+    ):
         snippet_path = output_dir / f"{spans[0].case_id}.wav"
         snippet_path.parent.mkdir(parents=True, exist_ok=True)
         snippet_path.write_bytes(b"RIFFsnippetWAVEfmt ")
@@ -678,9 +1503,194 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
     ]
     assert snippet_adapter.snippets_by_case["case-1"].mime_type == "audio/wav"
     artifact = json.loads((workdir / "episode" / "audio_snippets.json").read_text(encoding="utf-8"))
+    assert artifact["storage_mode"] == "bounded_batches"
+    assert artifact["candidate_count"] == 1
+    assert artifact["selected_count"] == 1
+    assert artifact["fallback_count"] == 0
     assert artifact["snippets"][0]["case_id"] == "case-1"
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     assert any(flag["new_text"] == "new spoken line" for flag in report["flags"] if flag["kind"] == "text_changed")
+
+
+def test_cli_sync_preserves_source_when_required_audio_budget_is_exhausted(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    calls: list[str] = []
+
+    class FallbackLLMAdapter:
+        def adjudicate(self, spans):
+            calls.append("text")
+            raise AssertionError("required case audio cannot fall back to a text-only decision")
+
+        def adjudicate_with_audio(self, spans, audio_snippets):
+            calls.append("audio")
+            raise AssertionError("no case audio exists after snippet budget exhaustion")
+
+    def fake_extract_audio_snippets(*_args, **_kwargs):
+        raise AudioSnippetError("Audio snippets would exceed the job storage budget")
+
+    monkeypatch.setattr("dubsync.pipeline.llm_adapter_from_config", lambda _config, pass_name=None: FallbackLLMAdapter())
+    monkeypatch.setattr("dubsync.pipeline.punctuation_adapter_from_config", lambda _config: None)
+    monkeypatch.setattr("dubsync.pipeline.speaker_mapping_adapter_from_config", lambda _config: None)
+    monkeypatch.setattr("dubsync.pipeline.extract_audio_snippets", fake_extract_audio_snippets, raising=False)
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nhello there\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nold line\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "hello", "start": 0.00, "end": 0.20, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "there", "start": 0.23, "end": 0.45, "confidence": 0.97, "speaker_id": "A"},
+                    {"text": "new", "start": 1.00, "end": 1.22, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "spoken", "start": 1.24, "end": 1.54, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "line", "start": 1.56, "end": 1.80, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "gemini",
+                    "adjudication": {
+                        "audio_snippet_double_check": {
+                            "enabled": True,
+                            "pad_seconds": 1.5,
+                            "max_duration_seconds": 8.0,
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+    held_cue = parse_srt_text(out_path.read_text(encoding="utf-8"))[1]
+    assert (held_cue.plain_text, held_cue.start_ms, held_cue.end_ms) == ("old line", 1000, 2000)
+    artifact = json.loads((workdir / "episode" / "audio_snippets.json").read_text(encoding="utf-8"))
+    assert artifact["storage_mode"] == "bounded_batches"
+    assert artifact["candidate_count"] == 1
+    assert artifact["selected_count"] == 0
+    assert artifact["fallback_count"] == 1
+    assert artifact["fallback_case_ids"] == ["case-1"]
+    assert artifact["snippets"] == []
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
+    assert any(flag["kind"] == "audio_snippet_unavailable" for flag in report["flags"])
+    assert any(flag["kind"] == "adjudication_audio_unavailable" and flag["cue_ids"] == [2] for flag in report["flags"])
+
+    rerun = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert rerun.exit_code == 0, rerun.output
+    assert calls == []
+
+
+def test_cli_sync_skips_live_punctuation_for_long_episode_audio(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nhello there.\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "hello", "start": 0.0, "end": 0.2, "confidence": 0.99},
+                    {"text": "there", "start": 0.25, "end": 0.5, "confidence": 0.99},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "gemini",
+                    "punctuation": {
+                        "provider": "gemini",
+                        "max_audio_duration_seconds": 30 * 60,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("dubsync.pipeline.audio_seconds", lambda _path: 45 * 60.0)
+    monkeypatch.setattr(
+        "dubsync.pipeline.punctuation_adapter_from_config",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("long-audio punctuation provider should not be constructed")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert parse_srt_text(out_path.read_text(encoding="utf-8"))[0].plain_text == "hello there."
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "punctuation_skipped_for_long_audio" for flag in report["flags"])
 
 
 def test_cli_sync_reuses_cached_llm_adjudication_without_resume(tmp_path):
@@ -732,7 +1742,7 @@ def test_cli_sync_reuses_cached_llm_adjudication_without_resume(tmp_path):
                             "case_id": "case-1",
                             "verdict": "use_audio",
                             "final_text": "new spoken line",
-                            "confidence": 0.93,
+                            "confidence": 0.96,
                             "speaker": "A",
                             "character": "unknown",
                             "reason": "actor improvised",
@@ -904,6 +1914,303 @@ def test_cli_sync_reuses_cached_llm_punctuation_without_resume(tmp_path):
     assert (workdir / "episode" / "llm-cache").exists()
 
 
+def test_cli_sync_retries_punctuation_after_transient_provider_failure(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    first_out_path = tmp_path / "episode.first.srt"
+    second_out_path = tmp_path / "episode.second.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    calls: list[list[int]] = []
+
+    class FlakyPunctuationAdapter:
+        def punctuate(self, cues):
+            calls.append([cue.index for cue in cues])
+            if len(calls) == 1:
+                raise ProviderError("temporary Gemini outage")
+            return {cue.index: "Hello there." for cue in cues}
+
+    adapter = FlakyPunctuationAdapter()
+    monkeypatch.setattr(
+        "dubsync.pipeline.punctuation_adapter_from_config",
+        lambda _config: adapter,
+    )
+    srt_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nhello there\n\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "hello", "start": 0.0, "end": 0.2, "confidence": 0.99},
+                    {"text": "there", "start": 0.25, "end": 0.5, "confidence": 0.99},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {"provider": "fixture", "model": "fixture-punctuation"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    for output_path in (first_out_path, second_out_path):
+        result = CliRunner().invoke(
+            app,
+            [
+                "sync",
+                str(srt_path),
+                str(audio_path),
+                "-o",
+                str(output_path),
+                "--providers",
+                str(providers_path),
+                "--workdir",
+                str(workdir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    assert len(calls) == 2
+    assert parse_srt_text(second_out_path.read_text(encoding="utf-8"))[0].text == "Hello there."
+
+
+def test_cli_sync_merges_bracketed_asr_insertion_into_source_cue(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "nicht von Bestien zerfleischt.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "nicht", "start": 0.10, "end": 0.32, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "von", "start": 0.35, "end": 0.52, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "den", "start": 0.55, "end": 0.68, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "Bestien", "start": 0.71, "end": 1.08, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "zerfleischt", "start": 1.11, "end": 1.58, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "den",
+                            "confidence": 0.98,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "audio confirms the inserted article",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == ["nicht von den Bestien zerfleischt."]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+
+
+def test_cli_sync_merges_continuation_insertion_into_following_cue(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "bin kein Bolton mehr.\n"
+        "\n"
+        "2\n"
+        "00:00:01,500 --> 00:00:02,500\n"
+        "diese kranke alte Frau\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "bin", "start": 0.10, "end": 0.22, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "kein", "start": 0.24, "end": 0.36, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Bolton", "start": 0.38, "end": 0.55, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "mehr", "start": 0.57, "end": 0.70, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Ich", "start": 0.90, "end": 1.02, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "diese", "start": 1.42, "end": 1.57, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "kranke", "start": 1.59, "end": 1.77, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "alte", "start": 1.79, "end": 1.93, "confidence": 0.99, "speaker_id": "A"},
+                    {"text": "Frau", "start": 1.95, "end": 2.15, "confidence": 0.99, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "Ich,",
+                            "confidence": 0.98,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "audio confirms a continuation into the next cue",
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == [
+        "bin kein Bolton mehr.",
+        "Ich, diese kranke alte Frau",
+    ]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+
+
+def test_cli_sync_reports_impossible_cps_without_extending_acoustic_timing(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    text = "this deliberately long subtitle must follow speech"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:00,500\n"
+        f"{text}\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {
+                        "text": word,
+                        "start": index * 0.05,
+                        "end": index * 0.05 + 0.04,
+                        "confidence": 0.99,
+                        "speaker_id": "A",
+                    }
+                    for index, word in enumerate(text.split())
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "timing": {"max_cps": 10},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--no-llm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert synced[0].end_ms == 500
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "impossible_cps_fast" for flag in report["flags"])
+
+
 def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
@@ -984,6 +2291,235 @@ def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     assert adlib_flag["old_text"] is None
     assert adlib_flag["new_text"] == "surprise line"
     assert adlib_flag["confidence"] == 0.88
+
+
+def test_cli_sync_holds_episode_length_asr_tail_when_source_is_incomplete(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    resumed_out_path = tmp_path / "episode.resumed.srt"
+    verify_out_path = tmp_path / "episode.verify.srt"
+    partial_verify_out_path = tmp_path / "episode.partial-verify.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    tail_text = (
+        "Verraten von Feinden. Unser Ziel ist ein abgelegenes Versteck. "
+        "Damian packte alle Vorräte, Waffen und das Bargeld auf die Packpferde hinter uns. "
+        "Hätte ich gewusst, worauf diese verzweifelte Flucht zu Pferd hinausläuft, "
+        "wäre ich lieber gestorben, als mitzukommen."
+    )
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "in die Familie.\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    words = [
+        {"text": "in", "start": 0.10, "end": 0.22, "confidence": 0.99, "speaker_id": "A"},
+        {"text": "die", "start": 0.25, "end": 0.37, "confidence": 0.99, "speaker_id": "A"},
+        {"text": "Familie.", "start": 0.40, "end": 0.70, "confidence": 0.99, "speaker_id": "A"},
+    ]
+    cursor = 1.05
+    for token in tail_text.split():
+        words.append(
+            {
+                "text": token,
+                "start": round(cursor, 3),
+                "end": round(cursor + 0.22, 3),
+                "confidence": 0.98,
+                "speaker_id": "A",
+            }
+        )
+        cursor += 0.30
+        if token.endswith((".", "?", "!")):
+            cursor += 0.85
+    wordstream_path.write_text(json.dumps({"words": words}), encoding="utf-8")
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": tail_text,
+                            "confidence": 0.99,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "the source subtitle ends while spoken narration continues",
+                        }
+                    },
+                },
+                "generation": {
+                    "max_gap_seconds": 0.8,
+                    "max_cue_duration_seconds": 5.0,
+                    "max_generated_adlib_duration_seconds": 8.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "dubsync.pipeline.llm_adapter_from_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an incomplete-source tail must be held before provider work")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == ["in die Familie."]
+
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    incomplete_source_flag = next(
+        flag
+        for flag in report["flags"]
+        if flag["kind"] == "generated_adlib_rejected_incomplete_source"
+    )
+    assert incomplete_source_flag["severity"] == "error"
+    assert incomplete_source_flag["new_text"] == tail_text
+    assert not any(flag["kind"] == "adlib_inserted" for flag in report["flags"])
+    adjudication = json.loads((workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8"))
+    assert adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert adjudication["decisions"][0]["final_text"] == ""
+
+    stale_decision = {
+        **adjudication["decisions"][0],
+        "verdict": "use_audio",
+        "final_text": tail_text,
+        "confidence": 0.99,
+        "reason": "stale pre-guard adjudication generated the missing episode section",
+    }
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": [stale_decision], "flags": []}),
+        encoding="utf-8",
+    )
+    stale_tail = Cue(
+        index=2,
+        start_ms=1_033,
+        end_ms=round(cursor * 1000),
+        lines=[tail_text],
+    )
+    (workdir / "episode" / "rebuild.json").write_text(
+        json.dumps({"cues": [synced[0].model_dump(), stale_tail.model_dump()]}),
+        encoding="utf-8",
+    )
+
+    verify = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(verify_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "verify",
+            "--no-llm",
+        ],
+    )
+
+    assert verify.exit_code != 0
+    assert "resume from rebuild" in verify.output.lower()
+    assert not verify_out_path.exists()
+
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": adjudication["decisions"], "flags": adjudication["flags"]}),
+        encoding="utf-8",
+    )
+    partial_stale_tail = stale_tail.model_copy(update={"lines": ["Verraten von Feinden."]})
+    (workdir / "episode" / "rebuild.json").write_text(
+        json.dumps({"cues": [synced[0].model_dump(), partial_stale_tail.model_dump()]}),
+        encoding="utf-8",
+    )
+    partial_verify = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(partial_verify_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "verify",
+            "--no-llm",
+        ],
+    )
+
+    assert partial_verify.exit_code != 0
+    assert "resume from rebuild" in partial_verify.output.lower()
+    assert not partial_verify_out_path.exists()
+    (workdir / "episode" / "adjudicate.json").write_text(
+        json.dumps({"decisions": [stale_decision], "flags": []}),
+        encoding="utf-8",
+    )
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(resumed_out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+            "--resume",
+            "rebuild",
+            "--no-llm",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    resumed_cues = parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in resumed_cues] == ["in die Familie."]
+    resumed_adjudication = json.loads(
+        (workdir / "episode" / "adjudicate.json").read_text(encoding="utf-8")
+    )
+    assert resumed_adjudication["decisions"][0]["verdict"] == "keep_srt"
+    assert any(
+        flag["kind"] == "generated_adlib_rejected_incomplete_source"
+        for flag in resumed_adjudication["flags"]
+    )
 
 
 def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp_path):
@@ -1067,6 +2603,117 @@ def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp
     assert [cue.index for cue in synced] == [1, 2, 3]
 
 
+def test_cli_sync_removes_generated_adlib_without_speech_activity(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    vad_path = tmp_path / "episode.vad.json"
+
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Du bildest dir nur etwas ein, Nova.\n"
+        "\n"
+        "2\n"
+        "00:00:19,166 --> 00:00:20,200\n"
+        "Informiere alle,\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "Du", "start": 15.80, "end": 15.90, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "bildest", "start": 15.92, "end": 16.10, "confidence": 0.97, "speaker_id": "A"},
+                    {"text": "dir", "start": 16.12, "end": 16.20, "confidence": 0.97, "speaker_id": "A"},
+                    {"text": "nur", "start": 16.22, "end": 16.34, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "ein", "start": 16.36, "end": 16.50, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "Nova", "start": 16.52, "end": 16.70, "confidence": 0.96, "speaker_id": "A"},
+                    {"text": "Du", "start": 17.43, "end": 17.80, "confidence": 0.91, "speaker_id": "A"},
+                    {"text": "Informiere", "start": 19.46, "end": 19.80, "confidence": 0.98, "speaker_id": "A"},
+                    {"text": "alle", "start": 19.82, "end": 20.10, "confidence": 0.97, "speaker_id": "A"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    vad_path.write_text(
+        json.dumps(
+            {
+                "regions": [
+                    {"start": 15.80, "end": 16.74, "confidence": 0.92},
+                    {"start": 19.46, "end": 20.12, "confidence": 0.93},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {"fixture_path": str(wordstream_path)},
+                "vad": {"fixture_path": str(vad_path), "min_coverage": 0.2},
+                "llm": {
+                    "provider": "fixture",
+                    "responses": {
+                        "case-1": {
+                            "case_id": "case-1",
+                            "verdict": "use_audio",
+                            "final_text": "ein",
+                            "confidence": 0.94,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "actor omitted one word",
+                        },
+                        "case-2": {
+                            "case_id": "case-2",
+                            "verdict": "use_audio",
+                            "final_text": "Du",
+                            "confidence": 0.91,
+                            "speaker": "A",
+                            "character": "unknown",
+                            "reason": "ASR-only adlib lacks speech-region support",
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--fps",
+            "30",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in synced] == [
+        "Du bildest dir nur ein, Nova.",
+        "Informiere alle,",
+    ]
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "adlib_removed_without_speech_activity" for flag in report["flags"])
+    assert not any(flag["kind"] == "adlib_inserted" and flag["new_text"] == "Du" for flag in report["flags"])
+
+
 def test_cli_sync_resume_align_reuses_asr_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
@@ -1121,6 +2768,147 @@ def test_cli_sync_resume_align_reuses_asr_artifact(tmp_path, shifted_srt_text, s
 
     assert resumed.exit_code == 0, resumed.output
     assert parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))[0].start_ms == 1000
+
+
+def test_cli_sync_resume_align_repairs_legacy_asr_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    broken_providers_path = tmp_path / "broken-providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    resumed_out_path = tmp_path / "episode.resumed.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+
+    srt_path.write_text(shifted_srt_text, encoding="utf-8")
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(json.dumps({"words": shifted_wordstream}), encoding="utf-8")
+    providers_path.write_text(yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}), encoding="utf-8")
+    broken_providers_path.write_text(yaml.safe_dump({"asr": {"provider": "not-real"}}), encoding="utf-8")
+
+    first = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--no-llm",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+
+    asr_path = workdir / "episode" / "asr.json"
+    legacy_words = [
+        {"text": "hello", "start": 1.00, "end": 1.20, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "general", "start": 2.00, "end": 2.33, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "there", "start": 1.23, "end": 1.23, "confidence": 0.97, "speaker_id": "A"},
+        {"text": "kenobi", "start": 2.36, "end": 2.80, "confidence": 0.99, "speaker_id": "A"},
+    ]
+    asr_path.write_text(json.dumps({"words": legacy_words}), encoding="utf-8")
+
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(resumed_out_path),
+            "--providers",
+            str(broken_providers_path),
+            "--workdir",
+            str(workdir),
+            "--resume",
+            "align",
+            "--no-llm",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    repair_flags = [flag for flag in report["flags"] if flag["kind"] == "word_stream_repaired"]
+    assert repair_flags
+    assert "ASR resume artifact" in repair_flags[0]["message"]
+    assert parse_srt_text(resumed_out_path.read_text(encoding="utf-8"))[0].start_ms == 1000
+
+
+def test_cli_sync_excludes_bracketed_screen_text_from_alignment_timing(tmp_path):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.synced.srt"
+    workdir = tmp_path / "work"
+    wordstream_path = tmp_path / "episode.wordstream.json"
+    srt_path.write_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "[Episode 1]\n"
+        "\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "[Station]\n"
+        "hello there\n"
+        "\n"
+        "3\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "general kenobi\n"
+        "\n",
+        encoding="utf-8",
+    )
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    wordstream_path.write_text(
+        json.dumps(
+            {
+                "words": [
+                    {"text": "hello", "start": 10.00, "end": 10.20, "confidence": 0.98},
+                    {"text": "there", "start": 10.23, "end": 10.45, "confidence": 0.98},
+                    {"text": "general", "start": 11.00, "end": 11.33, "confidence": 0.98},
+                    {"text": "kenobi", "start": 11.36, "end": 11.80, "confidence": 0.98},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    providers_path.write_text(yaml.safe_dump({"asr": {"fixture_path": str(wordstream_path)}}), encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--no-llm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    alignment = json.loads((workdir / "episode" / "align.json").read_text(encoding="utf-8"))
+    synced_cues = parse_srt_text(out_path.read_text(encoding="utf-8"))
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    assert alignment["anchor_coverage"] == 1.0
+    assert alignment["divergence_spans"] == []
+    assert alignment["cue_word_indices"] == {"2": [0, 1], "3": [2, 3]}
+    assert alignment["unmatched_cue_ids"] == []
+    assert synced_cues[0].plain_text == "[Episode 1]"
+    assert synced_cues[0].start_ms == 0
+    assert synced_cues[0].end_ms == 1000
+    assert synced_cues[1].text == "[Station]\nhello there"
+    assert synced_cues[1].start_ms == 10000
+    assert synced_cues[2].start_ms == 11000
+    assert report["summary"]["alignment_anchor_coverage"] == 1.0
+    assert report["summary"]["alignment_unmatched_cue_ratio"] == 0.0
 
 
 def test_cli_sync_resume_asr_uses_ingest_artifact(tmp_path, shifted_srt_text, shifted_wordstream):
@@ -1586,6 +3374,17 @@ def test_cli_sync_resume_adjudicate_uses_normalized_audio_artifact_for_verify(tm
     assert first.exit_code == 0, first.output
     normalized_audio = workdir / "episode" / "audio.16k.wav"
     normalized_audio.write_bytes(b"RIFFnormalizedWAVEfmt ")
+    # This checkpoint explicitly records that ASR used this normalized artifact.
+    # An unrelated leftover normalized WAV must never override the source audio.
+    from dubsync.cache import _sha256_file
+    asr_artifact = workdir / "episode" / "asr.json"
+    asr_payload = json.loads(asr_artifact.read_text(encoding="utf-8"))
+    asr_payload["metadata"]["audio_provenance"] = {
+        "source_sha256": _sha256_file(audio_path),
+        "asr_input_sha256": _sha256_file(normalized_audio),
+        "normalized": True,
+    }
+    asr_artifact.write_text(json.dumps(asr_payload), encoding="utf-8")
 
     resumed = CliRunner().invoke(
         app,
@@ -1637,8 +3436,64 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
     if result.exit_code == 0:
         assert out_path.exists()
     else:
-        assert "WhisperX" in result.output
+        assert "whisperx" in result.output.casefold()
     assert "Traceback" not in result.output
+
+
+def test_cli_sync_local_mode_rejects_nested_gemini_transcribe_override(tmp_path, monkeypatch):
+    srt_path = tmp_path / "episode.srt"
+    audio_path = tmp_path / "episode.wav"
+    providers_path = tmp_path / "providers.yaml"
+    out_path = tmp_path / "episode.gemini.synced.srt"
+    workdir = tmp_path / "work"
+    srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHallo Welt\n\n", encoding="utf-8")
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    providers_path.write_text(
+        yaml.safe_dump(
+            {
+                "asr": {
+                    "provider": "elevenlabs",
+                    "model_id": "scribe_v2",
+                    "local": {
+                        "provider": "gemini_transcribe",
+                        "model": "gemini-3.5-transcribe",
+                        "api_key": "test-key",
+                        "language_codes": ["de-DE"],
+                        "word_timestamps": True,
+                        "diarize": True,
+                        "store": False,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("dubsync.pipeline.normalize_audio", lambda source, _dest, **_kwargs: source)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sync",
+            str(srt_path),
+            str(audio_path),
+            "-o",
+            str(out_path),
+            "--providers",
+            str(providers_path),
+            "--workdir",
+            str(workdir),
+            "--local",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Gemini 3.5 Transcribe ASR is disabled" in result.output
+    assert not out_path.exists()
 
 
 def test_cli_batch_accepts_fps_flag(tmp_path, shifted_srt_text, shifted_wordstream):

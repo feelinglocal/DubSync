@@ -1,22 +1,37 @@
 from __future__ import annotations
 
-import json
-import unicodedata
+from math import isfinite
 from pathlib import Path
 
-from .audio import normalize_audio
-from .cache import JsonDiskCache
+from .audio import AudioNormalizationLimits, normalize_audio
+from .asr_timing import clamp_asr_word_durations
+from .cache import JsonDiskCache, write_json_atomic, write_text_atomic
 from .config import load_style_profile, load_yaml
-from .cost import CostMeter, asr_dollars_per_hour, record_llm_usage
+from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
+from .cue_segmentation import group_word_indices_for_cues
 from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_adapter_from_config
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
-from .providers import CachedASRAdapter, adapter_from_config, apply_asr_language
+from .providers import (
+    CachedASRAdapter,
+    adapter_from_config,
+    apply_asr_language,
+    apply_local_asr_config,
+    apply_transcription_provider_config,
+)
+from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .reports import write_qc_report
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
 from .text_metrics import join_word_texts, wrap_visual_width
+from .timing_refinement import boundary_refinement_config_from_config, refine_cues_to_speech_activity
+from .vad import (
+    min_coverage_from_config,
+    speech_activity_adapter_from_config,
+    speech_activity_flags_for_cues,
+    trailing_silence_flags_for_cues,
+)
 from .verify import cps_sanity_flags, lint_cues, score_cues
 
 
@@ -34,19 +49,44 @@ def build_cues_from_words(
     *,
     max_gap_seconds: float = 0.8,
     max_cue_duration_seconds: float = 5.0,
+    preserve_timing: bool = False,
 ) -> list[Cue]:
-    ordered = sorted(
-        (word for word in words if word.text.strip() and word.end >= word.start and word.start >= 0),
-        key=lambda word: (word.start, word.end),
+    cues, _ = _build_cues_with_word_ownership(
+        words,
+        profile,
+        max_gap_seconds=max_gap_seconds,
+        max_cue_duration_seconds=max_cue_duration_seconds,
+        preserve_timing=preserve_timing,
     )
-    groups = _word_groups(
-        ordered,
+    return cues
+
+
+def _build_cues_with_word_ownership(
+    words: list[Word],
+    profile: StyleProfile,
+    *,
+    max_gap_seconds: float,
+    max_cue_duration_seconds: float,
+    preserve_timing: bool,
+) -> tuple[list[Cue], AlignmentResult]:
+    """Keep lexical ownership from segmentation; display padding is not evidence."""
+    groups = group_word_indices_for_cues(
+        words,
+        list(range(len(words))),
         profile,
         max_gap_seconds=max_gap_seconds,
         max_cue_duration_seconds=max_cue_duration_seconds,
     )
-    cues = [_cue_from_group(index, group, profile) for index, group in enumerate(groups, start=1)]
-    return _cap_generated_overlaps(cues, profile)
+    cues = [
+        _cue_from_group(
+            index, [words[word_index] for word_index in group], profile, preserve_timing=preserve_timing
+        )
+        for index, group in enumerate(groups, start=1)
+    ]
+    alignment = AlignmentResult(
+        cue_word_indices={index: list(group) for index, group in enumerate(groups, start=1)}
+    )
+    return (cues if preserve_timing else _cap_generated_overlaps(cues, profile)), alignment
 
 
 def generate_srt_from_audio(
@@ -59,8 +99,11 @@ def generate_srt_from_audio(
     fps: float | None = None,
     local: bool = False,
     language: str | None = None,
+    transcription_provider: str = "default",
+    allow_gemini_transcribe_web: bool = False,
     style_profile: StyleProfile | None = None,
     generation_constraints: GenerationConstraints | None = None,
+    audio_limits: AudioNormalizationLimits | None = None,
 ) -> TranscriptionResult:
     episode_workdir = workdir / audio_path.stem
     episode_workdir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +111,11 @@ def generate_srt_from_audio(
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
 
-    provider_config = apply_asr_language(_provider_config(load_yaml(providers_path), local=local), language)
+    provider_config = apply_transcription_provider_config(
+        _provider_config(load_yaml(providers_path), local=local),
+        transcription_provider,
+    )
+    provider_config = apply_asr_language(provider_config, language)
     if local:
         no_llm = True
     asr_config = provider_config.get("asr", {})
@@ -77,13 +124,21 @@ def generate_srt_from_audio(
 
     audio_for_asr = audio_path
     if not asr_config.get("fixture_path"):
-        audio_for_asr = normalize_audio(audio_path, episode_workdir / "audio.16k.wav")
+        audio_for_asr = normalize_audio(
+            audio_path,
+            episode_workdir / "audio.16k.wav",
+            limits=audio_limits,
+        )
 
     provider = str(asr_config.get("provider", "fixture"))
     model = str(asr_config.get("model_id", asr_config.get("model", provider)))
     cost_meter = CostMeter()
     adapter = CachedASRAdapter(
-        adapter_from_config(provider_config),
+        adapter_from_config(
+            provider_config,
+            local_mode=local,
+            allow_gemini_transcribe_web=allow_gemini_transcribe_web,
+        ),
         JsonDiskCache(episode_workdir / "asr-cache"),
         model,
         asr_config,
@@ -91,8 +146,57 @@ def generate_srt_from_audio(
         cost_provider=model,
         dollars_per_hour=asr_dollars_per_hour(provider, asr_config),
     )
-    words = adapter.transcribe(audio_for_asr)
-    _write_json(episode_workdir / "asr.json", {"words": [word.model_dump() for word in words]})
+    try:
+        words = adapter.transcribe(audio_for_asr)
+    except Exception:
+        _write_json(episode_workdir / "asr_failure.json", {
+            "provider": provider, "model": model,
+            "usage": adapter.last_usage, "cost": cost_meter.as_dict(),
+        })
+        if not (episode_workdir / "cost.json").exists():
+            write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
+        raise
+    flags: list[QCFlag] = list(adapter.last_repair_flags)
+    asr_metadata = {
+        "provider": provider,
+        "model": model,
+        "usage": adapter.last_usage,
+        "cache_hit": adapter.last_cache_hit,
+        "repair_flags": [flag.model_dump() for flag in adapter.last_repair_flags],
+    }
+    _write_json(
+        episode_workdir / "asr.json",
+        {
+            "words": [word.model_dump() for word in words],
+            "metadata": asr_metadata,
+        },
+    )
+
+    boundary_refinement = boundary_refinement_config_from_config(provider_config)
+    speech_regions = []
+    speech_activity_adapter = speech_activity_adapter_from_config(provider_config)
+    if speech_activity_adapter is not None:
+        speech_regions = speech_activity_adapter.detect(audio_for_asr)
+        if getattr(speech_activity_adapter, "fallback_used", False):
+            flags.append(
+                QCFlag(
+                    kind="vad_provider_fallback",
+                    cue_ids=[],
+                    message="Configured VAD provider fell back to energy-based speech activity detection.",
+                    severity="warning",
+                )
+            )
+        _write_json(episode_workdir / "vad.json", {"regions": [region.model_dump() for region in speech_regions]})
+    timing_config = provider_config.get("timing", {})
+    if not isinstance(timing_config, dict):
+        raise ValueError("providers.yaml timing section must be a mapping")
+    words, word_clamp_flags = clamp_asr_word_durations(
+        words,
+        speech_regions,
+        max_word_duration=_positive_float(timing_config, "max_word_duration", 2.0),
+        max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
+    )
+    flags.extend(word_clamp_flags)
 
     generation_config = provider_config.get("generation", {})
     if not isinstance(generation_config, dict):
@@ -102,20 +206,31 @@ def generate_srt_from_audio(
         if generation_constraints is not None
         else _generation_constraints(provider_config, generation_config)
     )
-    cues = build_cues_from_words(
+    cues, alignment = _build_cues_with_word_ownership(
         words,
         profile,
         max_gap_seconds=constraints.max_gap_seconds,
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
+        preserve_timing=True,
     )
+    if speech_regions:
+        cues, timing_flags = refine_cues_to_speech_activity(
+            cues,
+            speech_regions,
+            profile,
+            boundary_refinement,
+            words=words,
+            alignment=alignment,
+        )
+        flags.extend(timing_flags)
 
-    flags: list[QCFlag] = []
     if not no_llm:
         punctuation_adapter = punctuation_adapter_from_config(provider_config)
         if punctuation_adapter is not None:
             cues, punctuation_flags = apply_punctuation_pass(
                 cues,
                 punctuation_adapter,
+                source_cues=[],
                 scene_gap_seconds=_punctuation_scene_gap(provider_config),
                 max_chars_per_line=profile.max_chars_per_line,
                 max_lines_per_cue=profile.max_lines_per_cue,
@@ -126,21 +241,34 @@ def generate_srt_from_audio(
     output_config = provider_config.get("output", {})
     if not isinstance(output_config, dict):
         raise ValueError("providers.yaml output section must be a mapping")
+    duration_seconds = audio_seconds(audio_for_asr)
     cues, output_flags = finalize_cues_for_output(
         cues,
         profile,
         no_overlaps=bool(output_config.get("no_overlaps", True)),
         max_cps=constraints.max_cps,
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
+        preserve_timing=True,
+        media_duration_ms=round(duration_seconds * 1000) if duration_seconds > 0 else None,
+        merge_duplicates=False,
     )
     flags.extend(output_flags)
+    if speech_activity_adapter is not None:
+        flags.extend(speech_activity_flags_for_cues(cues, speech_regions, min_coverage_from_config(provider_config)))
+        flags.extend(
+            trailing_silence_flags_for_cues(
+                cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms
+            )
+        )
+    cues, profanity_flags = apply_german_profanity_censorship(cues)
+    flags.extend(profanity_flags)
     flags.extend(cps_sanity_flags(cues, max_cps=constraints.max_cps, min_cps=constraints.min_cps))
+    flags = censor_german_profanity_flags(flags)
 
-    alignment = AlignmentResult(cue_word_indices=_cue_word_indices(cues, words))
     style_issues = lint_cues(cues, profile)
     cue_scores = score_cues(cues, words, alignment)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(write_srt(cues, renumber=True), encoding="utf-8")
+    write_text_atomic(output_path, write_srt(cues, renumber=True))
     _write_json(
         episode_workdir / "generate.json",
         {
@@ -148,6 +276,8 @@ def generate_srt_from_audio(
             "cues": [cue.model_dump() for cue in cues],
             "profile": profile.model_dump(),
             "constraints": constraints.model_dump(),
+            "asr": asr_metadata,
+            "cue_word_indices": alignment.cue_word_indices,
         },
     )
     report = write_qc_report(
@@ -157,91 +287,27 @@ def generate_srt_from_audio(
         flags,
         style_issues,
         cue_scores=cue_scores,
+        summary_metadata={
+            "fps": profile.fps,
+            "fps_source": "explicit" if fps is not None else "fallback",
+            "fps_detection_confident": fps is not None,
+            "asr_provider": provider,
+            "asr_model": model,
+            "asr_repair_count": len(adapter.last_repair_flags),
+        },
     )
-    (episode_workdir / "cost.json").write_text(cost_meter.to_json(), encoding="utf-8")
+    write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
     return TranscriptionResult(output_path, episode_workdir, cost_meter, report)
 
 
-def _word_groups(
-    words: list[Word],
-    profile: StyleProfile,
-    *,
-    max_gap_seconds: float,
-    max_cue_duration_seconds: float,
-) -> list[list[Word]]:
-    groups: list[list[Word]] = []
-    current: list[Word] = []
-    for unit in _word_units(words, max_gap_seconds=max_gap_seconds):
-        if current and _starts_new_cue(
-            current,
-            unit,
-            profile,
-            max_gap_seconds=max_gap_seconds,
-            max_cue_duration_seconds=max_cue_duration_seconds,
-        ):
-            groups.append(current)
-            current = []
-        current.extend(unit)
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _word_units(words: list[Word], *, max_gap_seconds: float) -> list[list[Word]]:
-    """Keep separately timestamped punctuation beside the word it belongs to."""
-    units: list[list[Word]] = []
-    pending_openers = False
-    for word in words:
-        is_opener = _only_punctuation(word.text, _SENTENCE_OPENERS)
-        if units:
-            previous = units[-1][-1]
-            same_speaker = not (previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id)
-            close_in_time = word.start - previous.end <= max_gap_seconds
-            if same_speaker and close_in_time and (
-                pending_openers or _only_punctuation(word.text, _SENTENCE_CLOSERS + ".?!…。、,;:")
-            ):
-                units[-1].append(word)
-                pending_openers = pending_openers and is_opener
-                continue
-        units.append([word])
-        pending_openers = is_opener
-    return units
-
-
-def _starts_new_cue(
-    current: list[Word],
-    unit: list[Word],
-    profile: StyleProfile,
-    *,
-    max_gap_seconds: float,
-    max_cue_duration_seconds: float,
-) -> bool:
-    previous = current[-1]
-    word = unit[0]
-    if word.start - previous.end > max_gap_seconds:
-        return True
-    if previous.speaker_id and word.speaker_id and previous.speaker_id != word.speaker_id:
-        return True
-    if unit[-1].end - current[0].start > max_cue_duration_seconds:
-        return True
-    current_text = join_word_texts(item.text for item in current)
-    # ASR can emit a closing quote separately; keep it with the sentence it closes.
-    if (
-        _ends_sentence(current_text)
-        and previous.end - current[0].start >= profile.min_cue_dur
-        and not _only_sentence_closers(word.text)
-    ):
-        return True
-    candidate = join_word_texts([current_text, *(item.text for item in unit)])
-    return len(wrap_visual_width(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
-
-
-def _cue_from_group(index: int, group: list[Word], profile: StyleProfile) -> Cue:
+def _cue_from_group(
+    index: int, group: list[Word], profile: StyleProfile, *, preserve_timing: bool = False
+) -> Cue:
     text = join_word_texts(word.text for word in group)
     lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
     start_ms = profile.snap_floor(max(0, group[0].start * 1000 - profile.lead_in_ms))
-    spoken_end_ms = profile.snap_ceil(group[-1].end * 1000 + profile.tail_ms)
-    minimum_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+    spoken_end_ms = profile.snap_ceil(max(word.end for word in group) * 1000 + profile.tail_ms)
+    minimum_end_ms = spoken_end_ms if preserve_timing else profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
     speaker_ids = [word.speaker_id for word in group if word.speaker_id]
     speaker_id = max(set(speaker_ids), key=speaker_ids.count) if speaker_ids else None
     return Cue(
@@ -258,33 +324,15 @@ def _cap_generated_overlaps(cues: list[Cue], profile: StyleProfile) -> list[Cue]
     for index, cue in enumerate(cues):
         next_start = cues[index + 1].start_ms if index + 1 < len(cues) else None
         end_ms = cue.end_ms
-        if next_start is not None and end_ms > next_start:
+        if next_start is not None and cue.start_ms < next_start < end_ms:
             end_ms = max(cue.start_ms + 1, next_start)
-        result.append(cue.with_timing(cue.start_ms, profile.snap_floor(end_ms) if end_ms > cue.start_ms else end_ms))
+        snapped_end_ms = profile.snap_floor(end_ms)
+        result.append(cue.with_timing(cue.start_ms, snapped_end_ms if snapped_end_ms > cue.start_ms else end_ms))
     return result
 
 
-def _cue_word_indices(cues: list[Cue], words: list[Word]) -> dict[int, list[int]]:
-    mapping: dict[int, list[int]] = {}
-    for cue in cues:
-        mapping[cue.index] = [
-            index
-            for index, word in enumerate(words)
-            if word.end * 1000 >= cue.start_ms and word.start * 1000 <= cue.end_ms
-        ]
-    return mapping
-
-
 def _provider_config(config: dict[str, object], *, local: bool) -> dict[str, object]:
-    if not local:
-        return dict(config)
-    next_config = dict(config)
-    existing = next_config.get("asr", {})
-    asr_config = dict(existing) if isinstance(existing, dict) else {}
-    asr_config["provider"] = "whisperx"
-    asr_config.pop("fixture_path", None)
-    next_config["asr"] = asr_config
-    return next_config
+    return apply_local_asr_config(config, local)
 
 
 def _punctuation_scene_gap(config: dict[str, object]) -> float:
@@ -307,8 +355,8 @@ def _record_punctuation_cost(meter: CostMeter, adapter: object, config: dict[str
 
 def _positive_float(source: dict[str, object], key: str, default: float) -> float:
     value = float(source.get(key, default))
-    if value <= 0:
-        raise ValueError(f"{key} must be greater than zero")
+    if not isfinite(value) or value <= 0:
+        raise ValueError(f"{key} must be finite and greater than zero")
     return value
 
 
@@ -329,28 +377,10 @@ def _generation_constraints(
 
 def _nonnegative_float(source: dict[str, object], key: str, default: float) -> float:
     value = float(source.get(key, default))
-    if value < 0:
-        raise ValueError(f"{key} must be zero or greater")
+    if not isfinite(value) or value < 0:
+        raise ValueError(f"{key} must be finite and zero or greater")
     return value
 
 
-_SENTENCE_CLOSERS = "\"'’”»›)]}」』）］｝】〕〉》〗〙〛"
-_SENTENCE_OPENERS = "‘“«‹([{「『（［｛【〔〈《〖〘〚"
-
-
-def _ends_sentence(text: str) -> bool:
-    normalized = unicodedata.normalize("NFKC", text)
-    return normalized.rstrip().rstrip(_SENTENCE_CLOSERS).rstrip().endswith((".", "?", "!", "…", "。"))
-
-
-def _only_sentence_closers(text: str) -> bool:
-    return _only_punctuation(text, _SENTENCE_CLOSERS)
-
-
-def _only_punctuation(text: str, punctuation: str) -> bool:
-    stripped = unicodedata.normalize("NFKC", text).strip()
-    return bool(stripped) and all(character in punctuation for character in stripped)
-
-
 def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_json_atomic(path, payload)

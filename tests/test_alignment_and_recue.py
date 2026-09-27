@@ -56,6 +56,47 @@ def test_alignment_normalizes_digits_and_spoken_number_words():
     assert result.cue_word_indices == {1: [0, 1, 2, 3]}
 
 
+def test_alignment_ignores_bracket_only_visual_text_for_spoken_timing():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n[Station of Beijing]\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nhello there\n\n"
+    )
+    words = [
+        Word(text="hello", start=10.00, end=10.20),
+        Word(text="there", start=10.25, end=10.50),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.divergence_spans == []
+    assert result.unmatched_cue_ids == []
+    assert result.cue_word_indices == {2: [0, 1]}
+
+
+def test_alignment_uses_only_spoken_text_from_mixed_bracket_cue():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "[This company is not for you]\n"
+        "Lime is not for you.\n"
+        "\n"
+    )
+    words = [
+        Word(text="Lime", start=3.00, end=3.20),
+        Word(text="is", start=3.25, end=3.32),
+        Word(text="not", start=3.35, end=3.45),
+        Word(text="for", start=3.50, end=3.62),
+        Word(text="you", start=3.70, end=3.90),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.divergence_spans == []
+    assert result.cue_word_indices == {1: [0, 1, 2, 3, 4]}
+
+
 def test_alignment_normalizes_german_hyphen_compounds_and_ordinals():
     cues = parse_srt_text(
         "1\n00:00:00,000 --> 00:00:01,000\nLevel-1-Versager dritte Prufung\n\n"
@@ -70,6 +111,121 @@ def test_alignment_normalizes_german_hyphen_compounds_and_ordinals():
 
     assert result.anchor_coverage == 1.0
     assert result.divergence_spans == []
+
+
+def test_alignment_ignores_bracketed_screen_text_lines_without_losing_spoken_lines():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "[Document: Final admission notice]\n"
+        "I accept.\n"
+        "\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "[Episode 1]\n"
+        "\n"
+        "3\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "We go now.\n"
+        "\n"
+    )
+    words = [
+        Word(text="I", start=10.00, end=10.10, confidence=0.98),
+        Word(text="accept", start=10.12, end=10.40, confidence=0.98),
+        Word(text="We", start=20.00, end=20.10, confidence=0.98),
+        Word(text="go", start=20.12, end=20.22, confidence=0.98),
+        Word(text="now", start=20.24, end=20.50, confidence=0.98),
+    ]
+
+    alignment = align_cues_to_words(cues, words)
+    rebuilt, flags = rebuild_cues(cues, words, alignment, StyleProfile(fps=30.0, min_cue_dur=0.5))
+
+    assert alignment.anchor_coverage == 1.0
+    assert alignment.divergence_spans == []
+    assert alignment.cue_word_indices == {1: [0, 1], 3: [2, 3, 4]}
+    assert alignment.unmatched_cue_ids == []
+    assert rebuilt[0].text == "[Document: Final admission notice]\nI accept."
+    assert rebuilt[0].start_ms == 10000
+    assert rebuilt[0].end_ms == 10500
+    assert rebuilt[1].plain_text == "[Episode 1]"
+    assert rebuilt[1].start_ms == 1000
+    assert rebuilt[1].end_ms == 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+
+
+def test_fuzzy_name_variant_stays_visible_for_audio_adjudication():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "Komm jetzt, Tristen, bitte.\n"
+        "\n"
+    )
+    words = [
+        Word(text=text, start=index * 0.2, end=index * 0.2 + 0.15)
+        for index, text in enumerate(["Komm", "jetzt", "Tristan", "bitte"])
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text == "Tristen"
+    assert result.divergence_spans[0].asr_text == "Tristan"
+
+
+def test_divergence_with_unknown_asr_confidence_remains_unscored():
+    cues = parse_srt_text(
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "Tristen\n"
+        "\n"
+    )
+    words = [Word(text="Tristan", start=0.1, end=0.6, confidence=None)]
+
+    result = align_cues_to_words(cues, words)
+
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].confidence == 0.0
+
+
+def test_alignment_rejects_an_implausibly_overlong_single_word_match():
+    cues = [Cue(index=771, start_ms=2_087_800, end_ms=2_088_670, lines=["Flora,"])]
+    words = [
+        Word(
+            text="Flora",
+            start=2_083.496,
+            end=2_088.276,
+            confidence=0.99,
+            speaker_id="A",
+        )
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {}
+    assert result.unmatched_cue_ids == [771]
+    assert result.diagnostics.missing_audio_cue_ids == [771]
+    assert result.diagnostics.missing_audio_guard_version == 6
+    duration_flag = next(
+        flag for flag in result.flags if flag.kind == "implausible_matched_word_duration"
+    )
+    assert duration_flag.cue_ids == [771]
+    assert duration_flag.severity == "error"
+    assert any(
+        flag.kind == "missing_audio_timing_held" and flag.cue_ids == [771]
+        for flag in result.flags
+    )
+
+
+def test_alignment_accepts_a_long_word_when_the_source_cue_is_also_long():
+    cues = [Cue(index=1, start_ms=0, end_ms=5_000, lines=["Flora,"])]
+    words = [Word(text="Flora", start=0.1, end=4.88, confidence=0.99, speaker_id="A")]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {1: [0]}
+    assert result.unmatched_cue_ids == []
+    assert result.diagnostics.missing_audio_cue_ids == []
+    assert not any(flag.kind == "implausible_matched_word_duration" for flag in result.flags)
 
 
 def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
@@ -97,6 +253,169 @@ def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     assert result.anchor_coverage == 1.0
     assert result.divergence_spans == []
     assert calls < (token_count * token_count) // 2
+
+
+def test_alignment_budget_exhaustion_rejects_a_bounded_run_that_misses_a_unique_exact_pair(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
+    token_count = 300
+    cues = [
+        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=["filler"])
+        for index in range(token_count)
+    ]
+    words = [
+        Word(text="filler", start=index * 0.2, end=index * 0.2 + 0.1, confidence=0.99)
+        for index in range(token_count)
+    ]
+    cues[20] = cues[20].with_lines(["needle"])
+    words[280] = words[280].model_copy(update={"text": "needle"})
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.token_matches == []
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text.startswith("filler")
+    assert result.divergence_spans[0].asr_text.startswith("filler")
+    assert result.diagnostics.unbanded_fallback is False
+    assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is True
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    assert any(flag.kind == "alignment_unresolved" and flag.severity == "error" for flag in result.flags)
+
+
+def test_alignment_budget_accepts_a_unique_pair_explained_by_an_adjacent_transposition(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
+    cues = [
+        Cue(index=index + 1, start_ms=index * 200, end_ms=index * 200 + 120, lines=["filler"])
+        for index in range(300)
+    ]
+    cues[20] = cues[20].with_lines(["um novo inquilino"])
+    cues[100] = cues[100].with_lines(["novo"])
+    tokens = aligner.tokenize_cues(cues)
+    words_norm = [token.normalized for token in tokens]
+    words_norm[21], words_norm[22] = words_norm[22], words_norm[21]
+
+    run = aligner._align_tokens_detailed(tokens, words_norm)
+
+    assert run.unresolved is False
+    assert run.band_limited is False
+    assert sum(op.kind == "match" for op in run.ops) == len(tokens) - 1
+    assert any(op.kind == "match" and op.srt_index == 21 and op.asr_index == 22 for op in run.ops)
+
+
+def test_local_transposition_check_uses_constant_radius_membership():
+    class MembershipOnlyPairs:
+        def __init__(self, pairs):
+            self.pairs = set(pairs)
+
+        def __contains__(self, pair):
+            return pair in self.pairs
+
+        def __iter__(self):
+            raise AssertionError("transposition proof must not scan every matched pair")
+
+    matched_pairs = MembershipOnlyPairs({(9, 9), (11, 10), (12, 12)})
+
+    assert aligner._is_locally_explained_transposition((10, 11), matched_pairs)
+
+
+def test_successful_timing_prior_replaces_failed_preliminary_unresolved_status(monkeypatch):
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\necho one\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\necho two\n\n"
+    )
+    words = [
+        Word(text="echo", start=0.1, end=0.2),
+        Word(text="one", start=0.3, end=0.4),
+        Word(text="echo", start=1.1, end=1.2),
+        Word(text="two", start=1.3, end=1.4),
+    ]
+    successful_ops = [aligner._Op("match", index, index, 1.0) for index in range(4)]
+    runs = iter(
+        [
+            aligner._AlignmentRun(
+                ops=aligner._fully_divergent_ops(4, 4),
+                band_limited=True,
+                unresolved=True,
+            ),
+            aligner._AlignmentRun(ops=successful_ops),
+        ]
+    )
+    monkeypatch.setattr(aligner, "_align_tokens_detailed", lambda *args, **kwargs: next(runs))
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.diagnostics.prior_used is True
+    assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is False
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    assert not any(flag.kind == "alignment_unresolved" for flag in result.flags)
+
+
+def test_alignment_retry_margins_progress_without_automatic_full_width():
+    assert aligner._retry_margins(64, 5_000) == [64, 256, 1_024]
+    assert aligner._retry_margins(64, 500) == [64, 256, 500]
+
+
+def test_small_initial_alignment_is_not_reported_as_an_unbanded_fallback():
+    cues = [Cue(index=1, start_ms=0, end_ms=1_000, lines=["alpha"])]
+    words = [Word(text="alpha", start=0.1, end=0.3)]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.diagnostics.unbanded_fallback is False
+
+
+def test_alignment_budget_exhaustion_preserves_a_reviewable_whole_span(monkeypatch):
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 0)
+    cues = [Cue(index=1, start_ms=0, end_ms=1_000, lines=["alpha beta"])]
+    words = [
+        Word(text="alpha", start=0.1, end=0.3),
+        Word(text="beta", start=0.4, end=0.6),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.token_matches == []
+    assert len(result.divergence_spans) == 1
+    assert result.divergence_spans[0].srt_text == "alpha beta"
+    assert result.divergence_spans[0].asr_text == "alpha beta"
+    assert result.diagnostics.band_limited is True
+    assert result.diagnostics.unresolved is True
+    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    unresolved = [flag for flag in result.flags if flag.kind == "alignment_unresolved"]
+    assert len(unresolved) == 1
+    assert unresolved[0].severity == "error"
+
+
+def test_similarity_uses_score_cutoff_without_rejecting_near_length_german_pairs(monkeypatch):
+    calls: list[tuple[str, str, float | None]] = []
+
+    def fake_ratio(left: str, right: str, score_cutoff: float | None = None) -> float:
+        calls.append((left, right, score_cutoff))
+        return 88.9
+
+    monkeypatch.setattr(aligner.fuzz, "ratio", fake_ratio)
+
+    assert aligner._similarity("gehen", "gehe") == 0.889
+    assert aligner._similarity("Haus", "Hause") == 0.889
+    assert calls == [
+        ("gehen", "gehe", 85.0),
+        ("Haus", "Hause", 85.0),
+    ]
+
+
+def test_band_windows_keep_distant_priors_disjoint_and_bounded():
+    windows = aligner._band_windows(
+        row=50,
+        token_count=100,
+        word_count=1_000,
+        margin=5,
+        prior_centers=(100, 900),
+    )
+
+    assert len(windows) == 3
+    assert windows == [(95, 105), (495, 505), (895, 905)]
 
 
 def test_injected_improv_span_is_isolated_to_changed_cue(shifted_srt_text):
@@ -242,9 +561,79 @@ def test_recue_default_keep_flagged_preserves_unmatched_cue():
 
     assert [cue.index for cue in rebuilt] == [1, 2]
     assert any(flag.kind == "unmatched_cue" and flag.cue_ids == [2] for flag in flags)
-    assert any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
-    assert rebuilt[1].start_ms != 1000
-    assert rebuilt[1].end_ms != 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    assert rebuilt[1].start_ms == 1000
+    assert rebuilt[1].end_ms == 2000
+
+
+def test_recue_preserves_missing_middle_source_timing_between_matched_neighbors():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nalpha one\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nmissing middle\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\nomega three\n\n"
+    )
+    words = [
+        Word(text="alpha", start=10.00, end=10.20),
+        Word(text="one", start=10.25, end=10.50),
+        Word(text="omega", start=20.00, end=20.20),
+        Word(text="three", start=20.25, end=20.50),
+    ]
+    alignment = align_cues_to_words(cues, words)
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5, drop_policy="keep_flagged")
+
+    rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
+
+    missing = next(cue for cue in rebuilt if cue.index == 2)
+    assert alignment.unmatched_cue_ids == [2]
+    assert alignment.diagnostics.missing_audio_cue_ids == [2]
+    assert missing.start_ms == 2000
+    assert missing.end_ms == 3000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+
+
+def test_alignment_does_not_assign_partial_repeated_missing_cue_to_later_sentence():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\ntake the card\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\ntake the ring\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\ntake the sword\n\n"
+    )
+    words = [
+        Word(text="take", start=10.00, end=10.10),
+        Word(text="the", start=10.15, end=10.20),
+        Word(text="card", start=10.25, end=10.50),
+        Word(text="take", start=20.00, end=20.10),
+        Word(text="the", start=20.15, end=20.20),
+        Word(text="sword", start=20.25, end=20.50),
+    ]
+
+    alignment = align_cues_to_words(cues, words)
+
+    assert alignment.cue_word_indices == {1: [0, 1, 2], 3: [3, 4, 5]}
+    assert alignment.unmatched_cue_ids == [2]
+
+
+def test_recue_keeps_bracket_only_visual_text_at_source_timing_without_interpolation():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nmatched line\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\n[Station of Beijing]\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nnext line\n\n"
+    )
+    words = [
+        Word(text="matched", start=10.0, end=10.2),
+        Word(text="line", start=10.25, end=10.5),
+        Word(text="next", start=20.0, end=20.2),
+        Word(text="line", start=20.25, end=20.5),
+    ]
+    alignment = align_cues_to_words(cues, words)
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5, drop_policy="remove")
+
+    rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
+
+    visual = next(cue for cue in rebuilt if cue.index == 2)
+    assert visual.start_ms == 2000
+    assert visual.end_ms == 4000
+    assert visual.text == "[Station of Beijing]"
+    assert not any(flag.cue_ids == [2] for flag in flags)
 
 
 def test_recue_drop_policy_remove_drops_unmatched_cue_with_qc_flag():

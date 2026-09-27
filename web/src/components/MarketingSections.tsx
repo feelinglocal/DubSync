@@ -9,8 +9,8 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
       <section className="feature-band" id="features">
         <div className="section-inner">
           <header className="section-heading">
-            <h2>Built for subtitle professionals</h2>
-            <p>Keep the source structure when it is right. See exactly what changed when it is not.</p>
+            <h2>Professional subtitle sync and auto captioning</h2>
+            <p>Keep valid source structure, follow the recorded performance, and review every uncertain change.</p>
           </header>
           <div className="feature-list">
             <Feature icon={<ScanLine />} title="Frame-accurate timing">Cue boundaries come from acoustic word timestamps and optional forced alignment.</Feature>
@@ -45,14 +45,15 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
           <div className="pricing-table-wrap">
             <h2>Usage pricing</h2>
             <table>
-              <thead><tr><th>Workflow</th><th>Rate</th><th>Minimum</th></tr></thead>
+              <thead><tr><th>Workflow</th><th>Rate</th><th>Order minimum</th></tr></thead>
               <tbody>
                 <PriceRow name="Audio to SRT" tier={pricing.generate} />
                 <PriceRow name="Sync existing SRT" tier={pricing.sync} />
-                <PriceRow name="Precision processing" tier={pricing.precision} />
+                <PriceRow name="Precision processing (Coming soon)" tier={pricing.precision} />
               </tbody>
             </table>
-            <p>Manual quote and invoice before paid processing. Accepted quotes receive a job access code. Prices exclude applicable taxes unless the quote states otherwise.</p>
+            <p>The minimum applies once per quoted order, including multi-file batches.</p>
+            <p>We total the source-audio duration for all files, multiply it by the workflow rate, then charge whichever is higher: that total or the order minimum. Rates include standard setup, file handling, and delivery support. Manual quote and invoice before paid processing. Accepted quotes receive a job access code. Prices exclude applicable taxes unless the quote states otherwise.</p>
             <a className="text-link" href="/payments">Read the payment and refund policy</a>
           </div>
         </div>
@@ -67,7 +68,7 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
           <dl className="privacy-facts">
             <div><dt>{config.retention_hours} hours</dt><dd>Uploads and generated artifacts are scheduled for deletion.</dd></div>
             <div><dt>Secret access</dt><dd>Each job uses a browser-held token for status and downloads.</dd></div>
-            <div><dt>Named providers</dt><dd>Render, ElevenLabs, and Gemini processing is disclosed in the Privacy Policy.</dd></div>
+            <div><dt>Named providers</dt><dd>Render, Microsoft through OpenRouter, ElevenLabs, OpenAI, and Gemini processing is disclosed in the Privacy Policy.</dd></div>
           </dl>
         </div>
       </section>
@@ -80,6 +81,7 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
             <Faq title="Does DubSync change my subtitle text?">Sync mode preserves unchanged cues. Spoken differences are reconciled and listed in the QC report.</Faq>
             <Faq title="Where does timing come from?">Only acoustic word timestamps and optional forced alignment. Language models never set timestamps.</Faq>
             <Faq title="How long are files retained?">Uploads and generated artifacts on DubSync are scheduled for deletion after {config.retention_hours} hours.</Faq>
+            <Faq title="Can DubSync create automatic captions?">Audio-to-SRT mode creates dialogue subtitles from audio. Add non-speech sound descriptions during review when accessibility captions require them.</Faq>
           </div>
         </div>
       </section>
@@ -87,7 +89,7 @@ export function MarketingSections({ config }: { config: PublicConfig }) {
       <section className="contact-band" id="contact">
         <div className="section-inner contact-inner">
           <div><h2>Contact the operator</h2><p>Questions, billing requests, feedback, or a specific localization workflow.</p></div>
-          <a href="mailto:reyhanputraph@gmail.com">reyhanputraph@gmail.com</a>
+          <a href="mailto:rey@feelslocal.com">rey@feelslocal.com</a>
         </div>
       </section>
     </>

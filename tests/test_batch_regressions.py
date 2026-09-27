@@ -3,7 +3,12 @@ from __future__ import annotations
 from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, SpeechRegion, Word
 from dubsync.output_order import finalize_cues_for_output
 from dubsync.changes import apply_adjudication_decisions
-from dubsync.pipeline import _adlib_cue_ids_by_case, _alignment_with_decision_words, _without_stale_verify_flags
+from dubsync.pipeline import (
+    _adlib_cue_ids_by_case,
+    _alignment_with_decision_words,
+    _remove_silent_generated_adlibs,
+    _without_stale_verify_flags,
+)
 from dubsync.recue import rebuild_cues
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import StyleProfile
@@ -33,10 +38,35 @@ def test_keep_srt_divergence_still_extends_to_spoken_span_words():
     assert updated.cue_word_indices[18] == [58, 59, 60, 61, 62, 63]
 
 
+def test_keep_srt_divergence_without_existing_match_does_not_gain_asr_timing():
+    alignment = AlignmentResult(cue_word_indices={})
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[18],
+        srt_text="source-only line",
+        asr_text="unrelated audio",
+        asr_word_indices=[63, 64],
+    )
+    decision = AdjudicationDecision(
+        case_id="case-1",
+        verdict="keep_srt",
+        final_text="source-only line",
+        confidence=0.2,
+        reason="audio did not prove this source cue was spoken",
+    )
+
+    updated = _alignment_with_decision_words(alignment, [decision], [span])
+
+    assert updated.cue_word_indices == {}
+
+
 def test_recue_ceil_snaps_end_so_last_syllable_is_not_cut():
     cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["Das Ding ist mindestens Level 15."])]
-    words = [Word(text="funfzehn.", start=0.25, end=0.501, confidence=0.95)]
-    alignment = AlignmentResult(cue_word_indices={1: [0]})
+    words = [
+        Word(text=text, start=index * 0.05, end=index * 0.05 + 0.04, confidence=0.95)
+        for index, text in enumerate(["Das", "Ding", "ist", "mindestens", "Level"])
+    ] + [Word(text="funfzehn.", start=0.25, end=0.501, confidence=0.95)]
+    alignment = AlignmentResult(cue_word_indices={1: list(range(len(words)))})
     profile = StyleProfile(fps=30.0, min_cue_dur=0.1, tail_ms=0)
 
     rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
@@ -68,7 +98,7 @@ def test_recue_trims_impossible_word_cluster_before_timing():
     assert flags[0].kind == "timing_outlier_trimmed"
 
 
-def test_unmatched_kept_cue_is_interpolated_instead_of_source_timed():
+def test_unmatched_kept_cue_preserves_source_timing_instead_of_interpolation():
     cues = [
         Cue(index=1, start_ms=0, end_ms=1000, lines=["before"]),
         Cue(index=2, start_ms=1000, end_ms=2000, lines=["missing"]),
@@ -82,10 +112,93 @@ def test_unmatched_kept_cue_is_interpolated_instead_of_source_timed():
 
     rebuilt, flags = rebuild_cues(cues, words, alignment, StyleProfile(fps=30.0, min_cue_dur=0.5))
 
-    interpolated = next(cue for cue in rebuilt if cue.index == 2)
-    assert interpolated.start_ms != 1000
-    assert interpolated.end_ms != 2000
-    assert any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    unmatched = next(cue for cue in rebuilt if cue.index == 2)
+    assert unmatched.start_ms == 1000
+    assert unmatched.end_ms == 2000
+    assert not any(flag.kind == "interpolated_timing" and flag.cue_ids == [2] for flag in flags)
+    assert any(flag.kind == "unmatched_cue" and flag.cue_ids == [2] for flag in flags)
+
+
+def test_trailing_unmatched_cue_preserves_source_timing_after_previous_match():
+    cues = [
+        Cue(index=56, start_ms=98800, end_ms=99566, lines=["Ach, komm schon."]),
+        Cue(index=57, start_ms=104333, end_ms=105433, lines=["Ahh!"]),
+    ]
+    words = [
+        Word(text="Ach", start=99.0, end=99.2, confidence=0.9),
+        Word(text="komm", start=99.25, end=99.45, confidence=0.9),
+        Word(text="schon", start=99.5, end=99.75, confidence=0.9),
+    ]
+    alignment = AlignmentResult(
+        cue_word_indices={56: [0, 1, 2]},
+        unmatched_cue_ids=[57],
+    )
+
+    rebuilt, _ = rebuild_cues(
+        cues,
+        words,
+        alignment,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+    )
+
+    trailing = next(cue for cue in rebuilt if cue.index == 57)
+    assert trailing.start_ms == 104333
+    assert trailing.end_ms == 105433
+    assert trailing.duration_ms == 1100
+
+
+def test_leading_unmatched_cue_never_gets_negative_timing_when_source_gap_will_not_fit():
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1000, lines=["lead"]),
+        Cue(index=2, start_ms=10000, end_ms=11000, lines=["match"]),
+    ]
+    words = [
+        Word(text="match", start=1.0, end=1.5, confidence=0.9),
+    ]
+    alignment = AlignmentResult(
+        cue_word_indices={2: [0]},
+        unmatched_cue_ids=[1],
+    )
+
+    rebuilt, _ = rebuild_cues(
+        cues,
+        words,
+        alignment,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+    )
+
+    leading = next(cue for cue in rebuilt if cue.index == 1)
+    following = next(cue for cue in rebuilt if cue.index == 2)
+    assert 0 <= leading.start_ms < leading.end_ms <= following.start_ms
+
+
+def test_generated_adlib_with_detected_speech_is_not_removed_for_low_coverage():
+    cue = Cue(index=3, start_ms=1000, end_ms=2000, lines=["Ah!"])
+    flags = [
+        QCFlag(
+            kind="adlib_inserted",
+            cue_ids=[3],
+            message="Generated from an audio-only insertion.",
+        )
+    ]
+    activity_flags = [
+        QCFlag(
+            kind="cue_without_speech_activity",
+            cue_ids=[3],
+            message="Cue overlaps speech activity for only 10% of its duration.",
+            confidence=0.1,
+        )
+    ]
+
+    remaining, retained_flags, retained_activity_flags = _remove_silent_generated_adlibs(
+        [cue],
+        flags,
+        activity_flags,
+    )
+
+    assert remaining == [cue]
+    assert retained_flags == flags
+    assert retained_activity_flags == activity_flags
 
 
 def test_adlib_reconciliation_reuses_unmatched_source_cue():

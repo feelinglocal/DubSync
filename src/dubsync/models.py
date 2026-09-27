@@ -15,6 +15,8 @@ class Cue(BaseModel):
     lines: list[str]
     speaker_id: str | None = None
     character: str | None = None
+    prompt_scene_id: int | None = Field(default=None, ge=1, exclude=True)
+    prompt_scene_position: int | None = Field(default=None, ge=1, exclude=True)
 
     @field_validator("lines")
     @classmethod
@@ -46,7 +48,7 @@ class Word(BaseModel):
     text: str
     start: float
     end: float
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    confidence: float | None = Field(default=1.0, ge=0.0, le=1.0)
     speaker_id: str | None = None
 
 
@@ -89,6 +91,15 @@ class DivergenceSpan(BaseModel):
     asr_word_indices: list[int] = Field(default_factory=list)
     context_before: list[CueContext] = Field(default_factory=list)
     context_after: list[CueContext] = Field(default_factory=list)
+    left_anchor_cue_id: int | None = None
+    right_anchor_cue_id: int | None = None
+    insertion_token_offset: int | None = Field(default=None, ge=0)
+    left_anchor_end: float | None = None
+    right_anchor_start: float | None = None
+    left_anchor_speaker_id: str | None = None
+    right_anchor_speaker_id: str | None = None
+    prompt_scene_id: int | None = Field(default=None, ge=1, exclude=True)
+    prompt_scene_position: int | None = Field(default=None, ge=1, exclude=True)
 
 
 class AudioSnippet(BaseModel):
@@ -103,25 +114,6 @@ class AudioSnippet(BaseModel):
         return max(0.0, self.end - self.start)
 
 
-class AlignmentResult(BaseModel):
-    token_matches: list[TokenMatch] = Field(default_factory=list)
-    anchor_regions: list[AnchorRegion] = Field(default_factory=list)
-    cue_word_indices: dict[int, list[int]] = Field(default_factory=dict)
-    anchor_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
-    divergence_spans: list[DivergenceSpan] = Field(default_factory=list)
-    unmatched_cue_ids: list[int] = Field(default_factory=list)
-
-
-class AdjudicationDecision(BaseModel):
-    case_id: str
-    verdict: Verdict
-    final_text: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    speaker: str | None = None
-    character: str | None = None
-    reason: str
-
-
 class QCFlag(BaseModel):
     kind: str
     cue_ids: list[int] = Field(default_factory=list)
@@ -132,6 +124,42 @@ class QCFlag(BaseModel):
     new_text: str | None = None
     start: float | None = None
     end: float | None = None
+
+
+class AlignmentDiagnostics(BaseModel):
+    prior_attempted: bool = False
+    prior_used: bool = False
+    transform_applied: bool = False
+    transform_rate: float | None = None
+    transform_offset_seconds: float | None = None
+    transform_anchor_count: int = Field(default=0, ge=0)
+    unbanded_fallback: bool = False
+    band_limited: bool = False
+    unresolved: bool = False
+    excluded_screen_text_cue_ids: list[int] = Field(default_factory=list)
+    missing_audio_cue_ids: list[int] = Field(default_factory=list)
+    missing_audio_guard_version: int = Field(default=0, ge=0)
+
+
+class AlignmentResult(BaseModel):
+    token_matches: list[TokenMatch] = Field(default_factory=list)
+    anchor_regions: list[AnchorRegion] = Field(default_factory=list)
+    cue_word_indices: dict[int, list[int]] = Field(default_factory=dict)
+    anchor_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    divergence_spans: list[DivergenceSpan] = Field(default_factory=list)
+    unmatched_cue_ids: list[int] = Field(default_factory=list)
+    flags: list[QCFlag] = Field(default_factory=list)
+    diagnostics: AlignmentDiagnostics = Field(default_factory=AlignmentDiagnostics)
+
+
+class AdjudicationDecision(BaseModel):
+    case_id: str
+    verdict: Verdict
+    final_text: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    speaker: str | None = None
+    character: str | None = None
+    reason: str
 
 
 class StyleIssue(BaseModel):

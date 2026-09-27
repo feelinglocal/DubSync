@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -6,17 +6,25 @@ import App from './App'
 
 const configResponse = {
   retention_hours: 24,
-  max_upload_bytes: 2_147_483_648,
+  max_upload_bytes: 536_870_912,
+  max_srt_bytes: 2_097_152,
   audio_extensions: ['.mp3', '.wav'],
   fps_values: [24, 25, 30],
   pricing: {
-    generate: { usd_per_minute: 0.12, minimum_usd: 3 },
-    sync: { usd_per_minute: 0.18, minimum_usd: 5 },
-    precision: { usd_per_minute: 0.25, minimum_usd: 10 },
+    generate: { usd_per_minute: 0.40, minimum_usd: 20 },
+    sync: { usd_per_minute: 0.60, minimum_usd: 30 },
+    precision: { usd_per_minute: 0.90, minimum_usd: 50 },
   },
   billing_enabled: false,
   access_code_required: false,
   jobs_available: true,
+  default_transcription_provider: 'scribe_v2',
+  transcription_models: [
+    { id: 'microsoft/mai-transcribe-2', label: 'MAI-Transcribe 2', available: true },
+    { id: 'scribe_v2', label: 'Scribe v2', available: true },
+  ],
+  gemini_transcribe_testing_available: false,
+  gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {
     default_preset: 'standard',
     presets: [
@@ -51,12 +59,35 @@ const configResponse = {
       tail_ms: { min: 0, max: 1000, step: 10 },
     },
   },
+  sync_style_limits: {
+    max_lines_per_cue: { min: 1, max: 2, step: 1 },
+  },
+}
+
+const completedBatchResponse = {
+  id: 'batch-1',
+  jobs: [
+    {
+      id: 'job-1', token: 'token-1', source_name: '001', batch_id: 'batch-1', batch_position: 0,
+      mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 3, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    },
+    {
+      id: 'job-2', token: 'token-2', source_name: '002', batch_id: 'batch-1', batch_position: 1,
+      mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 4, cost_usd: 0.02 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    },
+  ],
 }
 
 afterEach(() => {
   vi.restoreAllMocks()
   sessionStorage.clear()
   window.history.replaceState({}, '', '/')
+  document.title = ''
+  document.head.querySelector('link[rel="canonical"]')?.remove()
+  document.head.querySelector('meta[name="description"]')?.remove()
+  document.head.querySelector('meta[property="og:title"]')?.remove()
 })
 
 describe('DubSync workspace', () => {
@@ -98,12 +129,649 @@ describe('DubSync workspace', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
     render(<App />)
 
-    expect(screen.getByRole('heading', { name: 'Sync dialogue. Keep every cue honest.' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'SRT sync that follows the performance.' })).toBeVisible()
     expect(screen.getByLabelText('Dialogue audio')).toBeRequired()
     expect(screen.getByLabelText('Original SRT')).toBeRequired()
     expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
     expect(await screen.findByText('Files are deleted after 24 hours')).toBeVisible()
     expect(await screen.findByText(/Manual quote and invoice before paid processing/i)).toBeVisible()
+    expect(await screen.findByText(/Render, Microsoft through OpenRouter, ElevenLabs, OpenAI, and Gemini processing/)).toBeVisible()
+    expect(document.title).toBe('Subtitle Sync & Audio-to-SRT for Dubbing | DubSync')
+    expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/')
+    expect(document.head.querySelector('meta[name="description"]')).toHaveAttribute('content', expect.stringContaining('Sync an existing SRT'))
+  })
+
+  it('shows the agreed public rates and order minimums for every workflow', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    const generateRow = await screen.findByRole('row', { name: /Audio to SRT/i })
+    expect(within(generateRow).getByText('$0.40/min')).toBeVisible()
+    expect(within(generateRow).getByText('$20 minimum')).toBeVisible()
+
+    const syncRow = screen.getByRole('row', { name: /Sync existing SRT/i })
+    expect(within(syncRow).getByText('$0.60/min')).toBeVisible()
+    expect(within(syncRow).getByText('$30 minimum')).toBeVisible()
+
+    const precisionRow = screen.getByRole('row', { name: /Precision processing/i })
+    expect(within(precisionRow).getByText('$0.90/min')).toBeVisible()
+    expect(within(precisionRow).getByText('$50 minimum')).toBeVisible()
+  })
+
+  it('offers Portuguese and submits the pt language code', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'portuguese-job', token: 'portuguese-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const languageSelect = screen.getByLabelText('Language')
+    expect(within(languageSelect).getByRole('option', { name: 'Portuguese' })).toHaveValue('pt')
+    await user.selectOptions(languageSelect, 'pt')
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('language')).toBe('pt')
+  })
+
+  it.each([
+    ['when the availability flag is omitted', Object.fromEntries(
+      Object.entries(configResponse).filter(([key]) => key !== 'gemini_transcribe_testing_available'),
+    )],
+    ['when the availability flag is false', configResponse],
+  ])('hides the Gemini 3.5 Transcribe testing toggle %s', async (_scenario, config) => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(config), { status: 200 }))
+
+    render(<App />)
+
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Testing only. Maximum 30 minutes per audio file.')).not.toBeInTheDocument()
+  })
+
+  it('hides the Gemini 3.5 Transcribe testing toggle even if stale config enables it', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+
+    render(<App />)
+
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Testing only. Maximum 30 minutes per audio file.')).not.toBeInTheDocument()
+  })
+
+  it('keeps single sync on the default transcription provider even if stale config enables Gemini testing', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'gemini-job', token: 'gemini-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
+  })
+
+  it('keeps audio-to-SRT generation on the default transcription provider', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'gemini-generate-job', token: 'gemini-generate-token', mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('mode')).toBe('generate')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
+  })
+
+  it('keeps sync batches on the default transcription provider', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/batches')
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
+  })
+
+  it('does not request Gemini 3.5 Transcribe when the testing toggle is left unchecked', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ...configResponse,
+      gemini_transcribe_testing_available: true,
+    }), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'default-provider-job', token: 'default-provider-token', mode: 'sync', status: 'complete', progress: 100,
+      result: { cue_count: 2, cost_usd: 0.01 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    expect(screen.queryByRole('checkbox', { name: 'Use Gemini 3.5 Transcribe (testing)' })).not.toBeInTheDocument()
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('transcription_provider')).toBe('scribe_v2')
+  })
+
+  it.each([
+    ['sync', 1], ['sync', 2], ['generate', 1], ['generate', 2],
+  ])('offers Scribe by default and submits optional MAI for %s with %i files', async (mode, count) => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(
+      count === 2 ? completedBatchResponse : completedBatchResponse.jobs[0],
+    ), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const modelSelect = screen.getByRole('combobox', { name: 'Transcription model' })
+    expect(modelSelect).toHaveValue('scribe_v2')
+    expect(within(modelSelect).getByRole('option', { name: 'Scribe v2 (default)' })).toBeEnabled()
+    await user.selectOptions(modelSelect, 'microsoft/mai-transcribe-2')
+    if (mode === 'generate') await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    expect(modelSelect).toHaveValue('microsoft/mai-transcribe-2')
+    await user.upload(screen.getByLabelText('Dialogue audio'), Array.from({ length: count }, (_, index) => (
+      new File(['audio'], `00${index + 1}.wav`, { type: 'audio/wav' })
+    )))
+    if (mode === 'sync') {
+      await user.upload(screen.getByLabelText('Original SRT'), Array.from({ length: count }, (_, index) => (
+        new File(['subtitle'], `00${index + 1}.srt`, { type: 'application/x-subrip' })
+      )))
+    }
+    await user.click(screen.getByRole('button', { name: mode === 'sync' ? 'Start sync' : 'Generate SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls[1][0]).toBe(count === 2 ? '/api/batches' : '/api/jobs')
+    const body = fetchMock.mock.calls[1][1]?.body as FormData
+    expect(body.get('transcription_provider')).toBe('microsoft/mai-transcribe-2')
+    expect(body.get('mode')).toBe(mode)
+  })
+
+  it('keeps unavailable Scribe selected until the user chooses an available model', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ...configResponse,
+      transcription_models: configResponse.transcription_models.map((model) => ({
+        ...model, available: model.id === 'microsoft/mai-transcribe-2',
+      })),
+    }), { status: 200 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByText('Scribe v2 is currently unavailable. Choose an available model to continue.')
+    const modelSelect = screen.getByRole('combobox', { name: 'Transcription model' })
+    expect(modelSelect).toHaveValue('scribe_v2')
+    expect(within(modelSelect).getByRole('option', { name: 'Scribe v2 (default) (unavailable)' })).toBeDisabled()
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], 'episode.srt', { type: 'application/x-subrip' }))
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+
+    await user.selectOptions(modelSelect, 'microsoft/mai-transcribe-2')
+    expect(screen.queryByText(/is currently unavailable. Choose an available model/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeEnabled()
+  })
+
+  it('does not assume model availability when the server omits model configuration', async () => {
+    const { transcription_models: _models, default_transcription_provider: _default, ...legacyConfig } = configResponse
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(legacyConfig), { status: 200 }))
+    render(<App />)
+    expect(await screen.findByText('Scribe v2 is currently unavailable. Choose an available model to continue.')).toBeVisible()
+    expect(screen.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+  })
+
+  it('clearly marks precision processing as coming soon', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    const precisionRow = await screen.findByRole('row', { name: /Precision processing/i })
+    expect(within(precisionRow).getByText(/coming soon/i)).toBeVisible()
+  })
+
+  it('explains that one minimum applies to each quoted order, including multi-file batches', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    render(<App />)
+
+    expect(await screen.findByText(
+      'The minimum applies once per quoted order, including multi-file batches.',
+    )).toBeVisible()
+  })
+
+  it('shows the simple file-pair naming instruction for batch sync', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+
+    render(<App />)
+
+    const help = 'Match names: 001.wav + 001.srt. Up to 10 pairs.'
+    expect(await screen.findByText(help)).toBeVisible()
+    expect(screen.getByLabelText('Dialogue audio')).toHaveAccessibleDescription(help)
+    expect(screen.getByLabelText('Original SRT')).toHaveAccessibleDescription(help)
+  })
+
+  it('shows the configured SRT limit for original and style-example uploads', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    const user = userEvent.setup()
+
+    render(<App />)
+
+    expect(await screen.findByText('SRT up to 2 MB each')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.click(screen.getByRole('button', { name: 'From SRT' }))
+    expect(screen.getByText('SRT up to 2 MB')).toBeVisible()
+  })
+
+  it('keeps batch submission disabled when audio and subtitle stems do not match', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(configResponse), { status: 200 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-3'], '003.srt', { type: 'application/x-subrip' }),
+    ])
+
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+  })
+
+  it('submits two named pairs in one multipart batch request and renders both child results', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    const fpsSelect = screen.getByLabelText('Frame rate')
+    expect(fpsSelect).toHaveValue('auto')
+    expect(within(fpsSelect).getByRole('option', { name: 'Auto (detect from SRT)' })).toBeInTheDocument()
+    const firstAudio = new File(['audio-1'], '001.wav', { type: 'audio/wav' })
+    const secondAudio = new File(['audio-2'], '002.wav', { type: 'audio/wav' })
+    const firstSubtitle = new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' })
+    const secondSubtitle = new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' })
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [firstAudio, secondAudio])
+    await user.upload(screen.getByLabelText('Original SRT'), [secondSubtitle, firstSubtitle])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [url, options] = fetchMock.mock.calls[1]
+    const body = options?.body as FormData
+    expect(url).toBe('/api/batches')
+    expect(options?.method).toBe('POST')
+    expect((body.getAll('audio') as File[]).map((file) => file.name)).toEqual(['001.wav', '002.wav'])
+    expect((body.getAll('subtitle') as File[]).map((file) => file.name)).toEqual(['001.srt', '002.srt'])
+    expect(body.get('fps')).toBeNull()
+    expect(body.get('sync_max_lines_per_cue')).toBeNull()
+    expect(await screen.findByText('001')).toBeVisible()
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('002')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+  })
+
+  it('sends a sync FPS only when the user explicitly selects an override', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.selectOptions(screen.getByLabelText('Frame rate'), '24')
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [, options] = fetchMock.mock.calls[1]
+    expect((options?.body as FormData).get('fps')).toBe('24')
+  })
+
+  it('submits the sync maximum line limit when selected', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      id: 'line-limit-job',
+      token: 'line-limit-token',
+      mode: 'sync',
+      status: 'complete',
+      progress: 100,
+      result: { cue_count: 5, cost_usd: 0.01 },
+      downloads: ['srt'],
+      expires_at: '2026-07-12T00:00:00Z',
+      error: null,
+    }), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    const maxLines = screen.getByLabelText('Maximum lines per cue')
+    expect(maxLines).toHaveValue('source')
+    expect(within(maxLines).getByRole('option', { name: 'Keep source style (default)' })).toBeInTheDocument()
+    expect(within(maxLines).getByRole('option', { name: '1 line' })).toBeInTheDocument()
+    expect(within(maxLines).getByRole('option', { name: '2 lines' })).toBeInTheDocument()
+    expect(within(maxLines).queryByRole('option', { name: '3 lines' })).not.toBeInTheDocument()
+    await user.selectOptions(maxLines, '2')
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], '001.wav', { type: 'audio/wav' }))
+    await user.upload(screen.getByLabelText('Original SRT'), new File(['subtitle'], '001.srt', { type: 'application/x-subrip' }))
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const [, options] = fetchMock.mock.calls[1]
+    expect((options?.body as FormData).get('sync_max_lines_per_cue')).toBe('2')
+  })
+
+  it('uses the selected child token when downloading a batch result', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(['subtitle']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="002-dubsync-synced.srt"' },
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+    await user.click(await screen.findByRole('button', { name: 'Download 002 SRT' }))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/jobs/job-2/downloads/srt')
+    expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
+  })
+
+  it('places one ZIP download action in the completed batch header and sends every child token', async () => {
+    let finishDownload: (response: Response) => void = () => undefined
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finishDownload = resolve }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    const downloadAll = await screen.findByRole('button', { name: 'Download all SRTs' })
+    expect(downloadAll.closest('.batch-results-header')).not.toBeNull()
+    await user.click(downloadAll)
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/batches/batch-1/downloads/srt')
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      jobs: [
+        { id: 'job-1', token: 'token-1' },
+        { id: 'job-2', token: 'token-2' },
+      ],
+    })
+    expect(downloadAll).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Download 001 SRT' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Download 002 SRT' })).toBeDisabled()
+
+    await act(async () => finishDownload(new Response(new Blob(['zip']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="dubsync-batch-batch-1-synced-srts.zip"' },
+    })))
+    await waitFor(() => expect(downloadAll).toBeEnabled())
+  })
+
+  it('hides the batch ZIP action when any child access token is missing', async () => {
+    const batchMissingOneToken = {
+      ...completedBatchResponse,
+      jobs: completedBatchResponse.jobs.map((job, index) => (
+        index === 0 ? job : { ...job, token: undefined }
+      )),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(batchMissingOneToken), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByText('4 cues ready')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
+  })
+
+  it('shows a completed-SRT ZIP action after a partial batch finishes', async () => {
+    const partialBatch = {
+      ...completedBatchResponse,
+      jobs: completedBatchResponse.jobs.map((job, index) => (
+        index === 0
+          ? job
+          : { ...job, status: 'failed', progress: 100, result: null, downloads: [], error: 'Job failed.' }
+      )),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(partialBatch), { status: 202 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByRole('button', { name: 'Download completed SRTs' })).toBeVisible()
+  })
+
+  it('keeps every child token through mode switches and later completed submissions', async () => {
+    const laterJob = {
+      id: 'job-3', token: 'token-3', source_name: 'episode',
+      mode: 'generate', status: 'complete', progress: 100,
+      result: { cue_count: 8, cost_usd: 0.03 }, downloads: ['srt'],
+      expires_at: '2026-07-12T00:00:00Z', error: null,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(configResponse), { status: 200 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(completedBatchResponse), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(laterJob), { status: 202 }))
+    fetchMock.mockResolvedValueOnce(new Response(new Blob(['subtitle']), {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="002-dubsync-synced.srt"' },
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+    expect(await screen.findByText('4 cues ready')).toBeVisible()
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'job-1', token: 'token-1' },
+      { id: 'job-2', token: 'token-2' },
+    ]))
+
+    await user.click(screen.getByRole('button', { name: 'Sync existing SRT' }))
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+
+    await user.upload(
+      screen.getByLabelText('Dialogue audio'),
+      new File(['audio-3'], 'episode.wav', { type: 'audio/wav' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(await screen.findByText('8 cues ready')).toBeVisible()
+    expect(screen.getByText('3 cues ready')).toBeVisible()
+    expect(screen.getByText('4 cues ready')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'job-1', token: 'token-1' },
+      { id: 'job-2', token: 'token-2' },
+      { id: 'job-3', token: 'token-3' },
+    ]))
+
+    await user.click(screen.getByRole('button', { name: 'Download 002 SRT' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+    expect(fetchMock.mock.calls[3][0]).toBe('/api/jobs/job-2/downloads/srt')
+    expect(fetchMock.mock.calls[3][1]?.headers).toEqual({ Authorization: 'Bearer token-2' })
+  })
+
+  it('prevents another submission while any child job is queued or processing', async () => {
+    const queuedBatch = {
+      id: 'batch-queued',
+      jobs: completedBatchResponse.jobs.map((job, index) => ({
+        ...job,
+        id: `queued-${index + 1}`,
+        token: `queued-token-${index + 1}`,
+        status: index === 0 ? 'queued' : 'processing',
+        progress: index === 0 ? 0 : 25,
+        result: null,
+        downloads: [],
+      })),
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
+      if (String(input) === '/api/config') {
+        return new Response(JSON.stringify(configResponse), { status: 200 })
+      }
+      if (options?.method === 'POST') {
+        return new Response(JSON.stringify(queuedBatch), { status: 202 })
+      }
+      const jobId = String(input).split('/').at(-1)
+      const job = queuedBatch.jobs.find((candidate) => candidate.id === jobId)
+      return new Response(JSON.stringify(job), { status: job ? 200 : 404 })
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+
+    await user.upload(screen.getByLabelText('Dialogue audio'), [
+      new File(['audio-1'], '001.wav', { type: 'audio/wav' }),
+      new File(['audio-2'], '002.wav', { type: 'audio/wav' }),
+    ])
+    await user.upload(screen.getByLabelText('Original SRT'), [
+      new File(['subtitle-1'], '001.srt', { type: 'application/x-subrip' }),
+      new File(['subtitle-2'], '002.srt', { type: 'application/x-subrip' }),
+    ])
+    await user.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    expect(await screen.findByText('Waiting to start')).toBeVisible()
+    expect(screen.getByText('Processing dialogue')).toBeVisible()
+    expect(screen.getByRole('progressbar', { name: '001 progress' })).toHaveAttribute('value', '0')
+    expect(screen.getByRole('progressbar', { name: '002 progress' })).toHaveAttribute('value', '25')
+    expect(screen.getByRole('button', { name: 'Start sync' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Download all SRTs' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(
+      screen.getByLabelText('Dialogue audio'),
+      new File(['audio-3'], 'episode.wav', { type: 'audio/wav' }),
+    )
+    expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1)
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([
+      { id: 'queued-1', token: 'queued-token-1' },
+      { id: 'queued-2', token: 'queued-token-2' },
+    ])
   })
 
   it('serves the dedicated payment and refund policy route', () => {
@@ -111,6 +779,8 @@ describe('DubSync workspace', () => {
     render(<App />)
 
     expect(screen.getByRole('heading', { name: 'Payments and Refunds' })).toBeVisible()
+    expect(document.title).toBe('Payments and Refunds | DubSync')
+    expect(document.head.querySelector('link[rel="canonical"]')).toHaveAttribute('href', 'https://dubsync.onrender.com/payments')
   })
 
   it('switches to audio-only mode and submits a generate job without an SRT', async () => {
@@ -144,6 +814,7 @@ describe('DubSync workspace', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     const [, options] = fetchMock.mock.calls[1]
     expect((options?.body as FormData).get('mode')).toBe('generate')
+    expect((options?.body as FormData).get('fps')).toBe('30')
     expect((options?.body as FormData).get('subtitle')).toBeNull()
     expect(JSON.parse(String((options?.body as FormData).get('style')))).toEqual({ source: 'preset', preset: 'standard' })
     expect(await screen.findByText('12 cues ready')).toBeVisible()
@@ -227,7 +898,10 @@ describe('DubSync workspace', () => {
     await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect((fetchMock.mock.calls[1][1]?.body as FormData).get('access_code')).toBe('quote-code-1234')
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({
+      'X-DubSync-Access-Code': 'quote-code-1234',
+    })
+    expect((fetchMock.mock.calls[1][1]?.body as FormData).has('access_code')).toBe(false)
   })
 
   it('disables production intake when the access gate is not configured', async () => {
@@ -243,6 +917,7 @@ describe('DubSync workspace', () => {
   })
 
   it('restores an in-progress job after a page refresh', async () => {
+    sessionStorage.clear()
     sessionStorage.setItem('dubsync:active-job', JSON.stringify({ id: 'restored-job', token: 'restored-token' }))
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, options) => {
       const url = String(input)
@@ -271,6 +946,7 @@ describe('DubSync workspace', () => {
   })
 
   it('clears unusable restored access and shows the refresh error', async () => {
+    sessionStorage.clear()
     sessionStorage.setItem('dubsync:active-job', JSON.stringify({ id: 'expired-job', token: 'expired-token' }))
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
@@ -279,8 +955,147 @@ describe('DubSync workspace', () => {
 
     render(<App />)
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh the job.')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh job "expired-job".')
     expect(sessionStorage.getItem('dubsync:active-job')).toBeNull()
+    expect(sessionStorage.getItem('dubsync:active-jobs')).toBeNull()
+  })
+
+  it('keeps restored access after a transient refresh failure', async () => {
+    const access = { id: 'retry-job', token: 'retry-token' }
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([access]))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      return new Response('', { status: 503 })
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not refresh job "retry-job".')
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([access])
+  })
+
+  it('retries polling a queued job after a transient failure', async () => {
+    vi.useFakeTimers()
+    const access = { id: 'poll-job', token: 'poll-token' }
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([access]))
+    let jobLoads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      jobLoads += 1
+      if (jobLoads === 1) {
+        return new Response(JSON.stringify({
+          id: 'poll-job', mode: 'sync', status: 'queued', progress: 0,
+          result: null, downloads: [], expires_at: '2026-07-12T00:00:00Z', error: null,
+        }), { status: 200 })
+      }
+      if (jobLoads === 2) return new Response('', { status: 503 })
+      return new Response(JSON.stringify({
+        id: 'poll-job', mode: 'sync', status: 'complete', progress: 100,
+        result: { cue_count: 9, cost_usd: 0.02 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 200 })
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      expect(screen.getByText('Waiting to start')).toBeVisible()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(jobLoads).toBe(2)
+      expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual([access])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      expect(jobLoads).toBe(3)
+      expect(screen.getByText('9 cues ready')).toBeVisible()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not clear one child refresh error when a different child recovers', async () => {
+    vi.useFakeTimers()
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([
+      { id: 'expired-child', token: 'expired-token' },
+      { id: 'recovering-child', token: 'recovering-token' },
+    ]))
+    let recoveringLoads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      if (url === '/api/jobs/expired-child') return new Response('', { status: 404 })
+      if (url === '/api/jobs/recovering-child') {
+        recoveringLoads += 1
+        const complete = recoveringLoads > 1
+        return new Response(JSON.stringify({
+          id: 'recovering-child', mode: 'sync', status: complete ? 'complete' : 'queued',
+          progress: complete ? 100 : 0,
+          result: complete ? { cue_count: 4, cost_usd: 0.01 } : null,
+          downloads: complete ? ['srt'] : [], expires_at: '2026-07-12T00:00:00Z', error: null,
+        }), { status: 200 })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh job "expired-child".')
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+
+      expect(screen.getByText('4 cues ready')).toBeVisible()
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh job "expired-child".')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps only one refresh in flight per child while faster batch jobs keep polling', async () => {
+    vi.useFakeTimers()
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify([
+      { id: 'fast-child', token: 'fast-token' },
+      { id: 'slow-child', token: 'slow-token' },
+    ]))
+    const loads: Record<string, number> = {}
+    let resolveSlow!: (response: Response) => void
+    const slowResponse = new Promise<Response>((resolve) => { resolveSlow = resolve })
+    function response(id: string, complete = false) {
+      return new Response(JSON.stringify({
+        id, mode: 'sync', status: complete ? 'complete' : 'processing',
+        progress: complete ? 100 : 50,
+        result: complete ? { cue_count: 7, cost_usd: 0.01 } : null,
+        downloads: complete ? ['srt'] : [], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 200 })
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      const id = String(input).split('/').at(-1)!
+      loads[id] = (loads[id] || 0) + 1
+      if (id === 'slow-child' && loads[id] > 1) return slowResponse
+      return response(id)
+    })
+
+    try {
+      render(<App />)
+      await flushReactUpdates()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 2, 'slow-child': 2 })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 3, 'slow-child': 2 })
+      await act(async () => { resolveSlow(response('slow-child', true)) })
+      expect(screen.getByText('7 cues ready')).toBeVisible()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(loads).toEqual({ 'fast-child': 4, 'slow-child': 2 })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('shows API validation errors and permits another submission', async () => {
@@ -297,6 +1112,63 @@ describe('DubSync workspace', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Audio could not be decoded.')
     expect(screen.getByRole('button', { name: 'Generate SRT' })).toBeEnabled()
+  })
+
+  it('keeps completed results downloadable and warns when browser job storage is blocked', async () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('Blocked', 'SecurityError') })
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      if (String(input).includes('/downloads/')) return new Response('subtitle', { status: 200 })
+      return new Response(JSON.stringify({
+        id: 'memory-job', token: 'memory-token', mode: 'generate', status: 'complete', progress: 100,
+        result: { cue_count: 5, cost_usd: 0 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 202 })
+    })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByText(/Your browser could not save job access/)).toBeVisible()
+    expect(removeItem).not.toHaveBeenCalledWith('dubsync:active-jobs')
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+    expect(await screen.findByText('5 cues ready')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Download SRT' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/jobs/memory-job/downloads/srt', {
+      headers: { Authorization: 'Bearer memory-token' },
+    }))
+  })
+
+  it('preserves unread saved tokens if storage recovers after the initial restore failed', async () => {
+    const savedAccesses = [{ id: 'prior-job', token: 'prior-token' }]
+    sessionStorage.setItem('dubsync:active-jobs', JSON.stringify(savedAccesses))
+    const originalGetItem = Storage.prototype.getItem
+    let readsBlocked = true
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      if (readsBlocked && key === 'dubsync:active-jobs') throw new DOMException('Temporarily blocked', 'SecurityError')
+      return originalGetItem.call(this, key)
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      if (String(input) === '/api/config') return new Response(JSON.stringify(configResponse), { status: 200 })
+      return new Response(JSON.stringify({
+        id: 'new-job', token: 'new-token', mode: 'generate', status: 'complete', progress: 100,
+        result: { cue_count: 5, cost_usd: 0 }, downloads: ['srt'], expires_at: '2026-07-12T00:00:00Z', error: null,
+      }), { status: 202 })
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    expect(await screen.findByText(/Your browser could not save job access/)).toBeVisible()
+    readsBlocked = false
+    await user.click(screen.getByRole('button', { name: 'Generate from audio' }))
+    await user.upload(screen.getByLabelText('Dialogue audio'), new File(['audio'], 'episode.wav', { type: 'audio/wav' }))
+    await user.click(screen.getByRole('button', { name: 'Generate SRT' }))
+
+    expect(await screen.findByText('5 cues ready')).toBeVisible()
+    expect(JSON.parse(sessionStorage.getItem('dubsync:active-jobs') || 'null')).toEqual(savedAccesses)
+    expect(screen.getByText(/Your browser could not save job access/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Download SRT' })).toBeEnabled()
   })
 
   it('downloads a completed SRT with its bearer token', async () => {
@@ -322,3 +1194,10 @@ describe('DubSync workspace', () => {
     expect(fetchMock.mock.calls[2][1]?.headers).toEqual({ Authorization: 'Bearer download-token' })
   })
 })
+
+async function flushReactUpdates() {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}

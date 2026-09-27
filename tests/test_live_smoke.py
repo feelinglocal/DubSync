@@ -6,7 +6,7 @@ import wave
 
 import pytest
 
-from dubsync.llm_providers import AnthropicLLMAdapter, GeminiLLMAdapter
+from dubsync.llm_providers import AnthropicLLMAdapter, GeminiLLMAdapter, OpenAILLMAdapter
 from dubsync.models import Cue, DivergenceSpan
 from dubsync.providers import AssemblyAIAdapter, ElevenLabsScribeAdapter, OpenAIWhisperAdapter
 
@@ -105,6 +105,47 @@ def test_live_openai_whisper_smoke(tmp_path):
     words = OpenAIWhisperAdapter(api_key=api_key).transcribe(audio)
 
     assert isinstance(words, list)
+
+
+@pytest.mark.live
+def test_live_openai_luna_punctuation_smoke():
+    _require_module("openai")
+    api_key = _require_env("OPENAI_API_KEY")
+    adapter = OpenAILLMAdapter(
+        api_key=api_key,
+        model="gpt-5.6-luna",
+        reasoning_effort="medium",
+    )
+
+    result = adapter.punctuate(
+        [Cue(index=1, start_ms=0, end_ms=500, lines=["Wer bist du"])]
+    )
+
+    assert result[1].casefold().startswith("wer bist du")
+    assert not any(mark in result[1] for mark in "„“")
+
+
+@pytest.mark.live
+def test_live_openai_luna_high_adjudication_smoke():
+    _require_module("openai")
+    api_key = _require_env("OPENAI_API_KEY")
+    adapter = OpenAILLMAdapter(
+        api_key=api_key,
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+    )
+    span = DivergenceSpan(
+        case_id="case-1",
+        cue_ids=[1],
+        srt_text="Hallo",
+        asr_text="Hallo",
+        confidence=0.99,
+    )
+
+    decisions = adapter.adjudicate([span])
+
+    assert decisions[0]["case_id"] == "case-1"
+    assert decisions[0]["final_text"].casefold() == "hallo"
 
 
 @pytest.mark.live

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=83", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,7 +15,7 @@ dependencies = [
   "PyYAML>=6.0",
   "rapidfuzz>=3.9",
   "rich>=13.7",
-  "click>=8.1,<8.3",
+  "click>=8.4.2,<9",
   "typer>=0.12,<0.17",
 ]
 
@@ -35,8 +35,8 @@ cloud = [
   "anthropic>=0.49",
   "assemblyai>=0.35",
   "elevenlabs>=1.50",
-  "google-genai>=0.8",
-  "openai>=1.57",
+  "google-genai>=2.20,<3",
+  "openai>=2.44,<3",
 ]
 local = [
   "whisperx>=3.2",

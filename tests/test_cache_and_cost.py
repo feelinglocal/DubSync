@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import wave
+from datetime import date
 from pathlib import Path
 
+import dubsync.cost as cost_module
 from dubsync.cache import CacheKey, JsonDiskCache
 from dubsync.cost import (
     CostMeter,
@@ -14,6 +16,7 @@ from dubsync.cost import (
 )
 from dubsync.llm_providers import drain_usage_events
 from dubsync.models import Word
+from dubsync.pipeline import _record_llm_usage_events
 from dubsync.providers import CachedASRAdapter
 
 
@@ -37,6 +40,20 @@ def test_json_disk_cache_keys_audio_model_and_params(tmp_path):
     assert cache.read(key) == {"words": [{"text": "hello"}]}
     changed = CacheKey.from_audio(audio, model="scribe_v2", params={"diarize": False})
     assert cache.read(changed) is None
+
+
+def test_audio_cache_key_hashes_file_without_reading_entire_file(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio-a")
+
+    def fail_read_bytes(self: Path) -> bytes:
+        raise AssertionError("audio cache key should stream large files")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    key = CacheKey.from_audio(audio, model="scribe_v2", params={})
+
+    assert key.audio_sha256 == "68400d9af82bbdef1d72b21ede23682f712e2d1acbec23d56ace62e73b743546"
 
 
 def test_cache_key_excludes_secret_params(tmp_path):
@@ -140,14 +157,48 @@ def test_token_usage_from_common_provider_response_shapes():
     assert token_usage_from_response({"usage": {"input_tokens": 1}}) is None
 
 
+def test_token_usage_bills_gemini_thinking_tokens_as_output_tokens():
+    generate_content = {
+        "usage_metadata": {
+            "prompt_token_count": 120,
+            "response_token_count": 30,
+            "thoughts_token_count": 70,
+        }
+    }
+    interactions = {
+        "usage": {
+            "total_input_tokens": 80,
+            "total_output_tokens": 20,
+            "total_thought_tokens": 40,
+        }
+    }
+
+    assert token_usage_from_response(generate_content).input_tokens == 120
+    assert token_usage_from_response(generate_content).output_tokens == 100
+    assert token_usage_from_response(interactions).input_tokens == 80
+    assert token_usage_from_response(interactions).output_tokens == 60
+
+
 def test_llm_token_prices_use_plan_defaults_and_config_overrides():
     assert llm_token_prices("gemini", "gemini-3.5-flash", {}) == (1.5, 9.0)
-    assert llm_token_prices("gemini", "gemini-3.1-flash-lite", {}) == (0.25, 1.5)
+    assert llm_token_prices("gemini", "gemini-3.5-flash-lite", {}) == (0.3, 2.5)
+    legacy_flash_lite = "gemini-" + "3.1-flash-lite"
+    assert llm_token_prices("gemini", legacy_flash_lite, {}) == (0.25, 1.5)
     assert llm_token_prices("openai", "gpt-5.5", {}) is None
+    assert llm_token_prices("openai", "gpt-5.6-luna", {}) == (1.0, 6.0)
     assert llm_token_prices("openai", "gpt-5.5", {"input_per_million": 2, "output_per_million": 12}) == (
         2.0,
         12.0,
     )
+
+
+def test_gemini_37_flash_prices_follow_the_official_2027_transition(monkeypatch):
+    monkeypatch.setattr(cost_module, "_utc_today", lambda: date(2026, 12, 31))
+    assert llm_token_prices("gemini", "gemini-3.7-flash", {}) == (0.75, 3.75)
+    assert llm_token_prices("gemini", "models/gemini-3.7-flash", {}) == (0.75, 3.75)
+
+    monkeypatch.setattr(cost_module, "_utc_today", lambda: date(2027, 1, 1))
+    assert llm_token_prices("gemini", "gemini-3.7-flash", {}) == (1.5, 7.5)
 
 
 def test_record_llm_usage_adds_cost_only_when_usage_and_price_are_available():
@@ -203,10 +254,44 @@ def test_drain_usage_events_returns_and_clears_adapter_events():
     assert drain_usage_events(object()) == []
 
 
+def test_unpriced_llm_usage_emits_cost_unmetered_qc_flag():
+    class AnthropicUsageAdapter:
+        def __init__(self):
+            self.usage_events = [
+                {"usage": {"input_tokens": 1200, "output_tokens": 300}}
+            ]
+
+    meter = CostMeter()
+    flags = _record_llm_usage_events(
+        meter,
+        AnthropicUsageAdapter(),
+        {
+            "llm": {
+                "adjudication": {
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-5",
+                }
+            }
+        },
+        pass_name="adjudication",
+    )
+
+    assert meter.items == []
+    assert [flag.kind for flag in flags] == ["cost_unmetered"]
+    assert flags[0].severity == "warning"
+    assert "adjudication" in flags[0].message
+    assert "token pricing" in flags[0].message
+
+
 def test_default_asr_prices_match_plan_cost_table():
     assert asr_dollars_per_hour("elevenlabs", {}) == 0.22
     assert asr_dollars_per_hour("openai", {}) == 0.36
+    assert asr_dollars_per_hour("whisper-1", {}) == 0.36
     assert asr_dollars_per_hour("assemblyai", {}) == 0.23
+    assert asr_dollars_per_hour("gemini", {}) == 0.3
+    assert asr_dollars_per_hour("gemini_transcribe", {}) == 0.3
+    assert asr_dollars_per_hour("gemini_3_5_transcribe", {}) == 0.3
+    assert asr_dollars_per_hour("gemini-3.5-transcribe", {}) == 0.3
     assert asr_dollars_per_hour("whisperx", {}) == 0.0
     assert asr_dollars_per_hour("elevenlabs", {"dollars_per_hour": 0.5}) == 0.5
 

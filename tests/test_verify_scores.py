@@ -27,6 +27,20 @@ def test_score_cues_uses_average_asr_confidence_and_forced_alignment_override():
     assert scores[1].source == "forced_alignment"
 
 
+def test_score_cues_marks_unknown_asr_confidence_as_unscored():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1500, lines=["hello there"])]
+    words = [
+        Word(text="hello", start=1.0, end=1.2, confidence=None),
+        Word(text="there", start=1.2, end=1.5, confidence=None),
+    ]
+    alignment = AlignmentResult(cue_word_indices={1: [0, 1]})
+
+    scores = score_cues(cues, words, alignment)
+
+    assert scores[0].score == 0.0
+    assert scores[0].source == "unscored"
+
+
 def test_cps_sanity_flags_fire_for_fast_and_slow_cues():
     borderline = Cue(index=1, start_ms=0, end_ms=1000, lines=["x" * 30])
     impossible = Cue(index=2, start_ms=2000, end_ms=2500, lines=["x" * 40])

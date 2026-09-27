@@ -1,5 +1,17 @@
 export type JobMode = 'sync' | 'generate'
 export type JobStatus = 'queued' | 'processing' | 'complete' | 'failed'
+export type TranscriptionProvider = 'microsoft/mai-transcribe-2' | 'scribe_v2'
+
+export const transcriptionModelLabels: Record<TranscriptionProvider, string> = {
+  scribe_v2: 'Scribe v2',
+  'microsoft/mai-transcribe-2': 'MAI-Transcribe 2',
+}
+
+export const defaultTranscriptionProvider: TranscriptionProvider = 'scribe_v2'
+
+export const unavailableTranscriptionModels = Object.entries(transcriptionModelLabels).map(([id, label]) => ({
+  id: id as TranscriptionProvider, label, available: false,
+}))
 
 export interface PricingTier {
   usd_per_minute: number
@@ -43,23 +55,43 @@ export interface GenerationStylesConfig {
 export interface PublicConfig {
   retention_hours: number
   max_upload_bytes: number
+  max_srt_bytes: number
   audio_extensions: string[]
   fps_values: number[]
   pricing: Record<'generate' | 'sync' | 'precision', PricingTier>
   billing_enabled: boolean
   access_code_required: boolean
   jobs_available: boolean
+  default_transcription_provider?: TranscriptionProvider
+  transcription_models?: { id: TranscriptionProvider; label: string; available: boolean }[]
+  gemini_transcribe_testing_available?: boolean
+  gemini_transcribe_max_audio_seconds?: number
   generation_styles: GenerationStylesConfig
+  sync_style_limits: Pick<Record<GenerationStyleValueKey, GenerationStyleLimit>, 'max_lines_per_cue'>
 }
 
 export interface JobResult {
   cue_count: number
   cost_usd: number
+  fps?: number
+  fps_source?: 'detected' | 'fallback' | 'explicit'
+  fps_detection_confident?: boolean
+  qc_summary?: {
+    flags: number
+    style_violations: number
+    error_count?: number
+    warning_count?: number
+    info_count?: number
+  }
 }
 
 export interface JobResponse {
   id: string
   token?: string
+  source_name?: string | null
+  batch_id?: string | null
+  batch_position?: number | null
+  transcription_provider?: TranscriptionProvider | 'default'
   mode: JobMode
   status: JobStatus
   progress: number
@@ -69,19 +101,29 @@ export interface JobResponse {
   downloads: string[]
 }
 
+export interface BatchResponse {
+  id: string
+  jobs: JobResponse[]
+}
+
 export const defaultConfig: PublicConfig = {
   retention_hours: 24,
-  max_upload_bytes: 2_147_483_648,
+  max_upload_bytes: 536_870_912,
+  max_srt_bytes: 2_097_152,
   audio_extensions: ['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.wav'],
   fps_values: [23.976, 24, 25, 29.97, 30],
   pricing: {
-    generate: { usd_per_minute: 0.12, minimum_usd: 3 },
-    sync: { usd_per_minute: 0.18, minimum_usd: 5 },
-    precision: { usd_per_minute: 0.25, minimum_usd: 10 },
+    generate: { usd_per_minute: 0.40, minimum_usd: 20 },
+    sync: { usd_per_minute: 0.60, minimum_usd: 30 },
+    precision: { usd_per_minute: 0.90, minimum_usd: 50 },
   },
   billing_enabled: false,
   access_code_required: false,
   jobs_available: false,
+  default_transcription_provider: defaultTranscriptionProvider,
+  transcription_models: unavailableTranscriptionModels,
+  gemini_transcribe_testing_available: false,
+  gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {
     default_preset: 'standard',
     presets: [
@@ -157,5 +199,8 @@ export const defaultConfig: PublicConfig = {
       lead_in_ms: { min: 0, max: 1000, step: 10 },
       tail_ms: { min: 0, max: 1000, step: 10 },
     },
+  },
+  sync_style_limits: {
+    max_lines_per_cue: { min: 1, max: 2, step: 1 },
   },
 }

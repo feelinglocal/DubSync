@@ -3,6 +3,7 @@ asr:
 
 llm:
   provider: fixture
+  responses: {}
 
 generation:
   max_gap_seconds: 0.8

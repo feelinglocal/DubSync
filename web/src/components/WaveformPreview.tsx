@@ -4,11 +4,16 @@ interface WaveformPreviewProps {
   file: File | null
 }
 
+const MAX_WAVEFORM_BYTES = 16 * 1024 * 1024
+const MAX_WAVEFORM_SECONDS = 5 * 60
+const WAVEFORM_LIMIT_MESSAGE = 'Waveform preview is limited to audio up to 5 minutes and 16 MB. Audio playback and upload still work.'
+
 export function WaveformPreview({ file }: WaveformPreviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const mediaUrl = useObjectUrl(file)
   const [peaks, setPeaks] = useState<number[] | null>(null)
   const [waveformState, setWaveformState] = useState('Select audio to preview it.')
+  const [metadata, setMetadata] = useState<{ file: File; duration: number } | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -18,18 +23,42 @@ export function WaveformPreview({ file }: WaveformPreviewProps) {
       return
     }
 
+    if (file.size > MAX_WAVEFORM_BYTES) {
+      setWaveformState(WAVEFORM_LIMIT_MESSAGE)
+      return
+    }
+
     const AudioContextConstructor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!AudioContextConstructor) {
       setWaveformState('Waveform preview is unavailable in this browser. Audio playback still works.')
       return
     }
 
-    const audioContext = new AudioContextConstructor()
+    if (metadata?.file !== file) {
+      setWaveformState('Loading audio information...')
+      return
+    }
+    if (!Number.isFinite(metadata.duration) || metadata.duration <= 0) {
+      setWaveformState('Waveform preview is unavailable for this audio. Audio playback still works.')
+      return
+    }
+    if (metadata.duration > MAX_WAVEFORM_SECONDS) {
+      setWaveformState(WAVEFORM_LIMIT_MESSAGE)
+      return
+    }
+
+    let audioContext: AudioContext
+    try {
+      audioContext = new AudioContextConstructor({ sampleRate: 16_000 })
+    } catch {
+      setWaveformState('Waveform preview is unavailable in this browser. Audio playback still works.')
+      return
+    }
     setWaveformState('Reading waveform...')
     void file.arrayBuffer()
-      .then((buffer) => audioContext.decodeAudioData(buffer))
+      .then((buffer) => cancelled ? null : audioContext.decodeAudioData(buffer))
       .then((decoded) => {
-        if (cancelled) return
+        if (cancelled || !decoded) return
         setPeaks(downsampleWaveform(decoded.getChannelData(0), 220))
         setWaveformState(formatAudioDuration(decoded.duration))
       })
@@ -44,7 +73,7 @@ export function WaveformPreview({ file }: WaveformPreviewProps) {
       cancelled = true
       void audioContext.close().catch(() => undefined)
     }
-  }, [file])
+  }, [file, metadata])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -79,7 +108,7 @@ export function WaveformPreview({ file }: WaveformPreviewProps) {
           <strong>{file?.name || 'Your waveform will appear here'}</strong>
           <span className="waveform-state">{waveformState}</span>
         </div>
-        {mediaUrl && <audio controls src={mediaUrl} aria-label="Audio preview player" preload="metadata" />}
+        {mediaUrl && file && <audio key={mediaUrl} controls src={mediaUrl} aria-label="Audio preview player" preload="metadata" onLoadedMetadata={(event) => setMetadata({ file, duration: event.currentTarget.duration })} onError={() => setWaveformState('Audio preview is unavailable for this file. You can still upload it for processing.')} />}
       </div>
       <canvas ref={canvasRef} width="1100" height="120" aria-label="Dialogue waveform" />
     </section>
@@ -110,15 +139,15 @@ export function formatAudioDuration(seconds: number) {
 }
 
 function useObjectUrl(file: File | null) {
-  const [url, setUrl] = useState('')
+  const [media, setMedia] = useState<{ file: File; url: string } | null>(null)
   useEffect(() => {
     if (!file) {
-      setUrl('')
+      setMedia(null)
       return
     }
     const nextUrl = URL.createObjectURL(file)
-    setUrl(nextUrl)
+    setMedia({ file, url: nextUrl })
     return () => URL.revokeObjectURL(nextUrl)
   }, [file])
-  return url
+  return media?.file === file ? media?.url || '' : ''
 }

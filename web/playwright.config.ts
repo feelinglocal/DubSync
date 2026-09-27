@@ -1,4 +1,8 @@
 import { defineConfig } from '@playwright/test'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const e2eDataDir = join(tmpdir(), `dubsync-e2e-${process.pid}-${Date.now()}`)
 
 export default defineConfig({
   testDir: './e2e',
@@ -19,14 +23,23 @@ export default defineConfig({
     reuseExistingServer: true,
     timeout: 30_000,
     env: {
-      DUBSYNC_DATA_DIR: 'runtime-data/e2e',
+      DUBSYNC_DATA_DIR: e2eDataDir,
       DUBSYNC_PROVIDERS_PATH: 'web/e2e/fixtures/providers.yaml',
       DUBSYNC_STYLE_PATH: 'style_profile.yaml',
       DUBSYNC_STATIC_DIR: 'web/dist',
-      DUBSYNC_PROCESSING_INLINE: '1',
-      DUBSYNC_MAX_JOBS_PER_HOUR: '50',
+      DUBSYNC_PROCESSING_INLINE: '0',
+      DUBSYNC_MAX_SUBMISSIONS_PER_HOUR: '50',
+      DUBSYNC_MAX_OUTSTANDING_CHILD_JOBS: '20',
+      DUBSYNC_WORKER_THREADS: '2',
       DUBSYNC_REQUIRE_JOB_ACCESS_CODE: '0',
       DUBSYNC_JOB_ACCESS_CODE: 'fixture-access-code',
+      // Keep the entire browser suite offline even on a developer machine with keys.
+      ELEVENLABS_API_KEY: '',
+      GEMINI_API_KEY: '',
+      OPENAI_API_KEY: '',
+      OPENROUTER_API_KEY: '',
+      ANTHROPIC_API_KEY: '',
+      ASSEMBLYAI_API_KEY: '',
     },
   },
 })

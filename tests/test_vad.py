@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import wave
 
 import pytest
@@ -9,7 +10,13 @@ from typer.testing import CliRunner
 
 from dubsync.cli import app
 from dubsync.models import Cue, SpeechRegion
-from dubsync.vad import EnergySpeechActivityAdapter, SileroSpeechActivityAdapter, speech_activity_adapter_from_config, speech_activity_flags_for_cues
+from dubsync.vad import (
+    EnergySpeechActivityAdapter,
+    SileroSpeechActivityAdapter,
+    speech_activity_adapter_from_config,
+    speech_activity_flags_for_cues,
+    trailing_silence_flags_for_cues,
+)
 
 
 def test_speech_activity_flags_cues_with_low_region_coverage():
@@ -24,6 +31,29 @@ def test_speech_activity_flags_cues_with_low_region_coverage():
     assert [flag.kind for flag in flags] == ["cue_without_speech_activity"]
     assert flags[0].cue_ids == [2]
     assert flags[0].confidence == 0.0
+
+
+def test_trailing_silence_flags_cue_with_good_coverage_past_endpoint_limit():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["spoken line"])]
+    regions = [SpeechRegion(start=0.0, end=0.6, confidence=0.91)]
+
+    assert speech_activity_flags_for_cues(cues, regions, min_coverage=0.5) == []
+
+    flags = trailing_silence_flags_for_cues(cues, regions, max_trailing_silence_ms=300)
+
+    assert [flag.kind for flag in flags] == ["cue_with_excessive_trailing_silence"]
+    assert flags[0].cue_ids == [1]
+    assert flags[0].start == pytest.approx(0.6)
+    assert flags[0].end == pytest.approx(1.0)
+
+
+def test_trailing_silence_flags_ignores_cue_at_endpoint_limit():
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["spoken line"])]
+    regions = [SpeechRegion(start=0.0, end=0.7, confidence=0.91)]
+
+    flags = trailing_silence_flags_for_cues(cues, regions, max_trailing_silence_ms=300)
+
+    assert flags == []
 
 
 def test_energy_speech_activity_adapter_detects_loud_wav_region(tmp_path):
@@ -46,6 +76,21 @@ def test_silero_vad_provider_config_is_optional_adapter():
     adapter = speech_activity_adapter_from_config({"vad": {"provider": "silero"}})
 
     assert isinstance(adapter, SileroSpeechActivityAdapter)
+
+
+def test_silero_vad_records_when_it_falls_back_to_energy(tmp_path, monkeypatch):
+    audio = tmp_path / "speech.wav"
+    with wave.open(str(audio), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    adapter = SileroSpeechActivityAdapter()
+    monkeypatch.setitem(sys.modules, "torch", None)
+
+    adapter.detect(audio)
+
+    assert adapter.fallback_used is True
 
 
 def test_cli_sync_writes_vad_fixture_artifact_and_qc_flag(tmp_path):

@@ -91,6 +91,37 @@ def test_evaluate_against_golden_computes_improv_precision_and_recall():
     assert metrics["meets_improv_target"] is False
 
 
+def test_source_aware_improv_metrics_count_inserted_golden_cue_as_change():
+    source = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nhello\n\n"
+        "2\n00:00:02,000 --> 00:00:02,500\nbye\n\n"
+    )
+    predicted = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nhello\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nnew adlib\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\nbye\n\n"
+    )
+    golden = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nhello\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nnew adlib\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\nbye\n\n"
+    )
+
+    metrics = evaluate_against_golden(
+        predicted,
+        golden,
+        fps=30.0,
+        flags=[QCFlag(kind="adlib_inserted", cue_ids=[2], message="actor improvised")],
+        source=source,
+    )
+
+    assert metrics["improv_true_positives"] == 1
+    assert metrics["improv_false_positives"] == 0
+    assert metrics["improv_false_negatives"] == 0
+    assert metrics["improv_precision"] == 1.0
+    assert metrics["improv_recall"] == 1.0
+
+
 def test_report_command_can_emit_golden_evaluation_metrics(tmp_path):
     workdir = tmp_path / "work" / "episode"
     workdir.mkdir(parents=True)

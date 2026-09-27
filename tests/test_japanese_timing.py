@@ -132,10 +132,12 @@ def test_fixture_sync_and_verify_resume_preserve_shared_word_source_timing(tmp_p
     args = _sync_fixture(tmp_path)
     result = sync_episode(**args)
     if resume:
-        # Verification must also repair artifacts produced before the fallback existed.
+        # Verification must repair damaged cue timing while retaining current policy metadata.
         artifact = result.episode_workdir / "rebuild.json"
         damaged = [cue.with_timing(500, 1866 + 500 * index) for index, cue in enumerate(_source_cues())]
-        artifact.write_text(json.dumps({"cues": [cue.model_dump() for cue in damaged]}), encoding="utf-8")
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["cues"] = [cue.model_dump() for cue in damaged]
+        artifact.write_text(json.dumps(payload), encoding="utf-8")
         result = sync_episode(**args, resume="verify")
 
     output = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
@@ -217,7 +219,7 @@ def test_fixture_vad_does_not_cap_reliable_cue_at_shared_source_boundary(tmp_pat
     assert by_text == {"前": (2500, 3066), "今日は": (1000, 2000), "晴れです": (2000, 3000)}
 
 
-def test_vad_still_caps_at_next_reliable_cue_across_protected_source_cues():
+def test_vad_preserves_acoustic_endpoint_across_protected_source_cues():
     cues = [
         Cue(index=1, start_ms=0, end_ms=1000, lines=["前"]),
         Cue(index=2, start_ms=10000, end_ms=11000, lines=["今日は"]),
@@ -233,7 +235,8 @@ def test_vad_still_caps_at_next_reliable_cue_across_protected_source_cues():
         words=words, alignment=alignment, protected_cue_ids={2, 3},
     )
 
-    assert refined[0].end_ms == 1500
+    # The next cue can cap padding, but cannot cut a word ending at 2s.
+    assert refined[0].end_ms == 2000
     assert refined[1:3] == cues[1:3]
 
 
@@ -254,3 +257,15 @@ def test_forced_aligned_shared_cue_remains_valid_vad_cap():
 
     assert refined[0].end_ms == 1500
     assert refined[1:] == cues[1:]
+
+
+def test_duplicate_forced_alignment_rows_do_not_release_shared_source_timing(tmp_path):
+    result = sync_episode(**_sync_fixture(tmp_path, max_cps=30, forced_rows=[
+        {"cue_id": 1, "start": 0.2, "end": 0.9},
+        {"cue_id": 1, "start": 0.3, "end": 0.8},
+        {"cue_id": 2, "start": 1.1, "end": 1.7},
+    ]))
+
+    output = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert _timings(output) == [(1, 0, 1000), (2, 1100, 1700)]
+    assert [flag["cue_ids"] for flag in result.report["flags"] if flag["kind"] == "shared_word_timing_preserved"] == [[1]]

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import wave
 from pathlib import Path
 from typing import Protocol
 
+from .region_index import SpeechRegionIndex
+from .silence import _dbfs, _mono_pcm16, _validate_pcm16
 from .models import Cue, QCFlag, SpeechRegion
-from .silence import _dbfs, _read_mono_pcm
+from .subtitle_annotations import cue_has_spoken_text
 
 
 class SpeechActivityAdapter(Protocol):
@@ -31,28 +34,38 @@ class EnergySpeechActivityAdapter:
         self.min_region_ms = min_region_ms
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
-        pcm, frame_rate, max_value = _read_mono_pcm(audio_path)
-        if not pcm or frame_rate <= 0:
-            return []
-        window_frames = max(1, int(frame_rate * self.window_ms / 1000.0))
-        min_region_seconds = self.min_region_ms / 1000.0
-        regions: list[SpeechRegion] = []
-        active_start: float | None = None
-        active_end: float | None = None
+        with wave.open(str(audio_path), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            frame_rate = wav.getframerate()
+            total_frames = wav.getnframes()
+            _validate_pcm16(sample_width)
+            if total_frames <= 0 or frame_rate <= 0:
+                return []
+            window_frames = max(1, int(frame_rate * self.window_ms / 1000.0))
+            min_region_seconds = self.min_region_ms / 1000.0
+            regions: list[SpeechRegion] = []
+            active_start: float | None = None
+            active_end: float | None = None
+            start_frame = 0
 
-        for start_frame in range(0, len(pcm), window_frames):
-            end_frame = min(len(pcm), start_frame + window_frames)
-            is_active = _dbfs(pcm[start_frame:end_frame], max_value) > self.threshold_dbfs
-            start_seconds = start_frame / frame_rate
-            end_seconds = end_frame / frame_rate
-            if is_active:
-                if active_start is None:
-                    active_start = start_seconds
-                active_end = end_seconds
-            elif active_start is not None and active_end is not None:
-                _append_region(regions, active_start, active_end, min_region_seconds)
-                active_start = None
-                active_end = None
+            while start_frame < total_frames:
+                pcm = _mono_pcm16(wav.readframes(window_frames), channels)
+                if not pcm:
+                    break
+                end_frame = min(total_frames, start_frame + len(pcm))
+                is_active = _dbfs(pcm, 32767) > self.threshold_dbfs
+                start_seconds = start_frame / frame_rate
+                end_seconds = end_frame / frame_rate
+                if is_active:
+                    if active_start is None:
+                        active_start = start_seconds
+                    active_end = end_seconds
+                elif active_start is not None and active_end is not None:
+                    _append_region(regions, active_start, active_end, min_region_seconds)
+                    active_start = None
+                    active_end = None
+                start_frame = end_frame
 
         if active_start is not None and active_end is not None:
             _append_region(regions, active_start, active_end, min_region_seconds)
@@ -74,8 +87,10 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
         )
         self.sampling_rate = sampling_rate
         self.min_region_ms = min_region_ms
+        self.fallback_used = False
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
+        self.fallback_used = False
         try:
             import torch
 
@@ -95,6 +110,7 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
                 return_seconds=True,
             )
         except Exception:
+            self.fallback_used = True
             return self.fallback.detect(audio_path)
         return [
             SpeechRegion(
@@ -141,13 +157,16 @@ def speech_activity_flags_for_cues(
     min_coverage: float = 0.2,
 ) -> list[QCFlag]:
     flags: list[QCFlag] = []
+    region_index = SpeechRegionIndex(regions)
     for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0
         duration = cue_end - cue_start
         if duration <= 0:
             continue
-        coverage = _covered_seconds(cue_start, cue_end, regions) / duration
+        coverage = region_index.covered_seconds(cue_start, cue_end) / duration
         if coverage < min_coverage:
             flags.append(
                 QCFlag(
@@ -163,6 +182,41 @@ def speech_activity_flags_for_cues(
     return flags
 
 
+def trailing_silence_flags_for_cues(
+    cues: list[Cue],
+    regions: list[SpeechRegion],
+    max_trailing_silence_ms: int = 300,
+) -> list[QCFlag]:
+    flags: list[QCFlag] = []
+    region_index = SpeechRegionIndex(regions)
+    for cue in cues:
+        if not cue_has_spoken_text(cue):
+            continue
+        cue_start = cue.start_ms / 1000.0
+        cue_end = cue.end_ms / 1000.0
+        overlapping = region_index.overlapping(cue_start, cue_end)
+        if not overlapping:
+            continue
+        last_speech_end = min(cue_end, max(region.end for region in overlapping))
+        trailing_silence_ms = round((cue_end - last_speech_end) * 1000)
+        if trailing_silence_ms <= max_trailing_silence_ms:
+            continue
+        flags.append(
+            QCFlag(
+                kind="cue_with_excessive_trailing_silence",
+                cue_ids=[cue.index],
+                message=(
+                    f"Cue remains visible for {trailing_silence_ms} ms after "
+                    f"the last detected speech activity; limit is {max_trailing_silence_ms} ms."
+                ),
+                old_text=cue.text,
+                start=last_speech_end,
+                end=cue_end,
+            )
+        )
+    return flags
+
+
 def dropped_line_flags_for_unmatched_cues(
     cues: list[Cue],
     unmatched_cue_ids: list[int],
@@ -171,15 +225,18 @@ def dropped_line_flags_for_unmatched_cues(
 ) -> list[QCFlag]:
     unmatched = set(unmatched_cue_ids)
     flags: list[QCFlag] = []
+    region_index = SpeechRegionIndex(regions)
     for cue in cues:
         if cue.index not in unmatched:
+            continue
+        if not cue_has_spoken_text(cue):
             continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0
         duration = cue_end - cue_start
         if duration <= 0:
             continue
-        coverage = _covered_seconds(cue_start, cue_end, regions) / duration
+        coverage = region_index.covered_seconds(cue_start, cue_end) / duration
         if coverage < min_coverage:
             flags.append(
                 QCFlag(
@@ -208,10 +265,4 @@ def _append_region(regions: list[SpeechRegion], start: float, end: float, min_re
 
 
 def _covered_seconds(start: float, end: float, regions: list[SpeechRegion]) -> float:
-    total = 0.0
-    for region in regions:
-        overlap_start = max(start, region.start)
-        overlap_end = min(end, region.end)
-        if overlap_end > overlap_start:
-            total += overlap_end - overlap_start
-    return total
+    return SpeechRegionIndex(regions).covered_seconds(start, end)

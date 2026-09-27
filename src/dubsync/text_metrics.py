@@ -73,7 +73,15 @@ def token_texts(text: str) -> list[str]:
         ):
             # Some kana + voicing combinations have no precomposed codepoint.
             tokens[-1] += char
-        elif char.isalnum() or char == "_" or _is_inner_hyphen(char, buffer, normalized_text, index):
+        elif char == "%" and index > 0 and normalized_text[index - 1].isdigit():
+            flush()
+            tokens.append(char)
+        elif (
+            char.isalnum()
+            or char == "_"
+            or _is_inner_mask(char, buffer, normalized_text, index)
+            or _is_inner_hyphen(char, buffer, normalized_text, index)
+        ):
             buffer.append(char)
         else:
             flush()
@@ -117,7 +125,16 @@ def _is_unspaced_script(char: str) -> bool:
 
 
 def _is_inner_hyphen(char: str, buffer: list[str], text: str, index: int) -> bool:
-    return char in {"-", "‑"} and bool(buffer) and index + 1 < len(text) and text[index + 1].isalnum()
+    return char in {"-", "\u2011"} and bool(buffer) and index + 1 < len(text) and text[index + 1].isalnum()
+
+
+def _is_inner_mask(char: str, buffer: list[str], text: str, index: int) -> bool:
+    if char != "*" or not buffer:
+        return False
+    next_index = index + 1
+    while next_index < len(text) and text[next_index] == "*":
+        next_index += 1
+    return next_index < len(text) and text[next_index].isalnum()
 
 
 def wrap_visual_width(text: str, max_width: int) -> list[str]:
@@ -231,3 +248,36 @@ def _hyphen_split_unspaced(text: str, max_width: int) -> list[str]:
     if current:
         lines.append(current)
     return lines
+
+
+def token_character_spans(text: str, tokens: list[str] | None = None) -> list[tuple[int, int]] | None:
+    """Locate comparison tokens without normalizing the displayed source."""
+    tokens = token_texts(text) if tokens is None else tokens
+    normalized_parts: list[str] = []
+    original_bounds: dict[int, int] = {0: 0}
+    normalized_length = 0
+    start = 0
+    while start < len(text):
+        end = start + 1
+        while end < len(text) and (
+            unicodedata.category(text[end]).startswith("M") or text[end] in "\uff9e\uff9f"
+        ):
+            end += 1
+        part = unicodedata.normalize("NFKC", text[start:end])
+        normalized_parts.append(part)
+        normalized_length += len(part)
+        original_bounds[normalized_length] = end
+        start = end
+
+    normalized = "".join(normalized_parts)
+    bounds: list[tuple[int, int]] = []
+    cursor = 0
+    for token in tokens:
+        comparison_token = unicodedata.normalize("NFKC", token)
+        start = normalized.find(comparison_token, cursor)
+        end = start + len(comparison_token)
+        if start not in original_bounds or end not in original_bounds:
+            return None
+        bounds.append((original_bounds[start], original_bounds[end]))
+        cursor = end
+    return bounds

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
+from .asr_timing import clamp_asr_word_durations
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
+from .subtitle_annotations import is_bracketed_screen_text_cue
+
+
+MAX_INTRA_CUE_WORD_GAP_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -15,6 +22,49 @@ class BoundaryRefinementConfig:
     max_leading_silence_ms: int = 150
     max_trailing_silence_ms: int = 300
     max_word_duration_ms: int = 2000
+
+
+def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
+    """Read the same acoustic-boundary policy for synchronization and generation."""
+    vad_config = provider_config.get("vad", {}) if isinstance(provider_config, dict) else {}
+    if not isinstance(vad_config, dict):
+        return BoundaryRefinementConfig(enabled=False)
+    value = vad_config.get("boundary_refinement", False)
+    if value in (False, None):
+        return BoundaryRefinementConfig(enabled=False)
+    if value is not True and not isinstance(value, dict):
+        raise ValueError("vad.boundary_refinement must be a mapping or boolean")
+    options = {} if value is True else value
+    enabled = options.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("vad.boundary_refinement.enabled must be boolean")
+    timing_config = provider_config.get("timing", {})
+    max_word_duration = timing_config.get("max_word_duration", 2.0) if isinstance(timing_config, dict) else 2.0
+    try:
+        max_word_duration = float(max_word_duration)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timing.max_word_duration must be numeric") from exc
+    if not isfinite(max_word_duration) or max_word_duration <= 0:
+        raise ValueError("timing.max_word_duration must be finite and positive")
+    return BoundaryRefinementConfig(
+        enabled=enabled,
+        start_pad_ms=_boundary_milliseconds(options, "start_pad_ms", 40),
+        end_pad_ms=_boundary_milliseconds(options, "end_pad_ms", 40),
+        max_end_extension_ms=_boundary_milliseconds(options, "max_end_extension_ms", 300),
+        max_leading_silence_ms=_boundary_milliseconds(options, "max_leading_silence_ms", 150),
+        max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
+        max_word_duration_ms=int(max_word_duration * 1000),
+    )
+
+
+def _boundary_milliseconds(options: dict[str, object], key: str, default: int) -> int:
+    try:
+        number = int(options.get(key, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"vad.boundary_refinement.{key} must be an integer") from exc
+    if number < 0:
+        raise ValueError(f"vad.boundary_refinement.{key} must be non-negative")
+    return number
 
 
 def refine_cues_to_speech_activity(
@@ -32,29 +82,56 @@ def refine_cues_to_speech_activity(
     if not options.enabled or not regions:
         return cues, []
 
+    protected = (
+        set(alignment.diagnostics.missing_audio_cue_ids)
+        if alignment is not None
+        else set()
+    ) | (protected_cue_ids or set())
+    dialogue_cues = [
+        cue
+        for cue in cues
+        if cue.index not in protected and not is_bracketed_screen_text_cue(cue)
+    ]
     refined: list[Cue] = []
     flags: list[QCFlag] = []
-    sorted_regions = sorted(regions, key=lambda region: (region.start, region.end))
-    protected = protected_cue_ids or set()
-    fixed = protected | (fixed_cue_ids or set())
-    next_start_by_cue: dict[int, int] = {}
-    next_start: int | None = None
-    for cue in reversed(cues):
-        if cue.index in protected:
-            continue
-        if next_start is not None:
-            next_start_by_cue[cue.index] = next_start
-        next_start = cue.start_ms
+    word_repair_flags: list[QCFlag] = []
+    if words and any(_is_word_duration_outlier(word, options) for word in words):
+        # Repair a corrupt endpoint before choosing a lexical word cluster;
+        # otherwise a real final word can be discarded as a separate cluster.
+        clamped_words, word_repair_flags = clamp_asr_word_durations(
+            words, regions, max_word_duration=options.max_word_duration_ms / 1000.0,
+        )
+        # A duration-only fallback is still uncertain. Only adopt a shortened
+        # word when the speech region supplies a tighter endpoint. Compare the
+        # exact rounded fallback used by the clamp, not float subtraction:
+        # arbitrary sub-millisecond starts can otherwise appear shorter.
+        words = [
+            clamped
+            if clamped.end < round(original.start + options.max_word_duration_ms / 1000.0, 3)
+            else original
+            for original, clamped in zip(words, clamped_words)
+        ]
+        retained_repairs = {(word.start, word.end) for word in words}
+        word_repair_flags = [
+            flag for flag in word_repair_flags if (flag.start, flag.end) in retained_repairs
+        ]
+    region_index = SpeechRegionIndex(regions)
 
-    for cue in cues:
-        if cue.index in fixed:
+    for index, cue in enumerate(dialogue_cues):
+        # Accepted per-cue alignment remains a neighbor cap but is not retimed.
+        if cue.index in (fixed_cue_ids or set()):
             refined.append(cue)
             continue
-        word_window = _word_window_for_cue(cue, words, alignment)
+        word_window = _word_window_for_cue(
+            cue,
+            words,
+            alignment,
+            max_word_duration_seconds=options.max_word_duration_ms / 1000.0,
+        )
         cue_regions = (
-            _regions_from_word_window(word_window, sorted_regions, options)
+            _regions_from_word_window(word_window, region_index, options)
             if word_window is not None
-            else _regions_overlapping_cue(cue, sorted_regions)
+            else _regions_overlapping_cue(cue, region_index)
         )
         if cue_regions is None:
             refined.append(cue)
@@ -67,16 +144,62 @@ def refine_cues_to_speech_activity(
             if word_window is not None
             else _refined_end_ms(cue, end_region, profile, options)
         )
-        # Uncertain source boundaries are not evidence for shortening nearby speech.
-        end_cap_ms = next_start_by_cue.get(cue.index)
-        if end_cap_ms is not None:
+        end_cap_ms = None
+        if index + 1 < len(dialogue_cues):
+            # The following cue can limit display padding, but cannot erase
+            # speech from a simultaneous speaker or collapse an inverted source
+            # cue to zero length. Output policy handles real overlaps separately.
+            acoustic_floor_ms = min(cue.end_ms, end_ms)
+            if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
+                acoustic_floor_ms = profile.snap_ceil(word_window[-1].end * 1000)
+            end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
-        end_ms = max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
+        # Minimum display duration cannot add a silence tail beyond the
+        # acoustic endpoint. Preserve already accepted short tails, but do not
+        # manufacture more silence merely to reach the readability floor.
+        acoustic_end = end_region.end
+        if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
+            acoustic_end = min(acoustic_end, word_window[-1].end)
+        duration_extension_cap = max(
+            end_ms,
+            profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms),
+        )
+        end_ms = min(
+            max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)),
+            duration_extension_cap,
+        )
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
+        if end_ms <= start_ms:
+            # Conflicting cue order or word ownership must be repaired upstream.
+            # A speech cap is not permission to export reversed/zero duration or
+            # to manufacture a new endpoint merely to satisfy readability.
+            refined.append(cue)
+            flags.append(
+                QCFlag(
+                    kind="timing_refinement_held",
+                    cue_ids=[cue.index],
+                    severity="error",
+                    message=(
+                        "Speech evidence conflicts with this cue's placement; "
+                        "kept its prior timing instead of creating a non-positive duration. "
+                        "Review the cue's word ownership and neighboring dialogue."
+                    ),
+                    old_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
+                    new_text=f"{start_ms / 1000.0:.3f} --> {end_ms / 1000.0:.3f}",
+                    start=cue.start_ms / 1000.0,
+                    end=cue.end_ms / 1000.0,
+                )
+            )
+            continue
+
+        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000
+
         if start_ms == cue.start_ms and end_ms == cue.end_ms:
             refined.append(cue)
+            if minimum_unattainable:
+                flags.append(_min_duration_unattainable_flag(cue, cue, profile))
             continue
 
         next_cue = cue.with_timing(start_ms, end_ms)
@@ -92,18 +215,39 @@ def refine_cues_to_speech_activity(
                 end=next_cue.end_ms / 1000.0,
             )
         )
+        if minimum_unattainable:
+            flags.append(_min_duration_unattainable_flag(cue, next_cue, profile))
 
-    return refined, flags
+    refined_by_id = {cue.index: cue for cue in refined}
+    merged = [
+        cue
+        if cue.index in protected or is_bracketed_screen_text_cue(cue)
+        else refined_by_id[cue.index]
+        for cue in cues
+    ]
+    return merged, [*flags, *word_repair_flags]
 
 
-def _regions_overlapping_cue(cue: Cue, regions: list[SpeechRegion]) -> tuple[SpeechRegion, SpeechRegion] | None:
+def _min_duration_unattainable_flag(old_cue: Cue, cue: Cue, profile: StyleProfile) -> QCFlag:
+    return QCFlag(
+        kind="min_duration_unattainable",
+        cue_ids=[cue.index],
+        message=(
+            f"Cue could not reach the {profile.min_cue_dur:.3f}s minimum display duration "
+            "without exceeding the speech envelope or crossing the following cue boundary."
+        ),
+        severity="error",
+        old_text=f"{old_cue.start_ms / 1000.0:.3f} --> {old_cue.end_ms / 1000.0:.3f}",
+        new_text=f"{cue.start_ms / 1000.0:.3f} --> {cue.end_ms / 1000.0:.3f}",
+        start=cue.start_ms / 1000.0,
+        end=cue.end_ms / 1000.0,
+    )
+
+
+def _regions_overlapping_cue(cue: Cue, region_index: SpeechRegionIndex) -> tuple[SpeechRegion, SpeechRegion] | None:
     cue_start = cue.start_ms / 1000.0
     cue_end = cue.end_ms / 1000.0
-    overlapping = [
-        region
-        for region in regions
-        if region.end > cue_start and region.start < cue_end
-    ]
+    overlapping = region_index.overlapping(cue_start, cue_end)
     if not overlapping:
         return None
     return overlapping[0], overlapping[-1]
@@ -113,6 +257,8 @@ def _word_window_for_cue(
     cue: Cue,
     words: list[Word] | None,
     alignment: AlignmentResult | None,
+    *,
+    max_word_duration_seconds: float,
 ) -> list[Word] | None:
     if words is None or alignment is None:
         return None
@@ -123,40 +269,70 @@ def _word_window_for_cue(
     ]
     if not matched:
         return None
-    return sorted(matched, key=lambda word: (word.start, word.end))
+    ordered = sorted(matched, key=lambda word: (word.start, word.end))
+    clusters: list[list[Word]] = []
+    current: list[Word] = []
+    previous: Word | None = None
+    for word in ordered:
+        word_is_outlier = word.end - word.start > max_word_duration_seconds
+        starts_new_cluster = previous is not None and (
+            word.start - previous.end > MAX_INTRA_CUE_WORD_GAP_SECONDS
+            or previous.end - previous.start > max_word_duration_seconds
+        )
+        if word_is_outlier and current:
+            clusters.append(current)
+            current = []
+        if starts_new_cluster and current:
+            clusters.append(current)
+            current = []
+        current.append(word)
+        if word_is_outlier:
+            clusters.append(current)
+            current = []
+        previous = word
+    if current:
+        clusters.append(current)
+    return max(
+        clusters,
+        key=lambda cluster: (
+            sum(
+                1
+                for word in cluster
+                if word.end - word.start <= max_word_duration_seconds
+            ),
+            len(cluster),
+            -(cluster[-1].end - cluster[0].start),
+        ),
+    )
 
 
 def _regions_from_word_window(
     word_window: list[Word],
-    regions: list[SpeechRegion],
+    region_index: SpeechRegionIndex,
     config: BoundaryRefinementConfig,
 ) -> tuple[SpeechRegion, SpeechRegion] | None:
     first_word = word_window[0]
     last_word = word_window[-1]
-    start_region = _region_containing_timestamp(first_word.start, regions)
+    start_region = _region_containing_timestamp(first_word.start, region_index)
     if start_region is None:
-        start_region = _region_overlapping_word(first_word, regions)
+        start_region = _region_overlapping_word(first_word, region_index)
     end_probe = last_word.start if _is_word_duration_outlier(last_word, config) else last_word.end
-    end_region = _region_containing_timestamp(end_probe, regions)
+    end_region = _region_containing_timestamp(end_probe, region_index)
     if end_region is None:
-        end_region = _region_containing_timestamp(last_word.start, regions) or _region_overlapping_word(last_word, regions)
+        end_region = _region_containing_timestamp(last_word.start, region_index) or _region_overlapping_word(last_word, region_index)
     if start_region is None or end_region is None:
         return None
     return start_region, end_region
 
 
-def _region_containing_timestamp(timestamp: float, regions: list[SpeechRegion]) -> SpeechRegion | None:
-    for region in regions:
-        if region.start <= timestamp <= region.end:
-            return region
-    return None
+def _region_containing_timestamp(timestamp: float, region_index: SpeechRegionIndex) -> SpeechRegion | None:
+    match = region_index.first_containing(timestamp)
+    return match[1] if match is not None else None
 
 
-def _region_overlapping_word(word: Word, regions: list[SpeechRegion]) -> SpeechRegion | None:
-    for region in regions:
-        if region.end > word.start and region.start < word.end:
-            return region
-    return None
+def _region_overlapping_word(word: Word, region_index: SpeechRegionIndex) -> SpeechRegion | None:
+    overlapping = region_index.overlapping(word.start, word.end)
+    return overlapping[0] if overlapping else None
 
 
 def _is_word_duration_outlier(word: Word, config: BoundaryRefinementConfig) -> bool:
@@ -215,6 +391,8 @@ def _word_refined_end_ms(
         return padded_region_end_ms
 
     if cue.end_ms - word_end_ms > config.max_trailing_silence_ms:
-        return max(word_end_ms, min(cue.end_ms, padded_region_end_ms))
+        # VAD can remain active for another speaker or background sound. Its
+        # envelope cannot extend this cue beyond its own last reliable word.
+        return word_end_ms
 
     return cue.end_ms

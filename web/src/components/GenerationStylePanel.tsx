@@ -23,6 +23,7 @@ interface GenerationStylePanelProps {
   values: GenerationStyleDraft
   validation: GenerationStyleDraftValidation
   sample: File | null
+  maxSrtBytes: number
   onSourceChange: (source: GenerationStyleSource) => void
   onPresetChange: (preset: string) => void
   onValuesChange: (values: GenerationStyleDraft) => void
@@ -48,6 +49,7 @@ export function GenerationStylePanel({
   values,
   validation,
   sample,
+  maxSrtBytes,
   onSourceChange,
   onPresetChange,
   onValuesChange,
@@ -112,6 +114,7 @@ export function GenerationStylePanel({
             kind="style"
             accept=".srt,application/x-subrip,text/plain"
             file={sample}
+            maxBytes={maxSrtBytes}
             required
             onChange={onSampleChange}
           />

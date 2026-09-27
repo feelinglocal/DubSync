@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import wave
 
+import pytest
 from typer.testing import CliRunner
 
 from dubsync.cli import app
 from dubsync.models import Word
+from dubsync.providers import ProviderError
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import GenerationConstraints, StyleProfile
 from dubsync.transcription import build_cues_from_words, generate_srt_from_audio
@@ -73,12 +76,54 @@ def test_generate_srt_from_audio_with_fixture_provider_writes_downloadable_artif
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
     assert [cue.plain_text for cue in cues] == ["Ready now."]
     assert result.output_srt == output_path
-    assert result.report["summary"] == {"cue_count": 1, "flags": 0, "style_violations": 0}
+    assert result.report["summary"]["cue_count"] == 1
+    assert result.report["summary"]["flags"] == 0
+    assert result.report["summary"]["style_violations"] == 0
+    assert result.report["summary"]["flags_by_severity"] == {"error": 0, "warning": 0, "info": 0}
     assert (result.episode_workdir / "asr.json").exists()
     assert (result.episode_workdir / "generate.json").exists()
     assert (result.episode_workdir / "qc_report.json").exists()
     assert (result.episode_workdir / "qc_report.html").exists()
     assert (result.episode_workdir / "cost.json").exists()
+
+
+def test_generate_srt_local_gemini_option_is_disabled(tmp_path, monkeypatch):
+    audio_path = tmp_path / "dialogue.wav"
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000)
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(
+        "\n".join(
+            [
+                "asr:",
+                "  provider: elevenlabs",
+                "  model_id: scribe_v2",
+                "  local:",
+                "    provider: gemini_transcribe",
+                "    model: gemini-3.5-transcribe",
+                "    api_key: test-key",
+                "    language_codes: [de-DE]",
+                "    diarize: true",
+                "    word_timestamps: true",
+                "    store: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("dubsync.transcription.normalize_audio", lambda source, _dest, **_kwargs: source)
+    output_path = tmp_path / "dialogue.gemini.srt"
+
+    with pytest.raises(ProviderError, match="Gemini 3.5 Transcribe ASR is disabled"):
+        generate_srt_from_audio(
+            audio_path=audio_path,
+            output_path=output_path,
+            workdir=tmp_path / "gemini-work",
+            providers_path=providers_path,
+            local=True,
+        )
 
 
 def test_generate_srt_reflows_punctuation_to_the_style_width(tmp_path):
@@ -167,7 +212,8 @@ def test_generate_srt_applies_per_job_profile_and_reading_speed_constraints(tmp_
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
     assert all(len(cue.lines) <= 1 for cue in cues)
     assert all(len(line) <= 18 for cue in cues for line in cue.lines)
-    assert cues[-1].end_ms >= 1600
+    assert cues[-1].end_ms == 400
+    assert any(flag["kind"] == "impossible_cps_fast" for flag in result.report["flags"])
     assert result.report["summary"]["style_violations"] == 0
     generated = json.loads((result.episode_workdir / "generate.json").read_text(encoding="utf-8"))
     assert generated["profile"]["max_chars_per_line"] == 18

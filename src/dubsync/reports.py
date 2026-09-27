@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import html
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
+from .cache import write_json_atomic, write_text_atomic
 from .models import Cue, CueScore, QCFlag, StyleIssue
 from .srt_io import format_timestamp, write_srt
 
@@ -15,19 +17,30 @@ def write_qc_report(
     flags: list[QCFlag],
     style_issues: list[StyleIssue],
     cue_scores: list[CueScore] | None = None,
+    summary_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "summary": {
-            "cue_count": len(cues),
-            "flags": len(flags),
-            "style_violations": len(style_issues),
-        },
-        "cue_scores": [score.model_dump() for score in cue_scores or []],
-        "flags": [flag.model_dump() for flag in flags],
-        "style_issues": [issue.model_dump() for issue in style_issues],
+    ordered_flags = _sorted_flags(flags, cues)
+    ordered_issues = _sorted_style_issues(style_issues)
+    all_findings = [*ordered_flags, *ordered_issues]
+    summary: dict[str, object] = {
+        **dict(summary_metadata or {}),
+        "cue_count": len(cues),
+        "flags": len(ordered_flags),
+        "style_violations": len(ordered_issues),
+        "flags_by_severity": _severity_counts(ordered_flags),
+        "style_issues_by_severity": _severity_counts(ordered_issues),
+        "error_count": sum(1 for item in all_findings if item.severity == "error"),
+        "warning_count": sum(1 for item in all_findings if item.severity == "warning"),
+        "info_count": sum(1 for item in all_findings if item.severity == "info"),
     }
-    report_json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    report_html_path.write_text(_render_html(payload), encoding="utf-8")
+    payload: dict[str, object] = {
+        "summary": summary,
+        "cue_scores": [score.model_dump() for score in cue_scores or []],
+        "flags": [flag.model_dump() for flag in ordered_flags],
+        "style_issues": [issue.model_dump() for issue in ordered_issues],
+    }
+    write_json_atomic(report_json_path, payload)
+    write_text_atomic(report_html_path, _render_html(payload))
     return payload
 
 
@@ -42,15 +55,26 @@ def write_changes_diff(path: Path, flags: list[QCFlag]) -> None:
             lines.extend(f"- {line}" for line in flag.old_text.splitlines())
         if flag.new_text is not None:
             lines.extend(f"+ {line}" for line in flag.new_text.splitlines())
+        start_ms = _flag_seconds_to_ms(flag.start)
+        end_ms = _flag_seconds_to_ms(flag.end)
+        if end_ms <= start_ms:
+            # These are review markers, not dialogue. A point finding needs a
+            # representable interval while its actual evidence stays visible.
+            lines.insert(
+                1,
+                "# 1 ms diagnostic marker; original timing (seconds): "
+                f"{flag.start} --> {flag.end}",
+            )
+            end_ms = start_ms + 1
         cues.append(
             Cue(
                 index=len(cues) + 1,
-                start_ms=_flag_seconds_to_ms(flag.start),
-                end_ms=max(_flag_seconds_to_ms(flag.start), _flag_seconds_to_ms(flag.end)),
+                start_ms=start_ms,
+                end_ms=end_ms,
                 lines=lines,
             )
         )
-    path.write_text(write_srt(cues, renumber=True) if cues else "", encoding="utf-8")
+    write_text_atomic(path, write_srt(cues, renumber=True) if cues else "")
 
 
 def _render_html(payload: dict[str, object]) -> str:
@@ -71,6 +95,7 @@ def _render_html(payload: dict[str, object]) -> str:
     for item in flags if isinstance(flags, list) else []:
         rows.append(
             "<tr>"
+            f"<td>{html.escape(str(item.get('severity', '')))}</td>"
             f"<td>{html.escape(str(item.get('kind', '')))}</td>"
             f"<td>{html.escape(str(item.get('cue_ids', '')))}</td>"
             f"<td>{_format_seconds(item.get('start'))}</td>"
@@ -85,6 +110,7 @@ def _render_html(payload: dict[str, object]) -> str:
     for item in issues if isinstance(issues, list) else []:
         issue_rows.append(
             "<tr>"
+            f"<td>{html.escape(str(item.get('severity', '')))}</td>"
             f"<td>{html.escape(str(item.get('kind', '')))}</td>"
             f"<td>{html.escape(str(item.get('cue_id', '')))}</td>"
             f"<td>{html.escape(str(item.get('message', '')))}</td>"
@@ -101,13 +127,52 @@ def _render_html(payload: dict[str, object]) -> str:
         "<h2>Cue Scores</h2><table><tr><th>Cue</th><th>CPS</th><th>Score</th><th>Source</th></tr>"
         + "".join(score_rows)
         + "</table>"
-        "<h2>Flags</h2><table><tr><th>Kind</th><th>Cues</th><th>Start</th><th>End</th>"
+        "<h2>Flags</h2><table><tr><th>Severity</th><th>Kind</th><th>Cues</th><th>Start</th><th>End</th>"
         "<th>Message</th><th>Confidence</th><th>Old Text</th><th>New Text</th></tr>"
         + "".join(rows)
-        + "</table><h2>Style Issues</h2><table><tr><th>Kind</th><th>Cue</th><th>Message</th></tr>"
+        + "</table><h2>Style Issues</h2><table><tr><th>Severity</th><th>Kind</th><th>Cue</th><th>Message</th></tr>"
         + "".join(issue_rows)
         + "</table></body></html>"
     )
+
+
+_SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+
+
+def _sorted_flags(flags: list[QCFlag], cues: list[Cue]) -> list[QCFlag]:
+    cue_starts = {cue.index: cue.start_ms / 1000.0 for cue in cues}
+    return [
+        flag
+        for _original_index, flag in sorted(
+            enumerate(flags),
+            key=lambda item: _flag_sort_key(item[0], item[1], cue_starts),
+        )
+    ]
+
+
+def _flag_sort_key(
+    original_index: int,
+    flag: QCFlag,
+    cue_starts: dict[int, float],
+) -> tuple[int, float, int, int]:
+    cue_id = min(flag.cue_ids) if flag.cue_ids else 1_000_000_000
+    cue_position = min(
+        (cue_starts[flag_cue_id] for flag_cue_id in flag.cue_ids if flag_cue_id in cue_starts),
+        default=float("inf"),
+    )
+    position = flag.start if flag.start is not None else cue_position
+    return _SEVERITY_RANK.get(flag.severity, 9), position, cue_id, original_index
+
+
+def _sorted_style_issues(issues: list[StyleIssue]) -> list[StyleIssue]:
+    return sorted(issues, key=lambda issue: _SEVERITY_RANK.get(issue.severity, 9))
+
+
+def _severity_counts(items: list[QCFlag] | list[StyleIssue]) -> dict[str, int]:
+    return {
+        severity: sum(1 for item in items if item.severity == severity)
+        for severity in ("error", "warning", "info")
+    }
 
 
 def _format_seconds(value: object) -> str:

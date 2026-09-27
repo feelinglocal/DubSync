@@ -27,7 +27,7 @@ def test_japanese_jobs_complete_and_deliver_unicode_srt(tmp_path, mode, language
     }), encoding="utf-8")
     settings = WebSettings(
         data_dir=tmp_path / "data", providers_path=providers, style_path=None,
-        processing_inline=True, require_job_access_code=False, max_jobs_per_hour=20,
+        processing_inline=True, require_job_access_code=False, max_submissions_per_hour=20,
     )
     source = "1\n00:00:05,000 --> 00:00:07,000\n今日はいい天気です。\n"
     files = {"audio": ("dialogue.wav", b"fixture audio", "audio/wav")}
@@ -80,7 +80,7 @@ def test_web_auto_detection_is_forwarded_explicitly(tmp_path, monkeypatch, mode)
     job = new_job_record(
         job_id="japanese", token_hash="hash", mode=mode, directory=directory,
         audio_path=audio, srt_path=source if mode == "sync" else None,
-        fps=30, language="auto", style="standard", retention_hours=24,
+        fps=30, language="auto", style="source" if mode == "sync" else "standard", retention_hours=24,
     )
     default_processor(job, settings)
     assert captured["language"] == "auto"

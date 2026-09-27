@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import dubsync.evaluation as evaluation_module
+from dubsync import aligner as aligner_module
+from dubsync.aligner import align_cues_to_words
+from dubsync.evaluation import evaluate_against_golden
+from dubsync.models import Cue, TokenMatch, Word
+from dubsync.srt_io import parse_srt_text
+from dubsync.tokenize import tokenize_cues
+
+
+def test_alignment_uses_cue_timing_prior_for_repeated_word():
+    cues = parse_srt_text("1\n00:00:50,000 --> 00:00:51,000\nja\n\n")
+    words = [
+        Word(text="ja", start=1.0, end=1.2, confidence=0.99),
+        Word(text="ja", start=50.1, end=50.3, confidence=0.99),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {1: [1]}
+
+
+def test_alignment_flags_large_drift_relative_to_episode_offset():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:03,500\nneedle\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.1, end=0.2),
+        Word(text="beta", start=1.1, end=1.2),
+        Word(text="gamma", start=2.1, end=2.2),
+        *[
+            Word(text=f"filler{index}", start=3.0 + index * 0.15, end=3.1 + index * 0.15)
+            for index in range(300)
+        ],
+        Word(text="needle", start=50.1, end=50.3),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert 4 not in result.cue_word_indices
+    assert result.unmatched_cue_ids == [4]
+    assert result.diagnostics.missing_audio_cue_ids == [4]
+    outliers = [flag for flag in result.flags if flag.kind == "alignment_outlier"]
+    assert [flag.cue_ids for flag in outliers] == [[4]]
+
+
+def test_alignment_holds_complete_sentence_far_from_episode_timing_model():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:04,000\nmissing full phrase\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.1, end=0.2),
+        Word(text="beta", start=1.1, end=1.2),
+        Word(text="gamma", start=2.1, end=2.2),
+        Word(text="missing", start=50.0, end=50.2),
+        Word(text="full", start=50.25, end=50.4),
+        Word(text="phrase", start=50.45, end=50.7),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert 4 not in result.cue_word_indices
+    assert 4 in result.unmatched_cue_ids
+    assert 4 in result.diagnostics.missing_audio_cue_ids
+
+
+def test_alignment_holds_far_match_with_only_one_trustworthy_local_anchor():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nopening anchor\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nmissing phrase\n\n"
+    )
+    words = [
+        Word(text="opening", start=0.1, end=0.3),
+        Word(text="anchor", start=0.32, end=0.6),
+        Word(text="missing", start=50.0, end=50.2),
+        Word(text="phrase", start=50.25, end=50.5),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices == {1: [0, 1]}
+    assert result.unmatched_cue_ids == [2]
+    assert result.diagnostics.missing_audio_cue_ids == [2]
+
+
+def test_alignment_holds_partial_source_phrase_when_no_audio_window_exists():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nbefore missing words after\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nfinal anchor\n\n"
+    )
+    words = [
+        Word(text="before", start=0.7, end=1.0),
+        Word(text="after", start=1.0, end=1.3),
+        Word(text="final", start=3.1, end=3.3),
+        Word(text="anchor", start=3.4, end=3.6),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.cue_word_indices[1] == [0, 1]
+    assert result.diagnostics.missing_audio_cue_ids == [1]
+    missing = next(flag for flag in result.flags if flag.kind == "missing_audio_timing_held")
+    assert missing.cue_ids == [1]
+
+
+def test_alignment_does_not_flag_uniform_episode_shift_as_an_outlier():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+    )
+    words = [
+        Word(text="alpha", start=50.1, end=50.2),
+        Word(text="beta", start=51.1, end=51.2),
+        Word(text="gamma", start=52.1, end=52.2),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert not any(flag.kind == "alignment_outlier" for flag in result.flags)
+    assert result.diagnostics.missing_audio_cue_ids == []
+
+
+def test_alignment_flags_scrambled_episode_when_model_fit_is_unavailable():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:03,500\ndelta\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.1, end=0.2),
+        Word(text="beta", start=60.1, end=60.2),
+        Word(text="gamma", start=1.1, end=1.2),
+        Word(text="delta", start=61.1, end=61.2),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert any(flag.kind == "alignment_model_unavailable" for flag in result.flags)
+
+
+def test_alignment_model_sorts_observations_by_cue_center(monkeypatch):
+    cues = [
+        Cue(index=1, start_ms=10_000, end_ms=11_000, lines=["alpha"]),
+        Cue(index=2, start_ms=0, end_ms=1_000, lines=["beta"]),
+        Cue(index=3, start_ms=5_000, end_ms=6_000, lines=["gamma"]),
+    ]
+    tokens = tokenize_cues(cues)
+    words = [
+        Word(text="alpha", start=20.0, end=21.0),
+        Word(text="beta", start=0.0, end=1.0),
+        Word(text="gamma", start=10.0, end=11.0),
+    ]
+    matches = [
+        TokenMatch(cue_id=cue.index, srt_token_index=index, asr_word_index=index, score=1.0)
+        for index, cue in enumerate(cues)
+    ]
+    captured: list[tuple[float, float]] = []
+
+    def capture_fit(anchors: list[tuple[float, float]]):
+        captured.extend(anchors)
+        return None
+
+    monkeypatch.setattr(aligner_module, "_fit_time_transform", capture_fit)
+
+    flags = aligner_module._alignment_outlier_flags(matches, cues, tokens, words)
+
+    assert [cue_center for cue_center, _word_center in captured] == [0.5, 5.5, 10.5]
+    assert [flag.kind for flag in flags] == ["alignment_model_unavailable"]
+
+
+def test_alignment_outlier_threshold_scales_down_for_short_form_audio():
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,400\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,400\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,400\ngamma\n\n"
+        "4\n00:00:03,000 --> 00:00:03,400\ndelta\n\n"
+    )
+    words = [
+        Word(text="alpha", start=0.05, end=0.15),
+        Word(text="beta", start=1.05, end=1.15),
+        Word(text="gamma", start=2.05, end=2.15),
+        Word(text="delta", start=4.05, end=4.15),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    outliers = [flag for flag in result.flags if flag.kind == "alignment_outlier"]
+    assert [flag.cue_ids for flag in outliers] == [[4]]
+
+
+def test_evaluation_matches_golden_content_after_inserted_predicted_cue():
+    predicted = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,400\nalpha\n\n"
+        "2\n00:00:00,500 --> 00:00:00,900\ninserted\n\n"
+        "3\n00:00:01,000 --> 00:00:01,400\nbeta\n\n"
+        "4\n00:00:02,000 --> 00:00:02,400\ngamma\n\n"
+    )
+    golden = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,400\nalpha\n\n"
+        "2\n00:00:01,000 --> 00:00:01,400\nbeta\n\n"
+        "3\n00:00:02,000 --> 00:00:02,400\ngamma\n\n"
+    )
+
+    metrics = evaluate_against_golden(predicted, golden, fps=30.0)
+
+    assert metrics["matched_cues"] == 3
+    assert metrics["start_mae_ms"] == 0.0
+    assert metrics["starts_within_1_frame_ratio"] == 1.0
+
+
+def test_evaluation_precomputes_each_cue_signature_once(monkeypatch):
+    predicted = [
+        parse_srt_text(f"1\n00:00:{index:02d},000 --> 00:00:{index:02d},500\nword {index}\n\n")[0]
+        for index in range(40)
+    ]
+    golden = [cue.model_copy() for cue in predicted]
+    original = evaluation_module._text_signature
+    calls = 0
+
+    def counted_signature(cue):
+        nonlocal calls
+        calls += 1
+        return original(cue)
+
+    monkeypatch.setattr(evaluation_module, "_text_signature", counted_signature)
+
+    matches = evaluation_module._match_cues_by_content(predicted, golden)
+
+    assert len(matches) == 40
+    assert calls == len(predicted) + len(golden)

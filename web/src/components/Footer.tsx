@@ -1,17 +1,17 @@
-import { AudioWaveform } from 'lucide-react'
+import { BrandLockup } from './BrandLockup'
 
 export function Footer() {
   return (
     <footer className="site-footer">
       <div className="footer-identity">
-        <a className="brand" href="/"><AudioWaveform aria-hidden="true" />DubSync</a>
-        <span>Operated by Reyhan Putra in Indonesia.</span>
+        <BrandLockup />
+        <span>Part of Feels Local</span>
       </div>
       <nav aria-label="Legal navigation">
         <a href="/terms">Terms</a>
         <a href="/privacy">Privacy</a>
         <a href="/payments">Payments</a>
-        <a href="mailto:reyhanputraph@gmail.com">Contact</a>
+        <a href="mailto:rey@feelslocal.com">Contact</a>
       </nav>
     </footer>
   )

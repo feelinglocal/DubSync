@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +30,7 @@ class CacheKey(BaseModel):
 
     @classmethod
     def from_audio(cls, audio_path: Path, model: str, params: dict[str, Any]) -> "CacheKey":
-        audio_sha = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+        audio_sha = _sha256_file(audio_path)
         cache_params = _cache_safe_params(params)
         canonical = _canonical_json(
             {"kind": "audio", "audio_sha256": audio_sha, "model": model, "params": cache_params}
@@ -67,7 +69,29 @@ class JsonDiskCache:
 
     def write(self, key: CacheKey, value: dict[str, Any]) -> None:
         payload = {"cache_key": key.model_dump(), "value": value}
-        self._path(key).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_json_atomic(self._path(key), payload)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Publish a complete artifact without truncating a previous successful run."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    write_text_atomic(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _cache_safe_params(value: Any) -> Any:
@@ -84,3 +108,11 @@ def _cache_safe_params(value: Any) -> Any:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

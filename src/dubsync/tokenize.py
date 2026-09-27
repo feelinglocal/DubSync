@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .models import Cue, Word
+from .profanity import normalize_german_profanity_token
+from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import token_texts
 
 TOKEN_RE = re.compile(r"[\w\u3099\u309a]+", re.UNICODE)
@@ -25,7 +28,7 @@ _NUMBER_WORDS = {
     "five": "5",
     "fuenf": "5",
     "funf": "5",
-    "fünf": "5",
+    "f\u00fcnf": "5",
     "six": "6",
     "sechs": "6",
     "seven": "7",
@@ -41,7 +44,8 @@ _NUMBER_WORDS = {
     "twelve": "12",
     "zwoelf": "12",
     "zwolf": "12",
-    "zwölf": "12",
+    "zw\u00f6lf": "12",
+    "%": "prozent",
 }
 
 _GERMAN_ONES = {
@@ -117,8 +121,14 @@ class SRTToken:
     token_index: int
 
 
+@lru_cache(maxsize=16_384)
 def normalize_token(value: str) -> str:
+    profanity = normalize_german_profanity_token(value)
+    if profanity is not None:
+        return profanity
     value = _fold_latin_number_text(unicodedata.normalize("NFKC", value).lower())
+    if value in _NUMBER_WORDS:
+        return _NUMBER_WORDS[value]
     parts = TOKEN_RE.findall(value)
     normalized = "".join(_NUMBER_WORDS.get(part, part) for part in parts)
     return _NUMBER_WORDS.get(normalized, normalized)
@@ -157,7 +167,7 @@ def _fold_latin_number_text(value: str) -> str:
 def tokenize_cues(cues: list[Cue]) -> list[SRTToken]:
     tokens: list[SRTToken] = []
     for cue in cues:
-        for raw in token_texts(cue.plain_text):
+        for raw in token_texts(speech_text_for_alignment(cue)):
             normalized = normalize_token(raw)
             if not normalized:
                 continue

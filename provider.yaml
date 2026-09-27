@@ -10,22 +10,43 @@ asr:
   #   - Matthew
 
 llm:
-  provider: gemini
-  model: gemini-3.5-flash
+  provider: openai
+  model: gpt-5.6-luna
+  timeout_seconds: 90
+  max_retries: 2
   adjudication:
+    provider: gemini
+    model: gemini-3.5-flash-lite
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
+    max_batch_spans: 8
+    max_concurrent_batches: 4
+    retry_timed_out_batches: true
     thinking_level: high
+    fallback:
+      # Review flagged cases with selected clips and detailed local context only.
+      enabled: true
+      provider: gemini
+      model: gemini-3.8-flash
+      thinking_level: medium
+    audio_context:
+      # Lite uses focused audio clips; the full ordered source text remains available.
+      enabled: false
+      compress_long_audio: true
+      cache_enabled: true
+      cache_ttl_seconds: 900
+      max_uncached_audio_tokens: 256000
     audio_snippet_double_check:
       enabled: true
       pad_seconds: 2.0
       max_duration_seconds: 20.0
   punctuation:
-    model: gemini-3.1-flash-lite
+    provider: gemini
+    model: gemini-3.7-flash
     scene_gap_seconds: 4.0
-    thinking_level: low
+    thinking_level: medium
   speaker_mapping:
-    model: gemini-3.1-flash-lite
+    reasoning_effort: medium
 
 vad:
   provider: energy
@@ -50,6 +71,8 @@ timing:
 generation:
   max_gap_seconds: 0.8
   max_cue_duration_seconds: 5.0
+  # Fail closed when an ASR-only span looks like a missing section of the source SRT.
+  max_generated_adlib_duration_seconds: 20.0
 
 output:
   no_overlaps: true

@@ -10,6 +10,9 @@ from ..style_profile import GenerationConstraints, StyleProfile
 from ..text_metrics import display_width
 
 StyleSource = Literal["preset", "custom", "sample"]
+SyncStyleSource = Literal["source", "source_max_lines"]
+SYNC_MAX_LINES_MIN = 1
+SYNC_MAX_LINES_MAX = 2
 
 
 class GenerationStyleError(ValueError):
@@ -45,6 +48,17 @@ class ResolvedGenerationStyle(BaseModel):
     preset: str | None = None
     profile: StyleProfile
     constraints: GenerationConstraints
+
+
+class SyncStyleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: SyncStyleSource
+    max_lines_per_cue: int | None = Field(
+        default=None,
+        ge=SYNC_MAX_LINES_MIN,
+        le=SYNC_MAX_LINES_MAX,
+    )
 
 
 class _Preset(BaseModel):
@@ -127,6 +141,13 @@ _CUSTOM_LIMITS = {
     "lead_in_ms": {"min": 0, "max": 1000, "step": 10},
     "tail_ms": {"min": 0, "max": 1000, "step": 10},
 }
+_SYNC_STYLE_LIMITS = {
+    "max_lines_per_cue": {
+        "min": SYNC_MAX_LINES_MIN,
+        "max": SYNC_MAX_LINES_MAX,
+        "step": 1,
+    },
+}
 
 
 def public_generation_styles() -> dict[str, object]:
@@ -135,6 +156,37 @@ def public_generation_styles() -> dict[str, object]:
         "presets": [preset.model_dump() for preset in _PRESETS],
         "custom_limits": {key: dict(value) for key, value in _CUSTOM_LIMITS.items()},
     }
+
+
+def public_sync_style_limits() -> dict[str, object]:
+    return {key: dict(value) for key, value in _SYNC_STYLE_LIMITS.items()}
+
+
+def sync_style_from_max_lines(value: int | None) -> str:
+    if value is None:
+        return "source"
+    return SyncStyleRequest(source="source_max_lines", max_lines_per_cue=value).model_dump_json()
+
+
+def parse_sync_style_request(raw_style: str) -> SyncStyleRequest:
+    normalized = raw_style.strip()
+    if not normalized or normalized.lower() == "source":
+        return SyncStyleRequest(source="source")
+    if len(normalized) > 1024:
+        raise GenerationStyleError("Unsupported sync style.")
+    try:
+        payload = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise GenerationStyleError("Sync style must be valid JSON.") from exc
+    try:
+        request = SyncStyleRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise GenerationStyleError(_validation_message(exc).replace("generation style", "sync style")) from exc
+    if request.source == "source_max_lines" and request.max_lines_per_cue is None:
+        raise GenerationStyleError("Sync maximum lines per cue is required.")
+    if request.source == "source" and request.max_lines_per_cue is not None:
+        raise GenerationStyleError("Sync source style cannot include maximum lines.")
+    return request
 
 
 def parse_generation_style_request(raw_style: str) -> GenerationStyleRequest:

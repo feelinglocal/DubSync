@@ -3,7 +3,12 @@ from __future__ import annotations
 from .models import Cue, QCFlag
 
 
-def apply_overlap_policy(cues: list[Cue], policy: str = "stack") -> tuple[list[Cue], list[QCFlag]]:
+def apply_overlap_policy(
+    cues: list[Cue],
+    policy: str = "stack",
+    *,
+    protected_cue_ids: set[int] | None = None,
+) -> tuple[list[Cue], list[QCFlag]]:
     if policy == "stack":
         return cues, _overlap_flags(cues, "overlap_stacked")
     if policy == "flag_only":
@@ -11,6 +16,7 @@ def apply_overlap_policy(cues: list[Cue], policy: str = "stack") -> tuple[list[C
     if policy != "dash":
         raise ValueError(f"unsupported overlap policy: {policy}")
 
+    protected = protected_cue_ids or set()
     merged: list[Cue] = []
     flags: list[QCFlag] = []
     index = 0
@@ -18,7 +24,11 @@ def apply_overlap_policy(cues: list[Cue], policy: str = "stack") -> tuple[list[C
         current = cues[index]
         if index + 1 < len(cues):
             nxt = cues[index + 1]
-            if _can_dash_merge(current, nxt):
+            if (
+                current.index not in protected
+                and nxt.index not in protected
+                and _can_dash_merge(current, nxt)
+            ):
                 merged_cue = Cue(
                     index=current.index,
                     start_ms=min(current.start_ms, nxt.start_ms),

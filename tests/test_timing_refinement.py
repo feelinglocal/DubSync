@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dubsync.models import Cue, SpeechRegion
+from dubsync.models import AlignmentResult, Cue, SpeechRegion, Word
 from dubsync.style_profile import StyleProfile
 from dubsync.timing_refinement import BoundaryRefinementConfig, refine_cues_to_speech_activity
 
@@ -55,6 +55,72 @@ def test_refine_cues_to_speech_activity_preserves_timing_without_overlap():
     assert flags == []
 
 
+def test_refinement_cannot_borrow_nearby_speech_for_a_missing_audio_cue():
+    cue = Cue(index=2, start_ms=5000, end_ms=6000, lines=["missing line"])
+    alignment = AlignmentResult(
+        unmatched_cue_ids=[2],
+        diagnostics={"missing_audio_cue_ids": [2]},
+    )
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue],
+        [SpeechRegion(start=5.4, end=5.7)],
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+        alignment=alignment,
+    )
+
+    assert refined == [cue]
+    assert flags == []
+
+
+def test_refinement_ignores_a_distant_word_already_trimmed_from_the_cue_cluster():
+    cue = Cue(index=392, start_ms=1_044_440, end_ms=1_045_360, lines=["Cadê a Shang Zhitao?"])
+    words = [
+        Word(text="Cadê", start=1_044.468, end=1_044.748),
+        Word(text="a", start=1_044.758, end=1_044.759),
+        Word(text="Zhang", start=1_044.768, end=1_044.948),
+        Word(text="Zitao?", start=1_044.988, end=1_045.308),
+        Word(text="Ah,", start=1_057.818, end=1_057.968),
+    ]
+    alignment = AlignmentResult(cue_word_indices={392: list(range(len(words)))})
+
+    refined, _flags = refine_cues_to_speech_activity(
+        [cue],
+        [
+            SpeechRegion(start=1_044.4, end=1_045.4),
+            SpeechRegion(start=1_057.8, end=1_058.0),
+        ],
+        StyleProfile(fps=25.0, min_cue_dur=0.5),
+        words=words,
+        alignment=alignment,
+    )
+
+    assert refined[0].start_ms == 1_044_440
+    assert refined[0].end_ms <= 1_045_440
+
+
+def test_refinement_ignores_an_impossible_trailing_word_already_trimmed_from_the_cue_cluster():
+    cue = Cue(index=6, start_ms=43_800, end_ms=45_000, lines=["Drache!"])
+    words = [
+        Word(text="Drache!", start=43.82, end=44.98),
+        Word(text="noise", start=45.04, end=55.84),
+    ]
+    alignment = AlignmentResult(cue_word_indices={6: [0, 1]})
+
+    refined, _flags = refine_cues_to_speech_activity(
+        [cue],
+        [
+            SpeechRegion(start=43.8, end=45.0),
+            SpeechRegion(start=45.04, end=55.84),
+        ],
+        StyleProfile(fps=25.0, min_cue_dur=0.5),
+        words=words,
+        alignment=alignment,
+    )
+
+    assert refined[0].end_ms <= 45_040
+
+
 def test_refine_cues_to_speech_activity_does_not_extend_to_following_cues_in_merged_region():
     cue = Cue(index=5, start_ms=10233, end_ms=11133, lines=["brachte mir nur Verrat"])
 
@@ -104,3 +170,40 @@ def test_refine_cues_to_speech_activity_does_not_undo_next_cue_cap_for_min_durat
     assert refined[0].end_ms <= refined[1].start_ms
     assert refined[0].end_ms == 1100
     assert flags[0].kind == "timing_refined"
+
+
+def test_refine_cues_to_speech_activity_does_not_silently_emit_a_subminimum_cue():
+    profile = StyleProfile(fps=30.0, min_cue_dur=0.5)
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=500, lines=["previous speech"]),
+        Cue(index=2, start_ms=1000, end_ms=1050, lines=["short"]),
+        Cue(index=3, start_ms=1100, end_ms=1600, lines=["next speech"]),
+    ]
+
+    refined, flags = refine_cues_to_speech_activity(
+        cues,
+        [
+            SpeechRegion(start=0.0, end=0.5),
+            SpeechRegion(start=1.0, end=1.05),
+            SpeechRegion(start=1.1, end=1.6),
+        ],
+        profile,
+        BoundaryRefinementConfig(max_end_extension_ms=300),
+    )
+
+    target = next(cue for cue in refined if cue.index == 2)
+    previous = next(cue for cue in refined if cue.index == 1)
+    following = next(cue for cue in refined if cue.index == 3)
+    attained_floor_without_clipping_neighbors = (
+        target.duration_ms >= int(profile.min_cue_dur * 1000)
+        and target.start_ms >= previous.end_ms
+        and target.end_ms <= following.start_ms
+    )
+    explicit_failure = any(
+        flag.kind == "min_duration_unattainable"
+        and flag.severity == "error"
+        and target.index in flag.cue_ids
+        for flag in flags
+    )
+
+    assert attained_floor_without_clipping_neighbors or explicit_failure

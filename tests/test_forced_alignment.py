@@ -91,6 +91,28 @@ def test_forced_alignment_clamps_negative_start_to_zero_and_qc_window():
     assert flags[0].end == pytest.approx(0.5)
 
 
+def test_forced_alignment_cannot_retime_a_missing_audio_cue():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=1700, lines=["spoken line"]),
+        Cue(index=2, start_ms=2000, end_ms=3000, lines=["missing line"]),
+    ]
+    alignments = [
+        ForcedAlignmentCue(cue_id=1, start=10.0, end=10.6, score=0.95),
+        ForcedAlignmentCue(cue_id=2, start=11.0, end=11.8, score=0.95),
+    ]
+
+    updated, flags = apply_forced_alignment(
+        cues,
+        alignments,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+        protected_cue_ids={2},
+    )
+
+    assert (updated[0].start_ms, updated[0].end_ms) == (10000, 10600)
+    assert (updated[1].start_ms, updated[1].end_ms) == (2000, 3000)
+    assert [flag.cue_ids for flag in flags] == [[1]]
+
+
 def test_mms_forced_alignment_adapter_uses_ctc_python_api(tmp_path, monkeypatch):
     calls: dict[str, object] = {}
 
@@ -202,3 +224,65 @@ def test_mms_japanese_does_not_borrow_rows_when_character_output_is_incomplete()
     rows = [{"text": char, "start": index / 10, "end": (index + 1) / 10} for index, char in enumerate("は。 いいえ。")]
 
     assert _cue_alignments_from_word_timestamps(cues, rows, language="jpn") == []
+def test_mms_forced_alignment_adapter_ignores_bracketed_screen_text_lines(tmp_path, monkeypatch):
+    calls: dict[str, object] = {}
+
+    fake_torch = SimpleNamespace(
+        float16="float16",
+        float32="float32",
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+    fake_ctc = SimpleNamespace(
+        load_audio=lambda path, dtype, device: "waveform",
+        load_alignment_model=lambda device, dtype: (SimpleNamespace(dtype="float32", device="cpu"), "tokenizer"),
+        generate_emissions=lambda model, waveform, batch_size: ("emissions", 0.02),
+        preprocess_text=lambda text, romanize, language: calls.setdefault(
+            "preprocess_text",
+            (text, romanize, language),
+        )
+        and (["hello", "there"], text),
+        get_alignments=lambda emissions, tokens_starred, alignment_tokenizer: ("segments", [0.9, 0.8], "blank"),
+        get_spans=lambda tokens_starred, segments, blank_token: "spans",
+        postprocess_results=lambda text_starred, spans, stride, scores: [
+            {"text": "hello", "start": 2.00, "end": 2.20, "score": 0.9},
+            {"text": "there", "start": 2.24, "end": 2.40, "score": 0.8},
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "ctc_forced_aligner", fake_ctc)
+
+    audio_path = tmp_path / "episode.wav"
+    audio_path.write_bytes(b"RIFF....WAVEfmt ")
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=500, lines=["[Document title]", "hello there"]),
+        Cue(index=2, start_ms=500, end_ms=1000, lines=["[Episode 1]"]),
+    ]
+
+    alignments = MMSForcedAlignmentAdapter(language="eng", romanize=True).align(audio_path, cues)
+
+    assert calls["preprocess_text"] == ("hello there", True, "eng")
+    assert [(row.cue_id, row.start, row.end, row.score) for row in alignments] == [
+        (1, 2.00, 2.40, pytest.approx(0.85)),
+    ]
+
+
+def test_japanese_mms_excludes_screen_text_from_character_mapping():
+    from dubsync.forced_alignment import _cue_alignments_from_word_timestamps
+
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["[Episode 1]", "はい。"]), Cue(index=2, start_ms=1000, end_ms=2000, lines=["[Title]"])]
+    rows = [{"text": char, "start": i / 10, "end": (i + 1) / 10} for i, char in enumerate("はい。")]
+
+    result = _cue_alignments_from_word_timestamps(cues, rows, language="ja")
+
+    assert [(row.cue_id, row.start, row.end) for row in result] == [(1, 0, .2)]
+
+
+@pytest.mark.parametrize("overrides", [{"start": None}, {"start": float("nan")}, {"end": -.1}, {"score": float("nan")}, {"score": 2}])
+def test_japanese_mms_rejects_invalid_character_timing(overrides):
+    from dubsync.forced_alignment import _cue_alignments_from_word_timestamps
+
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["はい"])]
+    rows = [{"text": "は", "start": 0, "end": .1, "score": .9}, {"text": "い", "start": .1, "end": .2, "score": .9}]
+    rows[0].update(overrides)
+
+    assert _cue_alignments_from_word_timestamps(cues, rows, language="ja") == []

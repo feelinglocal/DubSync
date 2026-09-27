@@ -161,3 +161,29 @@ def test_disjoint_latin_corrections_preserve_spacing_and_repeated_word_position(
     )
 
     assert changed[0].text == "Old owls, unlike young trees, fly."
+
+
+@pytest.mark.parametrize("source,spoken", [("[画面]「ｶﾞﾗｽは青い。」", "ｶﾞﾗｽ"), ("[画面]「か\u3099らすは青い。」", "か\u3099らす")])
+def test_japanese_normalized_tokens_preserve_screen_annotations(source, spoken):
+    from dubsync.subtitle_annotations import alignment_token_character_spans
+    from dubsync.tokenize import tokenize_cues
+
+    cue = Cue(index=1, start_ms=0, end_ms=2000, lines=[source])
+    boundaries = alignment_token_character_spans(cue)
+    assert boundaries is not None
+    assert source[boundaries[0][0]:boundaries[2][1]] == spoken
+    tokens = tokenize_cues([cue])
+    blue_index = next(token.token_index for token in tokens if token.text == "青")
+    span = DivergenceSpan(case_id="screen-ja", cue_ids=[1], srt_text="青", asr_text="赤", srt_token_indices=[blue_index])
+    decision = AdjudicationDecision(case_id="screen-ja", verdict="use_audio", final_text="赤", confidence=0.95, reason="spoken correction")
+    changed, flags = apply_adjudication_decisions([cue], [span], [decision], StyleProfile(max_chars_per_line=100))
+    assert changed[0].text == source.replace("青", "赤")
+    assert not any(flag.kind == "screen_text_adjudication_held" for flag in flags)
+
+
+def test_japanese_anchored_insertion_does_not_add_ascii_spaces():
+    cue = Cue(index=1, start_ms=0, end_ms=2000, lines=["「今日はです。」"])
+    span = DivergenceSpan(case_id="insert-ja", cue_ids=[], srt_text="", asr_text="晴れ", left_anchor_cue_id=1, right_anchor_cue_id=1, insertion_token_offset=3)
+    decision = AdjudicationDecision(case_id="insert-ja", verdict="use_audio", final_text="晴れ", confidence=0.95, reason="spoken insertion")
+    changed, _ = apply_adjudication_decisions([cue], [span], [decision], StyleProfile(), adlib_cue_ids_by_case={"insert-ja": 1})
+    assert changed[0].text == "「今日は晴れです。」"

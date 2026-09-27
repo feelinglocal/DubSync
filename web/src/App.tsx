@@ -7,6 +7,7 @@ import { LegalPage } from './components/LegalPage'
 import { MarketingSections } from './components/MarketingSections'
 import { Workspace } from './components/Workspace'
 import { defaultConfig, type PublicConfig } from './types'
+import { applyRouteMetadata } from './seo'
 
 export default function App() {
   const path = window.location.pathname.replace(/\/$/, '') || '/'
@@ -15,6 +16,10 @@ export default function App() {
   useEffect(() => {
     loadConfig().then(setConfig).catch(() => setConfig(defaultConfig))
   }, [])
+
+  useEffect(() => {
+    applyRouteMetadata(path)
+  }, [path])
 
   if (path === '/terms') return <LegalPage kind="terms" />
   if (path === '/privacy') return <LegalPage kind="privacy" />

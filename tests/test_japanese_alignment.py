@@ -74,3 +74,35 @@ def test_japanese_omission_inside_one_provider_word_has_non_inverted_window():
     assert span.srt_text == "とても"
     assert span.start <= span.end
     assert (span.start, span.end) == (0.5, 1.8)
+
+
+def test_japanese_exact_alignment_needs_only_linear_comparison_budget(monkeypatch):
+    from dubsync import aligner
+    from dubsync.tokenize import tokenize_cues
+
+    cues = [Cue(index=1, start_ms=0, end_ms=2000, lines=["今日は晴れです。"])]
+    monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", len(tokenize_cues(cues)))
+    result = align_cues_to_words(cues, [Word(text="今日は晴れです。", start=0.1, end=1.8)])
+    assert result.anchor_coverage == 1.0
+    assert result.cue_word_indices == {1: [0]}
+    assert not result.diagnostics.unresolved
+
+
+def test_timed_japanese_punctuation_remains_acoustic_ownership_evidence():
+    from dubsync.changes import apply_adjudication_decisions
+    from dubsync.models import AdjudicationDecision
+    from dubsync.style_profile import StyleProfile
+
+    cues = [Cue(index=10, start_ms=0, end_ms=600, lines=["私発見"]),
+            Cue(index=11, start_ms=2200, end_ms=2800, lines=["次出来事"])]
+    words = [Word(text=text, start=start, end=end) for text, start, end in [
+        ("私", 0, .1), ("起床", .2, .3), ("認識", .4, .6),
+        ("。", 2., 2.1), ("次", 2.2, 2.3), ("出来事", 2.4, 2.7),
+    ]]
+    alignment = align_cues_to_words(cues, words)
+    span, = [span for span in alignment.divergence_spans if span.srt_text == "発見"]
+    assert 3 in span.asr_word_indices
+    decision = AdjudicationDecision(case_id=span.case_id, verdict="use_audio", final_text=span.asr_text, confidence=1, reason="ownership check")
+    changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile(), words=words)
+    assert changed == cues
+    assert any(flag.kind == "adjudication_replacement_ownership_held" for flag in flags)

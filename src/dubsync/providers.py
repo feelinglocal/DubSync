@@ -1,17 +1,33 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterable, Protocol
+
+from pydantic import ValidationError
 
 from .cache import CacheKey, JsonDiskCache
 from .cost import CostMeter, audio_seconds
-from .models import Word
+from .models import QCFlag, Word
+
+
+GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS = 30 * 60.0
+GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+MAI_TRANSCRIBE_MODEL = "microsoft/mai-transcribe-2"
+SCRIBE_TRANSCRIBE_MODEL = "scribe_v2"
+GEMINI_TRANSCRIBE_DISABLED_MESSAGE = (
+    "Gemini 3.5 Transcribe ASR is disabled; use ElevenLabs Scribe v2."
+)
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class ASRAdapter(Protocol):
@@ -48,18 +64,100 @@ class CachedASRAdapter:
         self.cost_meter = cost_meter
         self.cost_provider = cost_provider or model
         self.dollars_per_hour = dollars_per_hour
+        self.last_repair_flags: list[QCFlag] = []
+        self.last_cache_key: CacheKey | None = None
+        self.last_usage: dict[str, object] = {}
+        self.last_cache_hit = False
 
     def transcribe(self, audio_path: Path) -> list[Word]:
+        self.last_repair_flags = []
+        self.last_usage = {}
+        self.last_cache_hit = False
         key = CacheKey.from_audio(audio_path, self.model, self.params)
+        self.last_cache_key = key
         cached = self.cache.read(key)
         if cached is not None:
-            words = cached.get("words", cached) if isinstance(cached, dict) else cached
-            return [Word.model_validate(item) for item in words]
-        words = self.inner.transcribe(audio_path)
-        if self.cost_meter is not None and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
-            self.cost_meter.add_audio(self.cost_provider, audio_seconds(audio_path), self.dollars_per_hour)
-        self.cache.write(key, {"words": [word.model_dump() for word in words]})
+            self.last_cache_hit = True
+            if isinstance(cached, dict):
+                self.last_usage = _safe_asr_usage(cached.get("usage"))
+            cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
+            words, cache_repair_flags = repair_word_stream(cached_words, source="ASR cache")
+            persisted_flags = _cached_repair_flags(cached)
+            self.last_repair_flags = [*persisted_flags, *cache_repair_flags]
+            if _is_raw_provider_cache(cached):
+                self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
+            return words
+
+        succeeded = False
+        try:
+            provider_words = self.inner.transcribe(audio_path)
+            succeeded = True
+        finally:
+            self.last_usage = _safe_asr_usage(getattr(self.inner, "last_usage", None))
+            self._record_cost(audio_path, succeeded=succeeded)
+        provider_flags = list(getattr(self.inner, "last_repair_flags", []))
+        cacheable_words = _cacheable_word_items(provider_words)
+        if cacheable_words is None:
+            words, repair_flags = repair_word_stream(provider_words, source="ASR provider")
+            self.last_repair_flags = [*provider_flags, *repair_flags]
+            self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
+            return words
+        self.cache.write(
+            key,
+            {
+                "words": cacheable_words,
+                "metadata": {"raw_provider_response": True, "repair_flags": [flag.model_dump() for flag in provider_flags]},
+                "usage": self.last_usage,
+            },
+        )
+        words, repair_flags = repair_word_stream(cacheable_words, source="ASR provider")
+        self.last_repair_flags = [*provider_flags, *repair_flags]
+        self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
         return words
+
+    def _cache_payload(self, words: list[Word], flags: list[QCFlag]) -> dict[str, object]:
+        return {**_validated_word_cache_payload(words, flags), "usage": self.last_usage}
+
+    def _record_cost(self, audio_path: Path, *, succeeded: bool) -> None:
+        if self.cost_meter is None:
+            return
+        billed_cost = self.last_usage.get("cost")
+        seconds = self.last_usage.get("seconds")
+        if isinstance(billed_cost, (int, float)):
+            self.cost_meter.add_audio_billed(
+                self.cost_provider,
+                float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
+                float(billed_cost),
+            )
+        elif not succeeded and isinstance(self.last_usage.get("reported_cost"), (int, float)):
+            self.cost_meter.add_audio_billed(
+                self.cost_provider,
+                float(self.last_usage.get("reported_seconds", 0)),
+                float(self.last_usage["reported_cost"]),
+                partial=True,
+            )
+        elif succeeded and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
+            self.cost_meter.add_audio(
+                self.cost_provider,
+                float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
+                self.dollars_per_hour,
+            )
+
+
+def _safe_asr_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, object] = {}
+    for name in ("seconds", "cost", "reported_seconds", "reported_cost", "request_count"):
+        number = value.get(name)
+        if name in value and number is None:
+            result[name] = None
+        if isinstance(number, (int, float)) and not isinstance(number, bool) and math.isfinite(number) and number >= 0:
+            result[name] = number
+    identifiers = value.get("generation_ids")
+    if isinstance(identifiers, list):
+        result["generation_ids"] = [item for item in identifiers if isinstance(item, str) and item.startswith("gen-")][:10000]
+    return result
 
 
 class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
@@ -198,8 +296,10 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
             **language_kwargs,
         )
         transcript = aai.Transcriber().transcribe(str(audio_path), config=config)
-        if _field(transcript, "error"):
-            raise ProviderError(f"AssemblyAI transcription failed: {_field(transcript, 'error')}")
+        error_status = _field(_field(aai, "TranscriptStatus", None), "error", "error")
+        transcript_status = _field(transcript, "status", None)
+        if _field(transcript, "error") or transcript_status == error_status or str(_field(transcript_status, "value", transcript_status)).lower() == "error":
+            raise ProviderError("AssemblyAI transcription failed with a terminal error status.")
         raw_words = _field(transcript, "words", [])
         return [
             Word(
@@ -212,6 +312,37 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
             for item in raw_words
             if _field(item, "text", "")
         ]
+
+
+class GeminiTranscribeAdapter:
+    """Retained import shim for the retired Gemini 3.5 Transcribe ASR adapter."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = GEMINI_TRANSCRIBE_MODEL,
+        language_codes: list[str] | None = None,
+        custom_vocabulary: list[str] | None = None,
+        diarize: bool = True,
+        word_timestamps: bool = True,
+        store: bool = False,
+        max_audio_seconds: object = GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
+    ):
+        del (
+            api_key,
+            model,
+            language_codes,
+            custom_vocabulary,
+            diarize,
+            word_timestamps,
+            store,
+            max_audio_seconds,
+        )
+        raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
+
+    def transcribe(self, audio_path: Path) -> list[Word]:
+        del audio_path
+        raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
 
 
 class WhisperXAdapter:
@@ -284,21 +415,41 @@ class WhisperXAdapter:
         return whisperx.assign_word_speakers(diarize_segments, result)
 
 
-def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
+def adapter_from_config(
+    config: dict[str, object],
+    *,
+    local_mode: bool = False,
+    allow_gemini_transcribe_web: bool = False,
+) -> ASRAdapter:
+    del local_mode, allow_gemini_transcribe_web
     asr_config = config.get("asr", {}) if isinstance(config, dict) else {}
     if not isinstance(asr_config, dict):
         raise ProviderError("providers.yaml asr section must be a mapping")
     fixture_path = asr_config.get("fixture_path")
     if fixture_path:
         return FixtureASRAdapter(Path(str(fixture_path)))
-    provider = str(asr_config.get("provider", "elevenlabs")).lower()
+    provider = str(asr_config.get("provider", "elevenlabs")).strip().lower()
+    if provider in {"openrouter", MAI_TRANSCRIBE_MODEL}:
+        from .mai_transcribe import MAITranscribeAdapter
+
+        model = str(asr_config.get("model", MAI_TRANSCRIBE_MODEL))
+        if model != MAI_TRANSCRIBE_MODEL:
+            raise ProviderError("OpenRouter transcription model must be microsoft/mai-transcribe-2.")
+        return MAITranscribeAdapter(
+            api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
+            diarize=bool(asr_config.get("diarize", True)),
+            keyterms=_asr_keyterms(asr_config),
+            language_code=normalize_language_code(_configured_asr_language(asr_config)),
+            timeout_seconds=float(asr_config.get("timeout_seconds", 90)),
+            chunk_seconds=float(asr_config.get("chunk_seconds", 300)),
+        )
     if provider == "elevenlabs":
         return ElevenLabsScribeAdapter(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
             model_id=str(asr_config.get("model_id", "scribe_v2")),
             diarize=bool(asr_config.get("diarize", True)),
             keyterms=_asr_keyterms(asr_config),
-            language_code=str(asr_config["language_code"]) if asr_config.get("language_code") else None,
+            language_code=normalize_language_code(_configured_asr_language(asr_config)),
         )
     if provider == "openai":
         return OpenAIWhisperAdapter(
@@ -313,6 +464,8 @@ def adapter_from_config(config: dict[str, object]) -> ASRAdapter:
             speaker_labels=bool(asr_config.get("speaker_labels", True)),
             language_code=_configured_asr_language(asr_config),
         )
+    if _is_gemini_transcribe_provider(provider):
+        raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
     if provider == "whisperx":
         return WhisperXAdapter(
             model=str(asr_config.get("model", "large-v3")),
@@ -340,11 +493,14 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
     provider = str(asr_config.get("provider", "elevenlabs")).lower()
     asr_config.pop("language", None)
     asr_config.pop("language_code", None)
+    asr_config.pop("language_codes", None)
     if normalized is None:
         next_config["asr"] = asr_config
         return next_config
     if provider in {"whisperx", "openai"}:
         asr_config["language"] = normalized
+    elif _is_gemini_transcribe_provider(provider):
+        asr_config["language_codes"] = [normalized]
     else:
         asr_config["language_code"] = normalized
     next_config["asr"] = asr_config
@@ -369,10 +525,212 @@ def _configured_asr_language(asr_config: dict[str, object]) -> str | None:
     return str(value) if value else None
 
 
+def apply_transcription_provider_config(config: dict[str, object], provider: str) -> dict[str, object]:
+    normalized = provider.strip().lower()
+    if normalized in {"", "default"}:
+        next_config = deepcopy(config)
+        if not next_config.get("asr"):
+            next_config["asr"] = {"provider": "elevenlabs", "model_id": SCRIBE_TRANSCRIBE_MODEL}
+        return next_config
+    if normalized == GEMINI_TRANSCRIBE_MODEL:
+        raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)
+    if normalized not in {MAI_TRANSCRIBE_MODEL, SCRIBE_TRANSCRIBE_MODEL}:
+        raise ProviderError("Invalid transcription provider.")
+    next_config = deepcopy(config)
+    existing = next_config.get("asr", {})
+    if not isinstance(existing, dict):
+        raise ProviderError("providers.yaml asr section must be a mapping")
+    target = "openrouter" if normalized == MAI_TRANSCRIBE_MODEL else "elevenlabs"
+    # Provider-specific credentials and prices must never cross providers.
+    shared = {"diarize", "keyterms", "character_names", "language_code", "fixture_path", "local"}
+    original_provider = str(existing.get("provider", "")).strip().lower()
+    same_provider = original_provider == target or (target == "openrouter" and original_provider == MAI_TRANSCRIBE_MODEL)
+    asr_config = existing if same_provider else {
+        key: value for key, value in existing.items() if key in shared
+    }
+    asr_config.pop("model_id" if target == "openrouter" else "model", None)
+    asr_config["provider"] = target
+    asr_config["model" if target == "openrouter" else "model_id"] = normalized
+    next_config["asr"] = asr_config
+    return next_config
+
+
+def apply_local_asr_config(config: dict[str, object], local: bool) -> dict[str, object]:
+    if not local:
+        return dict(config)
+    next_config = dict(config)
+    existing = next_config.get("asr", {})
+    asr_config = dict(existing) if isinstance(existing, dict) else {}
+    local_override = asr_config.get("local", {})
+    if isinstance(local_override, dict) and local_override:
+        preserved = {
+            key: value
+            for key, value in asr_config.items()
+            if key not in {"fixture_path", "language_code", "local", "model", "model_id", "provider"}
+        }
+        preserved.update(local_override)
+        asr_config = preserved
+    elif not _is_gemini_transcribe_provider(str(asr_config.get("provider", "")).lower()):
+        asr_config["provider"] = "whisperx"
+    asr_config.pop("fixture_path", None)
+    next_config["asr"] = asr_config
+    return next_config
+
+
 def _field(item: object, name: str, default: object = None) -> object:
     if isinstance(item, dict):
         return item.get(name, default)
     return getattr(item, name, default)
+
+
+@dataclass(frozen=True)
+class _RepairCounts:
+    blank_dropped: int = 0
+    invalid_dropped: int = 0
+    timing_clamped: int = 0
+    reordered: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.blank_dropped + self.invalid_dropped + self.timing_clamped + self.reordered
+
+
+def _validated_word_stream(items: object, *, source: str) -> list[Word]:
+    words, _flags = repair_word_stream(items, source=source)
+    return words
+
+def _cached_repair_flags(cached: object) -> list[QCFlag]:
+    if not isinstance(cached, dict):
+        return []
+    metadata = cached.get("metadata", {})
+    raw_flags = metadata.get("repair_flags", []) if isinstance(metadata, dict) else []
+    if not isinstance(raw_flags, list):
+        raw_flags = []
+    if not raw_flags:
+        raw_flags = cached.get("repair_flags", [])
+    if not isinstance(raw_flags, list):
+        return []
+    flags: list[QCFlag] = []
+    for item in raw_flags:
+        try:
+            flags.append(QCFlag.model_validate(item))
+        except (TypeError, ValueError, ValidationError):
+            continue
+    return flags
+
+
+def repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
+    if isinstance(items, (str, bytes, dict, Word)) or not isinstance(items, Iterable):
+        raise ProviderError(f"{source} returned an invalid word stream.")
+
+    repaired: list[tuple[int, Word]] = []
+    blank_dropped = 0
+    invalid_dropped = 0
+    timing_clamped = 0
+    total_items = 0
+    for index, item in enumerate(items):
+        total_items += 1
+        try:
+            word = Word.model_validate(item)
+        except (TypeError, ValueError, ValidationError):
+            invalid_dropped += 1
+            continue
+
+        if not word.text.strip():
+            blank_dropped += 1
+            continue
+        if not math.isfinite(word.start) or not math.isfinite(word.end):
+            invalid_dropped += 1
+            continue
+
+        start = max(0.0, float(word.start))
+        end = float(word.end)
+        if end <= start:
+            end = start + 0.001
+            timing_clamped += 1
+        elif start != word.start:
+            timing_clamped += 1
+        next_word = word.model_copy(update={"text": word.text.strip(), "start": start, "end": end})
+        repaired.append((index, next_word))
+
+    if not repaired:
+        raise ProviderError(f"{source} returned no usable words after validation.")
+
+    malformed_dropped = blank_dropped + invalid_dropped
+    malformed_limit = max(1, math.ceil(total_items * 0.05))
+    if malformed_dropped > malformed_limit:
+        raise ProviderError(
+            f"{source} returned a malformed fraction too large to repair "
+            f"({malformed_dropped}/{total_items} words; maximum {malformed_limit})."
+        )
+
+    sorted_repaired = sorted(repaired, key=lambda item: (item[1].start, item[0]))
+    original_order = [original_index for original_index, _word in repaired]
+    sorted_order = [original_index for original_index, _word in sorted_repaired]
+    reordered = sum(1 for before, after in zip(original_order, sorted_order, strict=True) if before != after)
+    words = [word for _index, word in sorted_repaired]
+    counts = _RepairCounts(
+        blank_dropped=blank_dropped,
+        invalid_dropped=invalid_dropped,
+        timing_clamped=timing_clamped,
+        reordered=reordered,
+    )
+    flags = _word_stream_repair_flags(source, counts, len(words))
+    return words, flags
+
+
+def _repair_word_stream(items: object, *, source: str) -> tuple[list[Word], list[QCFlag]]:
+    """Compatibility alias for callers outside the package that used the old private name."""
+
+    return repair_word_stream(items, source=source)
+
+
+def _cacheable_word_items(items: object) -> list[dict[str, object] | None] | None:
+    if isinstance(items, (str, bytes, dict, Word)) or not isinstance(items, Iterable):
+        return None
+    cached: list[dict[str, object] | None] = []
+    for item in items:
+        try:
+            cached.append(Word.model_validate(item).model_dump())
+        except (TypeError, ValueError, ValidationError):
+            cached.append(None)
+    return cached
+
+
+def _is_raw_provider_cache(cached: object) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    metadata = cached.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("raw_provider_response") is True
+
+
+def _validated_word_cache_payload(words: list[Word], flags: list[QCFlag]) -> dict[str, object]:
+    return {
+        "words": [word.model_dump() for word in words],
+        "metadata": {
+            "repair_flags": [flag.model_dump() for flag in flags],
+        },
+    }
+
+
+def _word_stream_repair_flags(source: str, counts: _RepairCounts, usable_words: int) -> list[QCFlag]:
+    if counts.total == 0:
+        return []
+    parts = [
+        f"{counts.blank_dropped} blank dropped",
+        f"{counts.invalid_dropped} invalid dropped",
+        f"{counts.timing_clamped} timing clamped",
+        f"{counts.reordered} reordered",
+    ]
+    return [
+        QCFlag(
+            kind="word_stream_repaired",
+            cue_ids=[],
+            message=f"{source} word stream was repaired before alignment: {', '.join(parts)}; {usable_words} usable words remain.",
+            severity="warning",
+            confidence=None,
+        )
+    ]
 
 
 def _asr_keyterms(asr_config: dict[str, object]) -> list[str]:
@@ -390,6 +748,15 @@ def _asr_keyterms(asr_config: dict[str, object]) -> list[str]:
             if term and term not in terms:
                 terms.append(term)
     return terms
+
+
+def _is_gemini_transcribe_provider(provider: str) -> bool:
+    return provider.lower().replace("-", "_") in {
+        "gemini",
+        "gemini_transcribe",
+        "gemini_3.5_transcribe",
+        "gemini_3_5_transcribe",
+    }
 
 
 def _words_from_whisperx_result(result: dict[str, object]) -> list[Word]:
