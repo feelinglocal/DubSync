@@ -315,6 +315,73 @@ def test_far_word_running_into_the_next_line_is_not_kept_with_the_earlier_cue():
     assert (detached.left_anchor_cue_id, detached.right_anchor_cue_id, detached.right_anchor_start) == (330, 331, 1009.48)
 
 
+_ONLY_FAR_WORDS = [
+    ("Realizem", 0.72, 1.00), ("seus", 1.02, 1.20), ("desejos", 1.22, 1.46), ("no", 1.68, 1.76),
+    ("Alô?", 15.90, 16.30),
+    ("Quem", 17.00, 17.20), ("está", 17.22, 17.50), ("falando", 17.52, 18.00), ("agora?", 18.02, 18.40),
+]
+
+
+def test_single_approved_word_spoken_far_from_the_cue_is_not_written_into_it(tmp_path):
+    # The case's only word is spoken 14 s after the cue's retained "no": the
+    # approved wording replaced "Natal" inside the cue, shown 14 s early.
+    srt = _NEW_YEAR_SRT.replace("00:00:02,670", "00:00:02,400")
+    cues, flags = _sync(tmp_path, srt, _ONLY_FAR_WORDS, {"case-1": _decide("case-1", "Alô?")})
+
+    assert [cue.plain_text for cue in cues] == ["Realizem seus desejos", "no.", "Alô?", "Quem está falando agora?"]
+    assert _near(cues[1].start_ms, 1.68) and _near(cues[2].start_ms, 15.90)
+    kinds = _kinds(flags)
+    assert kinds.count("text_changed") == 1 and kinds.count("adlib_inserted") == 1
+    assert "timing_outlier_trimmed" not in kinds and not [flag for flag in flags if flag["severity"] == "error"]
+
+
+def test_far_word_directly_before_the_next_line_still_joins_that_line(tmp_path):
+    # ep17 case-99: 'de vez' was not spoken; "E" is spoken 4 s later, 80 ms
+    # before the next cue's words.
+    srt = (
+        "1\n00:00:07,670 --> 00:00:09,240\neu vou estar ferrada de vez.\n\n"
+        "2\n00:00:12,950 --> 00:00:14,950\nSe não for só eu a vítima,\n"
+    )
+    words = [
+        ("eu", 8.00, 8.10), ("vou", 8.12, 8.24), ("estar", 8.26, 8.50), ("ferrada.", 8.52, 8.92),
+        ("E", 13.04, 13.12),
+        ("se", 13.20, 13.30), ("não", 13.32, 13.50), ("for", 13.52, 13.70), ("só", 13.72, 13.84), ("eu", 13.86, 13.96),
+        ("a", 13.98, 14.02), ("vítima,", 14.06, 14.60),
+    ]
+
+    cues, _ = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "E")})
+
+    assert [cue.plain_text for cue in cues] == ["eu vou estar ferrada.", "E Se não for só eu a vítima,"]
+    assert _near(cues[0].end_ms, 8.96) and _near(cues[1].start_ms, 13.04)
+
+
+def test_far_wording_with_other_words_than_the_audio_is_not_placed(tmp_path):
+    # The approved text keeps a source word: it is not the far speech alone.
+    cues, flags = _sync(tmp_path, _NEW_YEAR_SRT, _ONLY_FAR_WORDS, {"case-1": _decide("case-1", "Natal, alô?", "hybrid")})
+
+    assert [cue.plain_text for cue in cues][1] in {"no Natal, alô?", "no Natal."}
+    assert "adlib_inserted" not in _kinds(flags)
+
+
+def test_single_far_word_does_not_time_the_kept_cue(tmp_path):
+    # ep17 cue 140: 'Vou voltar primeiro.' is kept; the case's only ASR word is
+    # "Ah!" 5.3 s later. It was assigned to the cue and reported as a trimmed outlier.
+    srt = (
+        "1\n00:00:05,110 --> 00:00:05,870\nVou voltar primeiro.\n\n"
+        "2\n00:00:13,000 --> 00:00:14,000\nAté amanhã então.\n"
+    )
+    words = [
+        ("Vou", 5.255, 5.379), ("voltar.", 5.480, 5.715), ("Ah!", 11.245, 11.435),
+        ("Até", 13.00, 13.20), ("amanhã", 13.22, 13.60), ("então.", 13.62, 13.95),
+    ]
+
+    cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "primeiro", "keep_srt")})
+
+    assert [cue.plain_text for cue in cues] == ["Vou voltar primeiro.", "Até amanhã então."]
+    assert _near(cues[0].start_ms, 5.255) and cues[0].end_ms < 7000
+    assert "timing_outlier_trimmed" not in _kinds(flags)
+
+
 def test_span_without_a_large_gap_is_left_alone():
     near = _span(asr_text="ano novo.", asr_word_indices=[4, 5], end=2.48)
     alignment, decisions, flags = _separate(near, "ano novo.")
