@@ -13,6 +13,7 @@ from .adjudication_regions import (
     JOINT_REGION_PREFIX,
     PROTECTED_SOURCE_PREFIX,
     SPEECH_REPEAT_PREFIX,
+    is_song_caption_cue,
     join_isolated_anchor_regions,
     split_protected_source_repetitions,
 )
@@ -61,7 +62,6 @@ TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
 MISSING_AUDIO_GUARD_VERSION = 7
-SONG_MARKERS = "♪♫"
 # The lyric part of a span that pooled unheard song lines with dialogue.
 SONG_SOURCE_PREFIX = "song-source-"
 _DERIVED_CASE_PREFIXES = (JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_SOURCE_PREFIX)
@@ -1346,7 +1346,7 @@ def _absorbed_cue_words(ops: list[_Op], tokens: list[SRTToken]) -> list[tuple[in
 
 
 def _is_song_lyric_cue(cue: Cue) -> bool:
-    return any(marker in cue.text for marker in SONG_MARKERS)
+    return is_song_caption_cue(cue)
 
 
 def _sparsely_matched_cue_ids(ops: list[_Op], tokens: list[SRTToken], cue_ids: set[int]) -> set[int]:

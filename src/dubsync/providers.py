@@ -265,10 +265,20 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
                 })
             if item_type != "word" or not text:
                 continue
+            try:
+                start = float(_field(item, "start"))
+                end = float(_field(item, "end"))
+            except (TypeError, ValueError, OverflowError):
+                # Missing timestamps are provider failures, not zero-time
+                # words. Never retry a successfully billed response here.
+                raise ProviderError(
+                    "ElevenLabs Scribe returned missing or invalid word timing.",
+                    code="invalid_response",
+                ) from None
             word = Word(
                 text=str(text),
-                start=float(_field(item, "start", 0.0)),
-                end=float(_field(item, "end", 0.0)),
+                start=start,
+                end=end,
                 confidence=float(_field(item, "confidence", 1.0)),
                 speaker_id=_field(item, "speaker_id", None),
             )
@@ -574,7 +584,10 @@ def adapter_from_config(
     fixture_path = asr_config.get("fixture_path")
     if fixture_path:
         return FixtureASRAdapter(Path(str(fixture_path)))
-    provider = str(asr_config.get("provider", "elevenlabs")).strip().lower()
+    # model_id is the legacy Scribe setting: retain that explicit selection
+    # while making providerless shared settings use the product's MAI default.
+    default_provider = "elevenlabs" if "model_id" in asr_config else "openrouter"
+    provider = str(asr_config.get("provider", default_provider)).strip().lower()
     if provider in {"openrouter", MAI_TRANSCRIBE_MODEL}:
         from .mai_transcribe import MAITranscribeAdapter
 
@@ -716,11 +729,19 @@ def _configured_asr_language(asr_config: dict[str, object]) -> str | None:
 def apply_transcription_provider_config(config: dict[str, object], provider: str) -> dict[str, object]:
     normalized = provider.strip().lower()
     if normalized in {"", "default"}:
-        # An explicitly configured ASR section is used as is; only a missing
-        # one falls back to the default model (never to a different model).
+        # Keep explicit provider/model choices, and resolve a providerless
+        # section before cache identity and cost labels are read by callers.
         next_config = deepcopy(config)
         if not next_config.get("asr"):
             next_config["asr"] = {"provider": "openrouter", "model": MAI_TRANSCRIBE_MODEL}
+        else:
+            asr_config = next_config["asr"]
+            if isinstance(asr_config, dict) and "provider" not in asr_config and not asr_config.get("fixture_path"):
+                if "model_id" in asr_config:
+                    asr_config["provider"] = "elevenlabs"
+                else:
+                    asr_config["provider"] = "openrouter"
+                    asr_config.setdefault("model", MAI_TRANSCRIBE_MODEL)
         return next_config
     if normalized == GEMINI_TRANSCRIBE_MODEL:
         raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)

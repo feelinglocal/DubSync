@@ -171,11 +171,12 @@ def refine_cues_to_speech_activity(
         if alignment is not None
         else set()
     ) | (protected_cue_ids or set())
-    dialogue_cues = [
-        cue
-        for cue in cues
-        if cue.index not in protected and not is_bracketed_screen_text_cue(cue)
-    ]
+    # Acoustic retiming can put dialogue before a source-held cue that was
+    # earlier in the script. Caps follow playback order, not source order.
+    dialogue_cues = sorted(
+        (cue for cue in cues if not is_bracketed_screen_text_cue(cue)),
+        key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
+    )
     refined: list[Cue] = []
     flags: list[QCFlag] = []
     word_repair_flags: list[QCFlag] = []
@@ -204,8 +205,9 @@ def refine_cues_to_speech_activity(
     word_starts = sorted(word.start for word in words) if words else []
 
     for index, cue in enumerate(dialogue_cues):
-        # Accepted per-cue alignment remains a neighbor cap but is not retimed.
-        if cue.index in (fixed_cue_ids or set()):
+        # Held dialogue and accepted per-cue alignment remain neighbor caps,
+        # but their own timing is preserved.
+        if cue.index in protected or cue.index in (fixed_cue_ids or set()):
             refined.append(cue)
             continue
         word_window = _word_window_for_cue(

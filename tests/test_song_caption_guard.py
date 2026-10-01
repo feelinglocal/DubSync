@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import yaml
 
 from dubsync import pipeline
@@ -197,6 +198,44 @@ def test_song_caption_absent_from_the_voice_track_has_one_informational_note(tmp
     caption_flags = [flag for flag in flags if 2 in flag["cue_ids"]]
     assert [(flag["kind"], flag["severity"]) for flag in caption_flags] == [("song_lyric_source_kept", "info")]
     assert not any(flag["severity"] == "error" for flag in flags)
+
+
+@pytest.mark.parametrize("first,second", [
+    ("♪ Seu riso, sua bondade", "seu beijo, sua crença ♪"),
+    ("♪ Seu riso, sua bondade", "♪ Seu beijo, sua crença"),
+    ("Seu riso, sua bondade ♫", "Seu beijo, sua crença ♫"),
+])
+def test_partial_song_marks_keep_each_caption_with_one_note(tmp_path, first, second):
+    srt = (
+        "1\n00:00:01,000 --> 00:00:02,000\nVamos lá agora.\n\n"
+        f"2\n00:00:05,000 --> 00:00:06,000\n{first}\n\n"
+        f"3\n00:00:06,200 --> 00:00:09,000\n{second}\n\n"
+        "4\n00:00:12,000 --> 00:00:13,500\nJá está melhor agora?\n"
+    )
+    words = [word for word in _episode_words(("x", 0.0, 0.1)) if word["text"] != "x"]
+    cues, flags = _sync(tmp_path, srt, words, {})
+    assert [(cue.plain_text, cue.start_ms, cue.end_ms) for cue in cues[1:3]] == [
+        (first, 5000, 6000), (second, 6200, 9000),
+    ]
+    assert [(flag["kind"], flag["severity"], flag["cue_ids"]) for flag in flags
+            if set(flag["cue_ids"]) & {2, 3}] == [
+        ("song_lyric_source_kept", "info", [2]),
+        ("song_lyric_source_kept", "info", [3]),
+    ]
+    assert not any(flag["severity"] == "error" for flag in flags)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("♪ first line", True), ("last line ♪", True), ("♫ Whole caption ♫", True),
+    ("♪♪", False), ("[♪ Music ♪]", False),
+    ("He sings ♪ a song ♪", False), ("♪ a song ♪ she said.", False),
+])
+def test_aligner_and_pipeline_share_song_caption_detection(text, expected):
+    from dubsync.aligner import _is_song_lyric_cue
+
+    cue = Cue(index=1, start_ms=0, end_ms=1000, lines=[text])
+    assert is_song_caption_cue(cue) is expected
+    assert _is_song_lyric_cue(cue) is expected
 
 
 def test_silence_findings_on_a_noted_song_caption_are_not_repeated():

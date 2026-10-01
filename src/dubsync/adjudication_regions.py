@@ -22,10 +22,18 @@ def is_joint_region(span: DivergenceSpan) -> bool:
 
 
 def is_song_caption_cue(cue: Cue) -> bool:
-    """A cue that is a song caption as a whole, not dialogue quoting a song."""
+    """A whole song caption, including a single opening or closing note.
+
+    A caption may continue across cues with a note only on its outer edge.
+    Paired notes embedded in dialogue do not make the whole cue a lyric.
+    """
     text = cue.plain_text.strip()
+    marks = sum(character in _SONG_MARKS for character in text)
     return (
-        len(text) > 2 and text[0] in _SONG_MARKS and text[-1] in _SONG_MARKS
+        bool(text) and (
+            text[0] in _SONG_MARKS and text[-1] in _SONG_MARKS
+            or marks == 1 and (text[0] in _SONG_MARKS or text[-1] in _SONG_MARKS)
+        )
         and not cue_has_bracketed_screen_text(cue)
         and bool(alphanumeric_signature(text))
     )

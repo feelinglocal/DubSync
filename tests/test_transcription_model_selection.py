@@ -28,7 +28,6 @@ def test_factory_and_language_compose_for_explicit_mai(language, monkeypatch):
 @pytest.mark.parametrize("language", ["auto", "de", "pt"])
 def test_unconfigured_default_uses_mai_with_language(language, monkeypatch):
     from dubsync.mai_transcribe import MAITranscribeAdapter
-    from dubsync.providers import ElevenLabsScribeAdapter
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     config = apply_transcription_provider_config({}, "default")
@@ -38,9 +37,8 @@ def test_unconfigured_default_uses_mai_with_language(language, monkeypatch):
     assert adapter.diarize is True
     assert adapter.language_code == (None if language == "auto" else language)
     assert "language_code" not in config["asr"]
-    # The raw factory keeps its legacy fallback for an asr section without a
-    # provider; the default model is chosen by apply_transcription_provider_config.
-    assert isinstance(adapter_from_config({}), ElevenLabsScribeAdapter)
+    # Direct factory calls and the application selection path share the default.
+    assert isinstance(adapter_from_config({}), MAITranscribeAdapter)
 
 
 def test_default_selection_never_switches_an_explicitly_configured_model():

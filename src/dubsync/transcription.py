@@ -4,7 +4,7 @@ from math import isfinite
 from pathlib import Path
 
 from .audio import AudioNormalizationLimits, normalize_audio
-from .asr_timing import clamp_asr_word_durations
+from .asr_timing import phrase_edge_snap_from_config, repair_asr_word_edges
 from .cache import JsonDiskCache, write_json_atomic, write_text_atomic
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
@@ -192,11 +192,16 @@ def generate_srt_from_audio(
     timing_config = provider_config.get("timing", {})
     if not isinstance(timing_config, dict):
         raise ValueError("providers.yaml timing section must be a mapping")
-    words, word_clamp_flags = clamp_asr_word_durations(
+    words, word_clamp_flags = repair_asr_word_edges(
         words,
         speech_regions,
         max_word_duration=_positive_float(timing_config, "max_word_duration", 2.0),
         max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
+        snap=phrase_edge_snap_from_config(
+            provider_config,
+            model,
+            default_end_extension=boundary_refinement.max_end_extension_ms / 1000.0,
+        ),
     )
     flags.extend(word_clamp_flags)
 
