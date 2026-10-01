@@ -461,3 +461,54 @@ def test_refinement_uses_the_configured_intra_cue_gap_like_rebuild():
 
     assert configured.max_intra_cue_gap_ms == 2000
     assert refined[0].start_ms == 1000
+
+
+# --- Task 5: the cue ends with the burst that holds its last word -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("burst_end", "expected_speech_end_ms"),
+    [
+        (1.42, 1420),  # the ASR word runs 80 ms past the voice (typical MAI end)
+        (1.62, 1620),  # the voice runs 120 ms past the ASR word (typical Scribe end)
+        (2.40, 1500),  # 0.9 s more sound in the burst is not this word
+    ],
+)
+def test_cue_end_is_the_offset_of_the_burst_holding_its_last_word(burst_end, expected_speech_end_ms):
+    cue = Cue(index=1, start_ms=1000, end_ms=2500, lines=["Oi."])
+    profile = StyleProfile(fps=30, min_cue_dur=0.1)
+
+    refined, _ = refine_cues_to_speech_activity(
+        [cue], [SpeechRegion(start=1.0, end=burst_end)], profile,
+        words=_words(("Oi.", 1.0, 1.5)), alignment=AlignmentResult(cue_word_indices={1: [0]}),
+    )
+
+    assert refined[0].start_ms == 1000
+    assert refined[0].end_ms == profile.snap_ceil(expected_speech_end_ms + 40)
+
+
+def test_cue_end_is_not_extended_over_another_speakers_word_in_the_same_burst():
+    # The old rule padded to the region end whenever it was within 300 ms.
+    cue = Cue(index=1, start_ms=1000, end_ms=1866, lines=["Uau, que lindo!"])
+    words = _words(("Uau,", 1.05, 1.3), ("que", 1.35, 1.5), ("lindo!", 1.55, 1.8), ("Outra", 1.85, 2.05))
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue], [SpeechRegion(start=1.0, end=2.05)], StyleProfile(fps=30, min_cue_dur=0.5),
+        words=words, alignment=AlignmentResult(cue_word_indices={1: [0, 1, 2]}),
+    )
+
+    assert refined == [cue]
+    assert flags == []
+
+
+def test_separate_breath_burst_after_the_last_word_does_not_extend_the_cue():
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+    cue = Cue(index=1, start_ms=1000, end_ms=profile.snap_ceil(1540), lines=["Oi."])
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue], [SpeechRegion(start=1.0, end=1.5), SpeechRegion(start=1.6, end=1.9)], profile,
+        words=_words(("Oi.", 1.0, 1.5)), alignment=AlignmentResult(cue_word_indices={1: [0]}),
+    )
+
+    assert refined == [cue]
+    assert not any(flag.kind == "timing_refined" for flag in flags)

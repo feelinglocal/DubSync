@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -16,6 +17,10 @@ from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
 from .vad import SpeechActivityAdapter
+
+
+# Another word may begin this close to a burst offset without sharing the burst.
+_SHARED_BURST_TOLERANCE_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -172,6 +177,7 @@ def refine_cues_to_speech_activity(
             flag for flag in word_repair_flags if (flag.start, flag.end) in retained_repairs
         ]
     region_index = SpeechRegionIndex(regions)
+    word_starts = sorted(word.start for word in words) if words else []
 
     for index, cue in enumerate(dialogue_cues):
         # Accepted per-cue alignment remains a neighbor cap but is not retimed.
@@ -196,27 +202,32 @@ def refine_cues_to_speech_activity(
 
         start_region, end_region = cue_regions
         start_ms = _refined_start_ms(cue, start_region, profile, options)
-        end_ms = (
-            _word_refined_end_ms(cue, end_region, word_window, profile, options)
+        last_word_is_outlier = word_window is not None and _is_word_duration_outlier(word_window[-1], options)
+        # The cue's own voice ends with the burst that holds its last word.
+        acoustic_end = (
+            _acoustic_end_seconds(word_window[-1], end_region, options, word_starts)
             if word_window is not None
-            else _refined_end_ms(cue, end_region, profile, options)
+            else end_region.end
         )
+        if word_window is None:
+            end_ms = _refined_end_ms(cue, end_region, profile, options)
+        elif last_word_is_outlier:
+            end_ms = profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms)
+        else:
+            end_ms = _word_refined_end_ms(cue, acoustic_end, profile, options)
         end_cap_ms = None
         if index + 1 < len(dialogue_cues):
             # The following cue can limit display padding, but cannot erase
             # speech from a simultaneous speaker or collapse an inverted source
             # cue to zero length. Output policy handles real overlaps separately.
             acoustic_floor_ms = min(cue.end_ms, end_ms)
-            if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
-                acoustic_floor_ms = profile.snap_ceil(word_window[-1].end * 1000)
+            if word_window is not None and not last_word_is_outlier:
+                acoustic_floor_ms = profile.snap_ceil(acoustic_end * 1000)
             end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
         # Minimum display duration cannot add a silence tail beyond the
         # acoustic endpoint. Preserve already accepted short tails, but do not
         # manufacture more silence merely to reach the readability floor.
-        acoustic_end = end_region.end
-        if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
-            acoustic_end = min(acoustic_end, word_window[-1].end)
         duration_extension_cap = max(
             end_ms,
             profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms),
@@ -400,31 +411,46 @@ def _refined_end_ms(
     return cue.end_ms
 
 
+def _acoustic_end_seconds(
+    last_word: Word,
+    last_region: SpeechRegion,
+    config: BoundaryRefinementConfig,
+    word_starts: list[float],
+) -> float:
+    """Where the cue's own voice stops: the offset of the burst holding its last word.
+
+    A word that runs past its burst ends with the burst. A burst that runs
+    past the word is the same voice only while it is short and no other word
+    begins inside it; a longer or shared burst is another sound, and a later
+    separate burst (a breath) is never considered.
+    """
+    if _is_word_duration_outlier(last_word, config):
+        return last_region.end
+    if last_region.end <= last_word.start:
+        return last_word.end
+    if last_word.end >= last_region.end:
+        return last_region.end
+    following = bisect_right(word_starts, last_word.start)
+    next_word_start = word_starts[following] if following < len(word_starts) else float("inf")
+    if (
+        (last_region.end - last_word.end) * 1000 <= config.max_end_extension_ms
+        and next_word_start >= last_region.end - _SHARED_BURST_TOLERANCE_SECONDS
+    ):
+        return last_region.end
+    return last_word.end
+
+
 def _word_refined_end_ms(
     cue: Cue,
-    last_region: SpeechRegion,
-    word_window: list[Word],
+    acoustic_end_seconds: float,
     profile: StyleProfile,
     config: BoundaryRefinementConfig,
 ) -> int:
-    last_word = word_window[-1]
-    speech_end_ms = int(last_region.end * 1000)
-    padded_region_end_ms = profile.snap_ceil(speech_end_ms + config.end_pad_ms)
-
-    if _is_word_duration_outlier(last_word, config):
-        return padded_region_end_ms
-
-    word_end_ms = profile.snap_ceil(last_word.end * 1000 + config.end_pad_ms)
-    if cue.end_ms < word_end_ms:
-        return word_end_ms
-
-    region_tail_ms = padded_region_end_ms - word_end_ms
-    if cue.end_ms < padded_region_end_ms and region_tail_ms <= config.max_trailing_silence_ms:
-        return padded_region_end_ms
-
-    if cue.end_ms - word_end_ms > config.max_trailing_silence_ms:
-        # VAD can remain active for another speaker or background sound. Its
-        # envelope cannot extend this cue beyond its own last reliable word.
-        return word_end_ms
-
+    speech_end_ms = profile.snap_ceil(acoustic_end_seconds * 1000 + config.end_pad_ms)
+    if cue.end_ms < speech_end_ms:
+        return speech_end_ms
+    if cue.end_ms - speech_end_ms > config.max_trailing_silence_ms:
+        # Display time far beyond the cue's own voice is an ASR overrun or
+        # padding; another speaker or sound in the tail cannot keep it.
+        return speech_end_ms
     return cue.end_ms
