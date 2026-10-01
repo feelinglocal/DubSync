@@ -65,9 +65,8 @@ forced_alignment:
 
 vad:
   provider: energy
-  threshold_dbfs: -45.0
-  window_ms: 100
-  min_region_ms: 100
+  # Thresholds adapt to each file. Setting threshold_dbfs / window_ms /
+  # min_region_ms selects the fixed-threshold detector instead.
   min_coverage: 0.2
 
 generation:
