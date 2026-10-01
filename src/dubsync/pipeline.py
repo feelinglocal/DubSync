@@ -1735,6 +1735,7 @@ def _run_verify_stage(
                     alignment.unmatched_cue_ids,
                     speech_regions,
                     min_coverage,
+                    cue_word_indices=alignment.cue_word_indices,
                 )
             )
     rebuilt, missing_audio_restore_flags = _restore_missing_audio_source_cues(

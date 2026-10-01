@@ -42,12 +42,18 @@ class PhraseEdgeSnap:
 NO_PHRASE_EDGE_SNAP = PhraseEdgeSnap(start_advance=0.0, end_extension=0.0)
 
 
-def phrase_edge_snap_from_config(provider_config: dict[str, object], asr_model: str | None = None) -> PhraseEdgeSnap:
+def phrase_edge_snap_from_config(
+    provider_config: dict[str, object],
+    asr_model: str | None = None,
+    *,
+    default_end_extension: float | None = None,
+) -> PhraseEdgeSnap:
     """Read ``timing.phrase_edge_snap``; ``models.<asr model id>`` entries override the shared limits."""
+    defaults = PhraseEdgeSnap() if default_end_extension is None else PhraseEdgeSnap(end_extension=default_end_extension)
     timing_config = provider_config.get("timing", {}) if isinstance(provider_config, dict) else {}
     options = timing_config.get("phrase_edge_snap") if isinstance(timing_config, dict) else None
     if options is None:
-        return PhraseEdgeSnap()
+        return defaults
     if options is False:
         return NO_PHRASE_EDGE_SNAP
     if not isinstance(options, dict):
@@ -58,7 +64,6 @@ def phrase_edge_snap_from_config(provider_config: dict[str, object], asr_model: 
         raise ValueError("timing.phrase_edge_snap.models must be a mapping")
     if models and asr_model is not None and isinstance(models.get(asr_model), dict):
         merged.update(models[asr_model])
-    defaults = PhraseEdgeSnap()
     return PhraseEdgeSnap(
         start_advance=_snap_seconds(merged, "start_advance_ms", defaults.start_advance),
         end_extension=_snap_seconds(merged, "end_extension_ms", defaults.end_extension),

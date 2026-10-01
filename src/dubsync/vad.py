@@ -364,8 +364,19 @@ def dropped_line_flags_for_unmatched_cues(
     unmatched_cue_ids: list[int],
     regions: list[SpeechRegion],
     min_coverage: float = 0.2,
+    *,
+    cue_word_indices: dict[int, list[int]] | None = None,
 ) -> list[QCFlag]:
-    unmatched = set(unmatched_cue_ids)
+    """Flag unmatched source cues that sit on silence.
+
+    ``unmatched_cue_ids`` is the aligner's list. A cue that received ASR words
+    afterwards (``cue_word_indices``) was spoken somewhere else than its source
+    time and is not a dropped line.
+    """
+    unmatched = {
+        cue_id for cue_id in unmatched_cue_ids
+        if not (cue_word_indices or {}).get(cue_id)
+    }
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
     for cue in cues:

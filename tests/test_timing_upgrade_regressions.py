@@ -27,6 +27,7 @@ from dubsync.timing_refinement import (
 from dubsync.vad import (
     EnergySpeechActivityAdapter,
     cue_ids_with_audible_words,
+    dropped_line_flags_for_unmatched_cues,
     speech_activity_adapter_from_config,
     speech_activity_flags_for_cues,
     trailing_silence_flags_for_cues,
@@ -628,6 +629,21 @@ def test_readability_tail_of_a_short_cue_is_not_reported_as_silence_or_missing_s
     assert [flag.cue_ids for flag in activity] == [[2], [3]]
 
 
+def test_source_cue_that_received_words_later_is_not_a_dropped_line():
+    # The aligner listed both cues as unmatched; adjudication then gave cue 2
+    # its spoken words, so only cue 1 can be a line the actor dropped.
+    source = [
+        Cue(index=1, start_ms=1000, end_ms=2000, lines=["Dropped line."]),
+        Cue(index=2, start_ms=3000, end_ms=4000, lines=["Spoken elsewhere."]),
+    ]
+
+    flags = dropped_line_flags_for_unmatched_cues(
+        source, [1, 2], [SpeechRegion(start=6.0, end=7.0)], cue_word_indices={2: [4, 5]},
+    )
+
+    assert [flag.cue_ids for flag in flags] == [[1]]
+
+
 # --- Task 7: no overlapping cues except simultaneous speech --------------------------------------
 
 
@@ -685,6 +701,29 @@ def test_overlap_flags_ignore_screen_text_and_see_past_the_list_neighbour():
     _, flags = apply_overlap_policy(cues, policy="stack")
 
     assert [flag.cue_ids for flag in flags] == [[1, 3], [1, 4]]
+
+
+def test_refinement_keeps_the_boundary_rebuild_chose_for_words_less_than_a_frame_apart():
+    # Rebuild ends the first cue at the next start; refinement used to push the
+    # end one frame back over the next cue and report timing_refined for it.
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+    words = _words(
+        ("trazer", 422.0, 422.5), ("de", 422.562, 422.592), ("Paris", 422.642, 422.872),
+        ("e", 422.892, 422.95), ("aceitei.", 423.0, 423.6),
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [0, 1, 2], 2: [3, 4]})
+    cues = [
+        Cue(index=1, start_ms=422_000, end_ms=423_000, lines=["trazer de Paris"]),
+        Cue(index=2, start_ms=423_000, end_ms=424_000, lines=["e aceitei."]),
+    ]
+    regions = [SpeechRegion(start=422.0, end=423.6)]
+
+    rebuilt, _ = rebuild_cues(cues, words, alignment, profile)
+    refined, flags = refine_cues_to_speech_activity(rebuilt, regions, profile, words=words, alignment=alignment)
+
+    assert rebuilt[0].end_ms == rebuilt[1].start_ms == profile.snap_floor(422_892)
+    assert refined == rebuilt
+    assert flags == []
 
 
 def _finalize(cues, *, protected=(), spans):

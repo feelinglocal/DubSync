@@ -118,12 +118,19 @@ def speech_evidence_for_words(
     if adapter is None:
         return SpeechEvidence(words=words)
     regions = adapter.detect(audio_path)
+    boundary = boundary_refinement_config_from_config(provider_config)
     repaired, word_flags = repair_asr_word_edges(
         words,
         regions,
         max_word_duration=max_word_duration,
-        max_region_overrun=boundary_refinement_config_from_config(provider_config).max_trailing_silence_ms / 1000.0,
-        snap=phrase_edge_snap_from_config(provider_config, asr_model_from_artifact(asr_artifact_path)),
+        max_region_overrun=boundary.max_trailing_silence_ms / 1000.0,
+        snap=phrase_edge_snap_from_config(
+            provider_config,
+            asr_model_from_artifact(asr_artifact_path),
+            # Refinement follows a burst past the last word by the same limit;
+            # a different word-level limit would only make the stages disagree.
+            default_end_extension=boundary.max_end_extension_ms / 1000.0,
+        ),
     )
     return SpeechEvidence(
         words=repaired,
@@ -237,10 +244,15 @@ def refine_cues_to_speech_activity(
             # The following cue can limit display padding, but cannot erase
             # speech from a simultaneous speaker or collapse an inverted source
             # cue to zero length. Output policy handles real overlaps separately.
+            next_start_ms = dialogue_cues[index + 1].start_ms
             acoustic_floor_ms = min(cue.end_ms, end_ms)
             if word_window is not None and not last_word_is_outlier:
                 acoustic_floor_ms = profile.snap_ceil(acoustic_end * 1000)
-            end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
+                if next_start_ms > start_ms and next_start_ms >= acoustic_end * 1000 - profile.frame_ms:
+                    # Words less than a frame apart share the next start as
+                    # their boundary, exactly as rebuild decided.
+                    acoustic_floor_ms = min(acoustic_floor_ms, next_start_ms)
+            end_cap_ms = max(next_start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
         speech_end_ms = profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms)
         minimum_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
