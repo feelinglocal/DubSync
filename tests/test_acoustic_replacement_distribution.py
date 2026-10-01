@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import yaml
 
 from dubsync import pipeline
@@ -124,6 +125,83 @@ def test_connector_exactly_at_the_attach_gap_joins_the_line_it_introduces(tmp_pa
     assert [cue.plain_text for cue in cues] == ["Você é muito cuidadosa.", "E Qual é o seu plano?"]
     assert _near(cues[1].start_ms, 234.56)
     assert "adlib_inserted" not in [flag["kind"] for flag in flags]
+
+
+def _case353():
+    cues = [
+        Cue(index=881, start_ms=2_731_990, end_ms=2_734_110, lines=["para dar uma animada na casa hoje à noite."]),
+        Cue(index=882, start_ms=2_735_240, end_ms=2_736_760, lines=["Acabei de aprender pelo celular"]),
+        Cue(index=883, start_ms=2_736_840, end_ms=2_738_920, lines=["como fazer arroz frito com ovo."]),
+    ]
+    words = [Word(text=text, start=start, end=end, confidence=None) for text, start, end in [
+        ("em", 2733.76, 2733.84), ("casa.", 2733.92, 2734.24), ("Eu", 2735.28, 2735.42), ("aprendi", 2735.52, 2735.92),
+        ("pela", 2736.00, 2736.16), ("internet", 2736.24, 2736.72), ("a", 2737.00, 2737.06),
+    ]]
+    span = DivergenceSpan(
+        case_id="case-353", cue_ids=[882, 883], srt_text="Acabei de aprender pelo celular como",
+        asr_text="em casa. Eu aprendi pela internet a", srt_token_indices=[9, 10, 11, 12, 13, 14],
+        asr_word_indices=[0, 1, 2, 3, 4, 5, 6], start=2733.76, end=2737.06,
+        left_anchor_cue_id=881, right_anchor_cue_id=883, left_anchor_end=2733.70, right_anchor_start=2737.159,
+    )
+    return cues, words, span
+
+
+def test_phrase_spoken_with_the_previous_cue_before_a_pause_ends_that_cue():
+    # ep11 cues 881-883: "em casa." follows "noite" by 60 ms and precedes a
+    # 1.04 s pause, yet it opened the next cue, shown 1.5 s before its sentence.
+    cues, words, span = _case353()
+    ownership: dict[int, list[int]] = {}
+
+    edits = indexed_multi_cue_replacements(
+        cues, span, "em casa. Eu aprendi pela internet a", words=words, ownership=ownership,
+    )
+
+    assert edits == {
+        881: (9, 9, "em casa."), 882: (0, 5, "Eu aprendi pela internet"), 883: (0, 1, "a"),
+    }
+    assert ownership in ({}, {881: [0, 1], 882: [2, 3, 4, 5], 883: [6]})
+
+
+@pytest.mark.parametrize("change", ["no_pause", "far_from_previous", "long_phrase", "other_speaker"])
+def test_leading_phrase_stays_in_its_case_without_clear_evidence(change):
+    cues, words, span = _case353()
+    if change == "no_pause":
+        words[2:] = [word.model_copy(update={"start": word.start - 0.6, "end": word.end - 0.6}) for word in words[2:]]
+    elif change == "far_from_previous":
+        span = span.model_copy(update={"left_anchor_end": 2733.30})
+    elif change == "long_phrase":
+        words[0] = words[0].model_copy(update={"text": "lá em nossa"})
+        span = span.model_copy(update={"asr_text": "lá em nossa casa. Eu aprendi pela internet a"})
+    else:
+        words[:2] = [word.model_copy(update={"speaker_id": "speaker_2"}) for word in words[:2]]
+        span = span.model_copy(update={"left_anchor_speaker_id": "speaker_4"})
+
+    edits = indexed_multi_cue_replacements(cues, span, span.asr_text, words=words)
+
+    assert edits is not None and 881 not in edits
+
+
+def test_sentence_continued_into_the_previous_cue_moves_its_full_stop(tmp_path):
+    srt = (
+        "1\n00:00:01,990 --> 00:00:04,110\npara dar uma animada hoje à noite.\n\n"
+        "2\n00:00:05,240 --> 00:00:06,760\nAcabei de aprender pelo celular\n\n"
+        "3\n00:00:06,840 --> 00:00:08,920\ncomo fazer arroz frito com ovo.\n"
+    )
+    words = [
+        ("para", 2.23, 2.40), ("dar", 2.42, 2.56), ("uma", 2.58, 2.70), ("animada", 2.72, 3.10),
+        ("hoje", 3.14, 3.30), ("à", 3.32, 3.36), ("noite", 3.38, 3.70),
+        ("em", 3.76, 3.84), ("casa.", 3.92, 4.24), ("Eu", 5.28, 5.42), ("aprendi", 5.52, 5.92),
+        ("pela", 6.00, 6.16), ("internet", 6.24, 6.72), ("a", 7.00, 7.06),
+        ("fazer", 7.16, 7.40), ("arroz", 7.44, 7.80), ("frito", 7.84, 8.10), ("com", 8.14, 8.26), ("ovo.", 8.30, 8.80),
+    ]
+
+    cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "em casa. Eu aprendi pela internet a")})
+
+    assert [cue.plain_text for cue in cues] == [
+        "para dar uma animada hoje à noite em casa.", "Eu aprendi pela internet", "a fazer arroz frito com ovo.",
+    ]
+    assert _near(cues[0].end_ms, 4.28) and _near(cues[1].start_ms, 5.28)
+    assert not [flag for flag in flags if flag["severity"] == "error"]
 
 
 def _case114():
