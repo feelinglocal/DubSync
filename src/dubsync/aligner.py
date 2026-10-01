@@ -77,6 +77,8 @@ COMPOUND_MATCH_SCORE = 0.99
 UNTIMED_PUNCTUATION_SECONDS = 0.020
 # Provider words of one phrase may overlap by a few tens of milliseconds.
 OMISSION_WORD_OVERLAP_SECONDS = 0.05
+# Two copies of one re-decoded word follow each other this closely.
+REPEATED_WORD_GAP_SECONDS = 0.1
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 # ``compound`` pairs a token of a concatenation-equal group with the provider
 # word it starts in; ``absorb`` hands a further word of that group to the cue.
@@ -1049,6 +1051,61 @@ def _compound_group_member_ops(
     return ops
 
 
+def _absorb_touching_repeats(
+    ops: list[_Op],
+    words: list[Word],
+    words_norm: list[str],
+) -> list[_Op]:
+    """Give a word re-decoded twice back to the cue that owns its twin.
+
+    MAI sometimes emits one utterance as two touching copies ("7," 1932.20 and
+    "7," 1932.40). The cue matches one copy; the other used to open its own
+    insertion case and cut the cue's start. A pure-insertion word that touches
+    an exactly matched word with the same key joins that word's cue.
+    """
+
+    matched = {
+        op.asr_index: op
+        for op in ops
+        if op.kind == "match" and op.srt_index is not None and op.asr_index is not None
+    }
+    if not matched:
+        return ops
+    absorbed: list[_Op] = []
+    for position, op in enumerate(ops):
+        if op.kind != "insert" or op.asr_index is None or not words_norm[op.asr_index]:
+            absorbed.append(op)
+            continue
+        pure = all(
+            ops[index].kind in {"insert", *_ANCHOR_OP_KINDS}
+            for index in range(max(0, position - 1), min(len(ops), position + 2))
+        )
+        twin = next(
+            (
+                matched[neighbor]
+                for neighbor in (op.asr_index + 1, op.asr_index - 1)
+                if neighbor in matched
+                and words_norm[neighbor] == words_norm[op.asr_index]
+                and _words_touch(words[min(neighbor, op.asr_index)], words[max(neighbor, op.asr_index)])
+            ),
+            None,
+        )
+        if pure and twin is not None:
+            absorbed.append(_Op("absorb", twin.srt_index, op.asr_index, 0.0))
+        else:
+            absorbed.append(op)
+    return absorbed
+
+
+def _words_touch(left: Word, right: Word) -> bool:
+    # Comparison units of one provider word share its envelope; they are not copies.
+    return (
+        (left.start, left.end) != (right.start, right.end)
+        and math.isfinite(left.end) and math.isfinite(right.start)
+        and -IMPLAUSIBLE_MATCHED_WORD_SECONDS < right.start - left.end <= REPEATED_WORD_GAP_SECONDS
+    )
+
+
 def _is_eligible_compound_spelling(spelled: str) -> bool:
     # The same letters spelled open, hyphenated or closed are the same speech
     # (Ano-Novo / Ano Novo, Ehefrau / Ehe Frau, zu Hause / Zuhause, Se não /
@@ -1125,6 +1182,7 @@ def _align_cues_to_units(
             unit_word_indices=unit_word_indices,
             atomic_word_indices=atomic_word_indices,
         )
+        ops = _absorb_touching_repeats(ops, words, words_norm)
     song_cue_ids = {cue.index for cue in cues if _is_song_lyric_cue(cue)}
     if song_cue_ids:
         # A lyric line is only timed by its words when the song itself was

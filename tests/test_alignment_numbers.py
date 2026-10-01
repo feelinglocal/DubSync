@@ -86,6 +86,39 @@ def test_words_the_language_keeps_distinct_stay_reviewable(source, spoken, srt_t
     assert (span.srt_text, span.asr_text) == (srt_text, asr_text)
 
 
+def test_countdown_with_re_decoded_digit_copies_keeps_each_cue_whole():
+    # MAI ep11: "Dez. / Nove. / Oito." heard as "10, 10, 9, 9, 8, 8," with touching copies.
+    cues = [
+        Cue(index=1, start_ms=1_000, end_ms=1_900, lines=["Dez."]),
+        Cue(index=2, start_ms=2_000, end_ms=2_900, lines=["Nove."]),
+        Cue(index=3, start_ms=3_000, end_ms=3_900, lines=["Oito."]),
+    ]
+    words = [
+        Word(text="10,", start=1.00, end=1.18), Word(text="10,", start=1.20, end=1.70),
+        Word(text="9,", start=2.00, end=2.18), Word(text="9,", start=2.20, end=2.70),
+        Word(text="8,", start=3.00, end=3.18), Word(text="8.", start=3.20, end=3.70),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.divergence_spans == []
+    assert result.cue_word_indices == {1: [0, 1], 2: [2, 3], 3: [4, 5]}
+
+
+def test_repetition_after_a_pause_stays_reviewable():
+    cues = [Cue(index=1, start_ms=1_000, end_ms=3_000, lines=["Não, eu vou."])]
+    words = [
+        Word(text="Não,", start=1.0, end=1.2), Word(text="não,", start=1.6, end=1.8),
+        Word(text="eu", start=1.9, end=2.0), Word(text="vou.", start=2.05, end=2.4),
+    ]
+
+    result = align_cues_to_words(cues, words)
+
+    span, = result.divergence_spans
+    assert span.srt_text == "" and normalize_token(span.asr_text) == normalize_token("não")
+    assert len(span.asr_word_indices) == 1
+
+
 def test_article_inflections_share_a_key_that_is_not_a_number():
     keys = {normalize_token(article) for article in ("ein", "eine", "einen", "einem", "einer", "eines")}
 
