@@ -29,7 +29,7 @@ from dubsync.pipeline import (
     _speaker_mapping_cache_key,
 )
 from dubsync.providers import ProviderError
-from dubsync.srt_io import parse_srt_text
+from dubsync.srt_io import format_timestamp, parse_srt_text
 from dubsync.text_metrics import display_width
 from dubsync.tokenize import alphanumeric_signature
 
@@ -2601,6 +2601,18 @@ def test_cli_sync_adlib_inserted_between_cues_exports_sequential_srt_indices(tmp
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
     assert [cue.plain_text for cue in synced] == ["hello there", "surprise line", "goodbye now"]
     assert [cue.index for cue in synced] == [1, 2, 3]
+
+    # QC must point at the delivered numbering: the ad-lib's internal id (3) is
+    # delivered as SRT #2, while SRT #3 is the script's "goodbye now".
+    report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
+    adlib_flag = next(flag for flag in report["flags"] if flag["kind"] == "adlib_inserted")
+    added = next(change for change in report["changes"] if change["change"] == "added")
+    assert adlib_flag["cue_ids"] == [3]
+    assert (added["srt_number"], added["cue_id"], added["new_text"]) == (2, 3, "surprise line")
+    assert added["timecode"] == format_timestamp(synced[1].start_ms)
+    for item in [*report["review"], *report["changes"]]:
+        numbers = item.get("srt_numbers") or ([item["srt_number"]] if item.get("srt_number") else [])
+        assert all(synced[number - 1].index == number for number in numbers)
 
 
 def test_cli_sync_removes_generated_adlib_without_speech_activity(tmp_path):

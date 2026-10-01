@@ -1820,6 +1820,7 @@ def _run_verify_stage(
                 source_cue_count=_spoken_source_cue_count(source_cues),
             ),
         },
+        source_cues=source_cues,
     )
     _write_json(
         episode_workdir / "verify.json",

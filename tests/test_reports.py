@@ -6,7 +6,7 @@ import pytest
 
 from dubsync.models import Cue, QCFlag, StyleIssue
 from dubsync.reports import write_changes_diff, write_qc_report
-from dubsync.srt_io import parse_srt_text
+from dubsync.srt_io import parse_srt_text, write_srt
 
 
 def test_qc_report_groups_counts_and_sorts_by_severity(tmp_path):
@@ -64,6 +64,52 @@ def test_qc_report_sorts_same_severity_flags_by_start_then_cue_id(tmp_path):
         "early_warning",
         "late_warning",
     ]
+
+
+def test_qc_report_keeps_raw_findings_and_adds_customer_sections(tmp_path):
+    source = [
+        Cue(index=33, start_ms=10_000, end_ms=11_000, lines=["Primeiro."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo."]),
+    ]
+    delivered = [
+        source[0],
+        Cue(index=940, start_ms=11_200, end_ms=11_600, lines=["Ei."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo!"]),
+    ]
+    flags = [
+        QCFlag(kind="timing_evidence_held", cue_ids=[34], severity="error", message="Sparse timing.",
+               start=12.0, end=13.0),
+        QCFlag(kind="adlib_inserted", cue_ids=[940], message="Adjudication verdict use_audio: [hybrid:primary] Ei.",
+               new_text="Ei.", start=11.2, end=11.6),
+        QCFlag(kind="text_changed", cue_ids=[34], message="Adjudication verdict use_audio: [hybrid:fallback] Shout.",
+               old_text="Segundo.", new_text="Segundo!", start=12.0, end=12.5),
+        QCFlag(kind="asr_word_clamped", message="ASR word endpoint clamped."),
+    ]
+
+    payload = write_qc_report(
+        tmp_path / "qc.json", tmp_path / "qc.html", delivered, flags, [],
+        summary_metadata={"fps_detection_confident": False}, source_cues=source,
+    )
+
+    stored = json.loads((tmp_path / "qc.json").read_text(encoding="utf-8"))
+    assert stored == payload
+    assert len(payload["flags"]) == 4
+    assert [item["kind"] for item in payload["review"]] == ["timing_evidence_held"]
+    # Delivered numbering: internal cue 34 is SRT #3 because the ad-lib was inserted before it.
+    delivered_srt = parse_srt_text(write_srt(delivered, renumber=True))
+    review_item = payload["review"][0]
+    assert review_item["srt_numbers"] == [3]
+    assert review_item["cue_ids"] == [34]
+    assert delivered_srt[2].plain_text == review_item["text"] == "Segundo!"
+    assert [(change["srt_number"], change["change"]) for change in payload["changes"]] == [(2, "added"), (3, "edited")]
+    assert [item["kind"] for item in payload["diagnostics"]] == ["asr_word_clamped"]
+    summary = payload["summary"]
+    assert summary["verdict"] == "attention"
+    assert (summary["review_item_count"], summary["review_error_count"], summary["change_count"]) == (1, 1, 2)
+    assert summary["error_count"] == 1 and summary["flags"] == 4
+    covered = {index for section in ("review", "changes", "notes", "diagnostics")
+               for item in payload[section] for index in item["raw_flags"]}
+    assert covered == {0, 1, 2, 3}
 
 
 @pytest.mark.parametrize("start,end", [(None, None), (2.0, 2.0), (1491.8, 1490.666)])

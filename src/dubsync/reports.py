@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .cache import write_json_atomic, write_text_atomic
 from .models import Cue, CueScore, QCFlag, StyleIssue
+from .qc_review import build_review
 from .srt_io import format_timestamp, write_srt
 
 
@@ -18,10 +19,26 @@ def write_qc_report(
     style_issues: list[StyleIssue],
     cue_scores: list[CueScore] | None = None,
     summary_metadata: Mapping[str, object] | None = None,
+    *,
+    source_cues: list[Cue] | None = None,
 ) -> dict[str, object]:
+    """Write the QC report for ``cues``, the delivered list in SRT order.
+
+    ``flags`` and ``style_issues`` stay verbatim (raw findings for operators and
+    tests); ``review``/``changes``/``notes``/``diagnostics`` are the customer view
+    from ``qc_review``, numbered like the delivered (renumbered) SRT.
+    """
+
     ordered_flags = _sorted_flags(flags, cues)
     ordered_issues = _sorted_style_issues(style_issues)
     all_findings = [*ordered_flags, *ordered_issues]
+    review = build_review(
+        ordered_flags,
+        ordered_issues,
+        cues,
+        source_cues=source_cues,
+        summary_metadata=summary_metadata,
+    )
     summary: dict[str, object] = {
         **dict(summary_metadata or {}),
         "cue_count": len(cues),
@@ -32,9 +49,15 @@ def write_qc_report(
         "error_count": sum(1 for item in all_findings if item.severity == "error"),
         "warning_count": sum(1 for item in all_findings if item.severity == "warning"),
         "info_count": sum(1 for item in all_findings if item.severity == "info"),
+        "verdict": review.verdict,
+        **review.counts,
     }
     payload: dict[str, object] = {
         "summary": summary,
+        "review": [item.model_dump() for item in review.review],
+        "changes": [item.model_dump() for item in review.changes],
+        "notes": [item.model_dump() for item in review.notes],
+        "diagnostics": [item.model_dump() for item in review.diagnostics],
         "cue_scores": [score.model_dump() for score in cue_scores or []],
         "flags": [flag.model_dump() for flag in ordered_flags],
         "style_issues": [issue.model_dump() for issue in ordered_issues],
