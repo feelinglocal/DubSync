@@ -57,12 +57,20 @@ def write_qc_report(
         "changes": [item.model_dump() for item in review.changes],
         "notes": [item.model_dump() for item in review.notes],
         "diagnostics": [item.model_dump() for item in review.diagnostics],
-        "cue_scores": [score.model_dump() for score in cue_scores or []],
+        "cue_scores": [_cue_score_payload(score) for score in cue_scores or []],
         "flags": [flag.model_dump() for flag in ordered_flags],
         "style_issues": [issue.model_dump() for issue in ordered_issues],
     }
     write_json_atomic(report_json_path, payload)
     write_text_atomic(report_html_path, _render_html(payload))
+    return payload
+
+
+def _cue_score_payload(score: CueScore) -> dict[str, object]:
+    payload = score.model_dump()
+    if score.source == "unscored":
+        # No evidence: report no number rather than a meaningless 0.0.
+        payload["score"] = None
     return payload
 
 

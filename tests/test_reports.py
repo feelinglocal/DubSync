@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from dubsync.models import Cue, QCFlag, StyleIssue
+from dubsync.models import Cue, CueScore, QCFlag, StyleIssue
 from dubsync.reports import write_change_log, write_changes_diff, write_qc_report
 from dubsync.srt_io import parse_srt_text, write_srt
 
@@ -186,6 +186,29 @@ def test_change_log_lists_only_text_changes_in_playback_order_with_delivered_num
     assert "- Terceiro." in removed.lines
     assert all("timing" not in block.text.lower() for block in blocks)
     assert "[hybrid:" not in destination.read_text(encoding="utf-8")
+
+
+def test_qc_report_shows_cue_scores_only_with_real_evidence(tmp_path):
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1_000, lines=["Olá."]),
+        Cue(index=2, start_ms=2_000, end_ms=3_000, lines=["Tchau."]),
+    ]
+    unscored = [CueScore(cue_id=cue.index, start=cue.start_ms / 1000, end=cue.end_ms / 1000, cps=4.0,
+                         score=0.0, source="unscored") for cue in cues]
+
+    payload = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", cues, [], [], unscored)
+
+    assert [score["score"] for score in payload["cue_scores"]] == [None, None]
+    page = (tmp_path / "qc.html").read_text(encoding="utf-8")
+    assert "<th>Score</th>" not in page
+    assert "0.0" not in page
+
+    scored = [unscored[0].model_copy(update={"score": 0.82, "source": "forced_alignment"}), unscored[1]]
+    payload = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", cues, [], [], scored)
+
+    assert [score["score"] for score in payload["cue_scores"]] == [0.82, None]
+    page = (tmp_path / "qc.html").read_text(encoding="utf-8")
+    assert "<th>Score</th>" in page and "0.82" in page
 
 
 @pytest.mark.parametrize("start,end", [(None, None), (2.0, 2.0), (1491.8, 1490.666)])

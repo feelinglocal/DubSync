@@ -45,6 +45,11 @@ def score_cues(
     forced_by_cue = usable_forced_alignments_by_cue(
         cues, forced_alignments or [], protected_cue_ids=protected
     )
+    # MAI words carry no confidence and Scribe words arrive with a constant
+    # default; a confidence that never varies cannot rank one cue above another.
+    confidence_is_evidence = len({
+        round(word.confidence, 4) for word in words if word.confidence is not None
+    }) > 1
     scores: list[CueScore] = []
 
     for cue in cues:
@@ -74,7 +79,7 @@ def score_cues(
             for word in cue_words
             if word.confidence is not None
         ]
-        if confidences:
+        if confidences and confidence_is_evidence:
             score = sum(confidences) / len(confidences)
             source = "asr_confidence"
         else:
