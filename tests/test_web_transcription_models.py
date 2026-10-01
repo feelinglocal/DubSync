@@ -45,7 +45,7 @@ def test_public_config_reports_model_availability_without_credentials(tmp_path, 
         response = client.get("/api/config")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["default_transcription_provider"] == SCRIBE_MODEL
+    assert payload["default_transcription_provider"] == MAI_MODEL
     assert payload["transcription_models"] == [
         {"id": SCRIBE_MODEL, "label": "Scribe v2", "available": configured},
         {"id": MAI_MODEL, "label": "MAI-Transcribe 2", "available": configured},
@@ -127,7 +127,8 @@ def test_model_choice_reaches_every_job_and_survives_status_reads(tmp_path, endp
     files = [("audio", (f"{stem}.wav", b"audio", "audio/wav")) for stem in stems]
     if mode == "sync":
         files.extend(("subtitle", (f"{stem}.srt", SRT_BYTES, "application/x-subrip")) for stem in stems)
-    expected = MAI_MODEL if selection == MAI_MODEL else SCRIBE_MODEL
+    # A missing or 'default' selection records the current default model (MAI) on the job.
+    expected = SCRIBE_MODEL if selection == SCRIBE_MODEL else MAI_MODEL
     with TestClient(app) as client:
         response = client.post(endpoint, data=data, files=files)
         assert response.status_code == 202, response.text
@@ -173,8 +174,8 @@ def test_worker_rejects_unknown_persisted_model_before_processing(tmp_path, monk
         default_processor(_record(tmp_path, transcription_provider="untrusted-model"), _settings(tmp_path))
 
 
-def test_new_job_records_default_to_scribe(tmp_path):
-    assert _record(tmp_path).transcription_provider == SCRIBE_MODEL
+def test_new_job_records_default_to_mai(tmp_path):
+    assert _record(tmp_path).transcription_provider == MAI_MODEL
 
 
 def test_reopening_job_store_preserves_explicit_mai_choice(tmp_path):

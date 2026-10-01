@@ -716,9 +716,11 @@ def _configured_asr_language(asr_config: dict[str, object]) -> str | None:
 def apply_transcription_provider_config(config: dict[str, object], provider: str) -> dict[str, object]:
     normalized = provider.strip().lower()
     if normalized in {"", "default"}:
+        # An explicitly configured ASR section is used as is; only a missing
+        # one falls back to the default model (never to a different model).
         next_config = deepcopy(config)
         if not next_config.get("asr"):
-            next_config["asr"] = {"provider": "elevenlabs", "model_id": SCRIBE_TRANSCRIBE_MODEL}
+            next_config["asr"] = {"provider": "openrouter", "model": MAI_TRANSCRIBE_MODEL}
         return next_config
     if normalized == GEMINI_TRANSCRIBE_MODEL:
         raise ProviderError(GEMINI_TRANSCRIBE_DISABLED_MESSAGE)

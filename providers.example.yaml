@@ -1,10 +1,13 @@
 asr:
-  provider: elevenlabs
-  model_id: scribe_v2
-  # ELEVENLABS_API_KEY is read from the environment.
-  # Optional alternative: provider: openrouter, model: microsoft/mai-transcribe-2
-  # MAI uses OPENROUTER_API_KEY and remains available in the web model picker.
+  provider: openrouter
+  model: microsoft/mai-transcribe-2
+  # OPENROUTER_API_KEY is read from the environment.
+  # Optional alternative: provider: elevenlabs, model_id: scribe_v2
+  # Scribe uses ELEVENLABS_API_KEY and remains available in the web model picker.
   diarize: true
+  # MAI requests are sent in 300 s chunks; each chunk is retried at most three
+  # times and, if diarization keeps timing out, once without diarization.
+  # timeout_seconds: 90
 
 llm:
   provider: openai

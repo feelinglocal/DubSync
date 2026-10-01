@@ -98,7 +98,7 @@ describe('shared components', () => {
     rerender(<LegalPage kind="privacy" />)
     expect(screen.getByRole('heading', { name: 'Privacy Policy' })).toBeVisible()
     expect(screen.getByRole('heading', { name: /Service providers/ })).toBeVisible()
-    expect(screen.getByText(/ElevenLabs Scribe v2 by default/)).toBeVisible()
+    expect(screen.getByText(/Microsoft MAI-Transcribe 2 through OpenRouter by default/)).toBeVisible()
     expect(screen.getByText(/Google Gemini for audio-aware adjudication and bounded punctuation/)).toBeVisible()
     expect(screen.getByText(/OpenAI for speaker mapping/)).toBeVisible()
     rerender(<LegalPage kind="payments" />)

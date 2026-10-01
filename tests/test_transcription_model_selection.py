@@ -26,18 +26,39 @@ def test_factory_and_language_compose_for_explicit_mai(language, monkeypatch):
 
 
 @pytest.mark.parametrize("language", ["auto", "de", "pt"])
-def test_unconfigured_default_uses_scribe_with_language(language, monkeypatch):
+def test_unconfigured_default_uses_mai_with_language(language, monkeypatch):
+    from dubsync.mai_transcribe import MAITranscribeAdapter
     from dubsync.providers import ElevenLabsScribeAdapter
 
-    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     config = apply_transcription_provider_config({}, "default")
     adapter = adapter_from_config(apply_asr_language(config, language))
-    assert isinstance(adapter, ElevenLabsScribeAdapter)
-    assert adapter.model_id == "scribe_v2"
+    assert isinstance(adapter, MAITranscribeAdapter)
+    assert adapter.model == MAI
     assert adapter.diarize is True
     assert adapter.language_code == (None if language == "auto" else language)
     assert "language_code" not in config["asr"]
+    # The raw factory keeps its legacy fallback for an asr section without a
+    # provider; the default model is chosen by apply_transcription_provider_config.
     assert isinstance(adapter_from_config({}), ElevenLabsScribeAdapter)
+
+
+def test_default_selection_never_switches_an_explicitly_configured_model():
+    scribe = {"asr": {"provider": "elevenlabs", "model_id": "scribe_v2", "diarize": True}}
+    assert apply_transcription_provider_config(scribe, "default") == scribe
+    assert apply_transcription_provider_config(scribe, "")["asr"]["provider"] == "elevenlabs"
+
+
+def test_missing_default_model_key_fails_instead_of_falling_back(monkeypatch, tmp_path):
+    from dubsync.mai_transcribe import MAITranscribeAdapter
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "available-but-not-selected")
+    adapter = adapter_from_config(apply_transcription_provider_config({}, "default"))
+    assert isinstance(adapter, MAITranscribeAdapter)
+    with pytest.raises(ProviderError) as caught:
+        adapter.transcribe(tmp_path / "missing.wav")
+    assert caught.value.code == "configuration"
 
 
 @pytest.mark.parametrize("language,expected", [
@@ -150,8 +171,8 @@ def test_model_switch_preserves_other_passes_but_not_other_provider_secrets():
     assert original == snapshot
 
 
-def test_scribe_is_default_and_explicit_selection_removes_mai_credentials():
-    assert apply_transcription_provider_config({}, "default")["asr"] == {"provider": "elevenlabs", "model_id": "scribe_v2"}
+def test_mai_is_default_and_explicit_scribe_selection_removes_mai_credentials():
+    assert apply_transcription_provider_config({}, "default")["asr"] == {"provider": "openrouter", "model": MAI}
     selected = apply_transcription_provider_config({"asr": {"provider": "openrouter", "api_key": "private", "chunk_seconds": 60}}, "scribe_v2")
     assert selected["asr"] == {"provider": "elevenlabs", "model_id": "scribe_v2"}
     assert asr_dollars_per_hour("openrouter", {"model": MAI}) == 0.1

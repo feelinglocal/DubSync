@@ -99,8 +99,10 @@ def test_provider_example_includes_documented_adjudication_confidence_gate():
     config = yaml.safe_load(Path("providers.example.yaml").read_text(encoding="utf-8"))
     example_text = Path("providers.example.yaml").read_text(encoding="utf-8")
 
-    assert config["asr"]["provider"] == "elevenlabs"
-    assert config["asr"]["model_id"] == "scribe_v2"
+    assert config["asr"]["provider"] == "openrouter"
+    assert config["asr"]["model"] == "microsoft/mai-transcribe-2"
+    assert "ELEVENLABS_API_KEY" in example_text
+    assert "OPENROUTER_API_KEY" in example_text
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["confidence_gate"] == 0.7
@@ -133,6 +135,8 @@ def test_docs_retire_gemini_transcribe_and_keep_elevenlabs_asr():
 
     assert "Gemini 3.5 Transcribe ASR is disabled" in readme
     assert "ElevenLabs Scribe v2" in readme
+    assert "Microsoft MAI-Transcribe 2 via OpenRouter is the default cloud ASR" in readme
+    assert "ElevenLabs Scribe v2 remains selectable" in readme
     assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING" not in readme
     assert "DUBSYNC_ENABLE_GEMINI_TRANSCRIBE_WEB_TESTING" not in env_example
     assert "provider: gemini_transcribe" not in example_text
@@ -146,8 +150,9 @@ def test_docs_retire_gemini_transcribe_and_keep_elevenlabs_asr():
 def test_production_llm_passes_use_requested_models_and_thinking_levels():
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
 
-    assert config["asr"]["provider"] == "elevenlabs"
-    assert config["asr"]["model_id"] == "scribe_v2"
+    assert config["asr"]["provider"] == "openrouter"
+    assert config["asr"]["model"] == "microsoft/mai-transcribe-2"
+    assert config["asr"]["diarize"] is True
     assert config["llm"]["provider"] == "openai"
     assert config["llm"]["model"] == "gpt-5.6-luna"
     assert config["llm"]["adjudication"]["provider"] == "gemini"
@@ -182,7 +187,7 @@ def test_commercial_runbook_names_current_models_and_provider_secrets():
 
     assert "Gemini 3.5 Flash-Lite adjudication (high thinking)" in commercial_plan
     assert "Gemini 3.7 Flash punctuation (medium thinking)" in commercial_plan
-    assert "Scribe v2 is the default transcription option; MAI remains selectable" in commercial_plan
+    assert "MAI-Transcribe 2 is the default transcription option for new jobs; Scribe v2 remains selectable" in commercial_plan
     assert "OpenAI GPT-5.6 Luna speaker-mapping pass" in commercial_plan
     assert "`OPENAI_API_KEY`" in commercial_plan
     assert "`GEMINI_API_KEY`" in commercial_plan
