@@ -11,6 +11,11 @@ from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import token_texts
 
 TOKEN_RE = re.compile(r"[\w\u3099\u309a]+", re.UNICODE)
+_STUTTER_SPLIT_RE = re.compile("[-\u2011]")
+# ``1.000`` / ``1,000`` group thousands; ``2,5`` / ``2.5`` are one decimal.
+_GROUPED_NUMBER_RE = re.compile(r"\d{1,3}(?:[.,]\d{3})+")
+_DECIMAL_NUMBER_RE = re.compile(r"\d+[.,]\d+")
+_NUMBER_EDGE_PUNCTUATION = " .,;:!?\u2026\"'()[]\u00ab\u00bb\u201c\u201d\u201e\u2018\u2019"
 _NUMBER_WORDS = {
     "zero": "0",
     "null": "0",
@@ -126,12 +131,36 @@ def normalize_token(value: str) -> str:
     profanity = normalize_german_profanity_token(value)
     if profanity is not None:
         return profanity
-    value = _fold_latin_number_text(unicodedata.normalize("NFKC", value).lower())
+    value = _without_glued_stutter(_fold_latin_number_text(unicodedata.normalize("NFKC", value).lower()))
     if value in _NUMBER_WORDS:
         return _NUMBER_WORDS[value]
+    number = value.strip(_NUMBER_EDGE_PUNCTUATION)
+    if _GROUPED_NUMBER_RE.fullmatch(number):
+        return number.replace(".", "").replace(",", "")
+    if _DECIMAL_NUMBER_RE.fullmatch(number):
+        return number.replace(",", ".")
     parts = TOKEN_RE.findall(value)
     normalized = "".join(_NUMBER_WORDS.get(part, part) for part in parts)
     return _NUMBER_WORDS.get(normalized, normalized)
+
+
+def _without_glued_stutter(value: str) -> str:
+    """Key a glued stutter (``N-não``, ``De-deixa``, ``eu-eu``) like its word.
+
+    Only hyphen-joined fragments that repeat the start of the final word (up to
+    three letters) or the whole word count; ordinary compounds keep every part.
+    """
+    segments = _STUTTER_SPLIT_RE.split(value)
+    if len(segments) < 2:
+        return value
+    keys = ["".join(TOKEN_RE.findall(segment)) for segment in segments]
+    word = keys[-1]
+    if not word.isalpha() or not all(
+        key and (key == word or (len(key) <= 3 and len(key) < len(word) and word.startswith(key)))
+        for key in keys[:-1]
+    ):
+        return value
+    return segments[-1]
 
 
 def _fold_latin_number_text(value: str) -> str:

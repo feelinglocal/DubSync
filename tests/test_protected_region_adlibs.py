@@ -50,8 +50,10 @@ def test_extra_complete_greeting_is_separate_from_later_protected_lyrics():
 
     alignment = align_cues_to_words(cues, words)
 
+    # "bem-sucedida" heard as "bem sucedida." is the same speech written
+    # without the hyphen; it is no longer an ordinary review case.
     assert [span.case_id for span in alignment.divergence_spans] == [
-        "protected-source-case-1", "speech-repeat-case-1", "case-2",
+        "protected-source-case-1", "speech-repeat-case-1",
     ]
     source, speech = alignment.divergence_spans[:2]
     assert source.cue_ids == [733, 734, 735]
@@ -65,7 +67,7 @@ def test_extra_complete_greeting_is_separate_from_later_protected_lyrics():
     assert (speech.left_anchor_cue_id, speech.right_anchor_cue_id) == (732, 737)
     assert (speech.left_anchor_end, speech.right_anchor_start) == (words[6].end, words[10].start)
     assert speech.insertion_token_offset is None
-    assert alignment.cue_word_indices == {730: [0], 731: [1, 2, 3], 732: [4, 5, 6], 737: [10]}
+    assert alignment.cue_word_indices == {730: [0], 731: [1, 2, 3], 732: [4, 5, 6], 737: [10, 11, 12]}
     assert alignment.diagnostics.excluded_screen_text_cue_ids == [736]
     assert [cue.model_dump() for cue in cues] == original
 
@@ -175,7 +177,7 @@ def test_ambiguous_or_incomplete_evidence_keeps_original_replacement(problem, mo
     elif problem == "wrong_right_anchor":
         span = span.model_copy(update={"right_anchor_cue_id": 736})
     elif problem == "missing_right_anchor":
-        matches.pop()
+        matches = [match for match in matches if match.asr_word_index != 10]
     elif problem == "nonconsecutive_words":
         span = span.model_copy(update={"asr_word_indices": [7, 9]})
     elif problem == "wrong_span_text":
@@ -301,6 +303,8 @@ class RecordingAdapter:
 
 def test_only_the_derived_speech_case_requires_audio_and_missing_audio_cannot_autoapprove():
     cues, words = actual_third_greeting()
+    # An ordinary substitution next to the protected region.
+    cues[7] = cues[7].with_lines(["Verificação concluída."])
     alignment = align_cues_to_words(cues, words)
     speech, ordinary = alignment.divergence_spans[1:]
     adapter = RecordingAdapter()

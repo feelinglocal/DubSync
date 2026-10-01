@@ -81,6 +81,7 @@ def token_texts(text: str) -> list[str]:
             or char == "_"
             or _is_inner_mask(char, buffer, normalized_text, index)
             or _is_inner_hyphen(char, buffer, normalized_text, index)
+            or _is_inner_number_separator(char, buffer, normalized_text, index)
         ):
             buffer.append(char)
         else:
@@ -126,6 +127,18 @@ def _is_unspaced_script(char: str) -> bool:
 
 def _is_inner_hyphen(char: str, buffer: list[str], text: str, index: int) -> bool:
     return char in {"-", "\u2011"} and bool(buffer) and index + 1 < len(text) and text[index + 1].isalnum()
+
+
+def _is_inner_number_separator(char: str, buffer: list[str], text: str, index: int) -> bool:
+    """Keep ``1.000`` and ``2,5`` whole, like a speaker says them."""
+    return (
+        char in {".", ","}
+        and bool(buffer)
+        and buffer[-1].isdigit()
+        and index + 1 < len(text)
+        and text[index + 1].isdigit()
+        and all(part.isdigit() or part in {".", ","} for part in buffer)
+    )
 
 
 def _is_inner_mask(char: str, buffer: list[str], text: str, index: int) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from statistics import median
@@ -46,7 +47,19 @@ TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
 MISSING_AUDIO_GUARD_VERSION = 6
+# Concatenation-equal groups (``Ano-Novo`` / ``Ano Novo``) of at most this many
+# tokens or words per side, spelling at least this many characters.
+COMPOUND_MAX_PARTS = 3
+COMPOUND_MIN_CHARACTERS = 4
+COMPOUND_MAX_RUN_CELLS = 20_000
+# Below 1.0 so literal-only repairs never mistake a compound for an exact word.
+COMPOUND_MATCH_SCORE = 0.99
+UNTIMED_PUNCTUATION_SECONDS = 0.020
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
+# ``compound`` pairs a token of a concatenation-equal group with the provider
+# word it starts in; ``absorb`` hands a further word of that group to the cue.
+_MATCH_OP_KINDS = frozenset({"match", "compound"})
+_ANCHOR_OP_KINDS = frozenset({"match", "compound", "absorb"})
 
 @dataclass(frozen=True)
 class _Op:
@@ -571,7 +584,7 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         asr_indices.clear()
 
     for op in ops:
-        if op.kind == "match":
+        if op.kind in _ANCHOR_OP_KINDS:
             flush(op)
             previous_match = op
             continue
@@ -626,32 +639,68 @@ def _build_anchor_regions(
     return regions
 
 
-def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int]]:
-    """Compare unspaced scripts in shared units, retaining provider word ownership.
+def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int], frozenset[int]]:
+    """Compare provider words in the units used for source tokens.
 
-    Unit timestamps are the complete original word envelope. They are never
-    interpolated into invented character timestamps or persisted as ASR words.
+    Source text is split on apostrophes, ``%``, ``:``, ``/`` and spaces, and
+    unspaced scripts per character; a provider word such as ``geht's``,
+    ``J'ai``, ``10%`` or ``8:30`` is split the same way. Unit timestamps are
+    the complete original word envelope. They are never interpolated into
+    invented character timestamps or persisted as ASR words. The returned set
+    names spaced-script words that must stay atomic: a partly matched one is
+    reviewed whole instead of being cut between a cue and a span.
     """
     units: list[Word] = []
     word_indices: list[int] = []
+    atomic_word_indices: set[int] = set()
     for index, word in enumerate(words):
         if word.start == word.end and not normalize_token(word.text) and word.text.strip() and all(
             char.isspace() or char in "、。！？「」『』【】〈〉《》（）｢｣｡､･"
             for char in word.text
         ):
             continue
+        # French-style spaced "!" / "?" arrive as untimed punctuation words;
+        # they carry no speech and must not open an insertion review case.
+        if word.end - word.start <= UNTIMED_PUNCTUATION_SECONDS and word.text.strip() and all(
+            char.isspace() or unicodedata.category(char).startswith("P") for char in word.text
+        ) and not normalize_token(word.text):
+            continue
         parts = token_texts(word.text)
         if any(contains_character_level_script(part) for part in parts):
             units.extend(word.model_copy(update={"text": part}) for part in parts)
             word_indices.extend([index] * len(parts))
+            continue
+        spoken_parts = [part for part in parts if normalize_token(part)]
+        if len(spoken_parts) > 1:
+            units.extend(word.model_copy(update={"text": part}) for part in spoken_parts)
+            word_indices.extend([index] * len(spoken_parts))
+            atomic_word_indices.add(index)
         else:
             units.append(word)
             word_indices.append(index)
-    return units, word_indices
+    return units, word_indices, frozenset(atomic_word_indices)
 
 def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
-    units, original_indices = _alignment_word_units(words)
-    result = _align_cues_to_units(cues, units)
+    units, original_indices, atomic_word_indices = _alignment_word_units(words)
+    result = _align_cues_to_units(
+        cues,
+        units,
+        unit_word_indices=original_indices if atomic_word_indices else None,
+        atomic_word_indices=atomic_word_indices,
+    )
+
+    def provider_text(unit_indices: list[int], unit_text: str) -> str:
+        # Split spaced-script words are reviewed whole, so their spans show the
+        # provider spelling (``geht's``) instead of the comparison units.
+        word_ids = sorted({original_indices[index] for index in unit_indices})
+        if not word_ids or not atomic_word_indices.intersection(word_ids):
+            return unit_text
+        unit_counts = Counter(original_indices[index] for index in set(unit_indices))
+        if any(unit_counts[word_id] != original_counts[word_id] for word_id in word_ids):
+            return unit_text
+        return join_word_texts(words[word_id].text for word_id in word_ids)
+
+    original_counts = Counter(original_indices)
     # All public ownership references address original provider words. Unit
     # timestamps never escape as invented character-level acoustic evidence.
     return result.model_copy(update={
@@ -659,14 +708,228 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
                           for match in result.token_matches],
         "cue_word_indices": {cue_id: sorted({original_indices[index] for index in indices})
                              for cue_id, indices in result.cue_word_indices.items()},
-        "divergence_spans": [span.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in span.asr_word_indices})})
+        "divergence_spans": [span.model_copy(update={
+                                 "asr_word_indices": sorted({original_indices[index] for index in span.asr_word_indices}),
+                                 "asr_text": provider_text(span.asr_word_indices, span.asr_text),
+                             })
                              for span in result.divergence_spans],
-        "anchor_regions": [region.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in region.asr_word_indices})})
+        "anchor_regions": [region.model_copy(update={
+                               "asr_word_indices": sorted({original_indices[index] for index in region.asr_word_indices}),
+                               "asr_text": provider_text(region.asr_word_indices, region.asr_text),
+                           })
                            for region in result.anchor_regions],
     })
 
 
-def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
+def _atomic_provider_word_ops(
+    ops: list[_Op],
+    unit_word_indices: list[int],
+    atomic_word_indices: frozenset[int],
+) -> list[_Op]:
+    """Review a split provider word whole when only some of its units matched."""
+
+    unit_counts = Counter(
+        unit_word_indices[index]
+        for index, word_index in enumerate(unit_word_indices)
+        if word_index in atomic_word_indices
+    )
+    matched_counts = Counter(
+        unit_word_indices[op.asr_index]
+        for op in ops
+        if op.kind == "match" and op.asr_index is not None
+        and unit_word_indices[op.asr_index] in atomic_word_indices
+    )
+    partial = {word_index for word_index, count in matched_counts.items() if count != unit_counts[word_index]}
+    if not partial:
+        return ops
+    demoted: list[_Op] = []
+    for op in ops:
+        if op.kind == "match" and op.asr_index is not None and unit_word_indices[op.asr_index] in partial:
+            demoted.extend([_Op("delete", op.srt_index, None, 0.0), _Op("insert", None, op.asr_index, 0.0)])
+            continue
+        demoted.append(op)
+    return demoted
+
+
+def _compound_group_ops(
+    ops: list[_Op],
+    tokens: list[SRTToken],
+    words: list[Word],
+    words_norm: list[str],
+    *,
+    unit_word_indices: list[int] | None = None,
+    atomic_word_indices: frozenset[int] = frozenset(),
+) -> list[_Op]:
+    """Pair concatenation-equal token and word groups inside divergence runs.
+
+    ``Ano-Novo`` spoken as ``Ano Novo`` (or ``Drachen Evolutionssystem`` heard
+    as ``Drachen-Evolutionssystem``) is the same speech written another way;
+    it must not become a review case or leave the cue without its words. The
+    group stays within one cue, so every grouped word has one owner.
+    """
+
+    result: list[_Op] = []
+    run: list[_Op] = []
+
+    def flush() -> None:
+        result.extend(_compound_run_ops(
+            run, tokens, words, words_norm,
+            unit_word_indices=unit_word_indices, atomic_word_indices=atomic_word_indices,
+        ) if run else ())
+        run.clear()
+
+    for op in ops:
+        if op.kind in _ANCHOR_OP_KINDS:
+            flush()
+            result.append(op)
+        else:
+            run.append(op)
+    flush()
+    return result
+
+
+def _compound_run_ops(
+    run: list[_Op],
+    tokens: list[SRTToken],
+    words: list[Word],
+    words_norm: list[str],
+    *,
+    unit_word_indices: list[int] | None,
+    atomic_word_indices: frozenset[int],
+) -> list[_Op]:
+    source = [op.srt_index for op in run if op.srt_index is not None]
+    audio = [op.asr_index for op in run if op.asr_index is not None]
+    if (
+        not source or not audio or len(source) + len(audio) < 3
+        or len(source) * len(audio) > COMPOUND_MAX_RUN_CELLS
+    ):
+        return run
+
+    def splits_provider_word(first: int, last: int) -> bool:
+        if unit_word_indices is None:
+            return False
+        return any(
+            unit_word_indices[inner] in atomic_word_indices
+            and 0 <= outer < len(unit_word_indices)
+            and unit_word_indices[outer] == unit_word_indices[inner]
+            for inner, outer in ((first, first - 1), (last, last + 1))
+        )
+
+    def group_at(source_position: int, audio_position: int) -> tuple[int, int] | None:
+        if tokens[source[source_position]].normalized[:1] != words_norm[audio[audio_position]][:1]:
+            return None
+        sizes = sorted(
+            (
+                (token_count, word_count)
+                for token_count in range(1, COMPOUND_MAX_PARTS + 1)
+                for word_count in range(1, COMPOUND_MAX_PARTS + 1)
+                if token_count + word_count > 2
+                and source_position + token_count <= len(source)
+                and audio_position + word_count <= len(audio)
+            ),
+            key=lambda size: -(size[0] + size[1]),
+        )
+        for token_count, word_count in sizes:
+            group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+            group_words = audio[audio_position : audio_position + word_count]
+            spelled = "".join(token.normalized for token in group_tokens)
+            if (
+                len(spelled) < COMPOUND_MIN_CHARACTERS
+                or spelled != "".join(words_norm[index] for index in group_words)
+                or len({token.cue_id for token in group_tokens}) != 1
+                or splits_provider_word(group_words[0], group_words[-1])
+                or not _is_eligible_compound_group(
+                    [token.text for token in group_tokens],
+                    [words[index].text for index in group_words],
+                )
+            ):
+                continue
+            return token_count, word_count
+        return None
+
+    rebuilt: list[_Op] = []
+    source_cursor = 0
+    audio_cursor = 0
+    grouped = False
+    while source_cursor < len(source) and audio_cursor < len(audio):
+        found = next(
+            (
+                (source_position, audio_position, size)
+                for source_position in range(source_cursor, len(source))
+                for audio_position in range(audio_cursor, len(audio))
+                if (size := group_at(source_position, audio_position)) is not None
+            ),
+            None,
+        )
+        if found is None:
+            break
+        source_position, audio_position, (token_count, word_count) = found
+        grouped = True
+        rebuilt.extend(_Op("delete", index, None, 0.0) for index in source[source_cursor:source_position])
+        rebuilt.extend(_Op("insert", None, index, 0.0) for index in audio[audio_cursor:audio_position])
+        rebuilt.extend(_compound_group_member_ops(
+            source[source_position : source_position + token_count],
+            audio[audio_position : audio_position + word_count],
+            tokens,
+            words_norm,
+        ))
+        source_cursor = source_position + token_count
+        audio_cursor = audio_position + word_count
+    if not grouped:
+        return run
+    rebuilt.extend(_Op("delete", index, None, 0.0) for index in source[source_cursor:])
+    rebuilt.extend(_Op("insert", None, index, 0.0) for index in audio[audio_cursor:])
+    return rebuilt
+
+
+def _compound_group_member_ops(
+    group_tokens: list[int],
+    group_words: list[int],
+    tokens: list[SRTToken],
+    words_norm: list[str],
+) -> list[_Op]:
+    """Give each token the word its spelling starts in; other words are absorbed."""
+
+    def owner(boundaries: list[int], offset: int) -> int:
+        return max(position for position, start in enumerate(boundaries) if start <= offset)
+
+    token_starts: list[int] = []
+    offset = 0
+    for index in group_tokens:
+        token_starts.append(offset)
+        offset += len(tokens[index].normalized)
+    word_starts: list[int] = []
+    offset = 0
+    for index in group_words:
+        word_starts.append(offset)
+        offset += len(words_norm[index])
+    token_words = {
+        token_position: owner(word_starts, start) for token_position, start in enumerate(token_starts)
+    }
+    referenced = set(token_words.values())
+    ops: list[_Op] = []
+    for word_position, word_index in enumerate(group_words):
+        for token_position, owned_word in token_words.items():
+            if owned_word == word_position:
+                ops.append(_Op("compound", group_tokens[token_position], word_index, COMPOUND_MATCH_SCORE))
+        if word_position not in referenced:
+            absorbing = owner(token_starts, word_starts[word_position])
+            ops.append(_Op("absorb", group_tokens[absorbing], word_index, 0.0))
+    return ops
+
+
+def _is_eligible_compound_group(token_texts_: list[str], word_texts: list[str]) -> bool:
+    # A hyphen marks the joined spelling of the same words (``Ano-Novo``).
+    return any("-" in text or "‑" in text for text in (*token_texts_, *word_texts))
+
+
+def _align_cues_to_units(
+    cues: list[Cue],
+    words: list[Word],
+    *,
+    unit_word_indices: list[int] | None = None,
+    atomic_word_indices: frozenset[int] = frozenset(),
+) -> AlignmentResult:
     tokens = tokenize_cues(cues)
     words_norm = normalized_words(words)
     excluded_screen_text_cue_ids = [
@@ -716,6 +979,17 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
                 unresolved = prior_run.unresolved
     if not unresolved:
         ops = _prefer_unique_full_cue_windows(ops, tokens, words_norm)
+    if unit_word_indices is not None and atomic_word_indices:
+        ops = _atomic_provider_word_ops(ops, unit_word_indices, atomic_word_indices)
+    if not unresolved:
+        ops = _compound_group_ops(
+            ops,
+            tokens,
+            words,
+            words_norm,
+            unit_word_indices=unit_word_indices,
+            atomic_word_indices=atomic_word_indices,
+        )
     provisional_matches = _token_matches_from_ops(ops, tokens)
     flags = [
         *_alignment_outlier_flags(provisional_matches, cues, tokens, words),
@@ -729,6 +1003,8 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
     for match in matches:
         cue_word_indices.setdefault(match.cue_id, []).append(match.asr_word_index)
+    for cue_id, word_index in _absorbed_cue_words(ops, tokens):
+        cue_word_indices.setdefault(cue_id, []).append(word_index)
 
     divergence_spans = _source_omissions_with_local_context(
         _build_divergences(ops, tokens, words), matches, cues, tokens, words,
@@ -845,9 +1121,17 @@ def _token_matches_from_ops(
             score=round(op.score, 4),
         )
         for op in ops
-        if op.kind == "match"
+        if op.kind in _MATCH_OP_KINDS
         and op.srt_index is not None
         and op.asr_index is not None
+    ]
+
+
+def _absorbed_cue_words(ops: list[_Op], tokens: list[SRTToken]) -> list[tuple[int, int]]:
+    return [
+        (tokens[op.srt_index].cue_id, op.asr_index)
+        for op in ops
+        if op.kind == "absorb" and op.srt_index is not None and op.asr_index is not None
     ]
 
 
@@ -876,19 +1160,20 @@ def _without_cue_matches(
     cue_ids: set[int],
 ) -> list[_Op]:
     filtered: list[_Op] = []
+    reopened_words: set[int] = set()
     for op in ops:
         if (
-            op.kind == "match"
+            op.kind in _ANCHOR_OP_KINDS
             and op.srt_index is not None
             and op.asr_index is not None
             and tokens[op.srt_index].cue_id in cue_ids
         ):
-            filtered.extend(
-                [
-                    _Op("delete", op.srt_index, None, 0.0),
-                    _Op("insert", None, op.asr_index, 0.0),
-                ]
-            )
+            if op.kind != "absorb":
+                filtered.append(_Op("delete", op.srt_index, None, 0.0))
+            # Tokens of one compound group can share a provider word.
+            if op.asr_index not in reopened_words:
+                reopened_words.add(op.asr_index)
+                filtered.append(_Op("insert", None, op.asr_index, 0.0))
             continue
         filtered.append(op)
     return filtered
@@ -1189,7 +1474,12 @@ def _alignment_outlier_flags(
         cue = cue_by_id.get(cue_id)
         if cue is None:
             continue
-        matched_words = [words[match.asr_word_index] for match in cue_matches]
+        # Comparison units of one provider word share its envelope; the word
+        # is one piece of timing evidence however many units it was split into.
+        matched_words = list({
+            (words[match.asr_word_index].start, words[match.asr_word_index].end): words[match.asr_word_index]
+            for match in cue_matches
+        }.values())
         word_centers = [(word.start + word.end) / 2.0 for word in matched_words]
         word_center = median(word_centers)
         representative_index = min(
@@ -1299,7 +1589,8 @@ def _implausible_matched_word_duration_flags(
 
     flags: list[QCFlag] = []
     for cue_id, cue_matches in matches_by_cue.items():
-        if len(cue_matches) != 1:
+        # Units split from one provider word still make a single matched word.
+        if len({(words[match.asr_word_index].start, words[match.asr_word_index].end) for match in cue_matches}) != 1:
             continue
         cue = cue_by_id.get(cue_id)
         if cue is None:
