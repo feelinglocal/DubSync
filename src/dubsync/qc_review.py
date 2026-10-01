@@ -225,6 +225,11 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     # Operator-only bookkeeping.
     "asr_word_clamped": _diagnostic_kind("ASR word end clamped"),
     "asr_timestamp_rounding_clamped": _diagnostic_kind("ASR timestamp rounding clamped"),
+    "asr_duplicate_words_dropped": _diagnostic_kind("ASR repeated word run dropped"),
+    "asr_doubled_words_collapsed": _diagnostic_kind("ASR doubled countdown words collapsed"),
+    "asr_doubled_word_run_kept": _diagnostic_kind("ASR doubled word run kept"),
+    "asr_invalid_word_dropped": _diagnostic_kind("ASR word with invalid timing dropped"),
+    "asr_diarization_unavailable": _diagnostic_kind("ASR speaker labels unavailable for part of the audio"),
     "word_stream_repaired": _diagnostic_kind("ASR word stream repaired"),
     "asr_audio_provenance_unverified": _diagnostic_kind("ASR checkpoint provenance unverified"),
     "hybrid_adjudication_summary": _diagnostic_kind("AI review routing summary"),
