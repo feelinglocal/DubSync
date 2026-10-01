@@ -406,7 +406,13 @@ def clean_customer_text(text: str | None) -> str | None:
 
     if text is None:
         return None
-    return " ".join(_VERDICT_PREFIX.sub("", _ROUTE_TAG.sub("", text)).split())
+    return " ".join(_VERDICT_PREFIX.sub("", strip_route_tags(text)).split())
+
+
+def strip_route_tags(text: str) -> str:
+    """Remove ``[hybrid:primary]``-style adjudication routing tags."""
+
+    return _ROUTE_TAG.sub("", text)
 
 
 def srt_label(numbers: Sequence[int]) -> str:
