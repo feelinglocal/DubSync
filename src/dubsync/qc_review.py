@@ -451,7 +451,6 @@ class _Bucket:
     raw_flags: list[int] = field(default_factory=list)
     raw_style: list[int] = field(default_factory=list)
     cue_ids: set[int] = field(default_factory=set)
-    values: list[float] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
     severity: str = "info"
 
@@ -596,7 +595,8 @@ class _FindingSorter:
             self._absorb(cue_ids[0], flag=index)
             return
         if spec.category == "change":
-            self._sort_change_flag(index, flag)
+            # Resolved against the delivered cues in _changes().
+            self.change_flags.append(index)
             return
         if spec.category == "note":
             self._note(kind, index, flag)
@@ -642,7 +642,7 @@ class _FindingSorter:
                 or not any(self.tool_timed(cue_id) for cue_id in cue_ids)
                 or all(self.is_screen_text(cue_id) for cue_id in cue_ids)
             ):
-                self._note("fast_reading_speed", index, flag, value=flag.confidence)
+                self._note("fast_reading_speed", index, flag)
                 return
         if kind == "impossible_cps_slow" and not any(self.tool_timed(cue_id) for cue_id in cue_ids):
             self._diagnostic(kind, index, flag)
@@ -744,22 +744,12 @@ class _FindingSorter:
             raw_style=[index],
         ))
 
-    def _note(
-        self,
-        key: str,
-        index: int,
-        flag: QCFlag | None = None,
-        *,
-        issue: StyleIssue | None = None,
-        value: float | None = None,
-    ) -> None:
+    def _note(self, key: str, index: int, flag: QCFlag | None = None, *, issue: StyleIssue | None = None) -> None:
         bucket = self.notes.setdefault(key, _Bucket(key))
         if flag is not None:
             bucket.add_flag(index, flag)
         if issue is not None:
             bucket.add_style(index, issue)
-        if value is not None:
-            bucket.values.append(value)
 
     def _diagnostic(self, key: str, index: int, flag: QCFlag | None = None, *, issue: StyleIssue | None = None) -> None:
         bucket = self.diagnostics.setdefault(key, _Bucket(key))
@@ -894,9 +884,6 @@ class _FindingSorter:
         return candidates, bucket
 
     # Changes ----------------------------------------------------------------
-
-    def _sort_change_flag(self, index: int, flag: QCFlag) -> None:
-        self.change_flags.append(index)
 
     def _changes(self) -> list[ChangeItem]:
         text_flags: dict[int, list[int]] = defaultdict(list)

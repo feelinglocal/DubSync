@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from dubsync.web.app import _public_job, _qc_result_metadata
-from dubsync.web.jobs import new_job_record
+from dubsync.web.jobs import default_processor, new_job_record
+from dubsync.web.security import hash_job_token
+from dubsync.web.settings import WebSettings
 
 
 def test_completed_job_exposes_qc_counts_with_one_existing_artifact_read(tmp_path, monkeypatch):
@@ -89,6 +92,43 @@ def test_qc_metadata_drops_unknown_verdicts_and_invalid_review_counts(tmp_path, 
     }}), encoding="utf-8")
 
     assert _qc_result_metadata(qc_json) == {"qc_summary": {"flags": 2, "style_violations": 0}}
+
+
+@pytest.mark.parametrize("change_log,offered", [("", False), ("1\n00:00:01,000 --> 00:00:02,000\n# SRT #1 edited\n", True)])
+def test_change_log_download_is_offered_only_when_it_lists_changes(tmp_path, monkeypatch, change_log, offered):
+    providers = tmp_path / "providers.yaml"
+    providers.write_text("asr:\n  provider: fixture\n", encoding="utf-8")
+    settings = WebSettings(
+        data_dir=tmp_path / "data", providers_path=providers, style_path=None,
+        max_upload_bytes=1024 * 1024, retention_hours=24, processing_inline=True, max_submissions_per_hour=20,
+    )
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-changes"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"fixture audio")
+    job = new_job_record(
+        job_id="changes", token_hash=hash_job_token("token"), mode="generate", directory=directory,
+        audio_path=audio, srt_path=None, fps=30, language="en", style="standard", retention_hours=24,
+    )
+
+    def fake_generate(_audio, output, _workdir, **_kwargs):
+        output.write_text("1\n00:00:00,000 --> 00:00:00,500\nReady.\n", encoding="utf-8")
+        artifacts = directory / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "qc_report.json").write_text("{}", encoding="utf-8")
+        (artifacts / "qc_report.html").write_text("<h1>QC</h1>", encoding="utf-8")
+        (artifacts / "changes.diff.srt").write_text(change_log, encoding="utf-8")
+        return SimpleNamespace(
+            output_srt=output, episode_workdir=artifacts, report={"summary": {"cue_count": 1}},
+            cost_meter=SimpleNamespace(total_usd=0.0),
+        )
+
+    monkeypatch.setattr("dubsync.web.jobs.generate_srt_from_audio", fake_generate)
+
+    artifacts = default_processor(job, settings)
+
+    assert (artifacts.changes_srt is not None) is offered
 
 
 def test_invalid_severity_counts_remain_unavailable(tmp_path):
