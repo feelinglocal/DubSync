@@ -169,8 +169,12 @@ def sync_episode(
     if resume_stage == "verify":
         _validate_rebuild_policy(episode_workdir / "rebuild.json")
     cost_meter = CostMeter()
-    cues = _source_cues_for_run(srt_path, episode_workdir, resume_stage)
+    cues, ingest_metadata = _source_cues_for_run(srt_path, episode_workdir, resume_stage)
     cues, source_order_flags = sort_cues_chronologically(cues)
+    source_order_flags = [
+        *(QCFlag.model_validate(item) for item in ingest_metadata.get("ingest_flags", [])),
+        *source_order_flags,
+    ]
     fps_detection = detect_fps_with_confidence(cues)
     fps_override_flags = _fps_override_mismatch_flags(cues, fps, fps_detection)
     explicit_style_override = style_profile is not None or style_path is not None
@@ -196,7 +200,7 @@ def sync_episode(
         explicitly_configured=fps is not None or style_path is not None,
     )
     if _should_write_ingest_artifacts(resume_stage, episode_workdir, explicit_style_override, fps):
-        _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues]})
+        _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues], **ingest_metadata})
         _write_json(style_artifact_path, profile.model_dump())
 
     provider_config = apply_transcription_provider_config(
@@ -1005,11 +1009,71 @@ def _should_load_ingest_artifact(resume_stage: str | None) -> bool:
     return resume_stage in {"asr", "align", "adjudicate", "rebuild", "verify"}
 
 
-def _source_cues_for_run(srt_path: Path, episode_workdir: Path, resume_stage: str | None) -> list[Cue]:
+_INGEST_METADATA_KEYS = ("source_cue_numbers", "ingest_flags")
+_REPAIRED_SOURCE_CUE_MS = 500
+
+
+def _source_cues_for_run(
+    srt_path: Path, episode_workdir: Path, resume_stage: str | None,
+) -> tuple[list[Cue], dict[str, object]]:
     ingest_path = episode_workdir / "ingest.json"
     if _should_load_ingest_artifact(resume_stage) and ingest_path.exists():
-        return _load_ingest_artifact(ingest_path)
-    return parse_srt_text(srt_path.read_text(encoding="utf-8-sig"))
+        payload = json.loads(ingest_path.read_text(encoding="utf-8"))
+        return (
+            [Cue.model_validate(item) for item in payload.get("cues", [])],
+            {key: payload[key] for key in _INGEST_METADATA_KEYS if key in payload},
+        )
+    return _hardened_source_cues(parse_srt_text(srt_path.read_text(encoding="utf-8-sig")))
+
+
+def _hardened_source_cues(cues: list[Cue]) -> tuple[list[Cue], dict[str, object]]:
+    """Make a customer SRT safe to process before any paid stage runs.
+
+    The cue number is the identity of a cue in every later stage. A file whose
+    numbering restarts or repeats would let one cue take the words, holds and
+    timing of another, so such a file gets sequential internal ids; the
+    original numbers are kept in ``ingest.json`` for reporting. A cue without
+    a positive duration can stay at source timing until export, where it used
+    to fail the finished job; its end is repaired here instead.
+    """
+    metadata: dict[str, object] = {}
+    flags: list[QCFlag] = []
+    numbers = [cue.index for cue in cues]
+    if len(set(numbers)) != len(numbers) or any(number <= 0 for number in numbers):
+        cues = [cue.model_copy(update={"index": position}) for position, cue in enumerate(cues, start=1)]
+        metadata["source_cue_numbers"] = {str(cue.index): number for cue, number in zip(cues, numbers)}
+        flags.append(QCFlag(
+            kind="source_cue_numbers_reassigned", severity="info",
+            cue_ids=[cue.index for cue, number in zip(cues, numbers) if cue.index != number],
+            message=(
+                "Source cue numbers were repeated or invalid; cues were numbered sequentially in "
+                "file order for processing. The original numbers are recorded in ingest.json."
+            ),
+        ))
+    starts = sorted({cue.start_ms for cue in cues})
+    repaired_ids: list[int] = []
+    repaired: list[Cue] = []
+    for cue in cues:
+        if cue.end_ms > cue.start_ms:
+            repaired.append(cue)
+            continue
+        end_ms = cue.start_ms + _REPAIRED_SOURCE_CUE_MS
+        later = next((start for start in starts if start > cue.start_ms), None)
+        if later is not None:
+            end_ms = min(end_ms, later)
+        repaired.append(cue.with_timing(cue.start_ms, max(cue.start_ms + 1, end_ms)))
+        repaired_ids.append(cue.index)
+    if repaired_ids:
+        flags.append(QCFlag(
+            kind="source_cue_timing_repaired", cue_ids=repaired_ids, severity="warning",
+            message=(
+                "Source cue had a zero or negative duration; its end was moved after its start "
+                "(at most to the next cue) so the cue can be processed and exported."
+            ),
+        ))
+    if flags:
+        metadata["ingest_flags"] = [flag.model_dump() for flag in flags]
+    return repaired, metadata
 
 
 def _should_write_ingest_artifacts(
