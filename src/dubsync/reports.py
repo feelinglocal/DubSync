@@ -20,6 +20,8 @@ def write_qc_report(
     summary_metadata: Mapping[str, object] | None = None,
     *,
     source_cues: list[Cue] | None = None,
+    pre_annotation_cues: list[Cue] | None = None,
+    annotation_composition: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Write the QC report for ``cues``, the delivered list in SRT order.
 
@@ -37,6 +39,7 @@ def write_qc_report(
         cues,
         source_cues=source_cues,
         summary_metadata=summary_metadata,
+        pre_annotation_cues=pre_annotation_cues,
     )
     summary: dict[str, object] = {
         **dict(summary_metadata or {}),
@@ -61,6 +64,8 @@ def write_qc_report(
         "flags": [flag.model_dump() for flag in ordered_flags],
         "style_issues": [issue.model_dump() for issue in ordered_issues],
     }
+    if annotation_composition:
+        payload["annotation_composition"] = dict(annotation_composition)
     write_json_atomic(report_json_path, payload)
     write_text_atomic(report_html_path, _render_html(payload))
     return payload

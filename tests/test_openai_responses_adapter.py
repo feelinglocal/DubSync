@@ -7,7 +7,7 @@ import types
 import pytest
 
 from dubsync.llm_providers import (
-    AdjudicationBatch,
+    AdjudicationResponseBatch,
     OpenAILLMAdapter,
     PunctuationBatch,
     SpeakerMappingBatch,
@@ -20,14 +20,15 @@ from dubsync.providers import ProviderError
 def test_openai_adapter_uses_responses_parse_for_structured_calls(monkeypatch):
     calls: list[dict[str, object]] = []
     parsed = [
-        AdjudicationBatch.model_validate(
+        AdjudicationResponseBatch.model_validate(
             {
                 "decisions": [
                     {
                         "case_id": "case-1",
                         "verdict": "keep_srt",
                         "final_text": "Hallo",
-                        "confidence": 0.91,
+                        "heard_text": "Hallo",
+                        "evidence": "heard_clearly",
                         "speaker": "A",
                         "character": "unknown",
                         "reason": "source is correct",
@@ -87,7 +88,7 @@ def test_openai_adapter_uses_responses_parse_for_structured_calls(monkeypatch):
     assert punctuation == {1: "Hallo."}
     assert mapping == {"A": "Luna"}
     assert [call["model"] for call in calls] == ["gpt-5.6-luna"] * 3
-    assert [call["text_format"] for call in calls] == [AdjudicationBatch, PunctuationBatch, SpeakerMappingBatch]
+    assert [call["text_format"] for call in calls] == [AdjudicationResponseBatch, PunctuationBatch, SpeakerMappingBatch]
     assert all(call["reasoning"] == {"effort": "high"} for call in calls)
     assert all(call["store"] is False for call in calls)
     assert all("input" in call for call in calls)

@@ -56,7 +56,7 @@ def test_live_llm_adapters_can_be_configured_per_pass():
     assert speaker_mapping.reasoning_effort == "medium"
 
 
-def test_production_config_routes_audio_adjudication_to_lite_high_with_focused_flash_review(monkeypatch):
+def test_production_config_routes_audio_adjudication_to_flash_medium(monkeypatch):
     config = yaml.safe_load(Path("provider.yaml").read_text(encoding="utf-8"))
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -65,12 +65,11 @@ def test_production_config_routes_audio_adjudication_to_lite_high_with_focused_f
     punctuation = punctuation_adapter_from_config(config)
     speaker_mapping = llm_adapter_from_config(config, pass_name="speaker_mapping")
 
-    assert isinstance(adjudication, HybridAdjudicationAdapter)
-    assert isinstance(adjudication.primary, GeminiLLMAdapter)
-    assert adjudication.primary.model == "gemini-3.5-flash-lite"
-    assert adjudication.primary.thinking_level == "high"
+    assert isinstance(adjudication, GeminiLLMAdapter)
+    assert adjudication.model == "gemini-3.8-flash"
+    assert adjudication.thinking_level == "medium"
     assert config["llm"]["adjudication"]["fallback"] == {
-        "enabled": True, "provider": "gemini", "model": "gemini-3.8-flash",
+        "enabled": False, "provider": "gemini", "model": "gemini-3.8-flash",
         "thinking_level": "medium",
     }
     assert config["llm"]["adjudication"]["audio_context"]["enabled"] is False

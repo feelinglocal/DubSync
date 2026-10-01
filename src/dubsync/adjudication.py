@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from math import isfinite
@@ -8,18 +8,13 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from .models import AdjudicationDecision, AudioSnippet, DivergenceSpan, QCFlag
+from .adjudication_policy import DETERMINISTIC_KEEP_CONFIDENCE, DeterministicAdjudicationPolicy
+from .models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan, QCFlag
 from .providers import ProviderError
-from .tokenize import alphanumeric_signature
 
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
 _MAX_UNPACKED_SCENE_BATCHES = 16
-# A deterministic "keep the source" outcome is a policy, not a model opinion.
-# It never inherits the span's ASR confidence: providers without word
-# confidences (every MAI word is None) surface there as 0.0, which is
-# "unknown", not "certainly wrong".
-DETERMINISTIC_KEEP_CONFIDENCE = 1.0
 
 
 class LLMAdapter(Protocol):
@@ -85,6 +80,9 @@ class AdjudicationEngine:
         retry_timed_out_batches: bool = False,
         require_audio_snippets: bool = False,
         required_audio_case_ids: set[str] | None = None,
+        source_cues: Sequence[Cue] | None = None,
+        language: str | None = None,
+        register_policy: str = "spoken",
     ):
         self.llm = llm
         self.confidence_gate = confidence_gate
@@ -106,16 +104,19 @@ class AdjudicationEngine:
             raise ValueError("adjudication.require_audio_snippets must be boolean")
         self.require_audio_snippets = require_audio_snippets
         self.required_audio_case_ids = frozenset(required_audio_case_ids or ())
+        self.deterministic_policy = DeterministicAdjudicationPolicy(source_cues, language, register_policy)
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
         decisions_by_case: dict[str, AdjudicationDecision] = {}
         llm_spans: list[DivergenceSpan] = []
+        deterministic_case_ids: set[str] = set()
         for span in spans:
-            heuristic_decision = _heuristic_decision(span)
+            heuristic_decision = self.deterministic_policy.decide(span)
             if heuristic_decision is None:
                 llm_spans.append(span)
             else:
                 decisions_by_case[span.case_id] = heuristic_decision
+                deterministic_case_ids.add(span.case_id)
 
         invalid_spans: list[DivergenceSpan] = []
         provider_failed_spans: list[DivergenceSpan] = []
@@ -212,9 +213,9 @@ class AdjudicationEngine:
                     )
                 )
 
-            if not held_by_engine:
+            if not held_by_engine and span.case_id not in deterministic_case_ids:
                 decision, confidence_flag = confidence_gated_decision(
-                    span, decision, self.confidence_gate
+                    span, decision, self.confidence_gate, policy=self.deterministic_policy,
                 )
                 if confidence_flag is not None:
                     flags.append(confidence_flag)
@@ -323,6 +324,9 @@ class AdjudicationEngine:
             if decision.case_id != span.case_id:
                 invalid_spans[span.case_id] = span
                 continue
+            if decision.verdict == "keep_srt" and decision.final_text != span.srt_text:
+                invalid_spans[span.case_id] = span
+                continue
 
             decisions[span.case_id] = decision
 
@@ -422,20 +426,34 @@ def confidence_gated_decision(
     span: DivergenceSpan,
     decision: AdjudicationDecision,
     confidence_gate: float,
+    *, policy: DeterministicAdjudicationPolicy | None = None,
 ) -> tuple[AdjudicationDecision, QCFlag | None]:
     """Keep uncertain proposed wording reviewable without applying it to the SRT."""
-    if decision.confidence >= confidence_gate:
+    from .hybrid_adjudication import _evidence_supports_wording
+
+    uncertain_audio = decision.evidence in {"heard_unclear", "not_audible"}
+    uncertain_source_keep = (
+        decision.verdict == "keep_srt" and decision.final_text == span.srt_text
+        and decision.evidence == "heard_clearly" and not _evidence_supports_wording(decision, policy)
+    )
+    if not uncertain_audio and not uncertain_source_keep and decision.confidence >= confidence_gate:
         return decision, None
+    hold_reason = ("Reported hearing differs from the preserved source wording and their equivalence is unresolved"
+                   if uncertain_source_keep else "Adjudication audio evidence is unclear or inaudible" if uncertain_audio
+                   else "Adjudication confidence is below the configured gate")
     flag = QCFlag(
         kind="low_confidence_adjudication",
         cue_ids=span.cue_ids,
         message=(
-            "Adjudication confidence is below the configured gate; source SRT was preserved. "
+            f"{hold_reason}; source SRT was preserved. "
             f"Proposed verdict: {decision.verdict}. Reason: {decision.reason}"
         ),
-        confidence=decision.confidence,
+        # Hearing can be clear while spelling/wording equivalence is unknown.
+        # Preserve the decision's actual evidence across serialization; the
+        # independent review flag records this semantic uncertainty.
+        confidence=0.0 if uncertain_source_keep else decision.confidence,
         old_text=span.srt_text,
-        new_text=decision.final_text,
+        new_text=decision.heard_text if uncertain_source_keep else decision.final_text,
         start=span.start,
         end=span.end,
     )
@@ -444,7 +462,7 @@ def confidence_gated_decision(
     return decision.model_copy(update={
         "verdict": "keep_srt",
         "final_text": span.srt_text,
-        "reason": "Adjudication confidence is below the configured gate; preserved source SRT for review.",
+        "reason": f"{hold_reason}; preserved source SRT for review.",
     }), flag
 
 
@@ -463,15 +481,7 @@ def _pack_scene_chunks(
 
 
 def _heuristic_decision(span: DivergenceSpan) -> AdjudicationDecision | None:
-    srt_signature = alphanumeric_signature(span.srt_text)
-    asr_signature = alphanumeric_signature(span.asr_text)
-    if not srt_signature or not asr_signature:
-        return None
-
-    if srt_signature == asr_signature:
-        return _keep_srt_decision(span, "Punctuation/casing-only difference; preserved source SRT.")
-
-    return None
+    return DeterministicAdjudicationPolicy().decide(span)
 
 
 def _starts_new_scene(previous: DivergenceSpan, current: DivergenceSpan, scene_gap_seconds: float) -> bool:

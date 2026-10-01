@@ -320,8 +320,7 @@ def _anchor_candidates(word: Word, chains: list[tuple[float, float]]) -> list[tu
     tail of the previous word. Multiple bursts long enough to contain the whole
     word are ambiguous: a preferred provider edge is not lexical evidence.
     """
-    needed = min(MIN_OWNED_OVERLAP_SECONDS, (word.end - word.start) / 2)
-    owned = [chain for chain in chains if _overlap(word, chain) >= needed]
+    owned = [chain for chain in chains if has_sufficient_speech_overlap(word, *chain)]
     if not owned:
         return []
     first, last = owned[0], owned[-1]
@@ -335,6 +334,12 @@ def _anchor_candidates(word: Word, chains: list[tuple[float, float]]) -> list[tu
     # Several short overlaps may be separate utterances or split phonemes.
     # Choosing the longest would still guess the word's acoustic ownership.
     return owned
+
+
+def has_sufficient_speech_overlap(word: Word, start: float, end: float) -> bool:
+    """Whether a burst covers enough of a word to replace its provider edge."""
+    needed = min(MIN_OWNED_OVERLAP_SECONDS, (word.end - word.start) / 2)
+    return _overlap(word, (start, end)) >= needed
 
 
 def _overlap(word: Word, chain: tuple[float, float]) -> float:

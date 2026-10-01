@@ -220,3 +220,10 @@ def _robust_lower_limit(values: list[float]) -> float:
         return ordered[0]
     trimmed_count = floor(_LOWER_STYLE_TRIM_FRACTION * len(ordered))
     return ordered[min(trimmed_count, len(ordered) - 1)]
+
+
+def robust_sample_bounds(values: list[float]) -> tuple[float, float]:
+    """Observed bounds for small samples, trimmed 5th/95th bounds for 20+."""
+    if not values:
+        raise ValueError("style sample must contain at least one value")
+    return _robust_lower_limit(values), _robust_upper_limit(values)

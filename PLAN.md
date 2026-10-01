@@ -1,7 +1,9 @@
 # DubSync — SRT Re-Timing & Improvisation Reconciliation for Dubbed Drama
 
-**Plan v1.0 — 2026-07-02**
+**Plan v1.1 — updated 2026-10-02**
 **Deliverable of this document:** a complete, executable construction plan for an app that takes (a) a customer-supplied target-language SRT with wrong timing and (b) the VO-only dubbed audio (WAV/MP3), and outputs a frame-accurate, house-style-compliant SRT whose text matches what the actors actually said — including improvised lines, multi-speaker scenes, and context-correct punctuation.
+
+The construction milestones and provider research below retain historical planning context. Current behavior follows `provider.yaml`, the [README](README.md), and the [October 1 accuracy-upgrade report](docs/testing/accuracy-upgrade-2026-10-01.md). That report records final policy 26 technical checks, matched offline measurements and all 13 actual SRT/QC inspections, while preserving the timing/overlap exceptions awaiting owner acceptance and the separate release boundary.
 
 ---
 
@@ -11,11 +13,11 @@ The customer's SRT text is *mostly* right but its timing is wrong and some lines
 
 DubSync solves this with a five-stage pipeline:
 
-1. **ASR** the VO-only audio with word-level timestamps + speaker diarization (ElevenLabs Scribe v2 primary; WhisperX local fallback).
+1. **ASR** the VO-only audio with word-level timestamps + speaker diarization (Microsoft MAI-Transcribe 2 via OpenRouter by default; ElevenLabs Scribe v2 stays selectable; WhisperX is an optional local route). A provider failure never silently switches MAI and Scribe.
 2. **Anchor-align** the SRT text to the ASR word stream with a fuzzy dynamic-programming aligner → every SRT word gets an audio timestamp; divergent spans are isolated as *improvisation candidates*.
-3. **Adjudicate** each divergent span with an audio-capable LLM (**Gemini 3.5 Flash-Lite**, high thinking, by default) that sees scene context, both text versions, ASR confidence, and raw-audio snippets → decides "SRT is right (ASR error)" vs "actor improvised (use spoken text)" vs "hybrid". Gemini 3.7 Flash handles bounded text-only punctuation with medium thinking; Luna stays on speaker mapping.
+3. **Adjudicate** each divergent span: first resolve proven equivalents under the actor-spoken default policy, then ask **Gemini 3.8 Flash** at medium thinking with focused audio and local ownership/context. Native prompt v12 returns literal `heard_text` and hearing evidence. Lite high followed by Flash medium review remains an opt-in YAML route. Gemini 3.7 Flash handles bounded text-only punctuation with medium thinking; Luna stays on speaker mapping.
 4. **Re-cue deterministically**: rebuild each cue's start/end from its words' timestamps, snap to the frame grid, enforce house style (max 2 lines, ~25 chars/line, min duration, chaining), preserving the customer's original cue segmentation wherever text is unchanged.
-5. **Verify & report**: optional forced-alignment pass (MMS, 158+ languages) on the *final* text for maximum precision, then emit the synced SRT + a QC report that flags every low-confidence cue, overlap region, and text change for human review.
+5. **Verify & report**: optional forced alignment of final text, shared acoustic edge refinement, final ordering/overlap checks, then the synced SRT and QC report. Actionable items determine `clean`/`check`/`attention`; successful changes, episode notes, and operator diagnostics remain separately inspectable. `changes.diff.srt` logs applied wording changes.
 
 Timing always comes from acoustic models (ASR word timestamps / forced alignment). LLMs are used **only** for language reasoning (improv adjudication, punctuation, speaker/character attribution) — never as the timing source, because research confirms LLM audio timestamps drift by seconds.
 
@@ -49,20 +51,23 @@ A `style_profile` module will re-derive this table automatically from any sample
 | # | Problem | Strategy |
 |---|---|---|
 | P1 | **Per-cue re-timing** (global offset tools can't) | Word-level anchor alignment SRT-text ↔ ASR-words; cue start = its first matched word's start, cue end = its last matched word's end (+ configurable pad, then frame-snap) |
-| P2 | **Improvised lines** (spoken ≠ SRT text) | Divergence spans from the aligner → Gemini 3.5 Flash-Lite high adjudication with scene context + ASR confidence + audio snippets |
+| P2 | **Improvised lines** (spoken ≠ SRT text) | Divergence spans from the aligner → Gemini 3.8 Flash medium adjudication with local context + acoustic ownership + focused audio snippets |
 | P3 | **Multiple people speaking together** | Diarization with overlap detection (Scribe speaker IDs; pyannote `community-1` overlap regions as fallback). Overlapping cues get overlapping time ranges or flags per `overlap_policy` |
 | P4 | **Distinguish characters/speakers** | Stable diarization cluster IDs → LLM maps clusters to character names from conversational context (names used in dialogue); optional voice-reference matching (OpenAI `known_speaker_references`, ElevenLabs speaker library) |
 | P5 | **Context-correct punctuation** | Whole-scene LLM pass that re-punctuates the final text with the house conventions (continuation commas across split cues, `?`/`!` from semantics, ellipses for interruptions), constrained to *not* change words |
 
 ---
 
-## 4. AI landscape research (July 2026)
+## 4. Historical AI landscape research (July 2026, defaults updated October 1)
+
+Prices and advertised capabilities in this section are historical research, not a current quote. Runtime billing evidence and configured estimates are recorded separately in `cost.json`.
 
 ### 4.1 ASR with word-level timestamps (the timing backbone)
 
 | Provider / model | Word timestamps | Diarization | Languages | Price | Verdict |
 |---|---|---|---|---|---|
-| **ElevenLabs Scribe v2** (`scribe_v2`) | ✅ precise, built for subtitle sync | ✅ up to 32 speakers, `words[].speaker_id` | 90+ (incl. id, zh, ja, ko, de, es, pt…) | $0.22/hr (+$0.05/hr keyterm prompting) | **Primary.** Purpose-built for subtitling; keyterm prompting takes character names; audio-event tags; multi-language auto-detect |
+| **Microsoft MAI-Transcribe 2 via OpenRouter** (`microsoft/mai-transcribe-2`) | ✅ required word timestamps | ✅ requested; bounded retry without it | Provider auto-detection or explicit language hint | September 5 catalog estimate $0.10/hr; returned `usage.cost` takes precedence | **Current default.** Bounded overlapping chunks, duplicate cleanup, no silent Scribe fallback |
+| **ElevenLabs Scribe v2** (`scribe_v2`) | ✅ precise, built for subtitle sync | ✅ up to 32 speakers, `words[].speaker_id` | 90+ (incl. id, zh, ja, ko, de, es, pt…) | $0.22/hr (+$0.05/hr keyterm prompting) | **Selectable alternative.** Keyterms, audio-event tags, multi-language auto-detect |
 | **WhisperX** (local, faster-whisper + wav2vec2 alignment + pyannote) | ✅ sub-100 ms after forced alignment | ✅ via pyannote | ~99 ASR / 35+ alignment models | Free (GPU recommended) | **Local/free fallback**; also the offline mode for sensitive content |
 | **AssemblyAI** Universal-3 Pro / Universal-2 | ✅ | ✅ word-level (+$0.02/hr) | U3-Pro: 6 (en/es/fr/de/it/pt); U2: 99+ | $0.21/hr / $0.15/hr | Strong alternative for European targets; U3-Pro accepts 1,500-word natural-language prompts |
 | **Deepgram Nova-3** | ✅ | ✅ | ~40 | ≈$0.26/hr batch (verify at signup) | Fast; fewer languages; fine as 3rd adapter |
@@ -92,14 +97,14 @@ Sources: elevenlabs.io/docs + pricing pages, developers.openai.com/api/docs/guid
 |---|---|---|
 | **OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`) | $1 / $6 ($0.10 cached input) | Default for speaker mapping. Responses API structured outputs; `medium` reasoning for this text-only pass. Text/image input only, so it is not the default adjudicator when audio snippets are enabled |
 | **Gemini 3.7 Flash** (`gemini-3.7-flash`) | $0.75 / $3.75 recorded standard paid tier through 2026-12-31; $1.50 / $7.50 from 2027-01-01 | **Default punctuation model**, using `medium` thinking |
-| **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`, GA July 2026) | $0.30 / $2.50; $0.03 cached input; $1/M cached tokens/hour storage | **Default adjudicator**, using its highest supported `high` thinking level, full source text, focused audio snippets, and structured decisions |
-| **Gemini 3.8 Flash** (`gemini-3.8-flash`) | $0.75 / $3.75 standard paid tier through 2026-12-31; $1.50 / $7.50 from 2027-01-01 | Default reviewer at `medium` thinking for flagged Lite cases; focused clips and local context only |
+| **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`, GA July 2026) | $0.30 / $2.50; $0.03 cached input; $1/M cached tokens/hour storage | Optional hybrid primary, using `high` thinking, local source context, focused audio snippets, and v12 hearing evidence |
+| **Gemini 3.8 Flash** (`gemini-3.8-flash`) | $0.75 / $3.75 standard paid tier through 2026-12-31; $1.50 / $7.50 from 2027-01-01 | **Default adjudicator** at `medium` thinking; also the optional reviewer for flagged Lite cases |
 | **Gemini 3.5 Flash** (`gemini-3.5-flash`, GA May 2026) | $1.50 / $9 ($0.15 cached input) | Optional higher-cost alternate adjudicator with native audio snippet verification |
 | Gemini 3.1 Pro / 3.5 Pro (when GA) | $2 / $12 | Optional quality upgrade for adjudication on difficult episodes |
 | Claude Opus/Sonnet (Anthropic) | higher | Alternative adjudicator; no audio input → text-only usage |
 | GPT-5.x (OpenAI) | comparable | Same role; structured outputs solid |
 
-Design rule: **provider-agnostic `LLMAdapter`** with structured-output schemas, so the studio can swap by API-key availability. Default: **Gemini 3.5 Flash-Lite high thinking** for adjudication with full source text and focused audio snippets, followed by **Gemini 3.8 Flash medium thinking** only for flagged cases; **Gemini 3.7 Flash medium thinking** for punctuation; **OpenAI GPT-5.6 Luna medium reasoning** for optional speaker mapping. The reviewer gets selected clips, nearby source cues, owned ASR words, and explicit reasons for review. It never receives full episode audio or an episode cache. Set `llm.adjudication.fallback.enabled: false` to disable review. Direct single-model routes remain configurable, including optional full episode audio. Unresolved replies preserve source text/timing and remain visible in QC; agreement between models does not guarantee correctness.
+Design rule: **provider-agnostic `LLMAdapter`** with structured-output schemas. Default: **Gemini 3.8 Flash medium thinking** for adjudication with local source context and focused audio snippets; **Gemini 3.7 Flash medium thinking** for punctuation; **OpenAI GPT-5.6 Luna medium reasoning** for optional speaker mapping. The October script-route comparison was repeated after exact-request recovery of truncated hybrid replies. Those written-reference results do not certify the actor-spoken goal. Final v9 technical checks and all 13 actual artifact inspections are complete; ten explicit overlap exceptions and caption visibility/readability tradeoffs await owner disposition. Hybrid remains configurable: use Lite high as primary and enable Flash medium fallback. Both wording passes use the v12 evidence policy and language/register context. The optional reviewer receives selected clips, nearby source cues, owned ASR words, and explicit review reasons; it receives no full episode audio or episode cache. Full episode audio remains configurable for supported alternatives. Unresolved wording preserves source text; only missing or ambiguous acoustic ownership requires retaining source timing. Known ambiguous passages remain reviewable while processing and downloads continue. Agreement between models does not guarantee correctness.
 
 ### 4.5 Prior art (why we must build)
 
@@ -115,13 +120,13 @@ Design rule: **provider-agnostic `LLMAdapter`** with structured-output schemas, 
 - **CLI**: Typer + Rich (progress, tables). Batch mode over folders of episodes.
 - **Subtitle I/O**: `pysubs2` (or `srt` lib) with a strict round-trip test-suite; whitespace/BOM/CRLF tolerant.
 - **Audio**: `ffmpeg` (bundled instructions) → 16 kHz mono WAV for all model inputs.
-- **ASR adapters**: `elevenlabs` SDK (primary), `whisperx` (optional extra, local), `assemblyai`, `openai` — behind one `ASRAdapter` interface returning a normalized `WordStream` (word, start, end, confidence, speaker_id).
+- **ASR adapters**: MAI through OpenRouter (default), `elevenlabs` SDK (selectable), `whisperx` (optional local extra), `assemblyai`, `openai` — behind one `ASRAdapter` interface returning word, start, end, optional confidence, and speaker ID.
 - **Alignment**: custom weighted Needleman–Wunsch over normalized tokens with `rapidfuzz` similarity (no heavy deps); optional embedding assist for paraphrase spans.
 - **Forced alignment (optional precision pass)**: `ctc-forced-aligner` (torch) as an optional extra `[precision]`.
 - **Diarization backstop**: `pyannote.audio` 4.x community-1 as optional extra `[diarize-local]`.
-- **LLM adapters**: `google-genai` (default adjudicator: `gemini-3.5-flash-lite`), `openai`, `anthropic` behind `LLMAdapter` with JSON-schema structured outputs.
+- **LLM adapters**: `google-genai` (default adjudicator: `gemini-3.8-flash`), `openai`, `anthropic` behind `LLMAdapter` with JSON-schema structured outputs.
 - **Config**: `style_profile.yaml` (house rules) + `providers.yaml` + `.env` for keys. Style profile can be auto-derived from a sample SRT.
-- **Caching**: content-hash (audio SHA-256 + model + params) → cached ASR/diarization JSON on disk. Re-runs are free.
+- **Caching**: content-hash ASR JSON plus validated LLM batch and independent case decisions. Case keys include local source context, acoustic ownership/audio provenance, language/register/name policy, prompt/policy versions, models, and non-secret settings. Cache hits create no new provider charge; changed or transiently failed cases can require a new call.
 - **Review UI (later milestone)**: FastAPI + single-page review app — table of flagged cues, waveform snippet playback, accept/reject per change, re-export.
 
 ---
@@ -187,29 +192,32 @@ Weighted Needleman–Wunsch (monotonic, global) over the two token sequences:
 - band-limited DP (Sakoe–Chiba around a coarse pre-alignment from cue order + cumulative duration) to keep it O(n·k), episodes align in seconds
 - output: for each SRT token → matched ASR word (with its timestamps) | INSERT | DELETE
 
-Contiguous runs of ≥N matched tokens (default 3) = **anchor regions** (timing is trusted). Runs of mismatch bounded by anchors = **divergence spans** — each becomes an adjudication case carrying: original SRT text, ASR hypothesis, ASR word confidences, speaker IDs, and the bounding timestamps inherited from surrounding anchors.
+Contiguous runs of matched tokens form **anchor regions**. Mismatch runs become **divergence spans** carrying source text, the ASR hypothesis, optional word confidence, speaker evidence, exact owned indices, and acoustic windows. Repaired word evidence is shared downstream; uncertain words spanning multiple plausible bursts cannot establish a unique cue boundary.
 
 ### 7.3 Divergence classification (before spending LLM tokens)
-Cheap heuristics triage spans: identical-after-normalization (punctuation-only diff → auto-keep SRT), tiny Levenshtein (ASR spelling noise → keep SRT), SRT span with zero ASR speech in window (line dropped by actors → flag), speech with no SRT text (ad-lib insertion → LLM), everything else → LLM.
+Deterministic predecisions handle punctuation/casing and finite language-scoped spacing, abbreviation, recurring-name, and register equivalents. The default `adjudication.register_policy: spoken` follows performed wording; proven whole-span register reductions use exact ASR wording. Explicit `script` preserves authored equivalents, and no-LLM processing retains script wording. Unknown languages get no language-specific rules. Near-homophones, ambiguous names, real lexical compounds, changed numbers, and negations remain review cases. An empty ASR span alone does not prove that an actor dropped a line.
+
+Eligible missing dialogue receives a native audio question whose editable indices cover exactly one whole missing cue between independent matched anchors. Exact neighboring source-token residue can receive its own question without making other words editable. A whole-cue omission requires complete clear hearing and no speech activity in the anchored gap. Recovered wording uses one independent speech chain with all internal pauses strictly below the existing 0.2-second threshold; no LLM supplies timestamps. Multiple chains, anchor-crossing activity, or changed residual wording without owned word times preserve source timing for review. No-LLM processing preserves these passages. Saved legacy verdicts cannot answer new native questions; unanswered cases are explicit confidence-zero holds, rather than fabricated 0.95 confirmations. Processing continues through these review items.
 
 ### 7.4 LLM adjudication contract (structured output)
-Per scene batch, the model returns for each case:
+Native prompt v12 returns one evidence decision per case:
 ```json
 { "case_id": "...", "verdict": "keep_srt | use_audio | hybrid",
-  "final_text": "...", "confidence": 0.0-1.0,
+  "final_text": "...", "heard_text": "...",
+  "evidence": "heard_clearly | heard_unclear | not_audible",
   "speaker": "cluster_3", "character": "Luna | unknown",
   "reason": "one sentence" }
 ```
-Low confidence (< threshold, default 0.7) ⇒ QC flag, never silent. Optional second opinion: ship the audio snippet (±2 s pad) to Gemini audio-native and ask "what is literally said?" — costs ~$0.001/snippet.
+The language and register policy are explicit prompt inputs. `final_text` replaces only the editable span; padded audio and neighboring source/ASR words are read-only. Clear hearing must pass deterministic wording validation; unclear/inaudible or unavailable audio keeps source wording and creates review. Legacy stored confidence decisions still use the configured gate (default 0.7). The configured hybrid reviewer receives selected clips and local evidence, with actual usage recorded per model; no fixed per-snippet cost is promised.
 
 ### 7.5 Re-cue rules (deterministic, unit-tested — no LLM)
 - Source cues are sorted chronologically before alignment using `(start_ms, original_index)` while preserving original cue ids; moved cues emit `source_out_of_order` QC.
-- Unchanged-text cues: keep exact original text and line breaks; only re-time. start = first word start minus `lead_in` (default 0 ms) then floor-snap, end = last word end + `tail` (default 40 ms) then ceil-snap, enforce `min_cue_dur` by extending into available gap, enforce monotonic non-overlap per speaker, allow 0-gap chaining.
+- Unchanged-text cues keep exact source text and line breaks. Starts floor-snap from the first owned acoustic word/burst; ends ceil-snap from the last owned speech edge plus the configured tail. `min_duration_policy: extend_into_silence` permits a display tail only through verified silence before another sound or cue, including held dialogue. `acoustic` disables that extension. Frame-grid export rounds upward to milliseconds; no timestamp comes from an LLM.
 - `keep_srt` adjudication keeps source wording but still attaches divergent ASR word indices to cue timing, so numeric/spelling preferences cannot cut off the actor's last word.
 - Changed-text spans: re-flow into cues mimicking the original segmentation density (target ≈ original cue count for that sentence; split at clause/phrase boundaries; ≤2 lines × ≤26 chars; balanced lines; compound hyphenation last resort), then time each new cue from its own words.
-- Dropped lines: configurable `drop_policy: remove | keep_flagged` (default `keep_flagged` with zero-length warning in QC, since a human must decide).
+- Missing dialogue: `drop_policy: remove | keep_flagged`, default `keep_flagged`; source text/timing stays available for review when no trustworthy speech supports a retime. No zero-duration dialogue is exported.
 - Overlaps (P3): per `overlap_policy: stack` (overlapping cue times, default) | `dash` (merge into one 2-line dashed cue) | `flag_only`.
-- VAD boundary refinement uses matched cue word timestamps when available, not only the broad cue rectangle. ASR word durations longer than `timing.max_word_duration` are clamped to the containing speech region and flagged as `asr_word_clamped`.
+- Streaming adaptive energy VAD uses a 10 ms hop. Shared phrase-edge repair handles stretched ASR edges against their burst before cue timing; `timing.phrase_edge_snap: false` disables it and model-specific limits remain configurable. Ambiguous multi-burst evidence stays held for review.
 - The final output pass sorts by `(start_ms, end_ms, index)`, merges duplicate overlapping captions as `duplicate_cue_merged`, resolves residual same/unknown-speaker overlaps when `output.no_overlaps: true`, and asserts monotonic cue starts before `write_srt`.
 
 ### 7.6 Punctuation pass
@@ -226,10 +234,10 @@ One LLM call per scene with the *final* word sequence, cue boundaries marked, sp
 | Two characters overlap | Diarization overlap region; words split by speaker_id; per `overlap_policy`; always QC-flagged |
 | Crowd/walla ("SSS! SSS!") | Audio-event/low-confidence cluster; if SRT has a cue there, time to the energy envelope; else ignore |
 | Line dropped in the dub | SRT cue with no matched speech → `drop_policy`, QC-flagged |
-| ASR hallucination in silence | VO-only audio minimizes it; VAD gate: no cue may sit on <-45 dBFS silence |
+| ASR hallucination in silence | Speech evidence checks supported additions; unsupported source dialogue stays held with a review item rather than fabricating an acoustic time |
 | Source SRT scrambled/out of chronological order | Source ingest sorts by time and emits `source_out_of_order`; duplicate-overlap guard merges any remaining repeated captions before export |
 | Impossible ASR word span or impossible display speed | Clamp long ASR word duration to VAD region and emit `asr_word_clamped`; verify emits `impossible_cps_fast` / `impossible_cps_slow` for QC |
-| Non-Latin targets (zh/ja/ko/th…) | Tokenizer switches to char/morpheme level; MMS aligner with `--romanize`; line-length rules from style profile (full-width counting) |
+| Non-Latin targets (zh/ja/ko/th…) | Character-based comparison, Japanese width/kana-safe normalization, grouped acoustic words, and visual-width line rules; optional MMS requires separate model validation |
 
 ---
 
@@ -262,13 +270,13 @@ Parallelizable: M1 ∥ M2 after M0; M5 ∥ M4 after M3.
 
 ## 11. Evaluation & QC metrics (definition of "good")
 
-Build a golden set from past delivered episodes (unsynced SRT + VO audio + final human-synced SRT). Targets for v1:
+Build a golden set from source SRT, VO audio, and independently corrected SRT. The current episode 11/17 references are edits of earlier DubSync output: most edges are inherited, so full timestamp agreement measures old-output similarity. Evaluate their text and `human_edit_subset`, then compare acoustic onset/offset distributions from the audio. These v1 targets remain objectives, not a claim that the upgrade has met them:
 
 - **Timing**: ≥90% of cue starts within ±1 frame of golden; ≥98% within ±3 frames; MAE < 50 ms.
 - **Improv detection**: precision ≥0.9 / recall ≥0.85 on spans that humans changed.
 - **Structure**: 0 style-lint violations (line count/length, grid, chaining); cue count preserved for unchanged text.
 - **Review burden**: ≤10% of cues flagged for human review on a typical episode.
-- QC report always errs toward flagging — silent wrong output is the worst failure mode in post-production.
+- Review precision and recall must be measured alongside count reduction. Raw findings remain in JSON; routine successful changes are a log, while real uncertainty and acoustic overlap stay actionable.
 
 ---
 
@@ -276,10 +284,11 @@ Build a golden set from past delivered episodes (unsynced SRT + VO audio + final
 
 | Item | Cost |
 |---|---|
-| Scribe v2 ASR + diarization | $0.165 (0.75 h × $0.22) |
+| MAI-Transcribe 2 (default) | Historical catalog estimate $0.075 for 45 minutes; provider-reported billing takes precedence |
+| Scribe v2 ASR + diarization (selectable) | Historical configured estimate $0.165 (0.75 h × $0.22) |
 | Keyterm prompting (character names) | +$0.04 |
-| LLM adjudication + punctuation (Gemini 3.7 Flash `high` adjudication with audio snippets + Gemini 3.7 Flash `medium` punctuation) | Long-form target must be re-benchmarked after complete episode context was added; the paid 258.9-second `testing 4` replay measured $0.20228 for these LLM passes |
-| Audio-snippet double-checks (~30 × 20 s) | ~$0.02 |
+| LLM adjudication + punctuation | Flash medium adjudication and punctuation need representative per-episode measurement with v12 and deterministic predecisions; the earlier August `testing 4` run is historical evidence for different adjudication settings |
+| Optional second ASR cross-check | Disabled by default; extra billed/estimated audio cost is reported separately when enabled |
 | Forced-align + pyannote (local) | $0 |
 | **Total** | **Not yet established for a 45-minute episode after the complete-context upgrade** (fully-local mode: $0) |
 
@@ -301,12 +310,15 @@ Build a golden set from past delivered episodes (unsynced SRT + VO audio + final
 
 ## 14. Defaults chosen (change in config, don't re-litigate in code)
 
-1. Primary ASR **ElevenLabs Scribe v2**; local mode WhisperX. 
-2. Default adjudication LLM **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`) with `thinking_level: high`, full source text, and focused audio snippets enabled. The enabled `fallback` reviews flagged cases with **Gemini 3.8 Flash**, `thinking_level: medium`, selected clips and local context only. Full episode audio is disabled for Lite and prohibited for the hybrid reviewer. Punctuation uses **Gemini 3.7 Flash** with `thinking_level: medium`; speaker mapping uses **OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`) through the Responses API with `reasoning_effort: medium`; Gemini/OpenAI/Anthropic adapters remain configurable alternates.
+1. Primary ASR **Microsoft MAI-Transcribe 2 via OpenRouter**; **ElevenLabs Scribe v2 remains selectable**, without silent provider fallback. Local mode uses WhisperX.
+2. Default adjudication LLM **Gemini 3.8 Flash** (`gemini-3.8-flash`) with `thinking_level: medium`, local source context, v12 hearing evidence, and focused audio snippets. The optional YAML hybrid uses Lite high as primary and enables Flash medium `fallback` for flagged cases. Full episode audio is disabled by default and prohibited for the hybrid reviewer. Punctuation uses **Gemini 3.7 Flash** with `thinking_level: medium`; speaker mapping uses **OpenAI GPT-5.6 Luna** (`gpt-5.6-luna`) through the Responses API with `reasoning_effort: medium`; alternate adapters remain configurable.
 3. Frame grid auto-detected, fallback 30 fps (matches the example). 
 4. `overlap_policy: stack`, `drop_policy: keep_flagged`, adjudication confidence gate 0.7. 
 5. Output preserves customer cue segmentation unless text changed. 
 6. All timing from acoustic models; LLMs never move timestamps.
+7. Actor-spoken register is the default (`adjudication.register_policy: spoken`), including confirmed improvised sentences. Explicit `script` preserves authored equivalents; no-LLM processing retains script wording. Optional dual-ASR cross-check remains off unless requested; the primary provider retains all timing and word ownership.
+8. Generation applies selected minimum-duration/CPS targets only within verified silence, with balanced wrapping and shared ownership-based overlap handling. Parsing supports comma/period timestamps and missing blank separators; legacy byte encodings need the reader's explicit notice or encoding selection.
+9. With default `output.no_overlaps: true`, pure bracketed captions without owned words compose around exact spoken cue intervals. Speech IDs, original lines, speaker metadata, and owned words remain unchanged; only caption text repeats across adjacent displays. A separate narrow interruption rule may partition a sentence around another actor's independently owned insertion while preserving every word and its acoustic ownership. Genuine greetings/choruses remain reviewable. Lyrics are not repeatable caption tracks. Caption visibility can extend beyond authored edges, with provenance and combined style review retained. Explicit `output.no_overlaps: false` preserves original annotation segmentation.
 
 **Open questions for the studio (answers slot into config; defaults above apply meanwhile):**
 - Which target languages ship first? (affects M2 language benchmark matrix)

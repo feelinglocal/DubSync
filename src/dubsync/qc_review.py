@@ -93,6 +93,13 @@ _LISTEN = "Listen to this passage and correct the subtitle if needed."
 # Default bucket per raw kind. Rules in ``_FindingSorter`` refine the kinds whose
 # meaning depends on the cue (song caption, held cue, untouched customer cue).
 KIND_REGISTRY: dict[str, KindSpec] = {
+    "source_encoding_converted": _review_kind(
+        "Subtitle used a legacy encoding", "Check accented characters in the delivered subtitle.", 42,
+        "warning", episode=True),
+    "source_empty_cues_ignored": _review_kind(
+        "Empty source cues were omitted", "Check the listed source cues for missing dialogue.", 42,
+        "warning", episode=True),
+    "source_language_inferred": _note_kind("Language inferred from the source dialogue"),
     # Problems a human must look at.
     "missing_audio_timing_held": _review_kind(
         "No matching speech in the audio",
@@ -209,6 +216,7 @@ KIND_REGISTRY: dict[str, KindSpec] = {
         "AI review failed for some passages", _LISTEN, 7, "warning", episode=True),
     # Normal successful operations.
     "text_changed": _change_kind("Wording changed to match the audio"),
+    "missing_dialogue_audio_reconciled": _change_kind("Source-only dialogue checked against the audio"),
     "adlib_inserted": _change_kind("Added line spoken in the audio"),
     "adlib_reconciled": _change_kind("Added line matched to a script cue"),
     "dropped_adjudicated_cue": _change_kind("Line removed"),
@@ -411,6 +419,7 @@ def build_review(
     *,
     source_cues: Sequence[Cue] | None = None,
     summary_metadata: Mapping[str, object] | None = None,
+    pre_annotation_cues: Sequence[Cue] | None = None,
 ) -> QCReview:
     """Classify raw findings for the customer.
 
@@ -419,7 +428,9 @@ def build_review(
     customer's cues; without them (generate mode) every cue counts as tool-made.
     """
 
-    return _FindingSorter(flags, style_issues, cues, source_cues, summary_metadata or {}).build()
+    return _FindingSorter(
+        flags, style_issues, cues, source_cues, summary_metadata or {}, pre_annotation_cues,
+    ).build()
 
 
 def clean_customer_text(text: str | None) -> str | None:
@@ -496,10 +507,15 @@ class _FindingSorter:
         cues: Sequence[Cue],
         source_cues: Sequence[Cue] | None,
         summary_metadata: Mapping[str, object],
+        pre_annotation_cues: Sequence[Cue] | None = None,
     ) -> None:
         self.flags = list(flags)
         self.style_issues = list(style_issues)
         self.cues = list(cues)
+        # Display composition can repeat a screen caption across cues without
+        # changing the wording. Compare edits before that display-only step;
+        # all locations and display-style findings still use delivered cues.
+        self.wording_cues = list(pre_annotation_cues) if pre_annotation_cues is not None else self.cues
         self.position: dict[int, int] = {}
         for position, cue in enumerate(self.cues):
             self.position.setdefault(cue.index, position)
@@ -724,13 +740,22 @@ class _FindingSorter:
         self._style_candidate(index, issue, key, spec.severity or issue.severity)
 
     def _real_proposal(self, flag: QCFlag) -> bool:
-        """A low-confidence flag that carries a real model proposal, not a pipeline hold."""
+        """A low-confidence flag carrying model evidence or a real proposal."""
 
         if flag.kind != "low_confidence_adjudication":
             return False
+        message = flag.message
+        # These engine-authored holds deliberately use zero confidence to preserve
+        # the source. They still need listening review; zero alone only identifies
+        # a synthetic pipeline hold for the older numeric-confidence flags below.
+        if message.startswith((
+            "Adjudication audio evidence is unclear or inaudible",
+            "Reported hearing differs from the preserved source wording and their equivalence is unresolved",
+            "Dual ASR cross-check hold:",
+        )):
+            return True
         if not flag.confidence:
             return False
-        message = flag.message
         return "no trustworthy local speech evidence" not in message and "Punctuation/casing-only" not in message
 
     def _first_held(self, cue_ids: Sequence[int]) -> int:
@@ -948,7 +973,7 @@ class _FindingSorter:
     def _text_changes(self, text_flags: dict[int, list[int]]) -> list[ChangeItem]:
         items: list[ChangeItem] = []
         claimed: set[int] = set()
-        for position, cue in enumerate(self.cues):
+        for cue in self.wording_cues:
             source = self.source.get(cue.index)
             if source is not None and source.plain_text == cue.plain_text:
                 continue
@@ -959,14 +984,15 @@ class _FindingSorter:
                 cue.index, raw,
                 old_text=source.text if source is not None else None,
                 new_text=cue.text,
-                start_ms=cue.start_ms, end_ms=cue.end_ms, position=position,
+                start_ms=cue.start_ms, end_ms=cue.end_ms, position=self.position.get(cue.index),
                 signature_equal=(
                     source is not None
                     and alphanumeric_signature(source.plain_text) == alphanumeric_signature(cue.plain_text)
                 ),
             ))
+        wording_ids = {cue.index for cue in self.wording_cues}
         for cue_id, source in self.source.items():
-            if cue_id in self.position:
+            if cue_id in wording_ids:
                 continue
             raw = sorted(set(text_flags.get(cue_id, [])))
             claimed.update(raw)
@@ -1237,14 +1263,27 @@ class _FindingSorter:
         )
 
     def _detail(self, primary: _Candidate, ranked: list[_Candidate], delivered: list[int], numbers: list[int]) -> str:
-        if primary.kind == "missing_audio_timing_held" and len(delivered) > 1:
-            first, last = self.by_id[delivered[0]], self.by_id[delivered[-1]]
-            sentence = (
-                f"{len(delivered)} cues ({format_timestamp(first.start_ms)}–{format_timestamp(last.end_ms)}) "
-                "have no matching speech in the dub audio; your text and timing were kept."
-            )
-        elif primary.kind == "missing_audio_timing_held":
-            sentence = "No matching speech was found in the dub audio; your text and timing were kept."
+        if primary.kind == "missing_audio_timing_held":
+            # An overlap may group a spoken neighbor with a held cue. Describe
+            # only the missing-audio candidates as missing, while retaining the
+            # entire group below so both sides of the overlap stay reviewable.
+            missing_ids = {
+                cue_id for candidate in ranked if candidate.kind == primary.kind
+                for cue_id in candidate.cue_ids
+            }
+            missing = [cue_id for cue_id in delivered if cue_id in missing_ids]
+            if len(missing) > 1:
+                start_ms = min(self.by_id[cue_id].start_ms for cue_id in missing)
+                end_ms = max(self.by_id[cue_id].end_ms for cue_id in missing)
+                sentence = (
+                    f"{len(missing)} cues ({format_timestamp(start_ms)}–{format_timestamp(end_ms)}) "
+                    "have no matching speech in the dub audio; your text and timing were kept."
+                )
+            elif missing and len(delivered) > 1:
+                number = self.position[missing[0]] + 1
+                sentence = f"Cue #{number} has no matching speech in the dub audio; its text and timing were kept."
+            else:
+                sentence = "No matching speech was found in the dub audio; your text and timing were kept."
         elif primary.episode and len(ranked) > 1:
             sentence = f"{len(ranked)} passages: {clean_customer_text(primary.message)}"
         else:

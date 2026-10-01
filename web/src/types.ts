@@ -64,6 +64,9 @@ export interface PublicConfig {
   jobs_available: boolean
   default_transcription_provider?: TranscriptionProvider
   transcription_models?: { id: TranscriptionProvider; label: string; available: boolean }[]
+  asr_cross_check_available?: boolean
+  asr_cross_check_default?: false
+  asr_cross_check_hourly_usd?: Partial<Record<TranscriptionProvider, number>>
   gemini_transcribe_testing_available?: boolean
   gemini_transcribe_max_audio_seconds?: number
   generation_styles: GenerationStylesConfig
@@ -105,6 +108,7 @@ export interface JobResponse {
   batch_id?: string | null
   batch_position?: number | null
   transcription_provider?: TranscriptionProvider | 'default'
+  asr_cross_check?: boolean
   mode: JobMode
   status: JobStatus
   progress: number
@@ -135,6 +139,8 @@ export const defaultConfig: PublicConfig = {
   jobs_available: false,
   default_transcription_provider: defaultTranscriptionProvider,
   transcription_models: unavailableTranscriptionModels,
+  asr_cross_check_available: false,
+  asr_cross_check_default: false,
   gemini_transcribe_testing_available: false,
   gemini_transcribe_max_audio_seconds: 1800,
   generation_styles: {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from .forced_alignment import usable_forced_alignments_by_cue
 from .models import AlignmentResult, Cue, CueScore, ForcedAlignmentCue, QCFlag, StyleIssue, Word
 from .speaker_evidence import speakers_known_different
@@ -8,7 +10,9 @@ from .subtitle_annotations import cue_has_spoken_text, speech_text_for_alignment
 from .text_metrics import display_width
 
 
-def lint_cues(cues: list[Cue], profile: StyleProfile) -> list[StyleIssue]:
+def lint_cues(
+    cues: list[Cue], profile: StyleProfile, *, continuous_screen_text_ms: Mapping[int, int] | None = None,
+) -> list[StyleIssue]:
     issues: list[StyleIssue] = []
     previous: Cue | None = None
     # Match boundary refinement: one frame of slack is a rounding tolerance,
@@ -20,7 +24,12 @@ def lint_cues(cues: list[Cue], profile: StyleProfile) -> list[StyleIssue]:
             issues.append(StyleIssue(kind="negative_duration", cue_id=cue.index, message="Cue start is after end.", severity="error"))
         elif cue.start_ms == cue.end_ms:
             issues.append(StyleIssue(kind="zero_duration", cue_id=cue.index, message="Cue has no display duration.", severity="error"))
-        if cue.duration_ms < min_duration_ms:
+        # A caption repeated continuously across a spoken cue and a short
+        # suffix is read once. This never changes dialogue duration checks.
+        readable_duration_ms = cue.duration_ms
+        if not cue_has_spoken_text(cue) and continuous_screen_text_ms is not None:
+            readable_duration_ms = max(readable_duration_ms, continuous_screen_text_ms.get(cue.index, 0))
+        if readable_duration_ms < min_duration_ms:
             issues.append(StyleIssue(kind="min_duration", cue_id=cue.index, message="Cue is shorter than minimum duration."))
         if not profile.is_frame_aligned(cue.start_ms) or not profile.is_frame_aligned(cue.end_ms):
             issues.append(StyleIssue(kind="frame_grid", cue_id=cue.index, message="Cue timestamp is off the frame grid."))

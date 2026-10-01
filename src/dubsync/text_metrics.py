@@ -191,7 +191,47 @@ def wrap_visual_width(text: str, max_width: int) -> list[str]:
     words = stripped.split()
     if len(words) <= 1:
         return _wrap_unspaced(stripped, max_width)
-    return _wrap_words(words, max_width)
+    greedy = _wrap_words(words, max_width)
+    if len(greedy) <= 1 or len(words) > 128 or len(greedy) > 8:
+        return greedy
+    widths = [display_width(word) for word in words]
+    # Keep the established CJK/long-word splitter when a word cannot fit.
+    if any(width > max_width for width in widths) or markup_spans(stripped):
+        return greedy
+    return _balanced_word_lines(words, widths, max_width, len(greedy))
+
+
+def _balanced_word_lines(words: list[str], widths: list[int], max_width: int, line_count: int) -> list[str]:
+    """Balance the few subtitle lines without increasing their minimum count."""
+    prefix = [0]
+    for width in widths:
+        prefix.append(prefix[-1] + width)
+    target = (prefix[-1] + len(words) - line_count) / line_count
+    # (number of lines, consumed words) -> (cost, line-end positions).
+    previous: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    for line_number in range(line_count):
+        current: dict[int, tuple[float, tuple[int, ...]]] = {}
+        for start, (cost, breaks) in previous.items():
+            for end in range(start + 1, len(words) + 1):
+                width = prefix[end] - prefix[start] + end - start - 1
+                if width > max_width:
+                    break
+                remaining_lines = line_count - line_number - 1
+                if len(words) - end < remaining_lines:
+                    break
+                orphan_cost = max_width ** 2 if end - start == 1 and width < target * 0.6 else 0
+                punctuation_bonus = 4 if end < len(words) and words[end - 1].endswith((",", ";", ":", ".", "!", "?")) else 0
+                candidate = (cost + (width - target) ** 2 + orphan_cost - punctuation_bonus, (*breaks, end))
+                if end not in current or candidate[0] < current[end][0]:
+                    current[end] = candidate
+        previous = current
+    _, breaks = previous[len(words)]
+    result = []
+    start = 0
+    for end in breaks:
+        result.append(" ".join(words[start:end]))
+        start = end
+    return result
 
 
 def _wrap_words(words: Iterable[str], max_width: int) -> list[str]:

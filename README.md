@@ -1,10 +1,10 @@
 # DubSync
 
-DubSync is a Windows-friendly Python 3.11+ CLI for retiming a customer-supplied target-language SRT to dubbed VO-only audio, preserving source segmentation where compatible with confirmed dialogue and splitting clearly identified actor turns. Dialogue changes and uncertain mappings remain visible in QC.
+DubSync is a Windows-friendly Python 3.11+ CLI for retiming a customer-supplied target-language SRT to dubbed VO-only audio, preserving source segmentation where compatible with confirmed dialogue and splitting clearly identified actor turns. The wording goal follows what the actors actually say, including improvised sentences and performed register. Dialogue changes and uncertain mappings remain visible in QC.
 
-Timing comes from acoustic data only: ASR word timestamps and optional forced alignment. LLM adapters are used only for language decisions such as improv adjudication and punctuation, never for timestamps.
+Timing comes from acoustic data only: ASR word timestamps, streaming speech-energy analysis, and optional forced alignment. LLM adapters are used only for language decisions such as improv adjudication and punctuation, never for timestamps.
 
-Automatic processing produces reviewable subtitles, not a guarantee of perfect transcription or phoneme timing. Low-confidence proposed edits remain in QC while their source wording and cue timing are held; independently approved edits elsewhere in that cue are retained. Real speech overlaps and readability pressure are reported instead of moving acoustic boundaries. Completed web jobs show the QC review state next to their downloads. See [the September 2026 quality audit](docs/testing/app-quality-audit-2026-09-05.md) for verified fixes, corpus evidence, and remaining limitations.
+Automatic processing produces reviewable subtitles, not a guarantee of perfect transcription or phoneme timing. Uncertain wording edits keep the source text and remain in QC; the cue can still be timed from its uniquely owned words. Missing or ambiguous acoustic evidence preserves source timing for review. Independently approved edits elsewhere in that cue are retained. Processing continues through known ambiguous passages, which remain reviewable in the delivered artifacts. Real speech overlaps and readability pressure remain visible. Completed web jobs show the QC review state next to their downloads. See [the October 1 accuracy-upgrade report](docs/testing/accuracy-upgrade-2026-10-01.md) for final v9 measurements and explicit acceptance exceptions, and [the September quality audit](docs/testing/app-quality-audit-2026-09-05.md) for historical results.
 
 ## Commercial Web MVP
 
@@ -13,7 +13,7 @@ DubSync also includes a responsive React/FastAPI application with two customer w
 - **Sync existing SRT:** upload one file pair or a batch of up to 10 matched audio/SRT pairs, then download synchronized SRT and QC artifacts for each source. Batch children run one by one, and cue presentation rules are derived from each uploaded SRT. The web sync form can optionally cap cues to a chosen maximum line count; overlong source-backed cues are split only when aligned ASR word timing provides a safe acoustic split point, otherwise they are kept and QC-flagged for review.
 - **Audio to SRT:** upload one audio file or a batch of up to 10, choose a built-in subtitle preset, enter custom line/timing/CPS rules, or upload an example SRT to derive them, then generate acoustically timed SRT and QC artifacts.
 
-The language selector defaults to provider auto-detection and includes **Japanese 日本語** for both workflows. An explicit language is forwarded to the configured ASR provider and becomes part of the cached ASR configuration. Selecting Auto-detect clears a configured ASR language hint for that job.
+The language selector defaults to Auto-detect and includes **Japanese 日本語** for both workflows. An explicit language is forwarded to the configured ASR provider and becomes part of the cached ASR configuration. Sync can derive a conservative hint from clearly identifiable source dialogue when no concrete language is set; short, mixed, or unrecognized text leaves provider detection in control. An inferred hint appears in QC and can be overridden explicitly. Audio-to-SRT generation retains provider auto-detection when no language is selected.
 
 ### Japanese subtitles
 
@@ -100,7 +100,7 @@ Live provider smoke tests are opt-in because they can spend API credits:
 python -m pytest --live tests/test_live_smoke.py
 ```
 
-Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. Microsoft MAI-Transcribe 2 via OpenRouter is the default cloud ASR for new sync and audio-to-SRT jobs; ElevenLabs Scribe v2 remains selectable. `GEMINI_API_KEY` powers Gemini 3.5 Flash-Lite adjudication with high thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
+Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. Microsoft MAI-Transcribe 2 via OpenRouter is the default cloud ASR for new sync and audio-to-SRT jobs; ElevenLabs Scribe v2 remains selectable. `GEMINI_API_KEY` powers Gemini 3.8 Flash adjudication with medium thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
 
 Create `.env` as needed:
 
@@ -149,23 +149,53 @@ Set `OPENROUTER_API_KEY` in the server environment for MAI and `ELEVENLABS_API_K
 
 See the [September 5, 2026 MAI/Scribe comparison](docs/testing/mai-transcribe-2-comparison-2026-09-05.md) for historical latency, reference-text agreement, costs, and validation limits. Failed requests retain sanitized billing evidence in `asr_failure.json`; known charges with an uncertain total are marked `audio_billed_partial`, and a failed or retried request that may still have been billed is estimated as `audio_uncertain_estimate`.
 
+### Optional ASR wording cross-check
+
+Sync can request the other transcription model as independent wording evidence; it is off by default. The primary alone supplies timing and word ownership. The web checkbox explicitly defaults off, including when YAML enables it. For a MAI primary, YAML uses `asr.cross_check: {provider: elevenlabs, model_id: scribe_v2}`; for Scribe, use `{provider: openrouter, model: microsoft/mai-transcribe-2}`. Generation does not use this option.
+
+Only narrow, unambiguous time-local multiword agreement can bypass audio review. Names, numbers, negations, repeated/character-level tokens, conflicting ownership, and source/acoustic holds remain reviewable; agreement is not proof of hearing. Secondary cache, settings, audio provenance, and costs are separate. Resume after ASR requires matching saved secondary evidence and makes no new secondary request; a requested secondary failure is explicit and retains both cost records. Recent paired runs showed no incremental WER benefit, so optional extra transcription spend is not enabled automatically. See the [accuracy report](docs/testing/accuracy-upgrade-2026-10-01.md) for scope and limits.
+
 ### Gemini Audio Context
 
-Flash-Lite adjudication receives focused case audio clips and the full ordered source subtitle text. The September 14 comparison found that removing the full-audio cache corrected a batch of improvisations Lite had left unchanged. ASR words and optional forced alignment remain the timing evidence. Instructions restrict edits to each case's local dialogue and prohibit moving words between scenes or returning replacement timestamps.
+Gemini adjudication receives focused case audio clips and nearby read-only source context, with exact editable-span and acoustic word ownership. Prompt v12 also carries the resolved language and `register_policy`. The default `adjudication.register_policy: spoken` follows the clearly audible performed form, including equivalent Portuguese reductions such as `para`/`pra` and `está`/`tá`. Set `adjudication.register_policy: script` to preserve authored equivalents explicitly. Register shortcuts do not settle genuine changes in meaning, number, or negation; those require audio adjudication. Instructions prohibit borrowing neighboring words, moving words between scenes, translating dialogue, or returning replacement timestamps. No-LLM processing retains script wording.
 
-The default hybrid uses Lite at HIGH thinking first. Deterministic checks escalate invalid or uncertain replies, retained source text that conflicts with ASR, and proposed wording that differs from the case's owned ASR words. Gemini 3.8 Flash at MEDIUM thinking then reviews only those cases, with their padded clips, nearby source cues, word ownership, and the reason for review. It receives no full episode audio or shared episode cache. Audio is the judge of wording; agreement with ASR is a routing signal, not proof of correctness. Confident errors can still pass both models.
+The native v12 reply contains `heard_text` and an `evidence` value of `heard_clearly`, `heard_unclear`, or `not_audible`; it does not ask the model for a confidence number. Clear hearing is still checked against the bounded wording and editorial policy. Unclear or inaudible replies keep source wording with a review item. Legacy stored decisions retain the configurable confidence gate. This evidence contract limits automatic edits; it is not a guarantee that a model heard the words correctly.
 
-Missing, invalid, or uncertain review replies preserve the source and produce QC findings. `hybrid_adjudication.json` records each route and reason; costs retain the actual model for each call. Set `llm.adjudication.fallback.enabled: false` for the Lite-only route. The [September 14 comparison](docs/testing/flash-lite-adjudication-2026-09-14.md) records measured quality and cost limits; these measurements were recorded locally; verify the deployed commit separately.
+Deterministic checks run before paid adjudication for punctuation/casing, finite language-scoped spacing and abbreviation equivalents, established source-name spellings, and equivalent register reductions. Under `spoken`, a proven whole-span register reduction uses exact ASR wording; formatting, markup, abbreviation, and name differences can still require audio review. Under explicit `script`, equivalent register variants preserve source text. Unknown languages receive no language-specific equivalence rules; ambiguous names, lexical compounds, changed numbers, and negations still require review. The [September 14 comparison](docs/testing/flash-lite-adjudication-2026-09-14.md) is historical evidence for the earlier prompt and routing, not validation of v12.
 
-If a required focused clip is unavailable or does not cover its case, that case retains its source text and timing with a QC flag. Other cases with complete audio can still proceed; the affected case is never approved from text alone.
+For an eligible whole cue absent from ASR, native adjudication asks a bounded audio question between independently matched neighboring anchors. A separate question can own the exact source-token residue in a neighboring cue; other words remain read-only. An empty ASR span never proves omission: removing the missing cue requires complete audio, clear native hearing that it is absent, and no detected speech activity in the anchored gap. Recovered wording needs one independent speech chain, with each internal pause strictly below 0.2 seconds, before acoustic timing can replace the source interval. Multiple separated chains, borrowed neighboring wording, or different residual wording without owned word timing stay reviewable. No-LLM processing preserves these source passages. Saved legacy decisions that do not answer the new questions also preserve them for review; they do not receive fabricated successful hearing evidence. A narrow interruption rule can partition an otherwise overlapping sentence around another actor's independently owned insertion when every word has an exact, unique partition. It retains the whole sentence and reaction, uses existing acoustic timestamps and preserves genuine greeting/chorus context; uncertain cases remain reviewable.
 
-The optional `llm.adjudication.audio_context.enabled: true` route supplies full episode audio and ordered source subtitle context alongside those clips. It remains available for configurable alternatives such as Gemini 3.8 Flash. The transport and fallback rules below apply when this route is enabled.
+The default route uses Gemini 3.8 Flash at MEDIUM thinking after deterministic predecisions. The older October script-route comparison was repeated after recovering truncated hybrid replies; its written-reference conventions differ from the actor-spoken goal. Final v9 technical checks and all 13 actual SRT/QC inspections are complete. Ten explicit uncertain-source, actor-owner and lyric/dialogue overlap pairs remain for owner acceptance; the [accuracy-upgrade report](docs/testing/accuracy-upgrade-2026-10-01.md) records those exceptions, mixed reference scores, caption visibility tradeoffs and the closed validation cost.
+
+The Lite-first hybrid remains opt-in through YAML: set `llm.adjudication.model: gemini-3.5-flash-lite`, `thinking_level: high`, and enable a `fallback` using `gemini-3.8-flash` with `thinking_level: medium`. Deterministic checks escalate invalid or uncertain replies, retained source text that conflicts with ASR, and proposed wording that differs from owned ASR words. The reviewer receives only padded clips, nearby cues, word ownership, and review reasons, with no full episode audio or shared episode cache. Missing, invalid, or uncertain replies preserve the source and produce QC findings. `hybrid_adjudication.json` records each route and reason; costs retain the actual model for each call. Disabling fallback while keeping Lite as primary selects Lite-only. Agreement between models does not prove correctness. The [September 14 comparison](docs/testing/flash-lite-adjudication-2026-09-14.md) remains historical evidence; verify any deployed commit separately.
+
+If a required focused clip is unavailable or does not cover its case, that case retains source wording with a QC flag. Timing can still use uniquely owned acoustic words; missing or ambiguous word ownership preserves source timing. Other cases with complete audio can still proceed.
+
+The optional `llm.adjudication.audio_context.enabled: true` route supplies full episode audio and ordered source subtitle context alongside those clips. It remains available for configurable alternatives such as Gemini 3.8 Flash. The default uses local clips and disables full episode audio. The transport and fallback rules below apply when this route is enabled.
 
 For audio longer than 180 seconds, DubSync prepares one mono 24 kHz, 64 kbps MP3 and uploads it once through Gemini's Files API; already compact MP3s can be reused. Short inputs retain the normalized WAV. Focused case snippets remain WAV and carry their episode offsets. They are sent inline unless the estimated aggregate request, including base64 encoding, exceeds 18 MB, in which case their Files API URIs are used.
 
 The episode audio and ordered source context are reused through a job-owned Gemini cache when eligible. Its TTL is capped at 900 seconds and renewed only within the job lifetime. Job completion or failure triggers cleanup of the owned cache and uploads; cleanup or billing uncertainty is reported in `gemini_audio_context.json` and QC. If cache creation or renewal fails, the existing audio URI can be used within a cumulative 256,000 uncached audio-token budget. Upload failure or budget exhaustion holds the affected source dialogue for QC rather than proceeding without the required context. Generation, cache creation, and cache storage costs are recorded in `cost.json` when available, with uncertainty made explicit.
 
 On September 10, 2026, local preparation of the supplied long audio reduced the context upload from 71.568 MB to 23.724 MB in 5.968 seconds, with a measured duration difference of -0.005 seconds. This verifies compression and duration preservation only; it does not establish adjudication accuracy or subjective audio quality.
+
+## QC and Acoustic Timing
+
+`qc_report.html` and `qc_report.json` separate findings into four views: `review` contains actionable problems, `changes` records successful wording and timing operations, `notes` contains episode information, and `diagnostics` retains operator details. Related findings collapse into one review item with the delivered SRT cue numbers and timecodes. The raw `flags` and `style_issues` remain in JSON; fewer review items do not mean findings were deleted. Unknown warning/error kinds enter review by default.
+
+The job verdict is `clean` with no review items, `check` with warnings, or `attention` with any review error. A warning-only job also becomes `attention` when at least ten cues need review and they exceed 10% of the delivered cues. These tiers describe review burden, not guaranteed subtitle accuracy.
+
+`changes.diff.srt` is a change log with one block per applied wording edit, addition, or removal in playback order, including old/new text. Timing changes remain in the QC report. Invalid or unavailable change windows use explicitly labeled 1 ms diagnostic markers; those markers never define delivered dialogue timing. Cue scores are shown only when real ASR or forced-alignment confidence exists. Missing provider confidence is `null`/unscored, not zero.
+
+Default energy VAD streams the normalized WAV at a 10 ms hop. Its thresholds adapt to the file's speech level and noise floor, with hysteresis for quiet edges. Set `vad.threshold_dbfs` for a fixed threshold or `vad.window_ms` for legacy non-overlapping analysis windows. Music beds can keep an energy detector active through pauses; full-mix quality needs separate validation.
+
+`timing.phrase_edge_snap` repairs stretched ASR phrase edges against their speech burst before downstream timing. Set it to `false` to disable that repair, or supply `start_advance_ms`, `end_extension_ms`, and `models.<ASR model id>` overrides. Both sync and generation honor the selected model's settings. Multiple plausible bursts remain uncertain instead of forcing a unique word boundary.
+
+`timing.min_duration_policy: extend_into_silence` lets a short cue reach its display minimum only while verified silence remains, capped by other speech and the next cue, including held dialogue. `acoustic` keeps speech-bound ends. Generation also uses verified silence for a selected CPS target, capped by media and maximum-cue duration; it never delays cue starts. A short or fast cue can remain when there is no room. Frame-grid values are rounded upward to milliseconds at export so editor frame flooring does not lose a frame.
+
+Useful raw kinds include `song_lyric_source_kept` (note), `asr_duplicate_words_dropped` and `asr_word_clamped` (diagnostics), `source_cue_timing_repaired` (review), and `timing_evidence_held` (review). Absent lyric captions keep source text/timing, including cues with a single music-note edge. Genuine simultaneous speech remains a review item when a safe non-overlapping output cannot preserve all words.
+
+With `output.no_overlaps: true` (default), pure bracketed screen captions without owned speech words are composed with intersecting speech displays. Every spoken cue retains its ID, interval, original line sequence, speaker metadata, and word ownership; caption lines are appended and may repeat across adjacent speech and caption-only segments. Lyrics remain timed text and are never repeated as caption tracks. Composition preserves caption coverage but can extend a caption before or after its authored screen edge; the [measured visibility tradeoffs](docs/testing/accuracy-upgrade-2026-10-01.md#r63-dialogue-and-annotation-overlaps) include zero movement of speech. Combined line count/width and genuinely fast caption reading remain reviewable. Set `output.no_overlaps: false` to preserve original annotation segmentation.
 
 ## Provider Matrix
 
@@ -179,8 +209,9 @@ On September 10, 2026, local preparation of the supplied long audio reduced the 
 | ASR local | WhisperX | Implemented optional adapter; requires `dubsync[local]` | `asr.provider: whisperx` |
 | Test/offline | Fixture wordstream | Implemented | `asr.fixture_path: path/to.wordstream.json` |
 | LLM text default | OpenAI GPT-5.6 Luna | Implemented adapter using the Responses API | `llm.provider: openai`, `model: gpt-5.6-luna`, per-pass `reasoning_effort` |
-| LLM adjudication default | Gemini 3.5 Flash-Lite | Full source text, focused audio clips, structured language decisions | `llm.adjudication.provider: gemini`, `model: gemini-3.5-flash-lite`, `thinking_level: high` |
-| LLM adjudication review | Gemini 3.8 Flash | Flagged cases only, focused clips and local context | `llm.adjudication.fallback.enabled: true`, `model: gemini-3.8-flash`, `thinking_level: medium` |
+| LLM adjudication default | Gemini 3.8 Flash | Local source context, focused audio clips, v12 evidence decisions | `llm.adjudication.provider: gemini`, `model: gemini-3.8-flash`, `thinking_level: medium`, `fallback.enabled: false` |
+| LLM adjudication alternative | Gemini 3.5 Flash-Lite | Optional Lite-first primary; focused audio clips and local context | `llm.adjudication.model: gemini-3.5-flash-lite`, `thinking_level: high` |
+| LLM adjudication review | Gemini 3.8 Flash | Opt-in hybrid reviewer for flagged Lite cases | `llm.adjudication.fallback.enabled: true`, `model: gemini-3.8-flash`, `thinking_level: medium` |
 | LLM punctuation default | Gemini 3.7 Flash | Word-preserving punctuation pass | `llm.punctuation.provider: gemini`, `model: gemini-3.7-flash`, `thinking_level: medium` |
 | LLM alt | Anthropic | Implemented optional adapter | `llm.provider: anthropic` |
 | Test/offline | Fixture decisions | Implemented | `llm.provider: fixture` |
@@ -189,7 +220,7 @@ On September 10, 2026, local preparation of the supplied long audio reduced the 
 | Overlap backstop | Fixture overlap regions | Implemented | `overlap_detection.fixture_path: path/to.overlap.json` |
 | Overlap backstop | pyannote community-1 | Implemented optional adapter; requires `dubsync[diarize-local]` and model access | `overlap_detection.provider: pyannote` |
 | Speech activity | Fixture VAD regions | Implemented | `vad.fixture_path: path/to.vad.json` |
-| Speech activity | Energy threshold VAD | Implemented deterministic adapter | `vad.provider: energy` |
+| Speech activity | Adaptive energy VAD | Streaming 10 ms bursts; fixed settings remain configurable | `vad.provider: energy` |
 | Speech activity | Silero VAD | Implemented optional local adapter; falls back to energy if unavailable | `vad.provider: silero` |
 
 ## Config Reference
@@ -221,6 +252,10 @@ asr:
     - Luna
     - Matthew
 
+adjudication:
+  # Follow performed wording; set script to preserve authored equivalents.
+  register_policy: spoken
+
 llm:
   provider: openai
   model: gpt-5.6-luna
@@ -229,10 +264,15 @@ llm:
   # Per-pass overrides inherit the base settings unless provider/model changes:
   adjudication:
     provider: gemini
-    model: gemini-3.5-flash-lite
+    model: gemini-3.8-flash
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
-    thinking_level: high
+    thinking_level: medium
+    fallback:
+      enabled: false
+      provider: gemini
+      model: gemini-3.8-flash
+      thinking_level: medium
     audio_context:
       enabled: false
       compress_long_audio: true
@@ -266,9 +306,9 @@ overlap_detection:
 
 vad:
   provider: energy
-  threshold_dbfs: -45.0
-  window_ms: 100
-  min_region_ms: 100
+  # Omit threshold_dbfs/window_ms for adaptive 10 ms detection.
+  # threshold_dbfs: -45.0  # optional fixed threshold
+  # window_ms: 100         # optional legacy windows
   min_coverage: 0.2
 # Optional neural VAD when torch/Silero are available; otherwise use energy.
 # vad:
@@ -278,6 +318,13 @@ vad:
 timing:
   max_word_duration: 2.0
   max_intra_cue_gap: 1.5
+  min_duration_policy: extend_into_silence
+  # phrase_edge_snap: false  # disable phrase-edge repair
+  # phrase_edge_snap:
+  #   start_advance_ms: 200
+  #   end_extension_ms: 300
+  #   models:
+  #     scribe_v2: {start_advance_ms: 200}
   max_cps: 30
   min_cps: 2
 
@@ -320,8 +367,8 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 ## What Works Now
 
-- SRT parser/writer with strict round-trip tests proving only CRLF and trailing text whitespace are normalized for valid cues. Parsing permits malformed durations for inspection; final ordering and serialization reject negative starts and zero/reversed durations without dropping text or replacing an existing successful output.
-- Style profile derivation from `Examples/srt test.srt`.
+- SRT parsing accepts comma or period timestamps, empty cues, and a new cue header without a blank separator. Sync omits empty entries without merging neighboring cues, preserves them in ingest metadata, and adds `source_empty_cues_ignored` review; an entirely blank source fails before ASR. The writer removes interior blank lines and rejects wholly blank output cues, negative starts, and zero/reversed durations. Original input files are preserved. Byte readers support UTF-8, BOM UTF-16/32, and a warned Windows-1252 fallback; sync surfaces `source_encoding_converted` review. Ambiguous Japanese legacy bytes require an explicit encoding or conversion to UTF-8.
+- Style profile derivation uses robust duration/CPS percentiles and confident sample FPS detection, with the configured FPS as fallback.
 - `profile` rejects malformed sample SRT files with clear CLI errors instead of raw parser exceptions.
 - Malformed `--providers` and `--style` YAML files are rejected with clear CLI errors that name the config file.
 - Invalid style-profile values such as `fps: 0` are rejected with clear CLI errors that name the file and field.
@@ -333,11 +380,12 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Source cues are sorted chronologically before alignment while preserving original cue ids; moved cues are reported as `source_out_of_order`.
 - Deterministic re-cueing from ASR word timestamps, frame snapping, min duration, and zero-gap chaining.
 - Cue starts floor-snap and cue ends ceil-snap, so fractional model timings cannot truncate the final spoken syllable.
-- Min-duration padding stays within supported speech bounds. Conflicting evidence that would reverse or collapse a cue's duration preserves its prior timing with `timing_refinement_held` QC; unresolved invalid intervals cannot be exported.
+- Min-duration padding extends only into verified silence and stops before following speech or cues. Conflicting evidence that would reverse or collapse a cue's duration preserves its prior timing with `timing_refinement_held` QC; unresolved invalid intervals cannot be exported.
 - Frame-grid ceiling never snaps fractional model timings backward when enforcing minimum duration or forced-alignment ends.
 - Configured cue lead-in is clamped at zero so early speech cannot produce invalid negative SRT timestamps.
 - Fixture-backed ASR/LLM path for offline E2E tests.
 - Web audio generation resolves explicit presets, custom rules, and uploaded-example subtitle styles per job while preserving the configured profile for the DubSync default preset; the selected line, timing, gap, lead/tail, and CPS rules are recorded in `generate.json` and applied during output finalization.
+- Generation uses exact word ownership and the shared overlap resolver, balanced wrapping for spaced text, and sentence boundaries that respect titles, ordinals, abbreviations, and continuing ellipses. Selected reading-time targets extend ends only into verified silence.
 - Web sync derives its style from the user-supplied source SRT instead of applying the server's global generation profile, with an optional maximum-line override that uses aligned word timing instead of blind text-only splitting.
 - Web batch intake accepts up to 10 matched audio/SRT pairs, matches them by case-insensitive filename stem, and submits each batch as one serial work unit. With two bounded workers, two batches may run concurrently while the children inside either batch remain sequential.
 - Browser-held access recovers every child in a submitted batch after refresh, while each child keeps an isolated token and failure state.
@@ -346,7 +394,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Opt-in `--live` pytest smoke tests for OpenAI GPT-5.6 Luna, Gemini, Anthropic, ElevenLabs, OpenAI Whisper, and AssemblyAI are deselected from normal offline test runs.
 - OpenAI LLM calls use the Responses API `responses.parse` structured-output path with `store: false`, bounded SDK retries/timeouts, refusal and incomplete-response handling, and explicit `reasoning.effort`. The production base text model is `gpt-5.6-luna`; speaker mapping uses `reasoning_effort: medium`. Gemini 3.7 Flash punctuation uses `thinking_level: medium`.
 - Gemini LLM calls use the installed `google-genai` `models.generate_content` API with JSON response schemas.
-- Gemini thinking-level controls use `thinking_config.thinking_level`; adjudication defaults to Gemini 3.5 Flash-Lite high, its highest supported thinking level, with Gemini 3.8 Flash medium for selected reviews. Punctuation remains Gemini 3.7 Flash medium.
+- Gemini thinking-level controls use `thinking_config.thinking_level`; adjudication defaults to Gemini 3.8 Flash medium. Lite high with Flash medium review remains an opt-in YAML route. Punctuation remains Gemini 3.7 Flash medium.
 - Gemini episode context uses a bounded job-owned Files API upload and explicit cache with cleanup. Externally supplied `cached_content` remains available when automatic episode context is disabled; DubSync does not replace or delete that external cache.
 - Long-audio context is compressed once, and the complete source transcript is serialized losslessly for the shared cache. Batches contain at most eight cases with four concurrent requests; timed-out multi-case batches have one bounded individual-case recovery pass. See [the September 10 subtitle audit](docs/testing/subtitle-quality-fixes-2026-09-10.md) for measured evidence and limits.
 - Default adjudication checks extract padded WAV snippets, persist `audio_snippets.json`, include source/snippet hashes and context settings in the LLM cache key, and use inline audio or Files API URIs according to the aggregate request size.
@@ -358,34 +406,33 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - Multi-cue improv replacements are distributed once. When an explicitly mapped replacement consumes earlier cues and a following cue's prefix, leaving one replacement word before a surviving clause, that word's text and acoustic timing stay with the surviving clause instead of becoming an orphan cue.
 - Multi-cue improv timing partitions the accepted spoken word indices across affected cues, so rebuilt changed cues do not all inherit the full span timing.
 - Exact local word and speaker evidence separates actor turns even when a cue already fits its line limit. Each split retains its own spoken-word indices; ambiguous mappings remain intact with `speaker_turn_split_held` QC instead of assigning improvised clauses to an actor by token count.
-- Heuristic adjudication keeps source SRT for punctuation/casing-only differences and tiny ASR spelling noise without spending an LLM call.
+- Deterministic adjudication resolves proven formatting, language-scoped spelling/abbreviation, recurring-name, and register equivalents without a paid call. The selected register policy controls proven reductions; ambiguous lexical differences remain review cases.
 - Adjudication LLM spans carry up to two cue texts before and after the divergent span as structured context.
 - Fixture-backed punctuation pass with validators that reject word changes and added/removed/restyled quotation delimiters, including German low-high dialogue quotes; word-identical proposals retain customer line-break positions.
 - Punctuation word-freeze validation rejects digit-to-word substitutions such as `2` -> `two`; number normalization remains limited to alignment.
 - LLM adjudication retries invalid structured output once before falling back to `keep_srt` with a QC flag.
 - `adjudicate.json` persists adjudication decisions and adjudication-stage QC flags, so `--resume rebuild` preserves low-confidence or invalid-response warnings instead of silently dropping them.
-- Validated LLM adjudication decisions, speaker mappings, and punctuation outputs are cached in `workdir/<episode>/llm-cache`, keyed by prompt version, input payload, model, and non-secret request params, so prompt edits cannot serve stale results.
+- Validated batch adjudication, speaker mappings, and punctuation outputs use `workdir/<episode>/llm-cache`. Independent adjudication decisions also use `llm-case-cache`; when a batch cache misses, unaffected cases can be reused after another divergence changes. Keys include prompt/policy versions, language/register and source-name policy, local source context, acoustic ownership, audio provenance, resolved models, and non-secret settings. Transient audio/provider/review failures are not cached as lasting verdicts.
 - QC JSON/HTML report, `changes.diff.srt`, and a verify-stage `verify.json` artifact.
-- `changes.diff.srt` contains one review cue per text-changing flag, preserving supported QC windows and old/new text. Untimed or reversed findings use explicitly labeled 1 ms diagnostic markers with their original timing printed in the marker text; this convention never fabricates dialogue timing.
-- Per-cue verification scores and CPS are written to `qc_report.json` and rendered in `qc_report.html`; scores use forced-alignment confidence when present, otherwise ASR word confidence.
+- `changes.diff.srt` records applied wording changes from the classified change log, with delivered numbering and old/new text; timing-only adjustments stay in the QC report.
+- Per-cue verification scores and CPS are written to `qc_report.json` and rendered in `qc_report.html`; scores use forced-alignment confidence when present, otherwise real ASR word confidence, and remain unscored when neither exists.
 - QC HTML flag rows include cue ids, timestamps, confidence, and old/new review text for changed or flagged cues.
 - The verify stage writes `verify.json` with the finalized summary, cue scores, QC flags, and style issues for resumable/debuggable stage inspection.
 - ASR cache keyed by audio SHA-256, model, and non-secret params; credential fields are stripped before cache metadata is written.
 - Uncached cloud ASR calls add audio-duration cost items to the cost meter; ElevenLabs keyterm/character-name prompting includes the plan's `$0.05/hr` surcharge; AssemblyAI uses the plan's Universal-3 Pro / Universal-2 rates plus the default speaker-label surcharge unless `speaker_labels: false`; cache hits remain free.
 - Live LLM adapters retain provider usage metadata and add token cost items for Gemini defaults or configured model prices.
 - LLM provider/model config can be overridden per pass for adjudication, punctuation, and speaker mapping, and cost items use the resolved pass model.
-- The adjudication confidence gate defaults to `0.7` and can be raised or lowered with `llm.adjudication.confidence_gate`. Hybrid mode requires a finite value greater than zero and at most one; model confidence is not an accuracy guarantee.
-- Live adjudication prompts receive the resolved confidence gate, so provider-side reasoning and local QC flagging use the same threshold.
+- The adjudication confidence gate defaults to `0.7` and can be changed with `llm.adjudication.confidence_gate`. Hybrid mode requires a finite value greater than zero and at most one. Native v12 replies use explicit hearing evidence and deterministic validation; legacy stored decisions still use their confidence gate.
 - Adjudication sends LLM cases in scene batches split by `llm.adjudication.scene_gap_seconds` instead of one episode-wide batch.
 - Punctuation sends cue batches split by `llm.punctuation.scene_gap_seconds`, with the same word-freeze validator applied after each proposed change.
 - Valid punctuation proposals preserve cue line breaks instead of flattening two-line subtitles into one line.
 - Punctuation prompts include speaker cluster and mapped character labels as context while keeping those labels out of the output SRT.
-- Deterministic 16-bit WAV silence gate for cues sitting below the configured dBFS threshold.
+- Streaming 16-bit WAV energy and speech-activity checks share the timing evidence, with adaptive defaults and configurable fixed thresholds.
 - VAD-backed unmatched cues with insufficient speech coverage are QC-flagged as dropped-line candidates.
 - Unmatched and policy-removed source cues carry their original timestamp windows in QC for review.
 - Source-error detector for adjacent duplicated/scrambled cue fragments, including the named dirty block in `Examples/srt test.srt`, with affected timestamp windows in QC.
 - Speaker ID propagation from matched ASR words into rebuilt cues, enabling overlap policy decisions.
-- Speaker-aware monotonic enforcement: same-speaker cues are chained, while different-speaker overlaps can remain stacked.
+- Overlap resolution uses word ownership rather than moving spoken boundaries to enforce ordering. Known different-speaker overlap can remain stacked and visibly reviewed.
 - Style lint allows known different-speaker stacked overlaps while still treating same/unknown-speaker overlap as invalid.
 - Overlap policy QC flags include the actual overlapping timestamp window for review, including overlaps where speaker IDs are still unknown.
 - `overlap_policy: dash` merges only known different-speaker overlaps; unknown-speaker overlaps stay separate and are QC-flagged for human review.
@@ -414,9 +461,29 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 - CJK/Thai/Hangul/Japanese tokenization uses character-level comparison units, with Japanese width normalization, kana-voicing preservation, and natural fragment joining. Style profile/lint/reflow use visual display width for full-width text.
 - Changed-text reflow hyphen-splits over-wide unspaced compounds so replacements can satisfy the two-line house style when possible.
 
+## Offline Accuracy Benchmarks
+
+The committed tools accept private manifest paths; corpus media, provider artifacts, human references, and generated run directories stay outside git. Paths resolve relative to a manifest's `repo_root`, or its directory when that field is omitted. No absolute owner-machine path is built into the tools. `scripts/replay_offline.py` substitutes recorded ASR/decisions and blocks network calls. `saved` mode measures replay compatibility with earlier verdicts; it does not test a new prompt's hearing quality. Its evidence reports exact, text-only, and unmatched decision reuse separately. `--no-loose` restricts reuse to exact ownership matches.
+
+Run from the repository root in PowerShell, using fresh output directories:
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+& .\.venv\Scripts\python.exe scripts\replay_offline.py --manifest C:\private\corpus.json --episode clip --model mai --mode nollm --out work\bench-run
+& .\.venv\Scripts\python.exe scripts\bench_corpus.py --manifest C:\private\corpus.json --providers provider.yaml --out work\bench-suite --jobs 4
+& .\.venv\Scripts\python.exe scripts\golden_bench.py --manifest C:\private\golden-suite.json --json work\golden-metrics.json
+& .\.venv\Scripts\python.exe scripts\timing_vs_audio.py --manifest C:\private\timing-suite.json --word-evidence raw --json work\timing-metrics.json
+```
+
+A corpus manifest has `episodes`, each with an `id`, `source_srt.path`, full `normalized_16k_candidates`, cached `asr.mai`/`asr.scribe_v2` transcripts (`id`, `coverage`, `fixture_path`), `stage_dirs`, and `offline_replay.commands` (`model`, `transcript`, `saved`). Saved replay additionally needs stage artifacts with `align.json` and `adjudicate.json`. The small portable example is constructed in [the benchmark tests](tests/test_offline_benchmark_tools.py).
+
+A golden manifest has `golden_suite`, mapping labels to `source`, `golden`, `outputs` (label-to-SRT paths), and `timing_valid`; set `timing_valid: false` for text-only references. A timing manifest has `timing_runs`, a list of replay directories. Timing analysis streams WAV samples and accepts `--word-evidence effective` for repaired ownership alongside the default raw-provider comparison.
+
+For another source revision, export it into a separate directory and set both `DUBSYNC_SRC` and `PYTHONPATH` to its `src` before running the same tools and comparator. Keep manifests, audio, saved decisions, and metric settings matched. The episode 11/17 human files mostly retain old app timestamps: compare word accuracy and the `human_edit_subset`, then use energy-based onset/offset measurements for acoustic timing. Source-timestamp equality alone does not establish a timing failure.
+
 ## Readiness Report
 
-The CLI and commercial web MVP are implemented, with fixture-backed tests for both customer workflows. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks. Historical results below do not establish the deployed state or quality of later changes; verify the exact Render commit for each release.
+The CLI and commercial web MVP are implemented, with fixture-backed tests for both customer workflows. The web surface includes per-job generation styles, source-derived sync styling, gated job creation, polling, refresh recovery, protected downloads, legal and payment policies, retention cleanup, and commit-aware Render health checks. The [October 1 report](docs/testing/accuracy-upgrade-2026-10-01.md) separates upgrade checkpoints from final acceptance work. Historical results below do not establish the deployed state or quality of later changes; verify the exact Render commit for each release.
 
 Still unverified or intentionally outside this release: real WhisperX/pyannote/MMS model execution in this workspace, production Silero model quality, language-specific morphological tokenizers, customer accounts, automatic payment collection, and a browser cue editor.
 

@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..models import Cue
-from ..style_profile import GenerationConstraints, StyleProfile
+from ..style_profile import GenerationConstraints, StyleProfile, detect_fps_with_confidence, robust_sample_bounds
 from ..text_metrics import display_width
 
 StyleSource = Literal["preset", "custom", "sample"]
@@ -268,26 +268,33 @@ def _resolved_from_sample(cues: list[Cue], *, fps: float) -> ResolvedGenerationS
     durations = [cue.duration_ms / 1000.0 for cue in ordered]
     widths = [display_width(cue.plain_text) for cue in ordered]
     cue_cps = [width / duration for width, duration in zip(widths, durations)]
-    max_lines = max(len(cue.lines) for cue in ordered)
-    max_line_width = max(display_width(line) for cue in ordered for line in cue.lines)
+    min_duration, max_duration = robust_sample_bounds(durations)
+    min_cps, max_cps = robust_sample_bounds(cue_cps)
+    _, max_lines = robust_sample_bounds([len(cue.lines) for cue in ordered])
+    _, max_line_width = robust_sample_bounds([display_width(line) for cue in ordered for line in cue.lines])
+    fps_detection = detect_fps_with_confidence(ordered, default=fps)
     allow_zero_gap = any(left.end_ms == right.start_ms for left, right in zip(ordered, ordered[1:]))
 
     profile = StyleProfile(
-        fps=fps,
+        fps=fps_detection.fps,
         max_lines_per_cue=int(_clamp(max_lines, 1, 4)),
         max_chars_per_line=int(_clamp(max_line_width, 10, 80)),
-        min_cue_dur=round(_clamp(min(durations), 0.2, 5.0), 3),
+        min_cue_dur=round(_clamp(min_duration, 0.2, 5.0), 3),
         allow_zero_gap=allow_zero_gap,
         cue_count=len(ordered),
         observed_min_duration=round(min(durations), 3),
         observed_max_duration=round(max(durations), 3),
-        notes=["Generation style derived from an uploaded SRT example."],
+        notes=[
+            "Generation style derived from an uploaded SRT example.",
+            f"Sample frame rate detected: {fps_detection.fps:g} fps." if fps_detection.confident
+            else f"Sample frame rate is ambiguous; using the selected {fps:g} fps.",
+        ],
     )
     constraints = GenerationConstraints(
         max_gap_seconds=0.8,
-        max_cue_duration_seconds=round(_clamp(max(durations), 0.5, 20.0), 3),
-        min_cps=round(_clamp(min(cue_cps), 0.0, 10.0), 2),
-        max_cps=round(_clamp(max(cue_cps), 5.0, 60.0), 2),
+        max_cue_duration_seconds=round(_clamp(max_duration, 0.5, 20.0), 3),
+        min_cps=round(_clamp(min_cps, 0.0, 10.0), 2),
+        max_cps=round(_clamp(max_cps, 5.0, 60.0), 2),
     )
     return ResolvedGenerationStyle(source="sample", profile=profile, constraints=constraints)
 

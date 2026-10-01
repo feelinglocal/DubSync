@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 Verdict = Literal["keep_srt", "use_audio", "hybrid"]
+AudioEvidence = Literal["heard_clearly", "heard_unclear", "not_audible"]
 
 
 class Cue(BaseModel):
@@ -160,6 +161,26 @@ class AdjudicationDecision(BaseModel):
     speaker: str | None = None
     character: str | None = None
     reason: str
+    # Saved decisions predating prompt v12 retain their original confidence.
+    # New audio evidence has a deterministic gate value, never a model score.
+    evidence: AudioEvidence | None = None
+    heard_text: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_audio_evidence(cls, value):
+        if not isinstance(value, dict):
+            return value
+        evidence, heard = value.get("evidence"), value.get("heard_text")
+        if evidence is None and heard is None:
+            return value
+        if not isinstance(evidence, str) or evidence not in {"heard_clearly", "heard_unclear", "not_audible"} or not isinstance(heard, str):
+            raise ValueError("audio decisions require valid evidence and heard_text together")
+        if evidence == "not_audible" and heard.strip():
+            raise ValueError("not_audible cannot claim heard words")
+        if evidence == "heard_clearly" and not heard.strip() and str(value.get("final_text", "")).strip():
+            raise ValueError("clear empty evidence cannot authorize nonempty wording")
+        return {**value, "confidence": 1.0 if evidence == "heard_clearly" else 0.0}
 
 
 class StyleIssue(BaseModel):

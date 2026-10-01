@@ -1,6 +1,6 @@
 # DubSync Commercial MVP Plan
 
-**Status:** implemented, tested locally, and deployed to the Render default domain. The September 14, 2026 hybrid adjudication and alignment changes have local benchmark evidence; each release requires verification of its exact Render commit.
+**Status:** the commercial service has been implemented, tested locally, and deployed to the Render default domain. The October 1, 2026 accuracy upgrade changes the local default to Gemini 3.8 Flash adjudication (medium thinking); its final policy 26 technical validation and 13 actual SRT/QC inspections are complete, while owner acceptance of ten explicit overlap exceptions and deployment remain pending. Historical September hybrid measurements remain reference evidence; each release requires verification of its exact Render commit.
 **Engine contract:** `PLAN.md` remains authoritative for subtitle timing and reconciliation behavior.  
 **Product contact:** rey@feelslocal.com
 
@@ -9,6 +9,10 @@
 DubSync should be a focused production utility, not a broad editing SaaS.
 
 Its promise is: upload dialogue audio with an existing SRT to repair timing, or upload audio alone to generate a timed SRT. In both workflows, timing comes from acoustic word timestamps. Language models may reason about words, punctuation, and speaker context, but never create timestamps.
+
+On October 2, 2026, the owner confirmed that captions should follow what the actor actually says, including improvised sentences. `adjudication.register_policy: spoken` is now the default; explicit `script` remains available for authored equivalents. Bounded native audio questions can reconcile eligible missing cues and exact neighboring residue; no-LLM processing preserves them. Confirmed omissions require complete clear hearing and no speech activity, while recovered dialogue needs an independent speech chain with each internal pause strictly below 0.2 seconds. A narrow actor-interruption split preserves exact words and ownership; genuine greeting/chorus context remains. Known ambiguous passages remain reviewable while automatic processing and downloads continue. The final v9 packet records mixed written-reference outcomes under that actor-spoken choice, ten residual overlap pairs and caption visibility/readability tradeoffs for owner disposition. Technical checks do not establish physical timing or subjective audio quality.
+
+Default `output.no_overlaps: true` composes pure bracketed screen captions with intersecting speech without moving or repeating spoken words or changing their original lines and IDs. Caption text may repeat continuously and gain visibility beyond authored picture-text edges; lyrics are never repeatable caption tracks. Exact display tradeoffs and style limits are recorded in the [accuracy report](testing/accuracy-upgrade-2026-10-01.md#r63-dialogue-and-annotation-overlaps). Explicit `output.no_overlaps: false` preserves original annotation segmentation.
 
 Primary customers:
 
@@ -68,8 +72,9 @@ flowchart LR
     W --> F["FFmpeg normalize"]
     F --> M["MAI-Transcribe 2 via OpenRouter (default)"]
     F --> E["ElevenLabs Scribe v2 (selectable)"]
-    W --> G["Gemini 3.5 Flash-Lite adjudication (high thinking)"]
-    G --> R["Flagged cases: Gemini 3.8 Flash review (medium thinking, selected clips)"]
+    W --> G["Gemini 3.8 Flash adjudication (medium thinking)"]
+    W --> L["Optional YAML hybrid: Gemini 3.5 Flash-Lite (high thinking)"]
+    L --> R["Flagged cases: Gemini 3.8 Flash review (medium thinking, selected clips)"]
     W --> P["Gemini 3.7 Flash punctuation (medium thinking)"]
     W --> H["OpenAI GPT-5.6 Luna speaker-mapping pass"]
     W --> C["Deterministic DubSync core"]
@@ -121,7 +126,7 @@ Current baseline infrastructure cost:
 | Render persistent SSD | $0.25/GB/month | $2.50 for 10 GB |
 | Total before bandwidth and providers |  | **$9.50/month** |
 
-Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes audio to 16 kHz mono for transcription and timing. Default Flash-Lite adjudication uses focused WAV clips and full source text. Optional Gemini full-episode context uses the normalized WAV for short audio; long audio is prepared once as mono 24 kHz, 64 kbps MP3 and reused through the Files API and a bounded job-owned cache. See the [README audio-context policy](../README.md#gemini-audio-context) for transport limits, cache cleanup, cost uncertainty, and source-hold behavior.
+Render includes 5 GB of monthly bandwidth on the Hobby workspace, then charges $0.15/GB. DubSync normalizes audio to 16 kHz mono for transcription and timing. Default Gemini 3.8 Flash adjudication (medium thinking) uses focused WAV clips and nearby source context. Optional Gemini full-episode context uses the normalized WAV for short audio; long audio is prepared once as mono 24 kHz, 64 kbps MP3 and reused through the Files API and a bounded job-owned cache. See the [README audio-context policy](../README.md#gemini-audio-context) for transport limits, cache cleanup, cost uncertainty, and source-hold behavior.
 
 Local release verification validates `render.yaml` against Render's published JSON Schema. GitHub auto-deploys the Docker service to Render. The health endpoint includes Render's injected commit SHA so a release can be verified without relying on dashboard status alone.
 
@@ -142,8 +147,8 @@ Current provider price anchors:
 - Microsoft MAI-Transcribe 2 via OpenRouter: $0.10/hour launch catalog rate verified September 5, 2026. OpenRouter `usage.cost` takes precedence in metering; the hourly rate remains configurable. MAI-Transcribe 2 is the default transcription option for new jobs; Scribe v2 remains selectable.
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
 - Gemini 3.7 Flash punctuation retains medium thinking. Its recorded Standard paid-tier price is $0.75 per million input tokens and $3.75 per million output tokens through December 31, 2026, including thinking tokens, then $1.50/$7.50 starting January 1, 2027. These are the recorded 3.7 price anchors, not a quote for 3.8 adjudication.
-- Gemini 3.5 Flash-Lite adjudication uses high thinking. Standard paid-tier prices verified September 14, 2026 are $0.30 per million input tokens, $2.50 per million output tokens including thinking, $0.03 per million cached-input tokens, and $1.00 per million cached tokens per hour of storage. Meter generation, cache creation, and cache storage separately; Files API reuse alone does not remove input-token charges.
-- The enabled hybrid reviewer uses Gemini 3.8 Flash medium only for flagged cases. It receives selected audio clips and nearby source/ASR context, with no full episode audio or episode cache. Its generation uses the recorded $0.75/M input and $3.75/M output rates through December 31, 2026; thinking tokens count as output. Per-model costs and review routes are recorded separately. See the [September 14 comparison](testing/flash-lite-adjudication-2026-09-14.md) for observed reference differences and cost estimates; those local measurements do not establish live deployment status.
+- Optional Gemini 3.5 Flash-Lite adjudication uses high thinking. Standard paid-tier prices verified September 14, 2026 are $0.30 per million input tokens, $2.50 per million output tokens including thinking, $0.03 per million cached-input tokens, and $1.00 per million cached tokens per hour of storage. Meter generation, cache creation, and cache storage separately; Files API reuse alone does not remove input-token charges.
+- Default Gemini 3.8 Flash adjudication uses medium thinking, focused audio clips, and nearby source/ASR context. It is also the reviewer for the optional Lite-first hybrid. That reviewer receives no full episode audio or episode cache. Configured generation prices use the recorded $0.75/M input and $3.75/M output rates through December 31, 2026; thinking tokens count as output. Per-model costs and review routes are recorded separately. The [October 1 report](testing/accuracy-upgrade-2026-10-01.md) records the current route comparison; the [September 14 comparison](testing/flash-lite-adjudication-2026-09-14.md) preserves historical differences and estimates. Local measurements do not establish live deployment status.
 - The August 14, 2026 paid `testing 4` replay measured $0.20228 for the historical Gemini 3.7 adjudication and punctuation route over 258.9 seconds of source audio with complete ordered episode context. This is not a cost or quality measurement of the September 10 Gemini 3.8 full-audio route. Re-benchmark representative long-form jobs before quoting from older per-episode LLM assumptions.
 - Every job writes provider cost to `cost.json`: OpenRouter-reported audio charges are marked `audio_billed`, while Scribe audio and missing-usage fallbacks use catalog estimates. Token charges use reported usage with configured token prices. Distinguish these bases when repricing.
 

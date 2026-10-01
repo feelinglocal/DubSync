@@ -115,7 +115,9 @@ def split_speaker_turn_cues(
             if timing_issue is not None:
                 break
         if timing_issue is not None:
-            held = _preserve_explicit_dialogue_turn_lines(cue)
+            # A held split preserves the authored layout as well as timing.
+            # Inline turn markers do not authorize new display line breaks.
+            held = cue
             output.append(held)
             flags.append(QCFlag(
                 kind="timing_evidence_held", cue_ids=[cue.index], severity="error",
@@ -389,17 +391,6 @@ def _text_without_dialogue_markers(text: str) -> str:
     return " ".join(text.split())
 
 
-def _preserve_explicit_dialogue_turn_lines(cue: Cue) -> Cue:
-    """Only move already authored turn markers onto separate display lines."""
-    text = cue.plain_text
-    if not re.match(r"^[-–—]\s+\S", text):
-        return cue
-    turns = re.split(r"\s+(?=[-–—]\s+\S)", text)
-    if len(turns) <= 1 or not all(alphanumeric_signature(turn) for turn in turns):
-        return cue
-    return cue.with_lines(turns)
-
-
 def group_words_for_cues(
     words: list[Word],
     profile: StyleProfile,
@@ -578,6 +569,131 @@ def segment_generated_adlib_cues(
         flags,
         expansions,
     )
+
+
+def split_at_generated_interruptions(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    generated_cue_ids: set[int],
+    profile: StyleProfile,
+    *,
+    protected_cue_ids: set[int] | None = None,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], dict[int, list[int]]]:
+    """Separate exact source fragments around one accepted, sequential actor turn.
+
+    The inserted cue already owns its words. Only a single-speaker source with
+    complete, exclusive word ownership can be divided around it; real acoustic
+    overlap and uncertain source layout remain intact.
+    """
+    if not generated_cue_ids:
+        return list(cues), alignment, [], {}
+    protected = (protected_cue_ids or set()) | set(alignment.diagnostics.missing_audio_cue_ids)
+    owners = Counter(index for indices in alignment.cue_word_indices.values() for index in indices)
+    cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
+    next_cue_id = max([0, *cue_word_indices, *(cue.index for cue in cues)]) + 1
+
+    def safe_words(cue: Cue) -> list[int]:
+        if (
+            cue.index in protected or len(cue.lines) != 1
+            or _has_inline_subtitle_markup(cue.text) or cue_has_bracketed_screen_text(cue)
+            or any(mark in cue.text for mark in "♪♫")
+        ):
+            return []
+        indices = cue_word_indices.get(cue.index, [])
+        if not indices or any(
+            index < 0 or index >= len(words) or owners[index] != 1
+            or not words[index].text.strip() or not words[index].speaker_id
+            or not isfinite(words[index].start) or not isfinite(words[index].end)
+            or words[index].start < 0 or not 0 < words[index].end - words[index].start <= 2.0
+            for index in indices
+        ):
+            return []
+        if len({words[index].speaker_id for index in indices}) != 1:
+            return []
+        ordered = sorted(indices, key=lambda index: (words[index].start, words[index].end, index))
+        if any(words[left].end > words[right].start for left, right in zip(ordered, ordered[1:])):
+            return []
+        if alphanumeric_signature(cue.text) != [
+            token for index in ordered for token in alphanumeric_signature(words[index].text)
+        ]:
+            return []
+        return ordered
+
+    insertions = [(cue, safe_words(cue)) for cue in cues if cue.index in generated_cue_ids]
+    output: list[Cue] = []
+    flags: list[QCFlag] = []
+    expansions: dict[int, list[int]] = {}
+    for cue in cues:
+        parent_indices = safe_words(cue) if cue.index not in generated_cue_ids else []
+        if not parent_indices:
+            output.append(cue)
+            continue
+        candidates = []
+        for inserted, inserted_indices in insertions:
+            if not inserted_indices or not speakers_known_different(
+                words[parent_indices[0]].speaker_id, words[inserted_indices[0]].speaker_id,
+            ):
+                continue
+            if timing_evidence_issue(inserted, [words[index] for index in inserted_indices]) is not None:
+                continue
+            insertion_start = words[inserted_indices[0]].start
+            insertion_end = words[inserted_indices[-1]].end
+            prefix = [index for index in parent_indices if words[index].end <= insertion_start]
+            suffix = [index for index in parent_indices if words[index].start >= insertion_end]
+            if not prefix or not suffix or prefix + suffix != parent_indices:
+                continue
+            combined = prefix + inserted_indices + suffix
+            if any(words[left].end > words[right].start for left, right in zip(combined, combined[1:])):
+                continue
+            owned = set(combined)
+            if any(
+                index not in owned and word.text.strip()
+                and word.start < words[combined[-1]].end and word.end > words[combined[0]].start
+                for index, word in enumerate(words)
+            ):
+                continue
+            units, separator = _split_units(cue.text)
+            chunks = _exact_text_chunks_for_word_groups(units, separator, [prefix, suffix], words)
+            if chunks is None or separator.join(units) != cue.text:
+                continue
+            if any(timing_evidence_issue(cue.with_lines([chunk]), [words[index] for index in group])
+                   for group, chunk in zip([prefix, suffix], chunks, strict=True)):
+                continue
+            candidates.append((inserted_indices, prefix, suffix, chunks))
+        if len(candidates) != 1:
+            output.append(cue)
+            continue
+
+        inserted_indices, prefix, suffix, chunks = candidates[0]
+        replacement_ids = [cue.index, next_cue_id]
+        next_cue_id += 1
+        replacements = []
+        for position, (cue_id, group, chunk) in enumerate(zip(replacement_ids, [prefix, suffix], chunks, strict=True)):
+            start_ms = profile.snap_floor(max(0, words[group[0]].start * 1000 - profile.lead_in_ms))
+            end_ms = profile.snap_ceil(words[group[-1]].end * 1000 + profile.tail_ms)
+            if position == 0:
+                end_ms = min(end_ms, max(
+                    profile.snap_ceil(words[group[-1]].end * 1000),
+                    profile.snap_floor(words[inserted_indices[0]].start * 1000 - profile.lead_in_ms),
+                ))
+            speaker_id = words[group[0]].speaker_id
+            replacements.append(cue.model_copy(update={
+                "index": cue_id, "start_ms": start_ms, "end_ms": max(start_ms + 1, end_ms),
+                "lines": [chunk], "speaker_id": speaker_id,
+                "character": cue.character if cue.speaker_id == speaker_id else None,
+            }))
+            cue_word_indices[cue_id] = list(group)
+        output.extend(replacements)
+        expansions[cue.index] = replacement_ids
+        flags.append(QCFlag(
+            kind="speaker_turn_split", cue_ids=replacement_ids, severity="info",
+            message=("Dialogue was separated around an accepted, exclusively owned interruption by another actor; "
+                     "all source text and sequential word ownership were preserved."),
+            old_text=cue.text, new_text="\n\n".join(item.text for item in replacements),
+            start=replacements[0].start_ms / 1000, end=replacements[-1].end_ms / 1000,
+        ))
+    return output, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, expansions
 
 
 def split_overlong_existing_cues(
@@ -1079,7 +1195,7 @@ def _starts_new_cue(
     if _snapped_duration_ms(words[current[0]], last_word, profile) > max_cue_duration_seconds * 1000:
         return True
     current_text = join_word_texts(words[index].text for index in current)
-    if _ends_sentence(current_text) and previous.end - words[current[0]].start >= profile.min_cue_dur:
+    if _ends_sentence(current_text, next_text=word.text) and previous.end - words[current[0]].start >= profile.min_cue_dur:
         return True
     candidate = join_word_texts(words[index].text for index in [*current, *unit])
     return len(wrap_visual_width(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
@@ -1095,9 +1211,33 @@ _SENTENCE_CLOSERS = "\"'’”»›)]}」』）］｝】〕〉》〗〙〛"
 _SENTENCE_OPENERS = "‘“«‹([{「『（［｛【〔〈《〖〘〚"
 
 
-def _ends_sentence(text: str) -> bool:
+_NONTERMINAL_ABBREVIATIONS = frozenset({
+    "dr", "dra", "prof", "sr", "sra", "srta", "mr", "mrs", "ms", "st", "nr",
+    "hr", "fr", "bzw", "ca", "vgl", "inkl", "zzgl", "geb", "jan", "feb", "apr",
+    "jun", "jul", "aug", "sep", "sept", "okt", "nov", "dez", "mme", "mlle",
+})
+
+
+def _ends_sentence(text: str, *, next_text: str | None = None) -> bool:
     normalized = unicodedata.normalize("NFKC", text)
-    return normalized.rstrip().rstrip(_SENTENCE_CLOSERS).rstrip().endswith((".", "?", "!", "…", "。"))
+    stripped = normalized.rstrip().rstrip(_SENTENCE_CLOSERS).rstrip()
+    if not stripped.endswith((".", "?", "!", "…", "。")):
+        return False
+    last = stripped.rsplit(maxsplit=1)[-1]
+    if stripped.endswith("..."):
+        # NFKC also maps the single-character ellipsis to three periods.
+        following = (next_text or "").lstrip().lstrip(_SENTENCE_OPENERS + _SENTENCE_CLOSERS)
+        return not following or not following[0].islower()
+    if stripped.endswith("."):
+        stem = last[:-1].casefold()
+        if stem.isdigit() or stem in _NONTERMINAL_ABBREVIATIONS:
+            return False
+        if re.fullmatch(r"(?:[^\W\d_]\.){2,}", last, re.UNICODE):
+            return False
+        # Initials before a name and spaced forms such as "z. B.".
+        if len(stem) == 1 and stem.isalpha():
+            return False
+    return True
 
 
 def _only_punctuation(text: str, punctuation: str) -> bool:

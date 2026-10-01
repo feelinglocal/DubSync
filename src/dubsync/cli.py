@@ -15,7 +15,7 @@ from .config import write_style_profile
 from .evaluation import evaluate_against_golden
 from .models import Cue, QCFlag
 from .pipeline import sync_episode
-from .srt_io import SRTParseError, parse_srt_text
+from .srt_io import SRTParseError, parse_srt_text, read_srt
 from .style_profile import derive_style_profile
 from .transcription import generate_srt_from_audio
 
@@ -247,14 +247,14 @@ def _load_report_payload(report_path: Path) -> dict[str, object]:
 
 def _parse_profile_srt(path: Path):
     try:
-        return parse_srt_text(path.read_text(encoding="utf-8-sig"))
+        return read_srt(path)
     except (SRTParseError, OSError) as exc:
         raise click.ClickException(f"invalid sample SRT: {exc}") from exc
 
 
 def _parse_report_srt(path: Path, option_name: str):
     try:
-        return parse_srt_text(path.read_text(encoding="utf-8-sig"))
+        return read_srt(path)
     except (SRTParseError, OSError) as exc:
         raise click.ClickException(f"invalid {option_name} SRT: {exc}") from exc
 

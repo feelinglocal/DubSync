@@ -45,13 +45,17 @@ def test_real_factory_does_not_turn_malformed_confidence_into_a_confident_approv
     def generate(**kwargs):
         calls.append(kwargs)
         primary = kwargs["model"] == "gemini-3.5-flash-lite"
-        confidence = invalid_confidence if primary == (stage == "primary") else 0.99
         # A valid source keep deliberately selects fallback. An invalid primary
         # approval agrees with ASR and must still be escalated as malformed.
         source_keep = primary and stage == "fallback"
         reply = {"case_id": "one", "verdict": "keep_srt" if source_keep else "use_audio",
-                 "final_text": "No" if source_keep else "Yes", "confidence": confidence,
+                 "final_text": "No" if source_keep else "Yes",
+                 "heard_text": "No" if source_keep else "Yes", "evidence": "heard_clearly",
                  "reason": "Synthetic recorded evidence"}
+        # v12 never requests confidence. A malformed legacy field cannot make
+        # an otherwise native-looking response into a valid approval.
+        if primary == (stage == "primary"):
+            reply["confidence"] = invalid_confidence
         return SimpleNamespace(text=json.dumps({"decisions": [reply]}), usage_metadata={
             "prompt_token_count": 10, "candidates_token_count": 5,
         })

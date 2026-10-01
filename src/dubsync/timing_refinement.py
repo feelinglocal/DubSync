@@ -9,11 +9,12 @@ from .asr_timing import (
     ambiguous_word_indices_from_regions,
     asr_model_from_artifact,
     clamp_asr_word_durations,
+    has_sufficient_speech_overlap,
     phrase_edge_snap_from_config,
     repair_asr_word_edges,
 )
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
-from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags, select_cue_word_window
+from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags, select_cue_word_window, source_fragment_boundary_word_ids
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
@@ -397,6 +398,7 @@ def _word_window_for_cue(
         sorted(matched, key=lambda word: (word.start, word.end)),
         max_word_duration=max_word_duration_seconds,
         max_intra_cue_gap=max_intra_cue_gap_seconds,
+        preserve_boundary_word_ids=source_fragment_boundary_word_ids(cue.index, words, alignment),
     )
     return selected
 
@@ -471,7 +473,8 @@ def _acoustic_end_seconds(
 ) -> float:
     """Where the cue's own voice stops: the offset of the burst holding its last word.
 
-    A word that runs past its burst ends with the burst. A burst that runs
+    A word that runs past a burst ends there only when the burst owns enough
+    of the word to replace its edge, as in word repair. A burst that runs
     past the word is the same voice only while it is short and no other word
     begins inside it; a longer or shared burst is another sound, and a later
     separate burst (a breath) is never considered.
@@ -481,7 +484,11 @@ def _acoustic_end_seconds(
     if last_region.end <= last_word.start:
         return last_word.end
     if last_word.end >= last_region.end:
-        return last_region.end
+        return (
+            last_region.end
+            if has_sufficient_speech_overlap(last_word, last_region.start, last_region.end)
+            else last_word.end
+        )
     following = bisect_right(word_starts, last_word.start)
     next_word_start = word_starts[following] if following < len(word_starts) else float("inf")
     if (

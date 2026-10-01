@@ -26,6 +26,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ..audio import probe_audio_duration
 from ..config import load_yaml
+from ..cost import asr_dollars_per_hour
 from ..providers import (
     GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
     GEMINI_TRANSCRIBE_MAX_AUDIO_SECONDS,
@@ -91,13 +92,13 @@ FRONTEND_ROUTE_METADATA = {
 }
 SITE_ORIGIN = "https://dubsync.onrender.com"
 MAX_BATCH_PARSER_FILES = 21
-MAX_BATCH_PARSER_FIELDS = 6
+MAX_BATCH_PARSER_FIELDS = 7
 MAX_BATCH_FIELD_BYTES = 64 * 1024
 MAX_BATCH_DOWNLOAD_BODY_BYTES = 16 * 1024
 BATCH_ARCHIVE_SPOOL_BYTES = 8 * 1024 * 1024
 ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
-MAX_SINGLE_PARSER_FIELDS = 6
+MAX_SINGLE_PARSER_FIELDS = 7
 MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
 QC_RESULT_COUNT_KEYS = (
     "flags", "style_violations", "error_count", "warning_count", "info_count",
@@ -213,6 +214,12 @@ def create_app(
             "access_code_required": access_code_required,
             "jobs_available": jobs_available,
             "default_transcription_provider": DEFAULT_TRANSCRIPTION_PROVIDER,
+            "asr_cross_check_available": _asr_cross_check_available(resolved_settings),
+            "asr_cross_check_default": False,
+            "asr_cross_check_hourly_usd": {
+                SCRIBE_TRANSCRIBE_MODEL: asr_dollars_per_hour(SCRIBE_TRANSCRIBE_MODEL, {}),
+                MAI_TRANSCRIBE_MODEL: asr_dollars_per_hour(MAI_TRANSCRIBE_MODEL, {}),
+            },
             "transcription_models": [
                 {
                     "id": SCRIBE_TRANSCRIBE_MODEL,
@@ -242,8 +249,10 @@ def create_app(
         style: str,
         sync_max_lines_per_cue: int | None,
         transcription_provider: str,
+        asr_cross_check: bool,
     ) -> dict[str, object]:
         normalized_mode = _validate_mode(mode)
+        _validate_cross_check(asr_cross_check, mode=normalized_mode, settings=resolved_settings)
         if normalized_mode == "sync" and subtitle is None:
             raise HTTPException(status_code=422, detail="An original SRT is required for sync mode.")
         _validate_options(mode=normalized_mode, fps=fps, language=language)
@@ -346,6 +355,7 @@ def create_app(
                 retention_hours=resolved_settings.retention_hours,
                 source_name=source_name,
                 transcription_provider=selected_transcription_provider,
+                asr_cross_check=asr_cross_check,
             )
             try:
                 service.store.create_many(
@@ -392,6 +402,7 @@ def create_app(
                 language=_batch_text_field(form, "language", default="auto"),
                 style=_batch_text_field(form, "style", default="standard"),
                 sync_max_lines_per_cue=_batch_sync_max_lines_field(form),
+                asr_cross_check=_batch_cross_check_field(form),
                 transcription_provider=_batch_text_field(
                     form,
                     "transcription_provider",
@@ -407,6 +418,8 @@ def create_app(
         try:
             _validate_batch_form_shape(form)
             normalized_mode = _validate_mode(_batch_text_field(form, "mode"))
+            asr_cross_check = _batch_cross_check_field(form)
+            _validate_cross_check(asr_cross_check, mode=normalized_mode, settings=resolved_settings)
             fps = _batch_fps_field(form, mode=normalized_mode)
             language = _batch_text_field(form, "language", default="auto")
             style = _batch_text_field(form, "style", default="standard")
@@ -518,6 +531,7 @@ def create_app(
                             batch_id=batch_id,
                             batch_position=position,
                             transcription_provider=selected_transcription_provider,
+                            asr_cross_check=asr_cross_check,
                         )
                     )
                     tokens.append(token)
@@ -855,6 +869,7 @@ def _validate_single_form_shape(form: FormData) -> None:
         "style",
         "sync_max_lines_per_cue",
         "transcription_provider",
+        "asr_cross_check",
     }
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
@@ -884,6 +899,7 @@ def _validate_batch_form_shape(form: FormData) -> None:
         "style",
         "sync_max_lines_per_cue",
         "transcription_provider",
+        "asr_cross_check",
     }
     allowed_files = {"audio", "subtitle", "style_sample"}
     for name, value in form.multi_items():
@@ -904,6 +920,43 @@ def _batch_text_field(form: FormData, name: str, *, default: str | None = None) 
     if len(value.encode("utf-8")) > MAX_BATCH_FIELD_BYTES:
         raise HTTPException(status_code=422, detail=f"The {name} field is too large.")
     return value
+
+
+def _batch_cross_check_field(form: FormData) -> bool:
+    value = _batch_text_field(form, "asr_cross_check", default="false").strip().lower()
+    if value not in {"true", "false"}:
+        raise HTTPException(status_code=422, detail="Invalid asr_cross_check field; use true or false.")
+    return value == "true"
+
+
+def _asr_cross_check_available(settings: WebSettings) -> bool:
+    available = {
+        MAI_TRANSCRIBE_MODEL: bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+        SCRIBE_TRANSCRIBE_MODEL: bool(os.getenv("ELEVENLABS_API_KEY", "").strip()),
+    }
+    primary = load_yaml(settings.providers_path).get("asr", {})
+    if isinstance(primary, dict):
+        secondary = primary.get("cross_check", {})
+        for config in (primary, secondary):
+            if not isinstance(config, dict):
+                continue
+            provider = str(config.get("provider", "")).strip().lower()
+            model = MAI_TRANSCRIBE_MODEL if provider in {"openrouter", MAI_TRANSCRIBE_MODEL} else (
+                SCRIBE_TRANSCRIBE_MODEL if provider in {"elevenlabs", SCRIBE_TRANSCRIBE_MODEL} else None
+            )
+            key = config.get("api_key")
+            if model and (bool(config.get("fixture_path")) or isinstance(key, str) and bool(key.strip())):
+                available[model] = True
+    return all(available.values())
+
+
+def _validate_cross_check(enabled: bool, *, mode: JobMode, settings: WebSettings) -> None:
+    if not enabled:
+        return
+    if mode != "sync":
+        raise HTTPException(status_code=422, detail="ASR cross-check is available only for sync jobs.")
+    if not _asr_cross_check_available(settings):
+        raise HTTPException(status_code=422, detail="ASR cross-check requires both transcription providers to be configured.")
 
 
 def _batch_fps_field(form: FormData, *, mode: JobMode) -> float | None:
@@ -1095,6 +1148,7 @@ def _public_job(job: JobRecord, *, token: str | None = None) -> dict[str, object
         "batch_id": job.batch_id,
         "batch_position": job.batch_position,
         "transcription_provider": job.transcription_provider,
+        "asr_cross_check": job.asr_cross_check,
         "result": None,
         "downloads": [],
     }

@@ -6,7 +6,7 @@ from fastapi import HTTPException, UploadFile
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from ..models import Cue
-from ..srt_io import SRTParseError, SRTParseLimits, parse_srt_text
+from ..srt_io import SRTParseError, SRTParseLimits, decode_srt_bytes, parse_srt_text
 
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 
@@ -15,6 +15,7 @@ UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 class ValidatedSRTUpload:
     data: bytes
     cues: tuple[Cue, ...]
+    encoding_notice: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,13 +36,16 @@ async def read_validated_srt_upload(
     chunks: list[bytes] = []
     total_bytes = 0
     scan_state = _SRTByteScanState()
+    bom_encoded = False
     try:
         while chunk := await upload.read(UPLOAD_READ_CHUNK_BYTES):
+            if not chunks:
+                bom_encoded = chunk.startswith((b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff"))
             total_bytes += len(chunk)
             if total_bytes > max_bytes:
                 raise HTTPException(status_code=413, detail="Uploaded file is too large.")
             try:
-                scan_state = _scan_srt_bytes(
+                scan_state = scan_state if bom_encoded else _scan_srt_bytes(
                     chunk,
                     state=scan_state,
                     max_lines=parse_limits.max_lines,
@@ -56,16 +60,21 @@ async def read_validated_srt_upload(
     if total_bytes == 0:
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
     try:
+        data = b"".join(chunks)
+        text, encoding_notice = decode_srt_bytes(data)
+        if bom_encoded:
+            scan_state = _scan_srt_bytes(
+                text.encode("utf-8"), state=_SRTByteScanState(),
+                max_lines=parse_limits.max_lines, max_line_bytes=max_line_bytes,
+            )
         _finish_srt_byte_scan(scan_state, max_lines=parse_limits.max_lines)
-        text = b"".join(chunks).decode("utf-8-sig")
         cues = parse_srt_text(text, limits=parse_limits)
         if not cues:
             raise SRTParseError("no subtitle cues were found")
-    except UnicodeDecodeError as exc:
-        raise _invalid_srt(label, ValueError("file is not valid UTF-8")) from exc
     except SRTParseError as exc:
         raise _invalid_srt(label, exc) from exc
-    return ValidatedSRTUpload(data=b"".join(chunks), cues=tuple(cues))
+    # Preserve the authored upload; downstream read_srt reports the conversion.
+    return ValidatedSRTUpload(data=data, cues=tuple(cues), encoding_notice=encoding_notice)
 
 
 def _scan_srt_bytes(

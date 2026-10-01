@@ -12,6 +12,10 @@ asr:
   #   - Luna
   #   - Matthew
 
+adjudication:
+  # Follow the actor's performed register. Set script to keep authored variants.
+  register_policy: spoken
+
 llm:
   provider: openai
   model: gpt-5.6-luna
@@ -19,21 +23,21 @@ llm:
   max_retries: 2
   adjudication:
     provider: gemini
-    model: gemini-3.5-flash-lite
+    model: gemini-3.8-flash
     confidence_gate: 0.7
     scene_gap_seconds: 4.0
     max_batch_spans: 8
     max_concurrent_batches: 4
     retry_timed_out_batches: true
-    thinking_level: high
+    thinking_level: medium
     fallback:
-      # Review flagged cases with selected clips and detailed local context only.
-      enabled: true
+      # Optional hybrid: set primary to gemini-3.5-flash-lite/high, then enable.
+      enabled: false
       provider: gemini
       model: gemini-3.8-flash
       thinking_level: medium
     audio_context:
-      # Lite uses focused audio clips; the full ordered source text remains available.
+      # Focused audio clips and bounded local source context support each decision.
       enabled: false
       compress_long_audio: true
       cache_enabled: true

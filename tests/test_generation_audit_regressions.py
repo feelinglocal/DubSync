@@ -191,9 +191,9 @@ def test_generation_uses_configured_speech_evidence_before_export(tmp_path):
     cues = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
 
     # The 2.6 s ASR overrun is cut at the speech offset (0.4 s). The 0.3 s cue
-    # then keeps the 0.5 s minimum display time because only silence follows
-    # (timing.min_duration_policy: extend_into_silence).
-    assert cues[0].end_ms <= 600
+    # then extends in verified silence to the requested 5 CPS (five characters
+    # for one second). The acoustic start remains 0.1 s.
+    assert (cues[0].start_ms, cues[0].end_ms) == (100, 1100)
     assert (result.episode_workdir / "vad.json").exists()
     assert any(flag["kind"] == "asr_word_clamped" for flag in result.report["flags"])
 
@@ -265,7 +265,7 @@ def test_generation_keeps_repeated_words_with_the_same_snapped_onset(tmp_path):
     )
     cues = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
 
-    assert [cue.plain_text for cue in cues] == ["No.", "No."]
+    assert [cue.plain_text for cue in cues] == ["No. No."]
     assert all(cue.duration_ms > 0 for cue in cues)
     assert not any(flag["kind"] == "duplicate_cue_merged" for flag in result.report["flags"])
 

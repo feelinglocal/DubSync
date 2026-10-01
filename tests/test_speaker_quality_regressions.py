@@ -357,7 +357,7 @@ def test_speaker_split_does_not_shorten_real_overlapping_speech():
 
 
 @pytest.mark.parametrize("approved_lines,held_lines", [
-    (["- Rápido, rápido. - Vem cá."], ["- Rápido, rápido.", "- Vem cá."]),
+    (["- Rápido, rápido. - Vem cá."], ["- Rápido, rápido. - Vem cá."]),
     (["Rápido, rápido. Vem cá."], ["Rápido, rápido. Vem cá."]),
 ])
 def test_episode_11_collapsed_photo_words_hold_whole_source_parent(approved_lines, held_lines):

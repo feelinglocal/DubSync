@@ -168,7 +168,7 @@ def test_generate_srt_reflows_punctuation_to_the_style_width(tmp_path):
     )
 
     cues = parse_srt_text(output_path.read_text(encoding="utf-8"))
-    assert cues[0].lines == ["Hello, this is the Dubsync", "Cloud test."]
+    assert cues[0].lines == ["Hello, this is the", "Dubsync Cloud test."]
     assert result.report["summary"]["style_violations"] == 0
 
 

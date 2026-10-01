@@ -9,6 +9,7 @@ from .cache import JsonDiskCache, write_json_atomic, write_text_atomic
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
 from .cue_segmentation import group_word_indices_for_cues
+from .generation_timing import bound_held_generation_padding, extend_generated_cues_into_silence, generated_spoken_spans
 from .llm_providers import drain_usage_events, llm_config_for_pass, punctuation_adapter_from_config
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .output_order import finalize_cues_for_output
@@ -23,6 +24,7 @@ from .profanity import apply_german_profanity_censorship, censor_german_profanit
 from .punctuation import apply_punctuation_pass
 from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags
 from .reports import write_qc_report
+from .speaker_evidence import speakers_known_different
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
 from .text_metrics import join_word_texts, wrap_visual_width
@@ -69,6 +71,7 @@ def _build_cues_with_word_ownership(
     max_gap_seconds: float,
     max_cue_duration_seconds: float,
     preserve_timing: bool,
+    uncertain_word_indices: set[int] | None = None,
 ) -> tuple[list[Cue], AlignmentResult]:
     """Keep lexical ownership from segmentation; display padding is not evidence."""
     groups = group_word_indices_for_cues(
@@ -77,6 +80,9 @@ def _build_cues_with_word_ownership(
         profile,
         max_gap_seconds=max_gap_seconds,
         max_cue_duration_seconds=max_cue_duration_seconds,
+    )
+    groups = _join_overlapping_generated_groups(
+        words, groups, profile, max_cue_duration_seconds, uncertain_word_indices=uncertain_word_indices,
     )
     cues = [
         _cue_from_group(
@@ -87,7 +93,85 @@ def _build_cues_with_word_ownership(
     alignment = AlignmentResult(
         cue_word_indices={index: list(group) for index, group in enumerate(groups, start=1)}
     )
-    return (cues if preserve_timing else _cap_generated_overlaps(cues, profile)), alignment
+    if not preserve_timing:
+        cues, _ = finalize_cues_for_output(
+            cues, profile, preserve_timing=True, merge_duplicates=False,
+            spoken_spans=generated_spoken_spans(words, alignment),
+        )
+    return cues, alignment
+
+
+def _join_overlapping_generated_groups(
+    words: list[Word], groups: list[list[int]], profile: StyleProfile, max_duration_seconds: float,
+    *, uncertain_word_indices: set[int] | None = None,
+) -> list[list[int]]:
+    """Do not put a sentence boundary inside one overlapping speech envelope.
+
+    Cached ASR can put adjacent same-voice phrases over the same sound. Keep
+    every word occurrence in order, within the selected line/duration limits;
+    simultaneous known different speakers remain separate for review.
+    """
+    uncertain = uncertain_word_indices or set()
+    joined: list[list[int]] = []
+    for group in groups:
+        if joined:
+            previous = joined[-1]
+            previous_end = max(words[index].end for index in previous)
+            next_start = min(words[index].start for index in group)
+            raw_overlap = words[group[0]].start < previous_end
+            held_frame_overlap = bool(uncertain.intersection((*previous, *group))) and (
+                profile.snap_ceil(previous_end * 1000) > profile.snap_floor(next_start * 1000)
+            )
+            if not raw_overlap and not held_frame_overlap:
+                joined.append(list(group))
+                continue
+            known_different = any(
+                speakers_known_different(words[left].speaker_id, words[right].speaker_id)
+                for left in previous for right in group
+            )
+            candidate = [*previous, *group]
+            # Moving a generated boundary to accommodate held timing requires
+            # a known common voice; missing or unrelated labels prove nothing.
+            if held_frame_overlap and not raw_overlap:
+                labels = {words[index].speaker_id for index in candidate}
+                if len(labels) != 1 or not next(iter(labels)):
+                    joined.append(list(group))
+                    continue
+            cue = _cue_from_group(0, [words[index] for index in candidate], profile, preserve_timing=True)
+            if (not known_different and len(cue.lines) <= profile.max_lines_per_cue
+                    and cue.duration_ms <= max_duration_seconds * 1000):
+                joined[-1] = candidate
+                continue
+            if not known_different:
+                # If the combined text cannot fit, move the lexical boundary
+                # to the nearest real gap. Never cut timestamps or discard the
+                # overlapping word just to satisfy the line limit.
+                splits = sorted(range(1, len(candidate)), key=lambda split: abs(split - len(previous)))
+                for split in splits:
+                    left, right = candidate[:split], candidate[split:]
+                    if held_frame_overlap and uncertain.intersection(set(previous).symmetric_difference(left)):
+                        continue
+                    if not any(char.isalnum() for char in words[right[0]].text):
+                        continue
+                    if max(words[index].end for index in left) > words[right[0]].start:
+                        continue
+                    if held_frame_overlap and (
+                        profile.snap_ceil(max(words[index].end for index in left) * 1000)
+                        > profile.snap_floor(min(words[index].start for index in right) * 1000)
+                    ):
+                        continue
+                    parts = [_cue_from_group(0, [words[index] for index in part], profile, preserve_timing=True)
+                             for part in (left, right)]
+                    if all(len(part.lines) <= profile.max_lines_per_cue
+                           and part.duration_ms <= max_duration_seconds * 1000 for part in parts):
+                        joined[-1] = left
+                        joined.append(right)
+                        break
+                else:
+                    joined.append(list(group))
+                continue
+        joined.append(list(group))
+    return joined
 
 
 def generate_srt_from_audio(
@@ -221,14 +305,19 @@ def generate_srt_from_audio(
         max_gap_seconds=constraints.max_gap_seconds,
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
         preserve_timing=True,
+        uncertain_word_indices=uncertain_word_indices,
     )
     ambiguous_cue_ids = ambiguous_word_cue_ids(alignment, uncertain_word_indices)
+    cues = bound_held_generation_padding(cues, words, alignment, ambiguous_cue_ids, profile)
+    retained_ambiguous_cues = {cue.index: cue for cue in cues if cue.index in ambiguous_cue_ids}
     flags.extend(ambiguous_word_timing_flags(cues, ambiguous_cue_ids))
     if speech_regions:
         cues, timing_flags = refine_cues_to_speech_activity(
             cues,
             speech_regions,
-            profile,
+            # Apply display-duration targets once, after punctuation, so only
+            # actual acoustic tails enter speech-coverage QC below.
+            profile.model_copy(update={"min_cue_dur": 0.0}),
             boundary_refinement,
             words=words,
             alignment=alignment,
@@ -255,6 +344,20 @@ def generate_srt_from_audio(
     if not isinstance(output_config, dict):
         raise ValueError("providers.yaml output section must be a mapping")
     duration_seconds = audio_seconds(audio_for_asr)
+    media_duration_ms = round(duration_seconds * 1000) if duration_seconds > 0 else None
+    cues, readability_flags, extended_from = extend_generated_cues_into_silence(
+        cues, words, alignment, speech_regions, profile, constraints, boundary_refinement,
+        media_duration_ms=media_duration_ms,
+    )
+    # Readability targets do not turn an uncertain provider interval into a
+    # proved acoustic boundary. Preserve text/punctuation but retain its bounds.
+    cues = [
+        cue.with_timing(retained_ambiguous_cues[cue.index].start_ms, retained_ambiguous_cues[cue.index].end_ms)
+        if cue.index in retained_ambiguous_cues else cue for cue in cues
+    ]
+    readability_flags = [flag for flag in readability_flags if not ambiguous_cue_ids.intersection(flag.cue_ids)]
+    extended_from = {cue_id: end for cue_id, end in extended_from.items() if cue_id not in ambiguous_cue_ids}
+    flags.extend(readability_flags)
     cues, output_flags = finalize_cues_for_output(
         cues,
         profile,
@@ -264,15 +367,25 @@ def generate_srt_from_audio(
         preserve_timing=True,
         protected_cue_ids=ambiguous_cue_ids,
         fixed_cue_ids=ambiguous_cue_ids,
-        media_duration_ms=round(duration_seconds * 1000) if duration_seconds > 0 else None,
+        media_duration_ms=media_duration_ms,
         merge_duplicates=False,
+        spoken_spans={cue_id: span for cue_id, span in generated_spoken_spans(words, alignment).items()
+                      if cue_id not in ambiguous_cue_ids},
     )
     flags.extend(output_flags)
+    final_by_id = {cue.index: cue for cue in cues}
+    flags = [flag for flag in flags if not (
+        flag.kind == "min_duration_unattainable" and flag.cue_ids
+        and all(final_by_id[cue_id].duration_ms >= profile.min_cue_dur * 1000 - profile.frame_ms
+                for cue_id in flag.cue_ids if cue_id in final_by_id)
+    )]
     if speech_activity_adapter is not None:
-        flags.extend(speech_activity_flags_for_cues(cues, speech_regions, min_coverage_from_config(provider_config)))
+        acoustic_cues = [cue.with_timing(cue.start_ms, min(cue.end_ms, extended_from[cue.index]))
+                         if cue.index in extended_from else cue for cue in cues]
+        flags.extend(speech_activity_flags_for_cues(acoustic_cues, speech_regions, min_coverage_from_config(provider_config)))
         flags.extend(
             trailing_silence_flags_for_cues(
-                cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms
+                acoustic_cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms
             )
         )
     cues, profanity_flags = apply_german_profanity_censorship(cues)
@@ -332,18 +445,6 @@ def _cue_from_group(
         lines=lines,
         speaker_id=speaker_id,
     )
-
-
-def _cap_generated_overlaps(cues: list[Cue], profile: StyleProfile) -> list[Cue]:
-    result: list[Cue] = []
-    for index, cue in enumerate(cues):
-        next_start = cues[index + 1].start_ms if index + 1 < len(cues) else None
-        end_ms = cue.end_ms
-        if next_start is not None and cue.start_ms < next_start < end_ms:
-            end_ms = max(cue.start_ms + 1, next_start)
-        snapped_end_ms = profile.snap_floor(end_ms)
-        result.append(cue.with_timing(cue.start_ms, snapped_end_ms if snapped_end_ms > cue.start_ms else end_ms))
-    return result
 
 
 def _provider_config(config: dict[str, object], *, local: bool) -> dict[str, object]:

@@ -116,14 +116,14 @@ def test_real_factory_sends_only_flagged_clip_to_fallback(monkeypatch, tmp_path)
         calls.append(kwargs)
         if kwargs["model"] == "gemini-3.5-flash-lite":
             decisions = [
-                {"case_id": "safe", "verdict": "use_audio", "final_text": "Yes",
-                 "confidence": 1, "reason": "Audible"},
+                {"case_id": "safe", "verdict": "use_audio", "final_text": "clear spoken words",
+                 "heard_text": "clear spoken words", "evidence": "heard_clearly", "reason": "Audible"},
                 {"case_id": "review", "verdict": "keep_srt", "final_text": "Go",
-                 "confidence": 1, "reason": "Source"},
+                 "heard_text": "Go", "evidence": "heard_clearly", "reason": "Source"},
             ]
         else:
             decisions = [{"case_id": "review", "verdict": "use_audio", "final_text": "Stay",
-                          "confidence": .95, "reason": "Stay is audible"}]
+                          "heard_text": "Stay", "evidence": "heard_clearly", "reason": "Stay is audible"}]
         return SimpleNamespace(text=json.dumps({"decisions": decisions}), usage_metadata={
             "prompt_token_count": 1000, "candidates_token_count": 100,
         })
@@ -131,19 +131,21 @@ def test_real_factory_sends_only_flagged_clip_to_fallback(monkeypatch, tmp_path)
     monkeypatch.setattr("dubsync.llm_providers._gemini_generate_json", generate)
     adapter = llm_adapter_from_config(hybrid_config(), "adjudication")
     spans = [
-        DivergenceSpan(case_id="safe", cue_ids=[1], srt_text="No", asr_text="Yes", start=1, end=2, asr_word_indices=[0]),
-        DivergenceSpan(case_id="review", cue_ids=[2], srt_text="Go", asr_text="Stay", start=4, end=5, asr_word_indices=[1]),
+        DivergenceSpan(case_id="safe", cue_ids=[1], srt_text="old source wording", asr_text="clear spoken words",
+                       start=1, end=2, asr_word_indices=[0, 1, 2]),
+        DivergenceSpan(case_id="review", cue_ids=[2], srt_text="Go", asr_text="Stay", start=4, end=5, asr_word_indices=[3]),
     ]
     snippets = {}
     for span in spans:
         clip = tmp_path / f"{span.case_id}.wav"
         clip.write_bytes(b"clip")
         snippets[span.case_id] = AudioSnippet(case_id=span.case_id, path=str(clip), start=span.start - .2, end=span.end + .2)
-    adapter.set_episode_context([Cue(index=1, start_ms=1000, end_ms=2000, lines=["No"]),
+    adapter.set_episode_context([Cue(index=1, start_ms=1000, end_ms=2000, lines=["old source wording"]),
                                  Cue(index=2, start_ms=4000, end_ms=5000, lines=["Go"])])
-    adapter.set_episode_words([Word(text="Yes", start=1, end=2), Word(text="Stay", start=4, end=5)])
+    adapter.set_episode_words([Word(text="clear", start=1, end=1.3), Word(text="spoken", start=1.3, end=1.7),
+                               Word(text="words", start=1.7, end=2), Word(text="Stay", start=4, end=5)])
     result = adapter.adjudicate_with_audio(spans, snippets)
-    assert [item["final_text"] for item in result] == ["Yes", "Stay"]
+    assert [item["final_text"] for item in result] == ["clear spoken words", "Stay"]
     assert len(calls) == 2
     assert calls[0]["thinking_level"] == "high"
     assert calls[1]["thinking_level"] == "medium"

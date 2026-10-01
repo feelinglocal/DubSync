@@ -72,7 +72,7 @@ def forbidden_review(**kwargs):
     raise AssertionError("This case must not call the reviewer")
 
 
-@pytest.mark.parametrize("text,asr", [("SPOKEN, words!", "spoken words"), ("Não, não!", "Não não")])
+@pytest.mark.parametrize("text,asr", [("SPOKEN, words!", "spoken words"), ("Olá, olá!", "Olá olá")])
 def test_owned_asr_agreement_preserves_punctuation_and_real_repetitions(tmp_path, text, asr):
     item = span(asr=asr)
     primary = Primary([decision(item, text)])

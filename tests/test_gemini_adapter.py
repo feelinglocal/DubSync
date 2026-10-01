@@ -96,11 +96,16 @@ def test_full_audio_uri_is_reused_with_case_offsets_and_no_automatic_paid_retrie
     assert all(client.closed for client in sdk.clients)
 
 
-def test_configured_adjudication_sends_flash_lite_with_highest_thinking(gemini_audio_sdk, monkeypatch, tmp_path):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_configured_adjudication_and_optional_hybrid_use_measured_routes(gemini_audio_sdk, monkeypatch, tmp_path, hybrid):
     from dubsync.config import load_yaml
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    adapter = llm_adapter_from_config(load_yaml(Path("provider.yaml")), pass_name="adjudication")
+    config = load_yaml(Path("provider.yaml"))
+    if hybrid:
+        config["llm"]["adjudication"].update(model="gemini-3.5-flash-lite", thinking_level="high")
+        config["llm"]["adjudication"]["fallback"]["enabled"] = True
+    adapter = llm_adapter_from_config(config, pass_name="adjudication")
     clip = tmp_path / "spoken-change.wav"
     clip.write_bytes(b"focused WAV")
     span = DivergenceSpan(
@@ -111,13 +116,14 @@ def test_configured_adjudication_sends_flash_lite_with_highest_thinking(gemini_a
         span.case_id: AudioSnippet(case_id=span.case_id, path=str(clip), start=0.0, end=3.0),
     })
     request = gemini_audio_sdk.calls[0]
-    assert request["model"] == "gemini-3.5-flash-lite"
-    assert request["config"]["thinking_config"] == {"thinking_level": "high"}
-    # The fake primary omits its decision, so the configured reviewer must run.
-    assert len(gemini_audio_sdk.calls) == 2
-    review = gemini_audio_sdk.calls[1]
-    assert review["model"] == "gemini-3.8-flash"
-    assert review["config"]["thinking_config"] == {"thinking_level": "medium"}
+    assert request["model"] == ("gemini-3.5-flash-lite" if hybrid else "gemini-3.8-flash")
+    assert request["config"]["thinking_config"] == {"thinking_level": "high" if hybrid else "medium"}
+    # The fake primary omits its decision; only the opt-in hybrid invokes review.
+    assert len(gemini_audio_sdk.calls) == (2 if hybrid else 1)
+    if hybrid:
+        review = gemini_audio_sdk.calls[1]
+        assert review["model"] == "gemini-3.8-flash"
+        assert review["config"]["thinking_config"] == {"thinking_level": "medium"}
     assert all("cached_content" not in call["config"] for call in gemini_audio_sdk.calls)
     assert not gemini_audio_sdk.uploads
     assert not gemini_audio_sdk.cache_creates
@@ -357,7 +363,8 @@ def test_gemini_adapter_uses_models_generate_content_for_structured_calls(monkey
                     "case_id": "case-1",
                     "verdict": "keep_srt",
                     "final_text": "hello there",
-                    "confidence": 0.91,
+                    "heard_text": "hello there",
+                    "evidence": "heard_clearly",
                     "speaker": "A",
                     "character": "unknown",
                     "reason": "ASR noise",
@@ -659,7 +666,8 @@ def test_gemini_adjudication_can_include_inline_audio_snippet(monkeypatch, tmp_p
                         "case_id": "case-1",
                         "verdict": "use_audio",
                         "final_text": "new line",
-                        "confidence": 0.91,
+                        "heard_text": "new line",
+                        "evidence": "heard_clearly",
                         "speaker": "A",
                         "character": "unknown",
                         "reason": "audio snippet confirms the spoken line",
@@ -884,7 +892,7 @@ def test_adjudication_prompt_keeps_shared_context_before_batch_specific_payload(
     prompt = json.loads(raw_prompt)
     keys = list(prompt)
 
-    assert prompt["prompt_version"] == "adjudication-v11-literal-audio-decision-workflow"
+    assert prompt["prompt_version"] == "adjudication-v12-local-audio-evidence-policy-native-normalization-v2"
     assert prompt["spans"][0]["scene_id"] == 7
     assert prompt["spans"][0]["scene_position"] == 2
     assert keys.index("episode_context") < keys.index("spans")
@@ -998,7 +1006,8 @@ def test_gemini_adjudication_prompt_uses_configured_confidence_gate(monkeypatch)
                         "case_id": "case-1",
                         "verdict": "keep_srt",
                         "final_text": "hello there",
-                        "confidence": 0.91,
+                        "heard_text": "hello there",
+                        "evidence": "heard_clearly",
                         "speaker": "A",
                         "character": "unknown",
                         "reason": "ASR noise",

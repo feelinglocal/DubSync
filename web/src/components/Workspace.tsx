@@ -27,6 +27,9 @@ interface DownloadState {
 export function Workspace({ config }: { config: PublicConfig }) {
   const batchNamingHelpId = useId()
   const transcriptionHelpId = useId()
+  const transcriptionModelId = useId()
+  const crossCheckPanelId = useId()
+  const crossCheckHelpId = useId()
   const storageReadFailed = useRef(false)
   const [accesses, setAccesses] = useState<ActiveJobAccess[]>(() => readActiveJobs(() => {
     storageReadFailed.current = true
@@ -45,6 +48,11 @@ export function Workspace({ config }: { config: PublicConfig }) {
   const transcriptionProvider = selectedTranscriptionProvider ?? config.default_transcription_provider ?? defaultTranscriptionProvider
   const transcriptionModels = config.transcription_models ?? unavailableTranscriptionModels
   const selectedModelAvailable = transcriptionModels.some((model) => model.id === transcriptionProvider && model.available)
+  const [asrCrossCheck, setAsrCrossCheck] = useState(false)
+  const [crossCheckExpanded, setCrossCheckExpanded] = useState(false)
+  const secondaryProvider: TranscriptionProvider = transcriptionProvider === 'scribe_v2' ? 'microsoft/mai-transcribe-2' : 'scribe_v2'
+  const crossCheckAvailable = config.asr_cross_check_available === true && selectedModelAvailable
+  const crossCheckHourlyUsd = config.asr_cross_check_hourly_usd?.[secondaryProvider]
   const [syncMaxLines, setSyncMaxLines] = useState('source')
   const [styleSource, setStyleSource] = useState<'preset' | 'custom' | 'sample'>('preset')
   const [stylePreset, setStylePreset] = useState(config.generation_styles.default_preset)
@@ -232,6 +240,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
     if (fps !== 'auto') body.set('fps', fps)
     body.set('language', language)
     body.set('transcription_provider', transcriptionProvider)
+    if (mode === 'sync') body.set('asr_cross_check', String(asrCrossCheck && crossCheckAvailable))
     if (mode === 'generate') {
       const style = styleSource === 'preset'
         ? { source: 'preset', preset: stylePreset }
@@ -291,6 +300,8 @@ export function Workspace({ config }: { config: PublicConfig }) {
   function selectMode(nextMode: JobMode) {
     if (nextMode === mode) return
     setMode(nextMode)
+    setAsrCrossCheck(false)
+    setCrossCheckExpanded(false)
     setFps(nextMode === 'sync' ? 'auto' : fps === 'auto' ? '30' : fps)
     setError('')
     if (nextMode === 'generate') setSubtitleFiles([])
@@ -345,10 +356,19 @@ export function Workspace({ config }: { config: PublicConfig }) {
             mode === 'sync' ? 'is-sync' : 'is-generate',
             config.access_code_required ? 'has-access-code' : '',
           ].filter(Boolean).join(' ')}>
-            <label className="transcription-model-field">
-              <span className="field-label">Transcription model</span>
+            <div className="transcription-model-field">
+              <div className="transcription-model-heading">
+                <label className="field-label" htmlFor={transcriptionModelId}>Transcription model</label>
+                {mode === 'sync' && (
+                  <button type="button" className="additional-checks-toggle" aria-expanded={crossCheckExpanded} aria-controls={crossCheckPanelId} onClick={() => setCrossCheckExpanded((expanded) => !expanded)}>
+                    Additional checks
+                    {asrCrossCheck && crossCheckAvailable && <span className="additional-checks-status">On</span>}
+                    <ChevronDown aria-hidden="true" />
+                  </button>
+                )}
+              </div>
               <span className="select-control">
-                <select value={transcriptionProvider} onChange={(event) => setTranscriptionProvider(event.target.value as TranscriptionProvider)} aria-describedby={config.jobs_available && !selectedModelAvailable ? transcriptionHelpId : undefined}>
+                <select id={transcriptionModelId} value={transcriptionProvider} onChange={(event) => setTranscriptionProvider(event.target.value as TranscriptionProvider)} aria-describedby={config.jobs_available && !selectedModelAvailable ? transcriptionHelpId : undefined}>
                   {transcriptionModels.map((model) => (
                     <option key={model.id} value={model.id} disabled={!model.available}>
                       {model.label}{model.id === (config.default_transcription_provider ?? defaultTranscriptionProvider) ? ' (default)' : ''}{!model.available ? ' (unavailable)' : ''}
@@ -357,7 +377,7 @@ export function Workspace({ config }: { config: PublicConfig }) {
                 </select>
                 <ChevronDown aria-hidden="true" />
               </span>
-            </label>
+            </div>
             <label><span className="field-label">Frame rate</span><span className="select-control"><select value={fps} onChange={(event) => setFps(event.target.value)}>{mode === 'sync' && <option value="auto">Auto (detect from SRT)</option>}{config.fps_values.map((value) => <option key={value} value={value}>{value} fps</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
             {mode === 'sync' && (
               <label><span className="field-label">Maximum lines per cue</span><span className="select-control"><select value={syncMaxLines} onChange={(event) => setSyncMaxLines(event.target.value)}><option value="source">Keep source style (default)</option>{syncLineOptions(config).map((value) => <option key={value} value={value}>{value} {value === 1 ? 'line' : 'lines'}</option>)}</select><ChevronDown aria-hidden="true" /></span></label>
@@ -368,6 +388,21 @@ export function Workspace({ config }: { config: PublicConfig }) {
             )}
             <button className="primary-button" type="submit" disabled={!canSubmit}><Play />{submitting ? 'Uploading' : mode === 'sync' ? 'Start sync' : 'Generate SRT'}</button>
           </div>
+          {mode === 'sync' && (
+            <div className="cross-check-option" id={crossCheckPanelId} hidden={!crossCheckExpanded}>
+              <p id={crossCheckHelpId}>
+                {crossCheckHourlyUsd !== undefined
+                  ? `Estimated extra transcription cost: about $${crossCheckHourlyUsd.toFixed(2)} per audio hour. `
+                  : 'Adds the cost of a second transcription. '}
+                Compare wording with a second model; the selected model still supplies timing.
+                {!crossCheckAvailable && ' Both transcription providers must be available.'}
+              </p>
+              <label>
+                <input type="checkbox" checked={asrCrossCheck && crossCheckAvailable} disabled={!crossCheckAvailable} onChange={(event) => setAsrCrossCheck(event.target.checked)} aria-describedby={crossCheckHelpId} />
+                <span>Cross-check wording with {transcriptionModelLabels[secondaryProvider]} (optional)</span>
+              </label>
+            </div>
+          )}
           {!config.jobs_available && <div className="service-notice" role="status">Job intake is temporarily unavailable. Contact <a href="mailto:rey@feelslocal.com">rey@feelslocal.com</a>.</div>}
           {config.jobs_available && !selectedModelAvailable && <div className="service-notice" role="status" id={transcriptionHelpId}>{transcriptionModelLabels[transcriptionProvider]} is currently unavailable. Choose an available model to continue.</div>}
           {storageUnavailable && <div className="service-notice" role="status">Your browser could not save job access. Keep this tab open and download your results before refreshing or closing it.</div>}

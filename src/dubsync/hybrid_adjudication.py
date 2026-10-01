@@ -12,13 +12,23 @@ from typing import Any
 from pydantic import ConfigDict, ValidationError
 
 from .adjudication import _snippet_covers_span
+from .adjudication_policy import DeterministicAdjudicationPolicy
 from .models import AdjudicationDecision, AudioSnippet, Cue, CueContext, DivergenceSpan, Word
 from .providers import ProviderError
-from .tokenize import alphanumeric_signature
+from .text_metrics import token_texts
+from .tokenize import alphanumeric_signature, normalize_token, number_value
 
 
-HYBRID_POLICY_VERSION = 2
+HYBRID_POLICY_VERSION = 5
 Reviewer = Callable[..., tuple[list[dict[str, object]], list[dict[str, object]]]]
+_NEGATIONS = frozenset({
+    "no", "not", "never", "nothing", "nobody", "neither", "nor", "without",
+    "não", "nao", "nunca", "jamais", "nem", "ninguém", "ninguem", "nada", "sem",
+    "nenhum", "nenhuma", "nenhuns", "nenhumas",
+    "nicht", "nein", "nie", "niemals", "nichts", "niemand", "kein", "keine",
+    "keinen", "keinem", "keiner", "keines", "ohne", "ningún", "ningun", "nadie",
+    "non", "pas", "jamais", "rien", "aucun", "sans", "ない", "ません", "ぬ",
+})
 
 
 def _confidence_gate(value: float) -> float:
@@ -29,6 +39,7 @@ def _confidence_gate(value: float) -> float:
 
 def _indexed_decisions(
     spans: Sequence[DivergenceSpan], raw: object, *, prefix: str, tolerate_stray: bool = False,
+    policy: DeterministicAdjudicationPolicy | None = None,
 ) -> tuple[dict[str, dict[str, object]], dict[str, list[str]]]:
     """Bind by exact ID only; never infer identity from response order.
 
@@ -62,7 +73,8 @@ def _indexed_decisions(
             continue
         payload = payloads[0]
         confidence = payload.get("confidence")
-        if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+        has_evidence = payload.get("evidence") is not None or payload.get("heard_text") is not None
+        if not has_evidence and (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
                 or not isfinite(confidence) or not 0 <= confidence <= 1):
             faults[cid] = [f"{prefix}_invalid_decision"]
             continue
@@ -71,6 +83,12 @@ def _indexed_decisions(
         except ValidationError:
             faults[cid] = [f"{prefix}_invalid_decision"]
             continue
+        if parsed.verdict != "keep_srt" and not _evidence_supports_wording(parsed, policy):
+            faults[cid] = [f"{prefix}_contradictory_audio_evidence"]
+            continue
+        if parsed.verdict == "keep_srt" and parsed.final_text != span.srt_text:
+            faults[cid] = [f"{prefix}_invalid_source_keep"]
+            continue
         decisions[cid] = parsed.model_dump(mode="json")
     if batch_fault:
         for cid in ids:
@@ -78,6 +96,54 @@ def _indexed_decisions(
                 continue
             faults[cid] = list(dict.fromkeys([batch_fault, *faults.get(cid, [])]))
     return decisions, faults
+
+
+def _evidence_supports_wording(
+    decision: AdjudicationDecision, policy: DeterministicAdjudicationPolicy | None = None,
+) -> bool:
+    """A clear hearing must support any changed words, allowing editorial forms."""
+    if decision.evidence != "heard_clearly":
+        return True
+    if alphanumeric_signature(decision.final_text) == alphanumeric_signature(decision.heard_text or ""):
+        return True
+    if policy is None:
+        return False
+    equivalent = policy.decide(DivergenceSpan(
+        case_id=decision.case_id, cue_ids=[], srt_text=decision.final_text,
+        asr_text=decision.heard_text or "",
+    ))
+    return equivalent is not None and equivalent.verdict == "keep_srt"
+
+
+def _risk_reasons(
+    span: DivergenceSpan, *, language: str | None = None,
+    source_names: frozenset[tuple[str, ...]] = frozenset(),
+) -> list[str]:
+    source, spoken = token_texts(span.srt_text), token_texts(span.asr_text)
+    if alphanumeric_signature(span.srt_text) == alphanumeric_signature(span.asr_text):
+        return []
+    tokens = [*source, *spoken]
+    keys = [token.casefold() for token in tokens]
+    risks = []
+    known_name = any(tuple(keys[start:start + len(name)]) == name
+                     for name in source_names for start in range(len(keys)))
+    # A mid-phrase titlecase word may be a new name absent from the script's
+    # recurring-name lexicon. This routes to review; it never changes text.
+    possible_name = any(token.istitle() and token.casefold() != phrase[0].casefold()
+                        for phrase in (source, spoken) if phrase for token in phrase[1:])
+    if known_name or possible_name:
+        risks.append("risky_name")
+    if any(any(char.isnumeric() for char in token) or number_value(normalize_token(token), language) is not None
+           for token in tokens):
+        risks.append("risky_number")
+    if any(key in _NEGATIONS for key in keys) or any(
+        marker in text.casefold() for text in (span.srt_text, span.asr_text)
+        for marker in ("n't", "n’t", "ない", "ません")
+    ):
+        risks.append("risky_negation")
+    if len(source) == len(spoken) == 1:
+        risks.append("risky_single_word_substitution")
+    return risks
 
 
 def _has_stray_entries(spans: Sequence[DivergenceSpan], raw: object) -> bool:
@@ -89,22 +155,32 @@ def _has_stray_entries(spans: Sequence[DivergenceSpan], raw: object) -> bool:
 
 def triage_decisions(
     spans: Sequence[DivergenceSpan], decisions: object, confidence_gate: float = .7,
+    *, language: str | None = None, source_names: frozenset[tuple[str, ...]] = frozenset(),
+    policy: DeterministicAdjudicationPolicy | None = None,
 ) -> dict[str, list[str]]:
     """Return review reasons without rewriting wording or guessing ownership."""
     gate = _confidence_gate(confidence_gate)
-    indexed, reasons = _indexed_decisions(spans, decisions, prefix="primary")
+    indexed, reasons = _indexed_decisions(spans, decisions, prefix="primary", policy=policy)
     for span in spans:
         cid = span.case_id
         if cid in reasons:
             continue
         decision = indexed[cid]
-        if decision["confidence"] < gate:
+        if decision.get("evidence") not in (None, "heard_clearly"):
+            reasons[cid] = ["primary_audio_unclear"]
+        elif decision["confidence"] < gate:
             reasons[cid] = ["low_primary_confidence"]
         elif decision["verdict"] == "keep_srt":
+            if not _evidence_supports_wording(AdjudicationDecision.model_validate(decision), policy):
+                reasons[cid] = ["source_keep_hearing_unresolved"]
             if alphanumeric_signature(span.srt_text) != alphanumeric_signature(span.asr_text):
-                reasons[cid] = ["source_differs_from_owned_asr"]
+                reasons.setdefault(cid, []).append("source_differs_from_owned_asr")
         elif alphanumeric_signature(decision["final_text"]) != alphanumeric_signature(span.asr_text):
             reasons[cid] = ["wording_differs_from_owned_asr"]
+        if cid not in reasons:
+            risks = _risk_reasons(span, language=language, source_names=source_names)
+            if risks:
+                reasons[cid] = risks
     return reasons
 
 
@@ -151,12 +227,18 @@ def _complete_clip(span: DivergenceSpan, snippet: AudioSnippet | None) -> bool:
 
 def _held(span: DivergenceSpan, reason: str, proposed: dict[str, object] | None = None) -> dict[str, object]:
     detail = ""
+    evidence = {}
     if proposed is not None:
         detail = f" Proposed {proposed['verdict']} ({proposed['confidence']}): {proposed['final_text']!r}."
+        # Retain validated reviewer uncertainty so the engine and customer
+        # reports distinguish a real listening hold from a synthetic failure.
+        if proposed.get("evidence") in {"heard_unclear", "not_audible"}:
+            evidence = {key: proposed[key] for key in ("evidence", "heard_text")}
     return {
         "case_id": span.case_id, "verdict": "keep_srt", "final_text": span.srt_text,
         "confidence": 0.0, "speaker": None, "character": "unknown",
         "reason": f"[hybrid:held] {reason}; source text and timing preserved for review.{detail}",
+        **evidence,
     }
 
 
@@ -174,11 +256,31 @@ class HybridAdjudicationAdapter:
         self._routes: list[dict[str, object]] = []
         self._episode_context: tuple[Cue, ...] = ()
         self._episode_words: tuple[Word, ...] = ()
+        self.language: str | None = None
+        self.register_policy = "spoken"
+        self._source_names: frozenset[tuple[str, ...]] = frozenset()
+        self._wording_policy = DeterministicAdjudicationPolicy()
+
+    def set_adjudication_context(self, *, language: str | None = None, register_policy: str = "spoken") -> None:
+        if language is not None and not isinstance(language, str):
+            raise ValueError("adjudication language must be a string or None")
+        policy = DeterministicAdjudicationPolicy(
+            self._episode_context, language=language, register_policy=register_policy)
+        with self._lock:
+            self.language, self.register_policy = language, register_policy
+            self._source_names = policy.source_names
+            self._wording_policy = policy
+        setter = getattr(self.primary, "set_adjudication_context", None)
+        if callable(setter):
+            setter(language=language, register_policy=register_policy)
 
     def set_episode_context(self, cues: list[Cue]) -> None:
         frozen = tuple(_frozen(cue, _ReadOnlyCue) for cue in cues)
         with self._lock:
             self._episode_context = frozen
+            self._wording_policy = DeterministicAdjudicationPolicy(
+                frozen, language=self.language, register_policy=self.register_policy)
+            self._source_names = self._wording_policy.source_names
         setter = getattr(self.primary, "set_episode_context", None)
         if callable(setter):
             setter([cue.model_copy(deep=True) for cue in cues])
@@ -246,6 +348,10 @@ class HybridAdjudicationAdapter:
         # Providers receive detached values; reviewer context cannot mutate another call.
         batch = [span.model_copy(deep=True) for span in spans]
         batch_snapshot = tuple(_frozen(span, _ReadOnlySpan) for span in batch)
+        with self._lock:
+            context, words = self._episode_context, self._episode_words
+            language, register_policy = self.language, self.register_policy
+            source_names, wording_policy = self._source_names, self._wording_policy
         results: dict[str, dict[str, object]] = {}
         traces: dict[str, dict[str, object]] = {}
 
@@ -268,8 +374,9 @@ class HybridAdjudicationAdapter:
                 if not callable(primary_method):
                     raise ProviderError("Primary adapter does not support case audio")
                 raw = primary_method([span.model_copy(deep=True) for span in available], deepcopy(exact_clips))
-                indexed, _ = _indexed_decisions(available, raw, prefix="primary")
-                reasons = triage_decisions(available, raw, self.confidence_gate)
+                indexed, _ = _indexed_decisions(available, raw, prefix="primary", policy=wording_policy)
+                reasons = triage_decisions(available, raw, self.confidence_gate,
+                                          language=language, source_names=source_names, policy=wording_policy)
             except ProviderError:
                 reasons = {span.case_id: ["primary_provider_failure"] for span in available}
             finally:
@@ -280,8 +387,6 @@ class HybridAdjudicationAdapter:
                 record(span, _routed(indexed[span.case_id], "primary"), "primary", [])
         if selected:
             selected_clips = {span.case_id: exact_clips[span.case_id] for span in selected}
-            with self._lock:
-                context, words = self._episode_context, self._episode_words
             stray_review_entries = False
             try:
                 review_raw, events = self.reviewer(
@@ -291,9 +396,11 @@ class HybridAdjudicationAdapter:
                     primary_decisions={span.case_id: deepcopy(indexed[span.case_id]) for span in selected if span.case_id in indexed},
                     batch_spans=batch_snapshot,
                     episode_context=deepcopy(context), episode_words=deepcopy(words),
+                    language=language, register_policy=register_policy,
                 )
                 self._record_usage(events, "fallback")
-                reviewed, invalid = _indexed_decisions(selected, review_raw, prefix="review", tolerate_stray=True)
+                reviewed, invalid = _indexed_decisions(
+                    selected, review_raw, prefix="review", tolerate_stray=True, policy=wording_policy)
                 stray_review_entries = _has_stray_entries(selected, review_raw)
             except ProviderError:
                 reviewed = {}
@@ -302,6 +409,8 @@ class HybridAdjudicationAdapter:
                 cid = span.case_id
                 proposal = reviewed.get(cid)
                 failure = invalid.get(cid, [])
+                if not failure and proposal.get("evidence") not in (None, "heard_clearly"):
+                    failure = ["review_audio_unclear"]
                 if not failure and proposal["confidence"] < self.confidence_gate:
                     failure = ["review_low_confidence"]
                 if failure:

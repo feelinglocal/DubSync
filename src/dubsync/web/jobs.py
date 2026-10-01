@@ -22,7 +22,7 @@ from dubsync.providers import (
     ProviderError,
     SCRIBE_TRANSCRIBE_MODEL,
 )
-from dubsync.srt_io import parse_srt_text
+from dubsync.srt_io import read_srt
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import derive_style_profile
 from dubsync.transcription import generate_srt_from_audio
@@ -94,6 +94,7 @@ class JobRecord:
     cue_count: int | None = None
     error: str | None = None
     transcription_provider: str = "default"
+    asr_cross_check: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,8 @@ class JobStore:
                     cue_count INTEGER,
                     error TEXT,
                     transcription_provider TEXT NOT NULL DEFAULT 'default'
-                        {TRANSCRIPTION_PROVIDER_CHECK}
+                        {TRANSCRIPTION_PROVIDER_CHECK},
+                    asr_cross_check INTEGER NOT NULL DEFAULT 0 CHECK(asr_cross_check IN (0, 1))
                 )
                 """
             )
@@ -171,6 +173,7 @@ class JobStore:
                 ("source_name", "TEXT"),
                 ("batch_id", "TEXT"),
                 ("batch_position", "INTEGER"),
+                ("asr_cross_check", "INTEGER NOT NULL DEFAULT 0 CHECK(asr_cross_check IN (0, 1))"),
                 (
                     "transcription_provider",
                     f"TEXT NOT NULL DEFAULT 'default' {TRANSCRIPTION_PROVIDER_CHECK}",
@@ -372,8 +375,8 @@ class JobStore:
                 INSERT INTO jobs (
                     id, token_hash, mode, status, progress, created_at, updated_at, expires_at,
                     directory, audio_path, srt_path, fps, language, style,
-                    source_name, batch_id, batch_position, transcription_provider
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_name, batch_id, batch_position, transcription_provider, asr_cross_check
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -395,6 +398,7 @@ class JobStore:
                         job.batch_id,
                         job.batch_position,
                         job.transcription_provider,
+                        int(job.asr_cross_check),
                     )
                     for job in jobs
                 ],
@@ -786,6 +790,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             "fps": job.fps,
             "language": language,
             "transcription_provider": transcription_provider,
+            "asr_cross_check": job.asr_cross_check,
             "allow_gemini_transcribe_web": False,
             "audio_limits": audio_limits,
         }
@@ -794,7 +799,7 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             max_lines_per_cue = sync_style.max_lines_per_cue
             if max_lines_per_cue is None:  # Defensive for manually persisted job records.
                 raise ValueError("Sync maximum lines per cue is required")
-            source_cues = parse_srt_text(job.srt_path.read_text(encoding="utf-8-sig"))
+            source_cues = read_srt(job.srt_path)
             source_cues, _ = sort_cues_chronologically(source_cues)
             profile = derive_style_profile(source_cues).model_copy(
                 update={"max_lines_per_cue": max_lines_per_cue}
@@ -835,6 +840,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
                     "style_profile": resolved_style.profile,
                     "generation_constraints": resolved_style.constraints,
                 }
+                if resolved_style.source == "sample":
+                    generate_options["fps"] = resolved_style.profile.fps
         result = generate_srt_from_audio(job.audio_path, output_path, workdir, **generate_options)
     summary = result.report.get("summary", {})
     cue_count = int(summary.get("cue_count", 0)) if isinstance(summary, dict) else 0
@@ -892,6 +899,7 @@ def new_job_record(
     batch_id: str | None = None,
     batch_position: int | None = None,
     transcription_provider: str = MAI_TRANSCRIBE_MODEL,
+    asr_cross_check: bool = False,
 ) -> JobRecord:
     now = datetime.now(UTC)
     return JobRecord(
@@ -913,6 +921,7 @@ def new_job_record(
         batch_id=batch_id,
         batch_position=batch_position,
         transcription_provider=transcription_provider,
+        asr_cross_check=asr_cross_check,
     )
 
 
@@ -943,6 +952,7 @@ def _record(row: sqlite3.Row) -> JobRecord:
         cue_count=row["cue_count"],
         error=row["error"],
         transcription_provider=row["transcription_provider"] or "default",
+        asr_cross_check=bool(row["asr_cross_check"]),
     )
 
 

@@ -1741,3 +1741,88 @@ button:active:not(:disabled),
     transition-duration: 1ms !important;
   }
 }
+.cross-check-option {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.transcription-model-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.transcription-model-heading .field-label {
+  margin-bottom: 0;
+}
+
+.additional-checks-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 44px;
+  flex: none;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.additional-checks-toggle > svg {
+  width: 14px;
+  height: 14px;
+  transition: transform 160ms ease;
+}
+
+.additional-checks-toggle[aria-expanded="true"] > svg {
+  transform: rotate(180deg);
+}
+
+.additional-checks-status {
+  color: var(--color-primary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.cross-check-option label {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.cross-check-option input[type="checkbox"] {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+
+.cross-check-option p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@media (max-width: 480px) {
+  .workspace-options.is-sync,
+  .workspace-options.is-sync.has-access-code {
+    gap: 4px;
+    margin-top: 0;
+  }
+
+  .transcription-model-heading {
+    margin-bottom: 4px;
+  }
+}

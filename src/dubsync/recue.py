@@ -16,6 +16,10 @@ from .tokenize import alphanumeric_signature, number_alias, spoken_number_values
 # words beyond it stop timing the cue, provided the cue's text contains them.
 LEXICAL_BRIDGE_GAP_FACTOR = 2.0
 
+# A leading sentence delimiter need not time the next phrase. Symbols such as
+# %, $ and + can represent spoken words and keep their provider timestamps.
+_BOUNDARY_SENTENCE_PUNCTUATION = frozenset(".,!?;:…。、！？；：\"'“”‘’«»「」『』()（）[]【】")
+
 
 @dataclass(frozen=True)
 class _CueTiming:
@@ -96,6 +100,7 @@ def rebuild_cues(
     protected_cue_ids: set[int] | None = None,
     min_duration_policy: str = "extend_into_silence",
     ambiguous_word_indices: set[int] | None = None,
+    confirmed_wording_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     rebuilt: list[Cue] = []
     flags: list[QCFlag] = []
@@ -115,6 +120,7 @@ def rebuild_cues(
         # The "acoustic" policy ends a short cue with its speech; refinement
         # applies the same policy with the audio evidence rebuild lacks.
         extend_short_cues=min_duration_policy != "acoustic",
+        confirmed_wording_cue_ids=confirmed_wording_cue_ids,
     )
     flags.extend(timing_flags)
     held_cue_ids = protected | {
@@ -174,6 +180,7 @@ def cue_spoken_spans(
     max_word_duration: float = 2.0,
     max_intra_cue_gap: float = 1.5,
     ambiguous_word_indices: set[int] | None = None,
+    protected_cue_ids: set[int] | None = None,
 ) -> dict[int, tuple[int, int]]:
     """First-word onset and last-word offset (ms) of every cue that owns timed words.
 
@@ -182,6 +189,7 @@ def cue_spoken_spans(
     """
     spans: dict[int, tuple[int, int]] = {}
     ambiguous = ambiguous_word_cue_ids(alignment, ambiguous_word_indices)
+    protected = set(protected_cue_ids or ()) | shared_word_cue_ids(alignment)
     for cue in cues:
         if cue.index in ambiguous:
             continue
@@ -194,6 +202,10 @@ def cue_spoken_spans(
             continue
         selected, _ = select_cue_word_window(
             cue, owned, max_word_duration=max_word_duration, max_intra_cue_gap=max_intra_cue_gap,
+            preserve_boundary_word_ids=(
+                {id(word) for word in owned} if cue.index in protected
+                else source_fragment_boundary_word_ids(cue.index, words, alignment)
+            ),
         )
         spans[cue.index] = (
             round(min(word.start for word in selected) * 1000),
@@ -212,6 +224,7 @@ def _cue_timings(
     max_intra_cue_gap: float,
     protected_cue_ids: set[int],
     extend_short_cues: bool = True,
+    confirmed_wording_cue_ids: set[int] | None = None,
 ) -> tuple[dict[int, _CueTiming], list[QCFlag]]:
     timings: dict[int, _CueTiming] = {}
     flags: list[QCFlag] = []
@@ -227,6 +240,7 @@ def _cue_timings(
             matched_words,
             max_word_duration=max_word_duration,
             max_intra_cue_gap=max_intra_cue_gap,
+            preserve_boundary_word_ids=source_fragment_boundary_word_ids(cue.index, words, alignment),
         )
         if trimmed:
             flags.append(
@@ -240,8 +254,13 @@ def _cue_timings(
                     end=selected_words[-1].end if selected_words else None,
                 )
             )
+        issue = timing_evidence_issue(
+            cue, selected_words,
+            wording_confirmed=not trimmed and cue.index in (confirmed_wording_cue_ids or ()),
+        )
+        if issue is None and trimmed:
+            issue = _trimmed_lexical_timing_issue(cue, matched_words, selected_words, max_word_duration)
         matched_words = selected_words
-        issue = timing_evidence_issue(cue, matched_words)
         if issue is not None:
             flags.append(QCFlag(
                 kind="timing_evidence_held", cue_ids=[cue.index], severity="error",
@@ -267,12 +286,32 @@ def _cue_timings(
     return timings, flags
 
 
-def timing_evidence_issue(cue: Cue, words: list[Word]) -> str | None:
+def _trimmed_lexical_timing_issue(cue: Cue, words: list[Word], selected: list[Word], max_word_duration: float) -> str | None:
+    """Do not time a whole phrase from a collapsed remnant of split evidence."""
+    if not selected or max(word.end for word in selected) - min(word.start for word in selected) >= 0.080 - 1e-9:
+        return None
+    source = alphanumeric_signature(speech_text_for_alignment(cue))
+    supported = _ordered_lexical_support(source, alphanumeric_signature(" ".join(word.text for word in selected)))
+    if not source or supported * 2 > len(source):
+        return None
+    regular = [word for word in words if 0 < word.end - word.start <= max_word_duration]
+    complete_support = _ordered_lexical_support(source, alphanumeric_signature(" ".join(word.text for word in regular)))
+    if complete_support <= supported:
+        return None
+    return (
+        f"Separated ASR word groups leave only {supported}/{len(source)} spoken source tokens "
+        "in a timing window shorter than 80 ms; the discarded group contains required wording."
+    )
+
+
+def timing_evidence_issue(cue: Cue, words: list[Word], *, wording_confirmed: bool = False) -> str | None:
     """Identify clearly unusable anchors without estimating missing speech.
 
     These conservative bounds detect placeholder timestamps and sparse lexical
     matches, not ordinary reading-speed problems. Display padding cannot turn
     those anchors into reliable timing for a complete source phrase.
+    The pipeline may separately confirm complete wording against uniquely
+    owned words in one isolated burst; that only replaces literal text support.
     """
     source_tokens = alphanumeric_signature(speech_text_for_alignment(cue))
     if not source_tokens or not words:
@@ -295,7 +334,7 @@ def timing_evidence_issue(cue: Cue, words: list[Word]) -> str | None:
             f"Matched ASR timing is collapsed: {len(evidence_tokens)} lexical tokens occupy "
             f"{span * 1000:.1f} ms, including {short_word_count} words of at most 20 ms."
         )
-    if len(source_tokens) >= 3:
+    if len(source_tokens) >= 3 and not wording_confirmed:
         supported = _ordered_lexical_support(source_tokens, evidence_tokens)
         if supported * 2 < len(source_tokens):
             return (
@@ -363,6 +402,7 @@ def select_cue_word_window(
     *,
     max_word_duration: float,
     max_intra_cue_gap: float,
+    preserve_boundary_word_ids: set[int] | None = None,
 ) -> tuple[list[Word], bool]:
     """Choose the owned words that time a cue; shared by rebuild and refinement.
 
@@ -371,11 +411,15 @@ def select_cue_word_window(
     neighbouring group is kept as well when the cue's own text contains its
     words and the pause is at most ``LEXICAL_BRIDGE_GAP_FACTOR`` gaps long, so
     a cue with a mid-sentence pause still starts on its first spoken word.
-    Returns the selected words in time order and whether any word was left out.
+    Leading sentence punctuation does not time the next phrase when lexical
+    words exist, unless its object identity is protected as source-fragment
+    evidence. Returns the selected words and whether an acoustic outlier was
+    left out; excluding a leading delimiter is not an outlier.
     """
     if len(words) <= 1:
         return words, False
     sorted_words = sorted(words, key=lambda word: (word.start, word.end))
+    sorted_words = _without_leading_sentence_punctuation(sorted_words, preserve_boundary_word_ids or set())
     clusters: list[list[Word]] = []
     current: list[Word] = []
     previous: Word | None = None
@@ -419,6 +463,42 @@ def select_cue_word_window(
         last += 1
     selected = [word for cluster in clusters[first:last + 1] for word in cluster]
     return selected, len(selected) != len(sorted_words)
+
+
+def source_fragment_boundary_word_ids(cue_id: int, words: list[Word], alignment: AlignmentResult) -> set[int]:
+    """Preserve a fragment's sole ASR evidence when it has no own lexical word.
+
+    A provider may label an audible interjection as punctuation. A lexical
+    word owned by a neighboring cue in the same divergence cannot replace it.
+    Identities refer to these word objects, without changing indexed ownership.
+    """
+    owned = set(alignment.cue_word_indices.get(cue_id, ()))
+    protected: set[int] = set()
+    for span in alignment.divergence_spans:
+        if cue_id not in span.cue_ids or not alphanumeric_signature(span.srt_text):
+            continue
+        evidence = owned.intersection(span.asr_word_indices)
+        fragment = [words[index] for index in evidence if 0 <= index < len(words)]
+        if fragment and not any(alphanumeric_signature(word.text) for word in fragment):
+            protected.update(id(word) for word in fragment)
+    return protected
+
+
+def _without_leading_sentence_punctuation(words: list[Word], protected: set[int]) -> list[Word]:
+    if not any(alphanumeric_signature(word.text) for word in words):
+        return words
+    first = 0
+    while first < len(words):
+        text = words[first].text.strip()
+        if id(words[first]) in protected or not text or not set(text) <= _BOUNDARY_SENTENCE_PUNCTUATION:
+            break
+        # A standalone period/comma before a number can mean "point five".
+        if text in {".", ","} and first + 1 < len(words) and any(
+            token.isdigit() for token in alphanumeric_signature(words[first + 1].text)
+        ):
+            break
+        first += 1
+    return words[first:]
 
 
 def _cluster_score(words: list[Word], supported: set[int], max_word_duration: float) -> tuple[int, int, int]:
