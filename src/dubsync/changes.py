@@ -582,6 +582,7 @@ def apply_adjudication_decisions(
         )
 
     final_token_edit_text_by_cue: dict[int, str] = {}
+    unchanged_cue_ids: set[int] = set()
     for cue_id, edits in token_edits_by_cue.items():
         changed_text = _apply_cue_token_edits(cues_by_id[cue_id], edits)
         if changed_text is None:
@@ -599,6 +600,12 @@ def apply_adjudication_decisions(
         final_token_edit_text_by_cue[cue_id] = changed_text
         if not alphanumeric_signature(changed_text):
             removed_cue_ids.add(cue_id)
+            replacements_by_cue.pop(cue_id, None)
+            continue
+        if changed_text.split() == cues_by_id[cue_id].text.split():
+            # An approved wording equal to the source (the far-away part of
+            # its case was placed elsewhere) keeps the authored lines.
+            unchanged_cue_ids.add(cue_id)
             replacements_by_cue.pop(cue_id, None)
             continue
         replacements_by_cue[cue_id] = (
@@ -622,6 +629,8 @@ def apply_adjudication_decisions(
         )
         else flag
         for flag in flags
+        # Nothing changed for the viewer: there is no change to report.
+        if not (flag.kind == "text_changed" and flag.cue_ids and set(flag.cue_ids) <= unchanged_cue_ids)
     ]
 
     for cue in cues:
@@ -685,48 +694,15 @@ def indexed_multi_cue_replacements(
     and timing cannot independently choose different cue boundaries.
     """
     cue_ids = list(dict.fromkeys(span.cue_ids))
-    indices = sorted(set(span.srt_token_indices))
     cues_by_id = {cue.index: cue for cue in cues}
-    if (
-        not cue_ids
-        or not indices
-        or indices != list(range(indices[0], indices[-1] + 1))
-        or any(cue_id not in cues_by_id for cue_id in cue_ids)
-        or any(cue_has_bracketed_screen_text(cues_by_id[cue_id]) for cue_id in cue_ids)
-    ):
+    bounds_by_cue = indexed_span_bounds(cues, span)
+    if bounds_by_cue is None:
         return None
-    offsets = _cue_token_offsets(cues)
-    bounds_by_cue: dict[int, tuple[int, int]] = {}
-    covered_indices: list[int] = []
-    covered_tokens: list[str] = []
-    for cue_id in cue_ids:
-        signature = alphanumeric_signature(speech_text_for_alignment(cues_by_id[cue_id]))
-        local_indices = [index - offsets[cue_id] for index in indices
-                         if offsets[cue_id] <= index < offsets[cue_id] + len(signature)]
-        if not local_indices:
-            return None
-        start, end = local_indices[0], local_indices[-1] + 1
-        bounds_by_cue[cue_id] = (start, end)
-        covered_indices.extend(range(offsets[cue_id] + start, offsets[cue_id] + end))
-        covered_tokens.extend(signature[start:end])
-    if covered_indices != indices or covered_tokens != alphanumeric_signature(span.srt_text):
-        return None
+    covered_tokens = alphanumeric_signature(span.srt_text)
 
-    token_spans = _token_character_spans(final_text)
-    if len(token_spans) != len(alphanumeric_signature(final_text)):
+    unit_spans = lexical_unit_spans(final_text)
+    if unit_spans is None:
         return None
-    # Alignment tokens split apostrophes and numeric punctuation. Keep such
-    # lexical units together so "aren't" cannot become "aren'" / "t".
-    unit_spans: list[tuple[int, int]] = []
-    for start, end in token_spans:
-        if (
-            unit_spans
-            and not any(character.isspace() for character in final_text[unit_spans[-1][1]:start])
-            and not contains_character_level_script(final_text[unit_spans[-1][0]:end])
-        ):
-            unit_spans[-1] = (unit_spans[-1][0], end)
-        else:
-            unit_spans.append((start, end))
     sentence_boundaries = _replacement_sentence_boundaries(final_text, unit_spans)
     if is_joint_region(span):
         return _joint_region_replacement_edits(cues_by_id, bounds_by_cue, span, final_text, unit_spans, words)
@@ -798,6 +774,148 @@ def indexed_multi_cue_replacements(
         previous_boundary = boundary
         previous_character = end_character
     return result
+
+
+def indexed_span_bounds(cues: list[Cue], span: DivergenceSpan) -> dict[int, tuple[int, int]] | None:
+    """Alignment-token bounds of an exact source span inside each of its cues.
+
+    None unless the token indices are contiguous, lie in plain dialogue cues
+    and reproduce the span's source text.
+    """
+    cue_ids = list(dict.fromkeys(span.cue_ids))
+    indices = sorted(set(span.srt_token_indices))
+    cues_by_id = {cue.index: cue for cue in cues}
+    if (
+        not cue_ids
+        or not indices
+        or indices != list(range(indices[0], indices[-1] + 1))
+        or any(cue_id not in cues_by_id for cue_id in cue_ids)
+        or any(cue_has_bracketed_screen_text(cues_by_id[cue_id]) for cue_id in cue_ids)
+    ):
+        return None
+    offsets = _cue_token_offsets(cues)
+    bounds_by_cue: dict[int, tuple[int, int]] = {}
+    covered_indices: list[int] = []
+    covered_tokens: list[str] = []
+    for cue_id in cue_ids:
+        signature = alphanumeric_signature(speech_text_for_alignment(cues_by_id[cue_id]))
+        local_indices = [index - offsets[cue_id] for index in indices
+                         if offsets[cue_id] <= index < offsets[cue_id] + len(signature)]
+        if not local_indices:
+            return None
+        start, end = local_indices[0], local_indices[-1] + 1
+        bounds_by_cue[cue_id] = (start, end)
+        covered_indices.extend(range(offsets[cue_id] + start, offsets[cue_id] + end))
+        covered_tokens.extend(signature[start:end])
+    if covered_indices != indices or covered_tokens != alphanumeric_signature(span.srt_text):
+        return None
+    return bounds_by_cue
+
+
+def lexical_unit_spans(text: str) -> list[tuple[int, int]] | None:
+    """Character spans of the units an approved text may be cut between.
+
+    Alignment tokens split apostrophes and numeric punctuation. Such tokens
+    stay one unit, so "aren't" cannot become "aren'" / "t".
+    """
+    token_spans = _token_character_spans(text)
+    if len(token_spans) != len(alphanumeric_signature(text)):
+        return None
+    unit_spans: list[tuple[int, int]] = []
+    for start, end in token_spans:
+        if (
+            unit_spans
+            and not any(character.isspace() for character in text[unit_spans[-1][1]:start])
+            and not contains_character_level_script(text[unit_spans[-1][0]:end])
+        ):
+            unit_spans[-1] = (unit_spans[-1][0], end)
+        else:
+            unit_spans.append((start, end))
+    return unit_spans
+
+
+def lexical_edit_costs(left: list[str], right: list[str]) -> list[list[int]]:
+    rows = [list(range(len(right) + 1))]
+    for left_position, left_token in enumerate(left, start=1):
+        previous = rows[-1]
+        row = [left_position]
+        for right_position, right_token in enumerate(right, start=1):
+            row.append(min(
+                previous[right_position - 1] + (left_token != right_token),
+                previous[right_position] + 1,
+                row[-1] + 1,
+            ))
+        rows.append(row)
+    return rows
+
+
+def replacement_text_cuts(final_text: str, spoken: list[Word], boundaries: list[int]) -> list[int] | None:
+    """Character offsets of an approved text at boundaries between spoken words.
+
+    Each boundary is a position in ``spoken``: the cut lies before that word.
+    Identical wording is cut at the same token. Changed wording is cut where
+    every optimal lexical alignment agrees, or where exactly one of them keeps
+    an identical word next to the cut. None when a cut is ambiguous or would
+    split a lexical unit. A cut at 0 or at the text end means the approved
+    text has no words on that side.
+    """
+    unit_spans = lexical_unit_spans(final_text)
+    if unit_spans is None:
+        return None
+    token_spans = _token_character_spans(final_text)
+    final_tokens = alphanumeric_signature(final_text)
+    spoken_tokens: list[str] = []
+    word_token_starts: list[int] = []
+    for word in spoken:
+        signature = alphanumeric_signature(word.text)
+        if not signature:
+            return None
+        word_token_starts.append(len(spoken_tokens))
+        spoken_tokens.extend(signature)
+    unit_starts = {start for start, _ in unit_spans}
+    exact = final_tokens == spoken_tokens
+    forward = [] if exact else lexical_edit_costs(final_tokens, spoken_tokens)
+    backward = [] if exact else lexical_edit_costs(final_tokens[::-1], spoken_tokens[::-1])
+    cuts: list[int] = []
+    for boundary in boundaries:
+        if not 0 < boundary < len(spoken):
+            return None
+        spoken_cut = word_token_starts[boundary]
+        if exact:
+            candidates = [spoken_cut]
+        else:
+            candidates = [
+                final_cut for final_cut in range(len(final_tokens) + 1)
+                if forward[final_cut][spoken_cut]
+                + backward[len(final_tokens) - final_cut][len(spoken_tokens) - spoken_cut] == forward[-1][-1]
+            ]
+            if len(candidates) > 1:
+                candidates = [
+                    final_cut for final_cut in candidates
+                    if (final_cut > 0 and final_tokens[final_cut - 1] == spoken_tokens[spoken_cut - 1])
+                    or (final_cut < len(final_tokens) and final_tokens[final_cut] == spoken_tokens[spoken_cut])
+                ]
+        if len(candidates) != 1:
+            return None
+        final_cut = candidates[0]
+        if final_cut == 0:
+            offset = 0
+        elif final_cut == len(final_tokens):
+            offset = len(final_text)
+        else:
+            offset = token_spans[final_cut][0]
+            if offset not in unit_starts:
+                return None
+            # An opening quote or dash belongs to the word it precedes.
+            previous_end = token_spans[final_cut - 1][1]
+            between = final_text[previous_end:offset]
+            spaces = [position for position, character in enumerate(between) if character.isspace()]
+            if spaces:
+                offset = previous_end + spaces[-1] + 1
+        if cuts and offset < cuts[-1]:
+            return None
+        cuts.append(offset)
+    return cuts
 
 
 def _anchored_prefix_replacement_target(

@@ -23,7 +23,7 @@ from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
 from .changes import (
     ReplacementOwnershipError, apply_adjudication_decisions, indexed_multi_cue_replacements,
-    whole_cue_replacement_plan,
+    lexical_edit_costs, whole_cue_replacement_plan,
     protected_replacement_targets, single_token_prefix_replacement_targets,
 )
 from .config import load_style_profile, load_yaml
@@ -32,6 +32,7 @@ from .cue_segmentation import (
     segment_generated_adlib_cues, settle_collapsed_generated_adlibs,
     split_overlong_existing_cues, split_speaker_turn_cues,
 )
+from .detached_speech import separate_detached_speech
 from .edit_consistency import (
     held_decisions as decisions_with_held_cases, hold_fragmenting_replacements,
     settle_edits_with_held_timing, settle_one_letter_residues,
@@ -134,7 +135,7 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
-_REBUILD_POLICY_VERSION = 9
+_REBUILD_POLICY_VERSION = 10
 _ADJUDICATION_POLICY_VERSION = 3
 _PUNCTUATION_POLICY_VERSION = 1
 
@@ -540,6 +541,15 @@ def sync_episode(
         )
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     source_timing_held_cue_ids = _source_timing_held_cue_ids(flags)
+
+    # One case can hold words that are seconds apart. Only the group spoken at
+    # a cue's own time may edit that cue; the others are placed on their own.
+    alignment, decisions, detached_speech_flags = separate_detached_speech(
+        cues, alignment, decisions, words,
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+    )
+    flags.extend(detached_speech_flags)
 
     adlib_cue_ids_by_case, adlib_reconciliation_flags = _adlib_cue_ids_by_case(
         cues,
@@ -3555,8 +3565,8 @@ def _indexed_replacement_word_indices(
         return None
 
     exact_text = final_tokens == asr_tokens
-    forward = [] if exact_text else _lexical_edit_costs(final_tokens, asr_tokens)
-    backward = [] if exact_text else _lexical_edit_costs(final_tokens[::-1], asr_tokens[::-1])
+    forward = [] if exact_text else lexical_edit_costs(final_tokens, asr_tokens)
+    backward = [] if exact_text else lexical_edit_costs(final_tokens[::-1], asr_tokens[::-1])
     total_cost = 0 if exact_text else forward[-1][-1]
     result: dict[int, list[int]] = {}
     previous_word_boundary = 0
@@ -3634,21 +3644,6 @@ def _anchor_confidence_is_acceptable(confidence: float | None) -> bool:
 
 def _ends_with_sentence_separator(text: str) -> bool:
     return re.search(r"[.!?\u2026][\"'\u2019\u201d\u00bb\)\]]*\s*$", text) is not None
-
-
-def _lexical_edit_costs(left: list[str], right: list[str]) -> list[list[int]]:
-    rows = [list(range(len(right) + 1))]
-    for left_position, left_token in enumerate(left, start=1):
-        previous = rows[-1]
-        row = [left_position]
-        for right_position, right_token in enumerate(right, start=1):
-            row.append(min(
-                previous[right_position - 1] + (left_token != right_token),
-                previous[right_position] + 1,
-                row[-1] + 1,
-            ))
-        rows.append(row)
-    return rows
 
 
 def _span_word_indices_by_cue(
