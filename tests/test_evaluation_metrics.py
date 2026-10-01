@@ -26,7 +26,11 @@ def test_evaluate_against_golden_computes_timing_and_review_metrics():
         predicted,
         golden,
         fps=30.0,
-        flags=[QCFlag(kind="text_changed", cue_ids=[2], message="changed")],
+        flags=[
+            # A logged wording change is not a review item; a held timing is.
+            QCFlag(kind="text_changed", cue_ids=[2], message="changed", old_text="their", new_text="there"),
+            QCFlag(kind="timing_evidence_held", cue_ids=[3], message="held", severity="error"),
+        ],
         style_violations=0,
     )
 
@@ -89,6 +93,59 @@ def test_evaluate_against_golden_computes_improv_precision_and_recall():
     assert metrics["improv_precision"] == 0.5
     assert metrics["improv_recall"] == 0.5
     assert metrics["meets_improv_target"] is False
+
+
+def test_review_burden_counts_review_cues_not_raw_flags():
+    predicted = parse_srt_text("".join(
+        f"{index}\n00:00:{index:02d},000 --> 00:00:{index:02d},500\nline {index}\n\n" for index in range(1, 11)
+    ))
+    flags = [
+        # Song-caption cascade, change log and diagnostics: no human look needed.
+        QCFlag(kind="missing_audio_timing_held", cue_ids=[1], message="held", severity="error"),
+        QCFlag(kind="cue_without_speech_activity", cue_ids=[1], message="no speech"),
+        QCFlag(kind="timing_refined", cue_ids=[4], message="moved", old_text="4.000 --> 4.500",
+               new_text="4.000 --> 4.566"),
+        QCFlag(kind="asr_word_clamped", message="clamped"),
+        QCFlag(kind="source_error", cue_ids=[6, 7], message="repeated phrase"),
+        # One overlap reported twice is one review item covering two cues.
+        QCFlag(kind="overlap_stacked", cue_ids=[8, 9], message="overlap", start=8.4, end=8.5),
+        QCFlag(kind="output_overlap_unresolved", cue_ids=[8, 9], message="overlap", severity="error"),
+    ]
+    predicted[0] = predicted[0].with_lines(["♪Song line♪"])
+    predicted[7] = predicted[7].with_timing(8_000, 9_200)
+
+    metrics = evaluate_against_golden(predicted, predicted, fps=30.0, flags=flags)
+
+    assert metrics["review_burden_ratio"] == 2 / 10
+
+
+def test_review_burden_and_improv_metrics_use_delivered_numbers_from_the_qc_report():
+    # The ad-lib inserted before "goodbye" has internal id 3 but is SRT #2.
+    source = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nhello\n\n"
+        "2\n00:00:02,000 --> 00:00:02,500\nbye\n\n"
+    )
+    predicted = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:00,500\nhello\n\n"
+        "2\n00:00:01,000 --> 00:00:01,500\nnew adlib\n\n"
+        "3\n00:00:02,000 --> 00:00:02,500\nbye\n\n"
+    )
+    flags = [
+        QCFlag(kind="adlib_inserted", cue_ids=[3], message="actor improvised", new_text="new adlib"),
+        QCFlag(kind="timing_evidence_held", cue_ids=[2], message="held", severity="error"),
+    ]
+    review_items = [{"kind": "timing_evidence_held", "srt_numbers": [3], "cue_ids": [2]}]
+    change_items = [{"change": "added", "srt_number": 2, "cue_id": 3}]
+
+    metrics = evaluate_against_golden(
+        predicted, predicted, fps=30.0, flags=flags, source=source,
+        review_items=review_items, change_items=change_items,
+    )
+
+    assert metrics["review_burden_ratio"] == 1 / 3
+    assert metrics["improv_true_positives"] == 1
+    assert metrics["improv_false_positives"] == 0
+    assert metrics["improv_recall"] == 1.0
 
 
 def test_source_aware_improv_metrics_count_inserted_golden_cue_as_change():
@@ -160,6 +217,29 @@ def test_report_command_can_emit_golden_evaluation_metrics(tmp_path):
     payload = json.loads(result.output)
     assert payload["evaluation"]["meets_timing_target"] is True
     assert payload["evaluation"]["review_burden_ratio"] == 0.0
+
+
+def test_report_command_measures_review_burden_from_the_report_review_list(tmp_path):
+    workdir = tmp_path / "work" / "episode"
+    workdir.mkdir(parents=True)
+    predicted_path = tmp_path / "predicted.srt"
+    srt = "".join(f"{index}\n00:00:0{index},000 --> 00:00:0{index},500\nline {index}\n\n" for index in range(1, 5))
+    predicted_path.write_text(srt, encoding="utf-8")
+    (workdir / "qc_report.json").write_text(json.dumps({
+        "summary": {"cue_count": 4, "flags": 1, "style_violations": 0},
+        # Raw flag on an ad-lib's internal cue id 5; the delivered SRT numbers it #4.
+        "flags": [{"kind": "timing_evidence_held", "cue_ids": [5], "message": "held", "severity": "error"}],
+        "style_issues": [],
+        "review": [{"kind": "timing_evidence_held", "srt_numbers": [4], "cue_ids": [5]}],
+        "changes": [],
+    }), encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app, ["report", str(workdir), "--synced", str(predicted_path), "--golden", str(predicted_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["evaluation"]["review_burden_ratio"] == 0.25
 
 
 def test_report_command_uses_ingest_source_for_improv_recall_metrics(tmp_path):
