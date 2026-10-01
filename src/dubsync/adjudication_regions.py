@@ -6,16 +6,131 @@ import unicodedata
 
 from .models import Cue, CueContext, DivergenceSpan, TokenMatch, Word
 from .subtitle_annotations import cue_has_bracketed_screen_text, is_bracketed_screen_text_cue
+from .text_metrics import join_word_texts
 from .tokenize import SRTToken, alphanumeric_signature, normalize_token, tokenize_cues
 
 
 JOINT_REGION_PREFIX = "joint-"
 PROTECTED_SOURCE_PREFIX = "protected-source-"
 SPEECH_REPEAT_PREFIX = "speech-repeat-"
+SONG_CAPTION_PREFIX = "song-caption-"
+_SONG_MARKS = "♪♫"
 
 
 def is_joint_region(span: DivergenceSpan) -> bool:
     return span.case_id.startswith(JOINT_REGION_PREFIX)
+
+
+def is_song_caption_cue(cue: Cue) -> bool:
+    """A cue that is a song caption as a whole, not dialogue quoting a song."""
+    text = cue.plain_text.strip()
+    return (
+        len(text) > 2 and text[0] in _SONG_MARKS and text[-1] in _SONG_MARKS
+        and not cue_has_bracketed_screen_text(cue)
+        and bool(alphanumeric_signature(text))
+    )
+
+
+def protect_song_captions(
+    spans: list[DivergenceSpan], cues: list[Cue], words: list[Word],
+) -> list[DivergenceSpan]:
+    """Take song captions out of every divergence an adjudicator may rewrite.
+
+    A dubbed voice track carries no music, so audio inside a caption's span is
+    dialogue spoken over the song (or an ASR artifact), never a new lyric. The
+    caption tokens become their own source-only case, which the pipeline keeps
+    verbatim. Spoken words remain adjudicable: with the dialogue tokens of a
+    mixed span, or as a pure insertion next to the caption.
+    """
+    caption_ids = {cue.index for cue in cues if is_song_caption_cue(cue)}
+    if not caption_ids:
+        return spans
+    tokens = tokenize_cues(cues)
+    derived = (JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_CAPTION_PREFIX)
+    result: list[DivergenceSpan] = []
+    for span in spans:
+        indices = span.srt_token_indices
+        if (
+            span.case_id.startswith(derived) or not indices
+            or not caption_ids.intersection(span.cue_ids)
+            or any(index < 0 or index >= len(tokens) for index in indices)
+        ):
+            result.append(span)
+            continue
+        caption_tokens = [index for index in indices if tokens[index].cue_id in caption_ids]
+        dialogue_tokens = [index for index in indices if tokens[index].cue_id not in caption_ids]
+        if not caption_tokens or (
+            dialogue_tokens and dialogue_tokens != list(range(dialogue_tokens[0], dialogue_tokens[-1] + 1))
+        ):
+            # Dialogue on both sides of a caption cannot be divided without
+            # guessing word ownership; the pipeline keeps the complete span.
+            result.append(span)
+            continue
+        audio = (
+            list(span.asr_word_indices) if dialogue_tokens
+            else _without_neighbour_duplicates(span.asr_word_indices, words)
+        )
+        if not dialogue_tokens and not audio and not span.asr_word_indices:
+            result.append(span)
+            continue
+        caption_span = span.model_copy(update={
+            "case_id": SONG_CAPTION_PREFIX + span.case_id,
+            "cue_ids": list(dict.fromkeys(tokens[index].cue_id for index in caption_tokens)),
+            "srt_token_indices": caption_tokens,
+            "srt_text": join_word_texts(tokens[index].text for index in caption_tokens),
+            "asr_text": "", "asr_word_indices": [], "speaker_ids": [], "insertion_token_offset": None,
+        })
+        if dialogue_tokens:
+            speech_span = span.model_copy(update={
+                "cue_ids": list(dict.fromkeys(tokens[index].cue_id for index in dialogue_tokens)),
+                "srt_token_indices": dialogue_tokens,
+                "srt_text": join_word_texts(tokens[index].text for index in dialogue_tokens),
+                "insertion_token_offset": None,
+            })
+        elif audio:
+            spoken = [words[index] for index in audio]
+            speech_span = span.model_copy(update={
+                "cue_ids": [], "srt_token_indices": [], "srt_text": "",
+                "asr_word_indices": audio,
+                "asr_text": join_word_texts(word.text for word in spoken),
+                "start": min(word.start for word in spoken), "end": max(word.end for word in spoken),
+                "speaker_ids": sorted({word.speaker_id for word in spoken if word.speaker_id}),
+                "insertion_token_offset": None,
+            })
+        else:
+            result.append(caption_span)
+            continue
+        dialogue_first = bool(dialogue_tokens) and dialogue_tokens[0] < caption_tokens[0]
+        result.extend([speech_span, caption_span] if dialogue_first else [caption_span, speech_span])
+    return result
+
+
+def _without_neighbour_duplicates(indices: list[int], words: list[Word]) -> list[int]:
+    """Drop a word that repeats the adjacent retained word at the same time.
+
+    A provider can return one spoken word twice with overlapping timestamps
+    (MAI: "Queria" / "Queria." at 1228.60 s). The copy that fell into a
+    caption's span is not additional speech.
+    """
+    own = set(indices)
+    kept: list[int] = []
+    for index in indices:
+        if not 0 <= index < len(words):
+            return list(indices)
+        word = words[index]
+        token = normalize_token(word.text)
+        duplicate = False
+        for neighbour_index in (index - 1, index + 1):
+            if neighbour_index in own or not 0 <= neighbour_index < len(words):
+                continue
+            neighbour = words[neighbour_index]
+            shorter = min(word.end - word.start, neighbour.end - neighbour.start)
+            overlap = min(word.end, neighbour.end) - max(word.start, neighbour.start)
+            if token and token == normalize_token(neighbour.text) and shorter > 0 and overlap >= 0.5 * shorter:
+                duplicate = True
+        if not duplicate:
+            kept.append(index)
+    return kept
 
 
 def split_protected_source_repetitions(

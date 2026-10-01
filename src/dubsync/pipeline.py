@@ -13,6 +13,7 @@ from rapidfuzz import fuzz
 from .adjudication import AdjudicationEngine, KeepSRTAdapter, confidence_gated_decision
 from .adjudication_regions import (
     PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, is_joint_region,
+    is_song_caption_cue, protect_song_captions,
     validated_protected_source_regions,
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
@@ -337,6 +338,7 @@ def sync_episode(
     else:
         alignment = align_cues_to_words(cues, words)
         alignment = _alignment_with_adjudication_context(alignment, cues)
+        alignment = _alignment_with_song_caption_guard(alignment, cues, words)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
 
     protected_source_regions = _protected_regions_for_alignment(alignment, cues, words)
@@ -362,6 +364,7 @@ def sync_episode(
             alignment_unresolved=alignment.diagnostics.unresolved,
             missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
             protected_source_regions=protected_source_regions,
+            song_caption_cue_ids=_song_caption_cue_ids(cues),
         )
         flags.extend(adjudication_flags)
         _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
@@ -374,6 +377,7 @@ def sync_episode(
                 alignment_unresolved=alignment.diagnostics.unresolved,
                 missing_audio_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
                 protected_source_regions=protected_source_regions,
+                song_caption_cue_ids=_song_caption_cue_ids(cues),
             )
         )
         provider_decisions: list[AdjudicationDecision] = []
@@ -824,11 +828,18 @@ def _fold_unconfirmed_evidence_holds(
     """
     unconfirmed = {cue_id for flag in flags
                    if flag.kind in _UNCONFIRMED_WORDING_FLAG_KINDS for cue_id in flag.cue_ids}
+    # A kept song caption with no or only coincidental matches is the same
+    # case: its note already says that it stays at source text and timing.
+    captions = {cue_id for flag in flags if flag.kind == _SONG_CAPTION_NOTE_KIND for cue_id in flag.cue_ids}
     retained: list[QCFlag] = []
     held: set[int] = set()
     for flag in recue_flags:
-        if flag.kind == "timing_evidence_held" and flag.cue_ids and set(flag.cue_ids) <= unconfirmed:
-            held.update(flag.cue_ids)
+        cue_ids = set(flag.cue_ids)
+        if cue_ids and (
+            (flag.kind == "timing_evidence_held" and cue_ids <= unconfirmed | captions)
+            or (flag.kind == "unmatched_cue" and cue_ids <= captions)
+        ):
+            held.update(cue_ids)
             continue
         retained.append(flag)
     return retained, held
@@ -1940,7 +1951,7 @@ def _run_verify_stage(
         )
     )
     flags = censor_german_profanity_flags(flags, source_cues)
-    flags = _unique_flags(flags)
+    flags = _unique_flags(_without_song_caption_silence_duplicates(flags))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(output_path, write_srt(rebuilt, renumber=True))
     _write_json(episode_workdir / "rebuild.json", {
@@ -2277,6 +2288,7 @@ def _hold_incomplete_source_insertions(
     alignment_unresolved: bool = False,
     missing_audio_cue_ids: set[int] | None = None,
     protected_source_regions: dict[str, set[int]] | None = None,
+    song_caption_cue_ids: set[int] | None = None,
 ) -> tuple[list[DivergenceSpan], list[AdjudicationDecision], list[QCFlag]]:
     max_duration = _generation_float_config(
         provider_config,
@@ -2289,6 +2301,12 @@ def _hold_incomplete_source_insertions(
     missing_audio = missing_audio_cue_ids or set()
     for span in spans:
         hold = _protected_source_region_hold(span, protected_source_regions or {})
+        if hold is None:
+            caption_hold = _song_caption_source_hold(span, song_caption_cue_ids or set(), missing_audio)
+            if caption_hold is not None:
+                held_decisions.append(caption_hold[0])
+                flags.extend(caption_hold[1])
+                continue
         if hold is None:
             hold = _missing_audio_source_hold(span, missing_audio)
         if hold is None:
@@ -2328,6 +2346,89 @@ def _protected_source_region_hold(
         message="Preserved the later song captions at their original text and timing; the distinct earlier speech requires independent audio approval.",
         old_text=span.srt_text, start=span.start, end=span.end,
     )
+
+
+_SONG_CAPTION_NOTE_KIND = "song_lyric_source_kept"
+
+
+def _song_caption_cue_ids(cues: list[Cue]) -> set[int]:
+    return {cue.index for cue in cues if is_song_caption_cue(cue)}
+
+
+def _song_caption_note(cue_id: int, *, absent_from_voice_track: bool) -> QCFlag:
+    return QCFlag(
+        kind=_SONG_CAPTION_NOTE_KIND, cue_ids=[cue_id], severity="info",
+        message=(
+            "Song caption is not part of the voice track; its source text and timing were kept."
+            if absent_from_voice_track
+            else "Song caption kept its source text; audio inside its span is dialogue, not a new lyric."
+        ),
+    )
+
+
+def _alignment_with_song_caption_guard(
+    alignment: AlignmentResult, cues: list[Cue], words: list[Word],
+) -> AlignmentResult:
+    """Keep song captions out of adjudication and out of the error list.
+
+    A voice-only dub contains no music. A caption without local speech is the
+    expected case, not a missing-audio failure: it keeps its source text and
+    timing (it stays in the protected missing-audio set) and is reported with
+    one informational note instead of an error-level hold.
+    """
+    caption_ids = _song_caption_cue_ids(cues)
+    if not caption_ids:
+        return alignment
+    unsung = caption_ids & set(alignment.diagnostics.missing_audio_cue_ids)
+    noted: set[int] = set()
+    flags: list[QCFlag] = []
+    for flag in alignment.flags:
+        if flag.kind == "missing_audio_timing_held" and flag.cue_ids and set(flag.cue_ids) <= unsung:
+            for cue_id in flag.cue_ids:
+                if cue_id not in noted:
+                    noted.add(cue_id)
+                    flags.append(_song_caption_note(cue_id, absent_from_voice_track=True))
+            continue
+        flags.append(flag)
+    return alignment.model_copy(update={
+        "divergence_spans": protect_song_captions(alignment.divergence_spans, cues, words),
+        "flags": flags,
+    })
+
+
+def _song_caption_source_hold(
+    span: DivergenceSpan, song_caption_cue_ids: set[int], missing_audio_cue_ids: set[int],
+) -> tuple[AdjudicationDecision, list[QCFlag]] | None:
+    """Never send a song caption's tokens to an adjudicator.
+
+    Dialogue words next to a caption once replaced it ("♪Queria♪"). A source
+    span that still touches a caption after the alignment guard cannot be
+    divided safely, so its complete source text is kept.
+    """
+    caption_ids = [cue_id for cue_id in dict.fromkeys(span.cue_ids) if cue_id in song_caption_cue_ids]
+    if not caption_ids or not span.srt_token_indices:
+        return None
+    decision = AdjudicationDecision(
+        case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text, confidence=1.0,
+        reason="Song captions keep their source text; dialogue audio never rewrites a caption.",
+    )
+    # A caption absent from the voice track already carries its per-cue note.
+    return decision, [
+        _song_caption_note(cue_id, absent_from_voice_track=False)
+        for cue_id in caption_ids if cue_id not in missing_audio_cue_ids
+    ]
+
+
+def _without_song_caption_silence_duplicates(flags: list[QCFlag]) -> list[QCFlag]:
+    """A noted song caption is expected to be silent in a voice-only track."""
+    noted = {cue_id for flag in flags if flag.kind == _SONG_CAPTION_NOTE_KIND for cue_id in flag.cue_ids}
+    if not noted:
+        return flags
+    silence_kinds = {"dropped_line_candidate", "cue_without_speech_activity", "cue_on_silence"}
+    return [
+        flag for flag in flags
+        if not (flag.kind in silence_kinds and flag.cue_ids and set(flag.cue_ids) <= noted)
+    ]
 
 
 def _missing_audio_source_hold(
@@ -2591,6 +2692,7 @@ def _apply_incomplete_source_holds_to_decisions(
     alignment_unresolved: bool = False,
     missing_audio_cue_ids: set[int] | None = None,
     protected_source_regions: dict[str, set[int]] | None = None,
+    song_caption_cue_ids: set[int] | None = None,
 ) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     _, held_decisions, incomplete_source_flags = _hold_incomplete_source_insertions(
         spans,
@@ -2599,6 +2701,7 @@ def _apply_incomplete_source_holds_to_decisions(
         alignment_unresolved=alignment_unresolved,
         missing_audio_cue_ids=missing_audio_cue_ids,
         protected_source_regions=protected_source_regions,
+        song_caption_cue_ids=song_caption_cue_ids,
     )
     if not held_decisions:
         return decisions, adjudication_flags
@@ -2621,6 +2724,7 @@ def _apply_incomplete_source_holds_to_decisions(
             "unresolved_alignment_adjudication_held",
             "missing_audio_source_cue_held",
             "protected_source_region_held",
+            _SONG_CAPTION_NOTE_KIND,
         }
     ]
     return ordered_decisions, [*retained_flags, *incomplete_source_flags]
@@ -2644,6 +2748,7 @@ def _unsafe_incomplete_source_resume_case_ids(
         alignment_unresolved=alignment_unresolved,
         missing_audio_cue_ids=missing_audio_cue_ids,
         protected_source_regions=protected_source_regions,
+        song_caption_cue_ids=_song_caption_cue_ids(source_cues),
     )
     decisions_by_case = {decision.case_id: decision for decision in decisions}
     spans_by_case = {span.case_id: span for span in spans}
@@ -2867,6 +2972,11 @@ def _anchored_adlib_cue_id(
 ) -> int | None:
     left_id = span.left_anchor_cue_id
     right_id = span.right_anchor_cue_id
+    # Dialogue spoken over a song is its own cue; it never joins the caption.
+    if left_id in cues_by_id and is_song_caption_cue(cues_by_id[left_id]):
+        left_id = None
+    if right_id in cues_by_id and is_song_caption_cue(cues_by_id[right_id]):
+        right_id = None
     # One existing cue cannot own an insertion spoken by multiple actors.
     # Keep it generated so the word-aware segmentation stage can split turns.
     if len(set(span.speaker_ids)) > 1:
@@ -2986,7 +3096,7 @@ def _reconciled_adlib_source_cue(
     span: DivergenceSpan,
     final_text: str,
 ) -> Cue | None:
-    candidates = [cue for cue in cues if cue.index in candidate_ids]
+    candidates = [cue for cue in cues if cue.index in candidate_ids and not is_song_caption_cue(cue)]
     if not candidates:
         return None
     final_signature = " ".join(alphanumeric_signature(final_text))
