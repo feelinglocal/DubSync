@@ -7,7 +7,7 @@ import yaml
 
 from dubsync import pipeline
 from dubsync.detached_speech import DETACHED_SPEECH_PREFIX, separate_detached_speech
-from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, Word
+from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, SpeechRegion, Word
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
 
@@ -234,6 +234,85 @@ def test_detached_group_is_a_pure_insertion_anchored_between_its_neighbours():
     assert [(decision.case_id, decision.verdict, decision.final_text) for decision in decisions] == [
         ("case-1", "hybrid", "Ano-Novo."), (detached.case_id, "hybrid", "Alô?"),
     ]
+
+
+def _police_case(regions: list[SpeechRegion] | None):
+    # ep17 cue 326: MAI timed "Ah." at 1250.16 s, 19 s before 'Chama a polícia.'
+    cues = [
+        Cue(index=325, start_ms=1_247_600, end_ms=1_249_360, lines=["Eu tenho vontade de te matar agora."]),
+        Cue(index=326, start_ms=1_269_600, end_ms=1_270_430, lines=["Chamar a polícia."]),
+    ]
+    words = [Word(text=text, start=start, end=end, confidence=None) for text, start, end in [
+        ("agora.", 1248.72, 1249.04), ("Ah.", 1250.16, 1250.72), ("Chama", 1269.72, 1269.92),
+        ("a", 1269.94, 1269.98), ("polícia.", 1270.04, 1270.56),
+    ]]
+    span = DivergenceSpan(
+        case_id="case-136", cue_ids=[326], srt_text="Chamar", asr_text="Ah. Chama",
+        srt_token_indices=[7], asr_word_indices=[1, 2], start=1250.16, end=1269.92,
+        left_anchor_cue_id=325, right_anchor_cue_id=326, left_anchor_end=1249.04, right_anchor_start=1269.94,
+    )
+    alignment = AlignmentResult(divergence_spans=[span], cue_word_indices={325: [0], 326: [3, 4]})
+    decision = AdjudicationDecision(case_id="case-136", verdict="use_audio", final_text="Ah. Chama",
+                                    confidence=0.95, reason="heard")
+    return separate_detached_speech(cues, alignment, [decision], words, speech_regions=regions)
+
+
+def test_far_interjection_stays_with_the_cue_when_unlabelled_speech_adjoins_the_cue():
+    # A burst without any ASR word ends 0.25 s before "Chama": the reviewer
+    # kept 'Ah. Chama a polícia.' and started the cue with that burst.
+    regions = [SpeechRegion(start=1247.66, end=1249.03), SpeechRegion(start=1250.04, end=1250.70),
+               SpeechRegion(start=1269.15, end=1269.47), SpeechRegion(start=1269.60, end=1270.43)]
+
+    alignment, decisions, flags = _police_case(regions)
+
+    (home,) = alignment.divergence_spans
+    assert (home.asr_word_indices, home.asr_text, home.start) == ([2], "Chama", 1269.72)
+    assert [(decision.case_id, decision.final_text) for decision in decisions] == [("case-136", "Ah. Chama")]
+    assert flags == []
+
+
+def test_far_interjection_is_detached_when_only_its_own_time_has_speech():
+    regions = [SpeechRegion(start=1247.66, end=1249.03), SpeechRegion(start=1250.04, end=1250.70),
+               SpeechRegion(start=1269.60, end=1270.43)]
+
+    for speech_regions in (regions, None):
+        alignment, decisions, _ = _police_case(speech_regions)
+        detached, home = alignment.divergence_spans
+        assert (detached.cue_ids, detached.asr_word_indices, detached.right_anchor_cue_id) == ([], [1], 326)
+        assert [decision.final_text for decision in decisions] == ["Ah.", "Chama"]
+        assert home.asr_word_indices == [2]
+
+
+def test_far_word_running_into_the_next_line_is_not_kept_with_the_earlier_cue():
+    # ep11 MAI cue 330: "Eu" is spoken 5.6 s later, 20 ms before the next
+    # cue's words. A noise right after the cue must not keep it there.
+    cues = [
+        Cue(index=330, start_ms=1_002_750, end_ms=1_003_920, lines=["Lá em cima não tem banheiro."]),
+        Cue(index=331, start_ms=1_009_230, end_ms=1_010_080, lines=["Vou segurar mais um pouco."]),
+    ]
+    words = [Word(text=text, start=start, end=end, confidence=None) for text, start, end in [
+        ("Tá", 1002.92, 1003.02), ("bom,", 1003.04, 1003.18), ("então", 1003.22, 1003.38),
+        ("vamos", 1003.42, 1003.56), ("lá.", 1003.60, 1003.76), ("Eu", 1009.40, 1009.46),
+        ("vou", 1009.48, 1009.60), ("esperar", 1009.62, 1009.90),
+    ]]
+    span = DivergenceSpan(
+        case_id="case-117", cue_ids=[330], srt_text="Lá em cima não tem banheiro",
+        asr_text="Tá bom, então vamos lá. Eu", srt_token_indices=[0, 1, 2, 3, 4, 5],
+        asr_word_indices=[0, 1, 2, 3, 4, 5], start=1002.92, end=1009.46,
+        right_anchor_cue_id=331, right_anchor_start=1009.48,
+    )
+    alignment = AlignmentResult(divergence_spans=[span], cue_word_indices={331: [6, 7]})
+    decision = AdjudicationDecision(case_id="case-117", verdict="use_audio", final_text="Tá bom, então vamos lá. Eu",
+                                    confidence=0.95, reason="heard")
+    regions = [SpeechRegion(start=1002.90, end=1003.80), SpeechRegion(start=1004.00, end=1004.30),
+               SpeechRegion(start=1009.35, end=1010.10)]
+
+    alignment, decisions, _ = separate_detached_speech(cues, alignment, [decision], words, speech_regions=regions)
+
+    home, detached = alignment.divergence_spans
+    assert [decision.final_text for decision in decisions] == ["Tá bom, então vamos lá.", "Eu"]
+    assert (home.asr_word_indices, detached.asr_word_indices) == ([0, 1, 2, 3, 4], [5])
+    assert (detached.left_anchor_cue_id, detached.right_anchor_cue_id, detached.right_anchor_start) == (330, 331, 1009.48)
 
 
 def test_span_without_a_large_gap_is_left_alone():

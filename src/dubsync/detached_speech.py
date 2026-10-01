@@ -18,7 +18,7 @@ from .adjudication_regions import (
 )
 from .changes import indexed_span_bounds, replacement_text_cuts
 from .edit_consistency import held_decisions
-from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, Word
+from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, SpeechRegion, Word
 from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import join_word_texts
 from .tokenize import alphanumeric_signature
@@ -33,6 +33,12 @@ _HELD_KIND = "adjudication_replacement_ownership_held"
 # offset its matched neighbours show.
 _EXPECTED_WINDOW_PAD_SECONDS = 0.5
 _NEIGHBOUR_SEARCH_CUES = 4
+# A far interjection of at most this many words may be a mistimed ASR word
+# when speech without any word is heard this close to the cue's own words.
+_MISTIMED_WORD_MAX_TOKENS = 2
+_ISOLATED_WORD_GAP_SECONDS = 0.3
+_UNLABELLED_SPEECH_REACH_SECONDS = 0.6
+_REGION_EDGE_TOLERANCE_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,7 @@ def separate_detached_speech(
     *,
     max_intra_cue_gap: float = 1.5,
     protected_cue_ids: set[int] | None = None,
+    speech_regions: list[SpeechRegion] | None = None,
 ) -> tuple[AlignmentResult, list[AdjudicationDecision], list[QCFlag]]:
     """Divide approved cases at acoustic gaps above ``max_intra_cue_gap``.
 
@@ -72,7 +79,7 @@ def separate_detached_speech(
     flags: list[QCFlag] = []
     for span in alignment.divergence_spans:
         decision = by_case.get(span.case_id)
-        result = _separate(span, decision, cues, alignment, words, max_intra_cue_gap, protected)
+        result = _separate(span, decision, cues, alignment, words, max_intra_cue_gap, protected, speech_regions)
         if result is None:
             spans.append(span)
             continue
@@ -98,6 +105,7 @@ def separate_detached_speech(
 def _separate(
     span: DivergenceSpan, decision: AdjudicationDecision | None, cues: list[Cue],
     alignment: AlignmentResult, words: list[Word], max_gap: float, protected: set[int],
+    speech_regions: list[SpeechRegion] | None,
 ) -> _Separation | None:
     if decision is None or span.case_id.startswith(_DERIVED_PREFIXES):
         return None
@@ -115,7 +123,9 @@ def _separate(
     cuts = None if kept else replacement_text_cuts(decision.final_text, spoken, boundaries)
     if insertion:
         return _separated_insertion(span, decision, groups, cuts, words)
-    return _separated_replacement(span, decision, groups, cuts, cues, alignment, words, max_gap, protected)
+    return _separated_replacement(
+        span, decision, groups, cuts, cues, alignment, words, max_gap, protected, speech_regions,
+    )
 
 
 def _acoustic_groups(span: DivergenceSpan, words: list[Word], max_gap: float) -> list[_Group] | None:
@@ -170,7 +180,7 @@ def _separated_insertion(
 def _separated_replacement(
     span: DivergenceSpan, decision: AdjudicationDecision, groups: list[_Group],
     cuts: list[int] | None, cues: list[Cue], alignment: AlignmentResult, words: list[Word],
-    max_gap: float, protected: set[int],
+    max_gap: float, protected: set[int], speech_regions: list[SpeechRegion] | None,
 ) -> _Separation | None:
     bounds = indexed_span_bounds(cues, span)
     if bounds is None:
@@ -225,7 +235,15 @@ def _separated_replacement(
 
     pieces = _pieces(decision.final_text, cuts)
     edges = [0, *cuts, len(decision.final_text)]
-    home_text = decision.final_text[edges[first]:edges[last + 1]].strip()
+    # A short word the ASR timed far away while unlabelled speech is heard
+    # directly beside the cue's own words was most likely spoken there: its
+    # text stays with the cue, its misplaced timestamp times nothing.
+    text_first, text_last = first, last
+    if first > 0 and _is_mistimed_beside(groups[first - 1], groups[first], words, speech_regions):
+        text_first = first - 1
+    if last + 1 < len(groups) and _is_mistimed_beside(groups[last + 1], groups[last], words, speech_regions):
+        text_last = last + 1
+    home_text = decision.final_text[edges[text_first]:edges[text_last + 1]].strip()
     home_decision = (
         decision.model_copy(update={"final_text": home_text}) if alphanumeric_signature(home_text)
         else decision.model_copy(update={
@@ -243,7 +261,7 @@ def _separated_replacement(
                 spans.append(home_span)
                 decisions.append(home_decision)
             continue
-        if not alphanumeric_signature(text):
+        if not alphanumeric_signature(text) or text_first <= number <= text_last:
             continue
         leading = number < first
         anchor_update = {
@@ -271,6 +289,40 @@ def _separated_replacement(
         spans.append(_group_span(span, group, words, case_id).model_copy(update=anchor_update))
         decisions.append(decision.model_copy(update={"case_id": case_id, "final_text": text}))
     return _Separation(spans, decisions, flags)
+
+
+def _is_mistimed_beside(
+    group: _Group, home: _Group, words: list[Word], speech_regions: list[SpeechRegion] | None,
+) -> bool:
+    """A short far word while speech without any ASR word adjoins the cue's own words.
+
+    MAI timed "Ah." 19 s before 'Chama a polícia.' although an unlabelled
+    burst is heard 0.25 s before "Chama"; the reviewer kept "Ah." in the cue.
+    """
+    if not speech_regions or sum(
+        len(alphanumeric_signature(words[index].text)) for index in group.indices
+    ) > _MISTIMED_WORD_MAX_TOKENS:
+        return False
+    leading = group.end <= home.start
+    # A word that runs into other speech at its own time is spoken there.
+    outer = group.indices[0] - 1 if leading else group.indices[-1] + 1
+    if 0 <= outer < len(words) and (
+        group.start - words[outer].end if leading else words[outer].start - group.end
+    ) < _ISOLATED_WORD_GAP_SECONDS:
+        return False
+    if leading:
+        return any(
+            region.start >= group.end - _REGION_EDGE_TOLERANCE_SECONDS
+            and region.end <= home.start + _REGION_EDGE_TOLERANCE_SECONDS
+            and home.start - region.end <= _UNLABELLED_SPEECH_REACH_SECONDS
+            for region in speech_regions
+        )
+    return any(
+        region.start >= home.end - _REGION_EDGE_TOLERANCE_SECONDS
+        and region.end <= group.start + _REGION_EDGE_TOLERANCE_SECONDS
+        and region.start - home.end <= _UNLABELLED_SPEECH_REACH_SECONDS
+        for region in speech_regions
+    )
 
 
 def _finite(value: float | None) -> bool:

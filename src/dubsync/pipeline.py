@@ -22,8 +22,8 @@ from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
 from .changes import (
-    ReplacementOwnershipError, apply_adjudication_decisions, indexed_multi_cue_replacements,
-    lexical_edit_costs, whole_cue_replacement_plan,
+    ReplacementOwnershipError, anchor_confidence_is_acceptable, apply_adjudication_decisions,
+    indexed_multi_cue_replacements, lexical_edit_costs, whole_cue_replacement_plan,
     protected_replacement_targets, single_token_prefix_replacement_targets,
 )
 from .config import load_style_profile, load_yaml
@@ -542,12 +542,22 @@ def sync_episode(
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     source_timing_held_cue_ids = _source_timing_held_cue_ids(flags)
 
+    # ASR word edges are repaired against the audio once, before any cue is
+    # timed; rebuild and verification share the same repaired words.
+    speech_evidence = speech_evidence_for_words(
+        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+        asr_artifact_path=episode_workdir / "asr.json",
+    )
+    timing_words = speech_evidence.words
+
     # One case can hold words that are seconds apart. Only the group spoken at
     # a cue's own time may edit that cue; the others are placed on their own.
     alignment, decisions, detached_speech_flags = separate_detached_speech(
         cues, alignment, decisions, words,
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
         protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+        speech_regions=speech_evidence.regions if speech_evidence.detected else None,
     )
     flags.extend(detached_speech_flags)
 
@@ -656,14 +666,6 @@ def sync_episode(
             ),
         )
         flags.extend(sync_line_flags)
-    # ASR word edges are repaired against the audio once, before any cue is
-    # timed; rebuild and verification share the same repaired words.
-    speech_evidence = speech_evidence_for_words(
-        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
-        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
-        asr_artifact_path=episode_workdir / "asr.json",
-    )
-    timing_words = speech_evidence.words
     def rebuild(cue_list: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
         return rebuild_cues(
             cue_list,
@@ -3429,6 +3431,9 @@ def _alignment_with_decision_words(
         word_indices_by_cue = _span_word_indices_by_cue(span, replacement_target=replacement_target)
         edits = None
         whole_plan = None
+        # Filled when the text pieces were placed from word timing: the same
+        # phrases then time the cues that show them.
+        placed_word_indices: dict[int, list[int]] = {}
         if source_cues and decision.verdict in {"use_audio", "hybrid"}:
             try:
                 whole_plan = whole_cue_replacement_plan(
@@ -3457,6 +3462,7 @@ def _alignment_with_decision_words(
             try:
                 edits = indexed_multi_cue_replacements(
                     source_cues, span, decision.final_text, replacement_target=replacement_target, words=words,
+                    ownership=placed_word_indices,
                 )
                 if edits is None and is_joint_region(span):
                     raise ReplacementOwnershipError("The joint source region could not be reconstructed; source evidence was held for review.")
@@ -3482,7 +3488,10 @@ def _alignment_with_decision_words(
                     new_text=decision.final_text, start=span.start, end=span.end,
                 ))
                 continue
-            mapped_indices = whole_plan.word_indices_by_cue if whole_plan is not None else _indexed_replacement_word_indices(span, edits, words=words)
+            mapped_indices = (
+                whole_plan.word_indices_by_cue if whole_plan is not None
+                else placed_word_indices or _indexed_replacement_word_indices(span, edits, words=words)
+            )
             if mapped_indices is None:
                 hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",
@@ -3592,11 +3601,11 @@ def _indexed_replacement_word_indices(
                     continue
                 left_anchor = (
                     final_tokens[final_boundary - 1] == asr_tokens[asr_boundary - 1]
-                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary - 1])
+                    and anchor_confidence_is_acceptable(token_confidences[asr_boundary - 1])
                 )
                 right_anchor = (
                     final_tokens[final_boundary] == asr_tokens[asr_boundary]
-                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary])
+                    and anchor_confidence_is_acceptable(token_confidences[asr_boundary])
                 )
                 matching_separator = sentence_boundary and _ends_with_sentence_separator(word_texts[word_boundary - 1])
                 if left_anchor or right_anchor or matching_separator:
@@ -3634,12 +3643,6 @@ def _indexed_replacement_word_indices(
         previous_asr_boundary = candidates[0]
         previous_final_boundary = final_boundary
     return result
-
-
-def _anchor_confidence_is_acceptable(confidence: float | None) -> bool:
-    # Providers without word confidences (MAI) report None: unknown, not zero.
-    # Only a known low confidence disqualifies an exact lexical anchor.
-    return confidence is None or confidence >= 0.8
 
 
 def _ends_with_sentence_separator(text: str) -> bool:

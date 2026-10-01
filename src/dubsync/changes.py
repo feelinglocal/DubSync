@@ -684,11 +684,15 @@ def indexed_multi_cue_replacements(
     *,
     replacement_target: int | None = None,
     words: list[Word] | None = None,
+    ownership: dict[int, list[int]] | None = None,
 ) -> dict[int, tuple[int, int, str]] | None:
     """Partition one exact source-token edit without consuming its cue residue.
 
-    Replacement tokens follow the source span's contribution to each cue,
-    preferring nearby corroborated sentence boundaries where available.
+    With word timing, every spoken phrase goes to the cue at whose time it
+    was spoken when the measured gaps decide that (``ownership`` then receives
+    the ASR word indices of each piece). Otherwise replacement tokens follow
+    the source span's contribution to each cue, preferring nearby corroborated
+    sentence boundaries where available.
     An anchored single-cue tail can transfer its replacement to the next cue.
     The pipeline uses these same pieces to assign acoustic evidence, so text
     and timing cannot independently choose different cue boundaries.
@@ -726,6 +730,13 @@ def indexed_multi_cue_replacements(
         }
     if len(cue_ids) < 2:
         return None
+    spoken_placement = _spoken_phrase_placement(cues_by_id, bounds_by_cue, span, final_text, words)
+    if spoken_placement is not None:
+        edits, word_indices_by_cue = spoken_placement
+        if ownership is not None:
+            ownership.clear()
+            ownership.update(word_indices_by_cue)
+        return edits
     if replacement_target is None:
         replacement_target = _contained_sentence_replacement_target(
             cues_by_id, bounds_by_cue, span, final_text, sentence_boundaries,
@@ -774,6 +785,158 @@ def indexed_multi_cue_replacements(
         previous_boundary = boundary
         previous_character = end_character
     return result
+
+
+# Spoken words closer together than this are one phrase and stay in one cue
+# unless the wording itself is divided by the source-based rules.
+_PHRASE_GAP_SECONDS = 0.3
+# A phrase is placed by timing only when the next-best cue is this much farther.
+_PLACEMENT_MARGIN_SECONDS = 0.25
+# A completely replaced cue is expected at its source time, moved by the
+# offset of the matched words around the case, within this tolerance.
+_EXPECTED_CUE_PAD_SECONDS = 0.5
+
+
+def _spoken_phrase_placement(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+    words: list[Word] | None,
+) -> tuple[dict[int, tuple[int, int, str]], dict[int, list[int]]] | None:
+    """Give every spoken phrase to the cue at whose time it was spoken.
+
+    Source token share cannot know that "Aqui," follows a 1.7 s pause and
+    belongs to the next cue, or that "Ah," is spoken 21 s after the cue whose
+    tail it replaces. A cue that keeps matched words is spoken where those
+    words are; a completely replaced cue near its source time. Phrases keep
+    their spoken order. None unless every phrase is clearly nearer to one cue
+    than to its neighbours and the approved text can be cut at the same words.
+    """
+    cue_ids = list(bounds_by_cue)
+    indices = span.asr_word_indices
+    if (
+        words is None or len(cue_ids) < 2 or not indices
+        or indices != list(range(indices[0], indices[-1] + 1))
+        or indices[0] < 0 or indices[-1] >= len(words)
+    ):
+        return None
+    spoken = [words[index] for index in indices]
+    if any(
+        not isfinite(word.start) or not isfinite(word.end) or word.end < word.start
+        or not alphanumeric_signature(word.text)
+        for word in spoken
+    ) or any(right.start < left.start for left, right in zip(spoken, spoken[1:])):
+        return None
+
+    # Phrase = run of words without a measurable pause; (first, end) positions.
+    phrases: list[tuple[int, int]] = []
+    first = 0
+    for position in range(1, len(spoken) + 1):
+        if position == len(spoken) or spoken[position].start - spoken[position - 1].end >= _PHRASE_GAP_SECONDS:
+            phrases.append((first, position))
+            first = position
+    times = [(spoken[first].start, max(word.end for word in spoken[first:end])) for first, end in phrases]
+
+    offsets = [
+        anchor_time - cue_time
+        for anchor_id, anchor_time, cue_time in (
+            (span.left_anchor_cue_id, span.left_anchor_end,
+             cues_by_id[span.left_anchor_cue_id].end_ms / 1000 if span.left_anchor_cue_id in cues_by_id else None),
+            (span.right_anchor_cue_id, span.right_anchor_start,
+             cues_by_id[span.right_anchor_cue_id].start_ms / 1000 if span.right_anchor_cue_id in cues_by_id else None),
+        )
+        if anchor_id is not None and anchor_id not in bounds_by_cue
+        and cue_time is not None and anchor_time is not None and isfinite(anchor_time)
+    ]
+    low, high = (min(offsets), max(offsets)) if offsets else (0.0, 0.0)
+
+    def distances(cue_position: int) -> list[float] | None:
+        cue_id = cue_ids[cue_position]
+        cue = cues_by_id[cue_id]
+        start, end = bounds_by_cue[cue_id]
+        token_count = len(alphanumeric_signature(speech_text_for_alignment(cue)))
+        if cue_position == 0 and start > 0:
+            anchor = span.left_anchor_end
+            if span.left_anchor_cue_id != cue_id or anchor is None or not isfinite(anchor):
+                return None
+            return [max(0.0, phrase_start - anchor) for phrase_start, _ in times]
+        if cue_position == len(cue_ids) - 1 and end < token_count:
+            anchor = span.right_anchor_start
+            if span.right_anchor_cue_id != cue_id or anchor is None or not isfinite(anchor):
+                return None
+            return [max(0.0, anchor - phrase_end) for _, phrase_end in times]
+        if (start, end) != (0, token_count):
+            return None
+        window_start = cue.start_ms / 1000 + low - _EXPECTED_CUE_PAD_SECONDS
+        window_end = cue.end_ms / 1000 + high + _EXPECTED_CUE_PAD_SECONDS
+        return [max(0.0, window_start - phrase_end, phrase_start - window_end) for phrase_start, phrase_end in times]
+
+    distance_by_cue = [distances(position) for position in range(len(cue_ids))]
+    if any(row is None for row in distance_by_cue):
+        return None
+
+    # Cheapest assignment of the phrases to the cues in spoken order.
+    costs = [[distance_by_cue[cue_position][0] for cue_position in range(len(cue_ids))]]
+    previous_cue: list[list[int]] = [[0] * len(cue_ids)]
+    for phrase in range(1, len(phrases)):
+        row: list[float] = []
+        origins: list[int] = []
+        best = 0
+        for cue_position in range(len(cue_ids)):
+            if costs[-1][cue_position] < costs[-1][best]:
+                best = cue_position
+            row.append(costs[-1][best] + distance_by_cue[cue_position][phrase])
+            origins.append(best)
+        costs.append(row)
+        previous_cue.append(origins)
+    assigned = [0] * len(phrases)
+    assigned[-1] = min(range(len(cue_ids)), key=costs[-1].__getitem__)
+    for phrase in range(len(phrases) - 1, 0, -1):
+        assigned[phrase - 1] = previous_cue[phrase][assigned[phrase]]
+    for phrase, cue_position in enumerate(assigned):
+        lowest = assigned[phrase - 1] if phrase else 0
+        highest = assigned[phrase + 1] if phrase + 1 < len(phrases) else len(cue_ids) - 1
+        own = distance_by_cue[cue_position][phrase]
+        if any(
+            distance_by_cue[other][phrase] - own < _PLACEMENT_MARGIN_SECONDS
+            for other in range(lowest, highest + 1) if other != cue_position
+        ):
+            return None
+
+    # Text and words are cut at the same place only for a wording that follows
+    # the spoken words one by one (spelling may differ). A changed word count
+    # would lend a phrase the timing of words its text does not contain.
+    unit_spans = lexical_unit_spans(final_text)
+    token_spans = _token_character_spans(final_text)
+    token_starts: list[int] = []
+    token_count = 0
+    for word in spoken:
+        token_starts.append(token_count)
+        token_count += len(alphanumeric_signature(word.text))
+    if unit_spans is None or len(token_spans) != token_count:
+        return None
+    cuts: list[int] = []
+    for phrase in range(1, len(phrases)):
+        if assigned[phrase] == assigned[phrase - 1]:
+            continue
+        offset = _token_cut_offset(final_text, token_spans, unit_spans, token_starts[phrases[phrase][0]])
+        if offset is None:
+            return None
+        cuts.append(offset)
+    edges = [0, *cuts, len(final_text)]
+    pieces: dict[int, str] = {}
+    owned: dict[int, list[int]] = {cue_id: [] for cue_id in cue_ids}
+    piece = 0
+    for phrase, cue_position in enumerate(assigned):
+        if phrase and cue_position != assigned[phrase - 1]:
+            piece += 1
+        pieces[cue_ids[cue_position]] = final_text[edges[piece]:edges[piece + 1]].strip()
+        owned[cue_ids[cue_position]].extend(indices[phrases[phrase][0]:phrases[phrase][1]])
+    if any(not alphanumeric_signature(text) for text in pieces.values()):
+        # The adjudicator left out the words of a phrase: nothing places its cue.
+        return None
+    return {cue_id: (*bounds_by_cue[cue_id], pieces.get(cue_id, "")) for cue_id in cue_ids}, owned
 
 
 def indexed_span_bounds(cues: list[Cue], span: DivergenceSpan) -> dict[int, tuple[int, int]] | None:
@@ -865,6 +1028,7 @@ def replacement_text_cuts(final_text: str, spoken: list[Word], boundaries: list[
     token_spans = _token_character_spans(final_text)
     final_tokens = alphanumeric_signature(final_text)
     spoken_tokens: list[str] = []
+    confident: list[bool] = []
     word_token_starts: list[int] = []
     for word in spoken:
         signature = alphanumeric_signature(word.text)
@@ -872,7 +1036,7 @@ def replacement_text_cuts(final_text: str, spoken: list[Word], boundaries: list[
             return None
         word_token_starts.append(len(spoken_tokens))
         spoken_tokens.extend(signature)
-    unit_starts = {start for start, _ in unit_spans}
+        confident.extend([anchor_confidence_is_acceptable(word.confidence)] * len(signature))
     exact = final_tokens == spoken_tokens
     forward = [] if exact else lexical_edit_costs(final_tokens, spoken_tokens)
     backward = [] if exact else lexical_edit_costs(final_tokens[::-1], spoken_tokens[::-1])
@@ -892,30 +1056,41 @@ def replacement_text_cuts(final_text: str, spoken: list[Word], boundaries: list[
             if len(candidates) > 1:
                 candidates = [
                     final_cut for final_cut in candidates
-                    if (final_cut > 0 and final_tokens[final_cut - 1] == spoken_tokens[spoken_cut - 1])
-                    or (final_cut < len(final_tokens) and final_tokens[final_cut] == spoken_tokens[spoken_cut])
+                    if (final_cut > 0 and confident[spoken_cut - 1]
+                        and final_tokens[final_cut - 1] == spoken_tokens[spoken_cut - 1])
+                    or (final_cut < len(final_tokens) and confident[spoken_cut]
+                        and final_tokens[final_cut] == spoken_tokens[spoken_cut])
                 ]
         if len(candidates) != 1:
             return None
-        final_cut = candidates[0]
-        if final_cut == 0:
-            offset = 0
-        elif final_cut == len(final_tokens):
-            offset = len(final_text)
-        else:
-            offset = token_spans[final_cut][0]
-            if offset not in unit_starts:
-                return None
-            # An opening quote or dash belongs to the word it precedes.
-            previous_end = token_spans[final_cut - 1][1]
-            between = final_text[previous_end:offset]
-            spaces = [position for position, character in enumerate(between) if character.isspace()]
-            if spaces:
-                offset = previous_end + spaces[-1] + 1
-        if cuts and offset < cuts[-1]:
+        offset = _token_cut_offset(final_text, token_spans, unit_spans, candidates[0])
+        if offset is None or (cuts and offset < cuts[-1]):
             return None
         cuts.append(offset)
     return cuts
+
+
+def anchor_confidence_is_acceptable(confidence: float | None) -> bool:
+    # Providers without word confidences (MAI) report None: unknown, not zero.
+    # Only a known low confidence disqualifies an exact lexical anchor.
+    return confidence is None or confidence >= 0.8
+
+
+def _token_cut_offset(
+    text: str, token_spans: list[tuple[int, int]], unit_spans: list[tuple[int, int]], token_cut: int,
+) -> int | None:
+    """Character offset of a cut before a token; None inside a lexical unit."""
+    if token_cut <= 0:
+        return 0
+    if token_cut >= len(token_spans):
+        return len(text)
+    offset = token_spans[token_cut][0]
+    if offset not in {start for start, _ in unit_spans}:
+        return None
+    # An opening quote or dash belongs to the word it precedes.
+    previous_end = token_spans[token_cut - 1][1]
+    spaces = [position for position, character in enumerate(text[previous_end:offset]) if character.isspace()]
+    return previous_end + spaces[-1] + 1 if spaces else offset
 
 
 def _anchored_prefix_replacement_target(
