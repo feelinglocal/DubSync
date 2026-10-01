@@ -72,10 +72,12 @@ def test_approved_wording_is_timed_from_the_words_the_adjudicator_heard(tmp_path
 
 def test_wording_without_a_place_of_its_own_is_held_with_its_timing(tmp_path):
     # ep11 cue 761: 'no Ano-Novo.' became 'no Ano-Novo. Alô?' at source timing,
-    # although "Alô?" is spoken 14 s later by another actor.
+    # although "Alô?" is spoken 14 s later by another actor. The scripted word
+    # here differs from the spoken one, because the aligner now matches the
+    # closed and open spellings of a compound without opening a case.
     srt = (
         "1\n00:00:01,000 --> 00:00:01,600\nRealizem seus desejos\n\n"
-        "2\n00:00:01,640 --> 00:00:02,670\nno Ano-Novo.\n\n"
+        "2\n00:00:01,640 --> 00:00:02,670\nno Natal.\n\n"
         "3\n00:00:17,000 --> 00:00:18,500\nQuem está falando agora?\n"
     )
     words = [
@@ -88,7 +90,7 @@ def test_wording_without_a_place_of_its_own_is_held_with_its_timing(tmp_path):
     cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "Ano-Novo. Alô?", "use_audio")})
 
     held = cues[1]
-    assert (held.plain_text, held.start_ms, held.end_ms) == ("no Ano-Novo.", 1640, 2670)
+    assert (held.plain_text, held.start_ms, held.end_ms) == ("no Natal.", 1640, 2670)
     kinds = _kinds(flags)
     assert "text_changed" not in kinds and "timing_evidence_held" not in kinds
     holds = [flag for flag in flags if flag["kind"] == "adjudication_replacement_ownership_held"]

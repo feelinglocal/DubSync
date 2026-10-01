@@ -128,6 +128,16 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     "adlib_removed_without_speech_activity": _review_kind(
         "Added line removed: no speech detected", "Listen at this time and restore the line if it is spoken.",
         32, "warning"),
+    "adlib_removed_collapsed_timing": _review_kind(
+        "Added line removed: its timing could not be measured",
+        "Listen at this time and restore the line if it is spoken.", 32, "warning"),
+    "adlib_timing_estimated": _review_kind(
+        "Added line placed with estimated timing", "Check the timing of this added line.", 36, "warning"),
+    "source_cue_timing_repaired": _review_kind(
+        "Script cue had an unusable duration", "Check the timing of this cue in the script.", 40, "warning"),
+    "adjudication_review_unavailable": _review_kind(
+        "AI second review was unavailable; script wording kept for some cues", _LISTEN, 35, "warning",
+        episode=True),
     "text_redistributed": _review_kind(
         "Wording moved between cues", "Check word order and line breaks across these cues.", 33, "warning"),
     "adjudication_audio_unavailable": _review_kind(
@@ -220,6 +230,7 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     "punctuation_skipped_for_long_audio": _note_kind("AI punctuation skipped for long audio"),
     "punctuation_provider_unavailable": _note_kind("AI punctuation unavailable; script punctuation kept"),
     "source_out_of_order": _note_kind("Script cues were re-sorted by time"),
+    "source_cue_numbers_reassigned": _note_kind("Script cue numbers were repeated or out of sequence"),
     "adlib_rejected_repetitive_content": _note_kind("Repetitive speech outside the script was not subtitled"),
     "adlib_rejected_outside_source_span": _note_kind("Speech outside the script range was not subtitled"),
     # Operator-only bookkeeping.
