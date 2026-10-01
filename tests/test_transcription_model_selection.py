@@ -40,6 +40,59 @@ def test_unconfigured_default_uses_scribe_with_language(language, monkeypatch):
     assert isinstance(adapter_from_config({}), ElevenLabsScribeAdapter)
 
 
+@pytest.mark.parametrize("language,expected", [
+    ("deu", "de"), ("ger", "de"), ("de-DE", "de"), ("ja-JP", "ja"), ("jpn", "ja"), ("JA_jp", "ja"),
+    ("pt-BR", "pt"), ("pt_br", "pt"), ("por", "pt"), ("spa", "es"), ("fra", "fr"), ("fre", "fr"),
+    ("eng", "en"), ("en-US", "en"), ("ind", "id"), ("zh-Hant", "zh"), ("PT", "pt"), (" de ", "de"),
+    ("auto", None), ("", None), (None, None), ("yue", "yue"),
+])
+def test_asr_language_codes_are_normalised_to_iso_639_1_for_providers(language, expected):
+    from dubsync.providers import asr_language_code
+
+    assert asr_language_code(language) == expected
+
+
+@pytest.mark.parametrize("selection,env", [(MAI, "OPENROUTER_API_KEY"), ("scribe_v2", "ELEVENLABS_API_KEY")])
+@pytest.mark.parametrize("language,expected", [("pt-BR", "pt"), ("deu", "de"), ("ja-JP", "ja")])
+def test_region_and_iso_639_3_codes_reach_each_provider_as_iso_639_1(monkeypatch, selection, env, language, expected):
+    monkeypatch.setenv(env, "test-key")
+    config = apply_asr_language(apply_transcription_provider_config({}, selection), language)
+    assert config["asr"]["language_code"] == expected
+    assert adapter_from_config(config).language_code == expected
+    provider = config["asr"]["provider"]
+    assert adapter_from_config({"asr": {"provider": provider, "language_code": language}}).language_code == expected
+    assert adapter_from_config({"asr": {"provider": provider, "language": language}}).language_code == expected
+
+
+def test_mai_request_carries_the_normalised_language(monkeypatch, tmp_path):
+    import io
+    import json
+
+    calls = []
+
+    class Response(io.BytesIO):
+        headers = {}
+
+    def urlopen(request, timeout):
+        calls.append(json.loads(request.data))
+        return Response(b'{"words": []}')
+
+    monkeypatch.setattr("dubsync.mai_transcribe.urlopen", urlopen)
+    audio = tmp_path / "clip.wav"
+    with wave.open(str(audio), "wb") as out:
+        out.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        out.writeframes(b"\0\0" * 16000)
+    adapter_from_config({"asr": {"provider": "openrouter", "api_key": "test-key", "language_code": "por"}}).transcribe(audio)
+    assert calls[0]["language"] == "pt"
+
+
+def test_forced_alignment_language_keeps_its_iso_639_3_code():
+    from dubsync.forced_alignment import MMSForcedAlignmentAdapter
+
+    assert MMSForcedAlignmentAdapter(language="deu").language == "deu"
+    assert MMSForcedAlignmentAdapter(language="ja-JP").language == "jpn"
+
+
 def test_factory_rejects_unexpected_openrouter_model():
     with pytest.raises(ProviderError, match="must be microsoft/mai-transcribe-2"):
         adapter_from_config({"asr": {"provider": "openrouter", "model": "other"}})

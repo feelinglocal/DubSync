@@ -220,7 +220,7 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
         self.model_id = model_id
         self.diarize = diarize
         self.keyterms = list(keyterms or [])
-        self.language_code = normalize_language_code(language_code)
+        self.language_code = asr_language_code(language_code)
         self.last_usage: dict[str, object] = {}
         self.last_evidence: dict[str, object] = {}
 
@@ -372,7 +372,7 @@ class OpenAIWhisperAdapter:  # pragma: no cover - live provider path
     def __init__(self, api_key: str | None = None, model: str = "whisper-1", language: str | None = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.model = model
-        self.language = normalize_language_code(language)
+        self.language = asr_language_code(language)
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         if not self.api_key:
@@ -417,7 +417,7 @@ class AssemblyAIAdapter:  # pragma: no cover - live provider path
         self.api_key = api_key or os.getenv("ASSEMBLYAI_API_KEY")
         self.model = model
         self.speaker_labels = speaker_labels
-        self.language_code = normalize_language_code(language_code)
+        self.language_code = asr_language_code(language_code)
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         if not self.api_key:
@@ -508,7 +508,7 @@ class WhisperXAdapter:
         self.device = device
         self.compute_type = compute_type
         self.batch_size = batch_size
-        self.language = normalize_language_code(language)
+        self.language = asr_language_code(language)
         self.diarize = diarize
         self.hf_token = hf_token or os.getenv("HUGGINGFACE_ACCESS_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
         self.min_speakers = min_speakers
@@ -585,7 +585,7 @@ def adapter_from_config(
             api_key=asr_config.get("api_key") if isinstance(asr_config.get("api_key"), str) else None,
             diarize=bool(asr_config.get("diarize", True)),
             keyterms=_asr_keyterms(asr_config),
-            language_code=normalize_language_code(_configured_asr_language(asr_config)),
+            language_code=asr_language_code(_configured_asr_language(asr_config)),
             timeout_seconds=float(asr_config.get("timeout_seconds", 90)),
             chunk_seconds=float(asr_config.get("chunk_seconds", 300)),
         )
@@ -595,7 +595,7 @@ def adapter_from_config(
             model_id=str(asr_config.get("model_id", "scribe_v2")),
             diarize=bool(asr_config.get("diarize", True)),
             keyterms=_asr_keyterms(asr_config),
-            language_code=normalize_language_code(_configured_asr_language(asr_config)),
+            language_code=asr_language_code(_configured_asr_language(asr_config)),
         )
     if provider == "openai":
         return OpenAIWhisperAdapter(
@@ -631,7 +631,7 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
     next_config = dict(config)
     if not language or not language.strip():
         return next_config
-    normalized = normalize_language_code(language)
+    normalized = asr_language_code(language)
     existing = next_config.get("asr", {})
     if not isinstance(existing, dict):
         return next_config
@@ -657,12 +657,54 @@ def apply_asr_language(config: dict[str, object], language: str | None) -> dict[
 
 
 def normalize_language_code(language: str | None) -> str | None:
-    """Normalize Japanese aliases without restricting other provider languages."""
+    """Normalize Japanese aliases without restricting other provider languages.
+
+    Forced alignment relies on this keeping ISO-639-3 codes such as ``deu``;
+    ASR requests use ``asr_language_code`` instead.
+    """
     normalized = (language or "").strip().lower()
     if not normalized or normalized == "auto":
         return None
     if normalized.replace("_", "-").split("-", 1)[0] in {"ja", "jpn"}:
         return "ja"
+    return normalized
+
+
+# ISO-639-2/3 codes (bibliographic and terminology forms) of languages that have
+# an ISO-639-1 code. Codes without one (``yue``, ``fil``) pass through.
+_ISO_639_1_BY_639_3 = {
+    "afr": "af", "ara": "ar", "arm": "hy", "aze": "az", "baq": "eu", "bel": "be", "ben": "bn", "bos": "bs",
+    "bul": "bg", "bur": "my", "cat": "ca", "ces": "cs", "chi": "zh", "cym": "cy", "cze": "cs", "dan": "da",
+    "deu": "de", "dut": "nl", "ell": "el", "eng": "en", "est": "et", "eus": "eu", "fas": "fa", "fin": "fi",
+    "fra": "fr", "fre": "fr", "geo": "ka", "ger": "de", "gle": "ga", "glg": "gl", "gre": "el", "guj": "gu",
+    "heb": "he", "hin": "hi", "hrv": "hr", "hun": "hu", "hye": "hy", "ice": "is", "ind": "id", "isl": "is",
+    "ita": "it", "jpn": "ja", "kan": "kn", "kat": "ka", "kaz": "kk", "khm": "km", "kor": "ko", "lao": "lo",
+    "lav": "lv", "lit": "lt", "mac": "mk", "mal": "ml", "mar": "mr", "may": "ms", "mkd": "mk", "mon": "mn",
+    "msa": "ms", "mya": "my", "nep": "ne", "nld": "nl", "nor": "no", "pan": "pa", "per": "fa", "pol": "pl",
+    "por": "pt", "ron": "ro", "rum": "ro", "rus": "ru", "sin": "si", "slk": "sk", "slo": "sk", "slv": "sl",
+    "spa": "es", "srp": "sr", "swa": "sw", "swe": "sv", "tam": "ta", "tel": "te", "tgl": "tl", "tha": "th",
+    "tur": "tr", "ukr": "uk", "urd": "ur", "uzb": "uz", "vie": "vi", "wel": "cy", "zho": "zh",
+}
+
+
+def asr_language_code(language: str | None) -> str | None:
+    """Language hint in the form every supported ASR provider accepts.
+
+    MAI (OpenRouter), OpenAI and WhisperX expect ISO-639-1; Scribe and
+    AssemblyAI accept it too. Region and script subtags are dropped
+    (``pt-BR`` -> ``pt``, ``ja-JP`` -> ``ja``) and ISO-639-3 codes are mapped
+    (``deu`` -> ``de``, ``por`` -> ``pt``). ``auto`` or empty means detect.
+    Codes without a known ISO-639-1 form pass through unchanged, so no
+    language is gated by this table.
+    """
+    normalized = (language or "").strip().lower().replace("_", "-")
+    if not normalized or normalized == "auto":
+        return None
+    primary = normalized.split("-", 1)[0]
+    if primary in _ISO_639_1_BY_639_3:
+        return _ISO_639_1_BY_639_3[primary]
+    if len(primary) == 2 and primary.isalpha():
+        return primary
     return normalized
 
 
