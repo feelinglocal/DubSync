@@ -29,7 +29,10 @@ from .changes import (
 )
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_gemini_context_cost, record_llm_usage
-from .cue_segmentation import segment_generated_adlib_cues, split_overlong_existing_cues, split_speaker_turn_cues
+from .cue_segmentation import (
+    segment_generated_adlib_cues, settle_collapsed_generated_adlibs,
+    split_overlong_existing_cues, split_speaker_turn_cues,
+)
 from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config, usable_forced_alignments_by_cue
 from .gemini_audio_context import validate_audio_context_config
@@ -630,6 +633,12 @@ def sync_episode(
     )
     recue_flags, unconfirmed_source_timed_cue_ids = _fold_unconfirmed_evidence_holds(recue_flags, flags)
     source_timing_held_cue_ids |= unconfirmed_source_timed_cue_ids
+    rebuilt, alignment, recue_flags, flags = _settle_collapsed_adlibs(
+        rebuilt, words, alignment, profile, recue_flags, flags,
+        generated_cue_ids=_generated_cue_ids(generated_adlib_cue_ids, cue_id_expansions, speaker_expansions),
+        fixed_cue_ids=confidence_held_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids
+        | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+    )
     flags.extend(recue_flags)
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
     flags.extend(source_order_inversion_flags(
@@ -871,11 +880,59 @@ def _without_duplicate_ownership_holds(flags: list[QCFlag], change_flags: list[Q
     ]
 
 
+def _generated_cue_ids(generated_adlib_cue_ids: set[int], *expansions: dict[int, list[int]]) -> set[int]:
+    generated = set(generated_adlib_cue_ids)
+    for expansion in expansions:
+        for parent, children in expansion.items():
+            if parent in generated:
+                generated.update(children)
+    return generated
+
+
+def _settle_collapsed_adlibs(
+    rebuilt: list[Cue], words: list[Word], alignment: AlignmentResult, profile: StyleProfile,
+    recue_flags: list[QCFlag], flags: list[QCFlag], *,
+    generated_cue_ids: set[int], fixed_cue_ids: set[int],
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], list[QCFlag]]:
+    """Never export a generated ad-lib at the envelope of placeholder ASR words.
+
+    A held generated cue has no source timing to fall back to, so "hold" left
+    it at its 1 ms (or zero) word envelope: a one-frame flash, or a failed
+    export after ASR and adjudication were paid. Its evidence hold is replaced
+    by the single flag of the outcome (joined, padded or removed).
+    """
+    collapsed = {
+        cue_id for flag in recue_flags if flag.kind == "timing_evidence_held"
+        for cue_id in flag.cue_ids if cue_id in generated_cue_ids
+    }
+    if not collapsed:
+        return rebuilt, alignment, recue_flags, flags
+    rebuilt, alignment, settle_flags, gone = settle_collapsed_generated_adlibs(
+        rebuilt, words, alignment, profile, collapsed_cue_ids=collapsed, fixed_cue_ids=fixed_cue_ids,
+    )
+    recue_flags = [
+        flag for flag in recue_flags
+        if not (flag.kind == "timing_evidence_held" and flag.cue_ids and set(flag.cue_ids) <= collapsed)
+    ]
+    retained: list[QCFlag] = []
+    for flag in flags:
+        if flag.kind == "adlib_inserted" and gone.intersection(flag.cue_ids):
+            remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in gone]
+            if not remaining:
+                continue
+            flag = flag.model_copy(update={"cue_ids": remaining})
+        retained.append(flag)
+    return rebuilt, alignment, [*recue_flags, *settle_flags], retained
+
+
 def _timing_evidence_held_cue_ids(flags: list[QCFlag]) -> set[int]:
+    # An ad-lib padded from collapsed words keeps that estimate: refining it
+    # to its placeholder word would shrink it to one frame again.
     return {cue_id for flag in flags
             if flag.kind in {
                 "timing_evidence_held", "adjudication_word_mapping_held",
                 "adjudication_replacement_ownership_held", "protected_source_region_held",
+                "adlib_timing_estimated",
             }
             for cue_id in flag.cue_ids}
 
@@ -2032,7 +2089,10 @@ def _remove_silent_generated_adlibs(
     retained_flags = [
         flag
         for flag in flags
-        if not (flag.kind == "adlib_inserted" and any(cue_id in silent_cue_ids for cue_id in flag.cue_ids))
+        if not (
+            flag.kind in {"adlib_inserted", "adlib_timing_estimated"}
+            and any(cue_id in silent_cue_ids for cue_id in flag.cue_ids)
+        )
     ]
     retained_activity_flags = [
         flag

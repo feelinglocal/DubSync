@@ -398,11 +398,15 @@ def apply_adjudication_decisions(
                     continue
                 replacements_by_cue[adlib_cue_id] = lines
                 continue
+            # Truncating both bounds can collapse a short ASR word to zero
+            # length (4.003-4.004 s), which fails the export. Round, and keep
+            # the generated envelope at least one millisecond long.
+            adlib_start_ms = max(0, round((span.start or 0.0) * 1000))
             adlib_cues.append(
                 Cue(
                     index=adlib_cue_id,
-                    start_ms=int((span.start or 0.0) * 1000),
-                    end_ms=int((span.end or span.start or 0.0) * 1000),
+                    start_ms=adlib_start_ms,
+                    end_ms=max(adlib_start_ms + 1, round((span.end or span.start or 0.0) * 1000)),
                     lines=lines,
                     speaker_id=decision.speaker,
                     character=decision.character,
