@@ -172,7 +172,7 @@ def test_default_energy_vad_keeps_soft_onsets_and_cuts_decay_tails(tmp_path):
     _write_wav(
         audio, frame_rate=16000, duration_seconds=6,
         bursts=[
-            (0.5, 1.0, LOUD), (1.0, 1.2, DECAY), (1.2, 1.6, LOUD),  # level dips but stays above off: one burst
+            (0.5, 1.0, LOUD), (1.0, 1.05, DECAY), (1.05, 1.6, LOUD),  # brief dip inside a word: one burst
             (2.5, 3.0, LOUD), (3.0, 3.3, DECAY),  # decay tail after the voice
             (4.0, 4.1, SOFT_ONSET), (4.1, 4.5, LOUD),  # soft consonant before the vowel
         ],
@@ -185,6 +185,24 @@ def test_default_energy_vad_keeps_soft_onsets_and_cuts_decay_tails(tmp_path):
     assert regions[0].end == pytest.approx(1.6, abs=0.02)
     assert regions[1].end == pytest.approx(3.0, abs=0.02)
     assert regions[2].start == pytest.approx(4.0, abs=0.02)
+
+
+def test_default_energy_vad_separates_a_breath_that_follows_a_word_without_silence(tmp_path):
+    # The level never falls to silence between the word and the breath, but the
+    # 120 ms between them is far below the voice: two bursts, and the word's
+    # region ends with the word.
+    audio = tmp_path / "breath.wav"
+    _write_wav(
+        audio, frame_rate=16000, duration_seconds=3,
+        bursts=[(0.5, 1.0, LOUD), (1.0, 1.12, DECAY), (1.12, 1.3, LOUD // 4), (1.3, 1.5, DECAY)],
+    )
+
+    regions = EnergySpeechActivityAdapter().detect(audio)
+
+    assert len(regions) == 2
+    assert regions[0].end == pytest.approx(1.0, abs=0.02)
+    assert regions[1].start == pytest.approx(1.12, abs=0.02)
+    assert regions[1].end == pytest.approx(1.3, abs=0.02)
 
 
 def test_adaptive_threshold_follows_a_quiet_delivery_and_absolute_override_still_works(tmp_path):

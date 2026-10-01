@@ -26,6 +26,8 @@ DEFAULT_MIN_REGION_MS = 30
 DEFAULT_MERGE_GAP_MS = 80
 DEFAULT_HYSTERESIS_DB = 6.0
 DEFAULT_EDGE_RISE_DB = 9.0
+# A soft consonant may lead into a burst this long before the voice proper.
+MAX_SOFT_ONSET_MS = 150
 ADAPTIVE_FLOOR_BLOCK_MS = 3000
 ADAPTIVE_LEVEL_PERCENTILE = 95.0
 ADAPTIVE_FLOOR_MARGIN_DB = 12.0
@@ -73,12 +75,14 @@ class EnergySpeechActivityAdapter:
 
     By default the thresholds follow the file: the on-threshold sits 32 dB under
     the loud speech level (95th percentile of the sounding frames) and at least
-    12 dB over the noise floor (typical quietest frame per 3 s), a burst continues while the level stays within
-    ``hysteresis_db`` below it, silences shorter than ``merge_gap_ms`` are
-    bridged and activity shorter than ``min_region_ms`` is dropped. A region
-    starts at the first frame above the on-threshold, so soft consonant onsets
-    stay inside it, and ends at the last frame ``edge_rise_db`` above that
-    threshold, so it ends with the voice rather than with its decay or a breath.
+    12 dB over the noise floor (typical quietest frame per 3 s). Activity
+    continues while the level stays within ``hysteresis_db`` below it, silences
+    shorter than ``merge_gap_ms`` are bridged and activity shorter than
+    ``min_region_ms`` is dropped. A region is the voiced part of that activity:
+    the frames ``edge_rise_db`` above the on-threshold, so it ends with the
+    voice rather than with its decay or a breath, plus a soft consonant that
+    leads straight into it. Activity that never gets that loud is kept as
+    quiet speech.
 
     ``threshold_dbfs`` forces an absolute on-threshold (both edges use it) and
     ``window_ms`` restores non-overlapping analysis windows of that size, which
@@ -133,7 +137,13 @@ class EnergySpeechActivityAdapter:
         offset_frames = 0 if legacy_windows else hop_frames // 2
         regions: list[SpeechRegion] = []
         pending: tuple[int, int] | None = None
-        for first, last in _active_runs(levels, thresholds):
+        bursts = _active_runs(
+            levels,
+            thresholds,
+            split_gap_hops=max(1, math.ceil(self.merge_gap_ms / hop_ms)),
+            max_soft_onset_hops=round(MAX_SOFT_ONSET_MS / hop_ms),
+        )
+        for first, last in bursts:
             start_frame = 0 if first == 0 else first * hop_frames + offset_frames
             end_frame = total_frames if last == len(levels) - 1 else (last + 1) * hop_frames + offset_frames
             end_frame = min(total_frames, end_frame)
@@ -518,33 +528,69 @@ def _noise_floor(levels: array, block_hops: int) -> float:
     return minima[len(minima) // 2]
 
 
-def _active_runs(levels: array, thresholds: EnergyThresholds) -> Iterator[tuple[int, int]]:
+def _active_runs(
+    levels: array,
+    thresholds: EnergyThresholds,
+    *,
+    split_gap_hops: int,
+    max_soft_onset_hops: int,
+) -> Iterator[tuple[int, int]]:
     """Yield inclusive (first, last) frame indices of each speech burst.
 
-    A burst is a run of frames above the off-threshold that reaches the
-    on-threshold at least once. It starts at its first on-frame and ends at its
-    last edge-frame (its last on-frame when it never gets that loud).
+    Hysteresis groups the frames above the off-threshold into runs. Inside a
+    run the voiced bursts are the frames above the edge level; a quieter
+    stretch of at least ``split_gap_hops`` separates two bursts, so a breath
+    that follows a word without a real silence does not prolong it. A burst
+    begins up to ``max_soft_onset_hops`` early when frames above the
+    on-threshold lead straight into it (a soft consonant). A run that never
+    reaches the edge level but does reach the on-threshold is quiet speech and
+    is reported from its first to its last on-frame.
     """
     on, off, edge = thresholds.on_dbfs, thresholds.off_dbfs, thresholds.edge_dbfs
-    in_run = False
-    first_on = last_on = last_edge = -1
+    run_start = -1
     for index, level in enumerate(levels):
         if level > off:
-            if not in_run:
-                in_run = True
-                first_on = last_on = last_edge = -1
-            if level > on:
-                if first_on < 0:
-                    first_on = index
-                last_on = index
-                if level > edge:
-                    last_edge = index
-        elif in_run:
-            in_run = False
-            if first_on >= 0:
-                yield first_on, last_edge if last_edge >= 0 else last_on
-    if in_run and first_on >= 0:
-        yield first_on, last_edge if last_edge >= 0 else last_on
+            if run_start < 0:
+                run_start = index
+        elif run_start >= 0:
+            yield from _bursts_in_run(levels, run_start, index, on, edge, split_gap_hops, max_soft_onset_hops)
+            run_start = -1
+    if run_start >= 0:
+        yield from _bursts_in_run(levels, run_start, len(levels), on, edge, split_gap_hops, max_soft_onset_hops)
+
+
+def _bursts_in_run(
+    levels: array,
+    first: int,
+    stop: int,
+    on: float,
+    edge: float,
+    split_gap_hops: int,
+    max_soft_onset_hops: int,
+) -> Iterator[tuple[int, int]]:
+    loud = [index for index in range(first, stop) if levels[index] > edge]
+    if not loud:
+        audible = [index for index in range(first, stop) if levels[index] > on]
+        if audible:
+            yield audible[0], audible[-1]
+        return
+    earliest_onset = first
+    burst_start = previous = loud[0]
+    for index in [*loud[1:], stop + split_gap_hops]:
+        if index - previous - 1 < split_gap_hops:
+            previous = index
+            continue
+        onset = burst_start
+        while (
+            onset > earliest_onset
+            and burst_start - onset < max_soft_onset_hops
+            and levels[onset - 1] > on
+        ):
+            onset -= 1
+        yield onset, previous
+        # The next burst must stay a full gap away or the two would be merged.
+        earliest_onset = previous + 1 + split_gap_hops
+        burst_start = previous = index
 
 
 def _append_region(
