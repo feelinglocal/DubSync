@@ -9,7 +9,13 @@ from typing import Literal
 
 from rapidfuzz import fuzz
 
-from .adjudication_regions import join_isolated_anchor_regions, split_protected_source_repetitions
+from .adjudication_regions import (
+    JOINT_REGION_PREFIX,
+    PROTECTED_SOURCE_PREFIX,
+    SPEECH_REPEAT_PREFIX,
+    join_isolated_anchor_regions,
+    split_protected_source_repetitions,
+)
 from .alignment_windows import (
     RETRY_MARGINS as ALIGNMENT_RETRY_MARGINS,
     band_cell_count as _band_cell_count,
@@ -54,7 +60,11 @@ NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-MISSING_AUDIO_GUARD_VERSION = 6
+MISSING_AUDIO_GUARD_VERSION = 7
+SONG_MARKERS = "♪♫"
+# The lyric part of a span that pooled unheard song lines with dialogue.
+SONG_SOURCE_PREFIX = "song-source-"
+_DERIVED_CASE_PREFIXES = (JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_SOURCE_PREFIX)
 # Concatenation-equal groups (``Ano-Novo`` / ``Ano Novo``) of at most this many
 # tokens or words per side, spelling at least this many characters.
 COMPOUND_MAX_PARTS = 3
@@ -1114,6 +1124,11 @@ def _align_cues_to_units(
             unit_word_indices=unit_word_indices,
             atomic_word_indices=atomic_word_indices,
         )
+    song_cue_ids = {cue.index for cue in cues if _is_song_lyric_cue(cue)}
+    if song_cue_ids:
+        # A lyric line is only timed by its words when the song itself was
+        # heard; a stray dialogue word must not pull it onto a conversation.
+        ops = _without_cue_matches(ops, tokens, _sparsely_matched_cue_ids(ops, tokens, song_cue_ids))
     provisional_matches = _token_matches_from_ops(ops, tokens)
     flags = [
         *_alignment_outlier_flags(provisional_matches, cues, tokens, words),
@@ -1139,33 +1154,21 @@ def _align_cues_to_units(
         for cue in cues
         if cue.index in tokenized_cue_ids and not cue_word_indices.get(cue.index)
     ]
-    anchor_coverage = len(matches) / len(tokens)
-    missing_audio_cue_ids = sorted(
+    # Unspoken song lyrics are expected silence in a voice-over, not missed speech.
+    unspoken_song_cue_ids = song_cue_ids & set(unmatched_cue_ids)
+    spoken_token_count = sum(1 for token in tokens if token.cue_id not in unspoken_song_cue_ids)
+    anchor_coverage = len(matches) / max(1, spoken_token_count)
+    missing_audio = (
         rejected_outlier_cue_ids
         | _source_only_unmatched_cue_ids(unmatched_cue_ids, divergence_spans)
         | _source_only_zero_window_cue_ids(divergence_spans)
     )
-    cue_by_id = {cue.index: cue for cue in cues}
-    for cue_id in missing_audio_cue_ids:
-        cue = cue_by_id.get(cue_id)
-        flags.append(
-            QCFlag(
-                kind="missing_audio_timing_held",
-                cue_ids=[cue_id],
-                message=(
-                    "No trustworthy local speech evidence was available for this source cue; "
-                    "its source text and timing are locked instead of borrowing another passage."
-                ),
-                severity="error",
-                old_text=cue.text if cue is not None else None,
-                start=cue.start_ms / 1000.0 if cue is not None else None,
-                end=cue.end_ms / 1000.0 if cue is not None else None,
-            )
-        )
+    missing_audio_cue_ids = sorted(missing_audio)
+    health_flags: list[QCFlag] = []
     if band_limited:
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
-        flags.append(
+        health_flags.append(
             QCFlag(
                 kind="alignment_band_limited",
                 cue_ids=[],
@@ -1182,7 +1185,7 @@ def _align_cues_to_units(
     if unresolved:
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
-        flags.append(
+        health_flags.append(
             QCFlag(
                 kind="alignment_unresolved",
                 cue_ids=[],
@@ -1206,6 +1209,15 @@ def _align_cues_to_units(
             divergence_spans, matches, cues, tokens, words,
             protected_cue_ids=set(missing_audio_cue_ids),
         )
+        divergence_spans = _separate_unspoken_song_cues(divergence_spans, tokens, cues, unspoken_song_cue_ids)
+        missing_audio_cue_ids = sorted(missing_audio | {
+            cue_id
+            for span in divergence_spans
+            if span.case_id.startswith(SONG_SOURCE_PREFIX)
+            for cue_id in span.cue_ids
+        })
+    flags.extend(_missing_audio_flags(missing_audio_cue_ids, cues, song_cue_ids, tokenized_cue_ids))
+    flags.extend(health_flags)
     return AlignmentResult(
         token_matches=matches,
         anchor_regions=anchor_regions,
@@ -1257,6 +1269,127 @@ def _absorbed_cue_words(ops: list[_Op], tokens: list[SRTToken]) -> list[tuple[in
         for op in ops
         if op.kind == "absorb" and op.srt_index is not None and op.asr_index is not None
     ]
+
+
+def _is_song_lyric_cue(cue: Cue) -> bool:
+    return any(marker in cue.text for marker in SONG_MARKERS)
+
+
+def _sparsely_matched_cue_ids(ops: list[_Op], tokens: list[SRTToken], cue_ids: set[int]) -> set[int]:
+    token_counts = Counter(token.cue_id for token in tokens if token.cue_id in cue_ids)
+    matched_counts = Counter(
+        tokens[op.srt_index].cue_id
+        for op in ops
+        if op.kind in _MATCH_OP_KINDS and op.srt_index is not None and tokens[op.srt_index].cue_id in cue_ids
+    )
+    return {cue_id for cue_id, count in matched_counts.items() if count * 2 < token_counts[cue_id]}
+
+
+def _separate_unspoken_song_cues(
+    spans: list[DivergenceSpan],
+    tokens: list[SRTToken],
+    cues: list[Cue],
+    song_cue_ids: set[int],
+) -> list[DivergenceSpan]:
+    """Review unheard lyric lines apart from the dialogue they were pooled with.
+
+    A span runs from one exact match to the next, so an unsung lyric block
+    next to an improvised line would share its review case and could be
+    replaced by a dialogue word. The lyric part becomes a source-only case
+    (locked as missing audio); the rest keeps its case id and every word.
+    """
+
+    if not song_cue_ids:
+        return spans
+    cues_by_id = {cue.index: cue for cue in cues}
+    separated: list[DivergenceSpan] = []
+    for span in spans:
+        lyric = [index for index in span.srt_token_indices if tokens[index].cue_id in song_cue_ids]
+        rest = [index for index in span.srt_token_indices if tokens[index].cue_id not in song_cue_ids]
+        if (
+            not lyric
+            or (not rest and not span.asr_word_indices)
+            or span.case_id.startswith(_DERIVED_CASE_PREFIXES)
+        ):
+            separated.append(span)
+            continue
+        lyric_cue_ids = sorted({tokens[index].cue_id for index in lyric})
+        lyric_span = span.model_copy(update={
+            "case_id": SONG_SOURCE_PREFIX + span.case_id,
+            "cue_ids": lyric_cue_ids,
+            "srt_text": _span_text_from_tokens(tokens, lyric),
+            "asr_text": "",
+            "srt_token_indices": lyric,
+            "asr_word_indices": [],
+            "speaker_ids": [],
+            "confidence": 0.0,
+            "insertion_token_offset": None,
+            "start": min(cues_by_id[cue_id].start_ms for cue_id in lyric_cue_ids) / 1000.0,
+            "end": max(cues_by_id[cue_id].end_ms for cue_id in lyric_cue_ids) / 1000.0,
+        })
+        rest_span = span.model_copy(update={
+            "cue_ids": sorted({tokens[index].cue_id for index in rest}),
+            "srt_text": _span_text_from_tokens(tokens, rest),
+            "srt_token_indices": rest,
+        })
+        lyric_first = (lyric[0] < rest[0]) if rest else (
+            rest_span.start is None or lyric_span.start <= rest_span.start
+        )
+        separated.extend([lyric_span, rest_span] if lyric_first else [rest_span, lyric_span])
+    return separated
+
+
+def _missing_audio_flags(
+    missing_audio_cue_ids: list[int],
+    cues: list[Cue],
+    song_cue_ids: set[int],
+    tokenized_cue_ids: set[int],
+) -> list[QCFlag]:
+    """One hold per dialogue cue, one per contiguous block of unheard lyrics."""
+
+    missing = set(missing_audio_cue_ids)
+    groups: list[list[Cue]] = []
+    song_block: list[Cue] = []
+    emitted: set[int] = set()
+    for cue in cues:
+        if cue.index in emitted:
+            continue
+        if cue.index in missing and cue.index in song_cue_ids:
+            song_block.append(cue)
+            emitted.add(cue.index)
+            continue
+        if cue.index not in tokenized_cue_ids:
+            # Screen text between lyric lines does not interrupt the song.
+            continue
+        if song_block:
+            groups.append(song_block)
+            song_block = []
+        if cue.index in missing:
+            groups.append([cue])
+            emitted.add(cue.index)
+    if song_block:
+        groups.append(song_block)
+    flags: list[QCFlag] = []
+    for group in groups:
+        song = group[0].index in song_cue_ids
+        flags.append(
+            QCFlag(
+                kind="missing_audio_timing_held",
+                cue_ids=[cue.index for cue in group],
+                message=(
+                    "These song lyrics are not heard in the voice-over; their source text and "
+                    "timing are locked as one block."
+                    if song
+                    else "No trustworthy local speech evidence was available for this source cue; "
+                    "its source text and timing are locked instead of borrowing another passage."
+                ),
+                severity="error",
+                old_text="\n\n".join(cue.text for cue in group),
+                start=group[0].start_ms / 1000.0,
+                end=max(cue.end_ms for cue in group) / 1000.0,
+            )
+        )
+    return flags
 
 
 def _rejectable_outlier_cue_ids(
