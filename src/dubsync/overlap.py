@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from .models import Cue, QCFlag
+from .subtitle_annotations import is_bracketed_screen_text_cue
+
+_POLICY_OVERLAP_FLAG_KINDS = frozenset({"overlap_stacked", "overlap_flag_only"})
+_FINAL_OVERLAP_FLAG_KINDS = frozenset({"output_overlap_unresolved", "output_overlap_preserved"})
 
 
 def apply_overlap_policy(
@@ -57,21 +61,52 @@ def apply_overlap_policy(
 
 def _overlap_flags(cues: list[Cue], kind: str) -> list[QCFlag]:
     flags: list[QCFlag] = []
-    previous: Cue | None = None
+    # Compare with the earlier cue that is still on screen, not only with the
+    # list neighbour, and leave on-screen text annotations out: a sign shown
+    # during dialogue is not two speakers talking over each other.
+    latest_ending: Cue | None = None
     for cue in cues:
-        if previous is not None and cue.start_ms < previous.end_ms:
+        if is_bracketed_screen_text_cue(cue):
+            continue
+        if latest_ending is not None and cue.start_ms < latest_ending.end_ms:
             flags.append(
                 QCFlag(
                     kind=kind,
-                    cue_ids=[previous.index, cue.index],
+                    cue_ids=[latest_ending.index, cue.index],
                     message="Overlapping speaker cues require QC review.",
-                    old_text=f"{previous.text}\n{cue.text}",
-                    start=_overlap_start(previous, cue),
-                    end=_overlap_end(previous, cue),
+                    old_text=f"{latest_ending.text}\n{cue.text}",
+                    start=_overlap_start(latest_ending, cue),
+                    end=_overlap_end(latest_ending, cue),
                 )
             )
-        previous = cue
+        if latest_ending is None or cue.end_ms > latest_ending.end_ms:
+            latest_ending = cue
     return flags
+
+
+def reconcile_overlap_flags(flags: list[QCFlag], final_cues: list[Cue], final_flags: list[QCFlag]) -> list[QCFlag]:
+    """Keep one finding per overlap that is really in the exported cues.
+
+    ``overlap_stacked`` / ``overlap_flag_only`` are raised after rebuild. A pair
+    that was separated later is stale, and a pair that final ordering reports
+    itself would be counted twice; both are dropped here.
+    """
+    cues_by_id = {cue.index: cue for cue in final_cues}
+    reported = {
+        frozenset(flag.cue_ids)
+        for flag in final_flags
+        if flag.kind in _FINAL_OVERLAP_FLAG_KINDS
+    }
+
+    def still_needed(flag: QCFlag) -> bool:
+        if flag.kind not in _POLICY_OVERLAP_FLAG_KINDS or len(flag.cue_ids) != 2:
+            return True
+        left, right = (cues_by_id.get(cue_id) for cue_id in flag.cue_ids)
+        if left is None or right is None or frozenset(flag.cue_ids) in reported:
+            return False
+        return left.start_ms < right.end_ms and right.start_ms < left.end_ms
+
+    return [flag for flag in flags if still_needed(flag)]
 
 
 def _can_dash_merge(left: Cue, right: Cue) -> bool:

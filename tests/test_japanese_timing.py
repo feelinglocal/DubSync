@@ -216,7 +216,7 @@ def test_fixture_vad_does_not_cap_reliable_cue_at_shared_source_boundary(tmp_pat
 
     output = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
     by_text = {cue.plain_text: (cue.start_ms, cue.end_ms) for cue in output}
-    assert by_text == {"前": (2500, 3066), "今日は": (1000, 2000), "晴れです": (2000, 3000)}
+    assert by_text == {"前": (2500, 3067), "今日は": (1000, 2000), "晴れです": (2000, 3000)}
 
 
 def test_vad_preserves_acoustic_endpoint_across_protected_source_cues():

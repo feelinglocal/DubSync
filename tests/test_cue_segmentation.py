@@ -62,7 +62,7 @@ def test_generated_adlib_uses_only_the_asr_window_retained_by_adjudication():
         retained_text
     )
     assert cues[0].start_ms == 10_000
-    assert cues[-1].end_ms == 13_266
+    assert cues[-1].end_ms == 13_267
     assert [index for cue_id in expansions[7] for index in updated.cue_word_indices[cue_id]] == list(
         range(3, 9)
     )

@@ -190,7 +190,10 @@ def test_generation_uses_configured_speech_evidence_before_export(tmp_path):
     )
     cues = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
 
-    assert cues[0].end_ms <= 467
+    # The 2.6 s ASR overrun is cut at the speech offset (0.4 s). The 0.3 s cue
+    # then keeps the 0.5 s minimum display time because only silence follows
+    # (timing.min_duration_policy: extend_into_silence).
+    assert cues[0].end_ms <= 600
     assert (result.episode_workdir / "vad.json").exists()
     assert any(flag["kind"] == "asr_word_clamped" for flag in result.report["flags"])
 

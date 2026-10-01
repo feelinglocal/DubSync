@@ -71,8 +71,8 @@ def test_cli_sync_applies_forced_alignment_fixture_refinement(tmp_path):
 
     assert result.exit_code == 0, result.output
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
-    assert synced[0].start_ms == 933
-    assert synced[0].end_ms == 1633
+    assert synced[0].start_ms == 934
+    assert synced[0].end_ms == 1634
     assert (workdir / "episode" / "forced_align.json").exists()
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     assert any(flag["kind"] == "forced_alignment_refined" for flag in report["flags"])

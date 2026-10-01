@@ -53,9 +53,10 @@ llm:
 
 vad:
   provider: energy
-  threshold_dbfs: -45.0
-  window_ms: 100
-  min_region_ms: 100
+  # Energy VAD: 10 ms hop, thresholds adapt to each file's speech level and
+  # noise floor. Optional overrides: threshold_dbfs (absolute on-threshold),
+  # window_ms (non-overlapping analysis windows), min_region_ms, merge_gap_ms,
+  # hysteresis_db, edge_rise_db.
   min_coverage: 0.2
   boundary_refinement:
     enabled: true
@@ -68,6 +69,18 @@ vad:
 timing:
   max_word_duration: 2.0
   max_intra_cue_gap: 1.5
+  # extend_into_silence: a cue shorter than the minimum display time stays up
+  # while nothing else is heard and no other cue starts. acoustic: it ends
+  # with its speech.
+  min_duration_policy: extend_into_silence
+  # ASR phrase edges are moved onto the edge of the speech burst they belong
+  # to. Measured on Scribe v2 and MAI-Transcribe 2 the same windows fit both,
+  # so no per-model values are set; models.<asr model id> can override them.
+  # phrase_edge_snap:
+  #   start_advance_ms: 200
+  #   end_extension_ms: 300
+  #   models:
+  #     scribe_v2: {start_advance_ms: 200}
   max_cps: 30
   min_cps: 2
 

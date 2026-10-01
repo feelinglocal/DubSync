@@ -238,7 +238,7 @@ def test_episode_11_trailing_hum_splits_within_one_frame_of_local_envelope():
     assert expansions == {682: [682, 683]}
     assert [flag.kind for flag in flags] == ["speaker_turn_split"]
     assert [(cue.start_ms, cue.end_ms) for cue in cues] == [
-        (1900333, 1902533), (1902533, 1902766),
+        (1900334, 1902534), (1902534, 1902767),
     ]
     assert alignment.cue_word_indices == {682: [0, 1, 2]}
     assert [(word.start, word.end) for word in words] == [

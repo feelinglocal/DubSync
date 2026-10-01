@@ -173,9 +173,11 @@ def test_dialogue_word_never_overwrites_a_song_caption(tmp_path):
     by_text = {cue.plain_text: cue for cue in cues}
     assert "♪Essa décima milésima luz acesa♪" in by_text
     caption = by_text["♪Essa décima milésima luz acesa♪"]
-    assert (caption.start_ms, caption.end_ms) == (5000, 9000)
     # The spoken reaction is its own cue next to the caption.
     assert "Uhum." in by_text and abs(by_text["Uhum."].start_ms - 7000) <= 34
+    # The caption keeps its source start; delivered cues never overlap, so it
+    # yields to the spoken line instead of staying on screen over it.
+    assert caption.start_ms == 5000 and caption.end_ms == by_text["Uhum."].start_ms
     assert not any("♪Uhum" in cue.plain_text for cue in cues)
     assert any(flag["kind"] == "adlib_inserted" for flag in flags)
     caption_kinds = [flag["kind"] for flag in flags if 2 in flag["cue_ids"]]

@@ -12,10 +12,16 @@ from .subtitle_annotations import is_bracketed_screen_text_cue, speech_text_for_
 from .tokenize import alphanumeric_signature
 
 
+# A pause inside a cue may be this many ``max_intra_cue_gap`` long before the
+# words beyond it stop timing the cue, provided the cue's text contains them.
+LEXICAL_BRIDGE_GAP_FACTOR = 2.0
+
+
 @dataclass(frozen=True)
 class _CueTiming:
     start_ms: int
     spoken_end_ms: int
+    spoken_end_raw_ms: float
     end_ms: int
     min_end_ms: int
     speaker_id: str | None
@@ -64,6 +70,7 @@ def rebuild_cues(
     max_word_duration: float = 2.0,
     max_intra_cue_gap: float = 1.5,
     protected_cue_ids: set[int] | None = None,
+    min_duration_policy: str = "extend_into_silence",
 ) -> tuple[list[Cue], list[QCFlag]]:
     rebuilt: list[Cue] = []
     flags: list[QCFlag] = []
@@ -77,6 +84,9 @@ def rebuild_cues(
         max_word_duration=max_word_duration,
         max_intra_cue_gap=max_intra_cue_gap,
         protected_cue_ids=protected,
+        # The "acoustic" policy ends a short cue with its speech; refinement
+        # applies the same policy with the audio evidence rebuild lacks.
+        extend_short_cues=min_duration_policy != "acoustic",
     )
     flags.extend(timing_flags)
     held_cue_ids = protected | {
@@ -121,13 +131,43 @@ def rebuild_cues(
         end_ms = _extend_into_available_gap(timing, next_start_by_cue.get(cue.index), profile)
         rebuilt.append(cue.with_timing(timing.start_ms, end_ms).model_copy(update={"speaker_id": timing.speaker_id}))
 
+    # A cue always starts with its own first word. Display padding and frame
+    # snapping were capped at the following start above; what still overlaps
+    # is simultaneous speech, which stays visible for the overlap policy.
     flags.extend(shared_word_timing_flags(cues, shared_cue_ids))
-    return _enforce_monotonic(
-        rebuilt,
-        profile,
-        preserve_source_timing_ids=set(alignment.unmatched_cue_ids) | preserved_cue_ids,
-        next_start_by_cue=next_start_by_cue,
-    ), flags
+    return rebuilt, flags
+
+
+def cue_spoken_spans(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    *,
+    max_word_duration: float = 2.0,
+    max_intra_cue_gap: float = 1.5,
+) -> dict[int, tuple[int, int]]:
+    """First-word onset and last-word offset (ms) of every cue that owns timed words.
+
+    Final overlap resolution uses these to tell display padding, which may be
+    trimmed, from a cue's own speech, which may not.
+    """
+    spans: dict[int, tuple[int, int]] = {}
+    for cue in cues:
+        owned = [
+            words[index]
+            for index in alignment.cue_word_indices.get(cue.index, [])
+            if 0 <= index < len(words)
+        ]
+        if not owned:
+            continue
+        selected, _ = select_cue_word_window(
+            cue, owned, max_word_duration=max_word_duration, max_intra_cue_gap=max_intra_cue_gap,
+        )
+        spans[cue.index] = (
+            round(min(word.start for word in selected) * 1000),
+            round(max(word.end for word in selected) * 1000),
+        )
+    return spans
 
 
 def _cue_timings(
@@ -139,6 +179,7 @@ def _cue_timings(
     max_word_duration: float,
     max_intra_cue_gap: float,
     protected_cue_ids: set[int],
+    extend_short_cues: bool = True,
 ) -> tuple[dict[int, _CueTiming], list[QCFlag]]:
     timings: dict[int, _CueTiming] = {}
     flags: list[QCFlag] = []
@@ -149,7 +190,8 @@ def _cue_timings(
         if not word_indices:
             continue
         matched_words = [words[index] for index in word_indices]
-        selected_words, trimmed = _largest_dense_cluster(
+        selected_words, trimmed = select_cue_word_window(
+            cue,
             matched_words,
             max_word_duration=max_word_duration,
             max_intra_cue_gap=max_intra_cue_gap,
@@ -181,10 +223,11 @@ def _cue_timings(
         start_ms = max(0, profile.snap_floor(min(word.start for word in matched_words) * 1000 - profile.lead_in_ms))
         spoken_end = max(word.end for word in matched_words) * 1000
         end_ms = profile.snap_ceil(spoken_end + profile.tail_ms)
-        min_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+        min_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000) if extend_short_cues else end_ms
         timings[cue.index] = _CueTiming(
             start_ms=start_ms,
             spoken_end_ms=profile.snap_ceil(spoken_end),
+            spoken_end_raw_ms=spoken_end,
             end_ms=end_ms,
             min_end_ms=min_end_ms,
             speaker_id=_dominant_speaker(matched_words),
@@ -243,12 +286,22 @@ def _ordered_lexical_support(source: list[str], evidence: list[str]) -> int:
     return previous[-1]
 
 
-def _largest_dense_cluster(
+def select_cue_word_window(
+    cue: Cue,
     words: list[Word],
     *,
     max_word_duration: float,
     max_intra_cue_gap: float,
 ) -> tuple[list[Word], bool]:
+    """Choose the owned words that time a cue; shared by rebuild and refinement.
+
+    Words are grouped at gaps above ``max_intra_cue_gap`` and around impossible
+    word durations. The group with the most usable evidence anchors the cue. A
+    neighbouring group is kept as well when the cue's own text contains its
+    words and the pause is at most ``LEXICAL_BRIDGE_GAP_FACTOR`` gaps long, so
+    a cue with a mid-sentence pause still starts on its first spoken word.
+    Returns the selected words in time order and whether any word was left out.
+    """
     if len(words) <= 1:
         return words, False
     sorted_words = sorted(words, key=lambda word: (word.start, word.end))
@@ -275,14 +328,62 @@ def _largest_dense_cluster(
         clusters.append(current)
     if len(clusters) <= 1:
         return sorted_words, False
-    selected = max(clusters, key=lambda cluster: _cluster_score(cluster, max_word_duration))
+
+    supported = _lexically_supported_words(cue, sorted_words)
+    # Equal evidence must not pick an arbitrary half: the earliest group wins,
+    # because a cue is read from its first words.
+    anchor = max(
+        range(len(clusters)),
+        key=lambda index: (*_cluster_score(clusters[index], supported, max_word_duration), -index),
+    )
+    def belongs(cluster: list[Word], gap: float) -> bool:
+        return gap <= max_intra_cue_gap * LEXICAL_BRIDGE_GAP_FACTOR and all(
+            _word_duration(word) <= max_word_duration and id(word) in supported for word in cluster
+        )
+
+    first = last = anchor
+    while first > 0 and belongs(clusters[first - 1], clusters[first][0].start - clusters[first - 1][-1].end):
+        first -= 1
+    while last + 1 < len(clusters) and belongs(clusters[last + 1], clusters[last + 1][0].start - clusters[last][-1].end):
+        last += 1
+    selected = [word for cluster in clusters[first:last + 1] for word in cluster]
     return selected, len(selected) != len(sorted_words)
 
 
-def _cluster_score(words: list[Word], max_word_duration: float) -> tuple[int, int, float]:
-    normal_count = sum(1 for word in words if _word_duration(word) <= max_word_duration)
-    span = max(word.end for word in words) - min(word.start for word in words)
-    return normal_count, len(words), -span
+def _cluster_score(words: list[Word], supported: set[int], max_word_duration: float) -> tuple[int, int, int]:
+    normal = [word for word in words if _word_duration(word) <= max_word_duration]
+    return sum(1 for word in normal if id(word) in supported), len(normal), len(words)
+
+
+def _lexically_supported_words(cue: Cue, words: list[Word]) -> set[int]:
+    """Identities of the words whose text appears, in order, in the cue's own dialogue."""
+    source = alphanumeric_signature(speech_text_for_alignment(cue))
+    evidence: list[tuple[str, int]] = [
+        (token, id(word)) for word in words for token in alphanumeric_signature(word.text)
+    ]
+    if not source or not evidence:
+        return set()
+    # Longest ordered match with the aligner's spelling tolerance, then walk it
+    # back to learn which timestamped words took part.
+    table = [[0] * (len(evidence) + 1) for _ in range(len(source) + 1)]
+    for row, token in enumerate(source, start=1):
+        for column, (candidate, _) in enumerate(evidence, start=1):
+            matches = token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
+            table[row][column] = max(
+                table[row - 1][column], table[row][column - 1], table[row - 1][column - 1] + int(matches),
+            )
+    supported: set[int] = set()
+    row, column = len(source), len(evidence)
+    while row > 0 and column > 0:
+        if table[row][column] == table[row - 1][column]:
+            row -= 1
+        elif table[row][column] == table[row][column - 1]:
+            column -= 1
+        else:
+            supported.add(evidence[column - 1][1])
+            row -= 1
+            column -= 1
+    return supported
 
 
 def _word_duration(word: Word) -> float:
@@ -324,9 +425,17 @@ def _extend_into_available_gap(timing: _CueTiming, next_start_ms: int | None, pr
     if next_start_ms is None:
         return desired_end_ms
     cap_ms = next_start_ms if profile.allow_zero_gap else profile.snap_floor(max(0, next_start_ms - 1))
-    # A following actor limits optional display padding too. A true word
-    # overlap remains intact; readability must never manufacture one.
-    return max(timing.spoken_end_ms, min(desired_end_ms, cap_ms))
+    if cap_ms >= timing.spoken_end_ms:
+        # A following actor limits optional display padding too.
+        return min(desired_end_ms, cap_ms)
+    # The next cue begins before this one's frame-ceiled last word. Words less
+    # than a frame apart only collide because the start is floored and the end
+    # is ceiled: the shared boundary is the next start. A true word overlap
+    # remains intact; readability must never manufacture one.
+    snap_slack_ms = profile.frame_ms * (1 if profile.allow_zero_gap else 2)
+    if cap_ms > timing.start_ms and cap_ms >= timing.spoken_end_raw_ms - snap_slack_ms:
+        return cap_ms
+    return timing.spoken_end_ms
 
 
 def _dominant_speaker(words: list[Word]) -> str | None:
@@ -334,49 +443,3 @@ def _dominant_speaker(words: list[Word]) -> str | None:
     if not speakers:
         return None
     return Counter(speakers).most_common(1)[0][0]
-
-
-def _enforce_monotonic(
-    cues: list[Cue],
-    profile: StyleProfile,
-    *,
-    preserve_source_timing_ids: set[int] | None = None,
-    next_start_by_cue: dict[int, int] | None = None,
-) -> list[Cue]:
-    if not cues:
-        return []
-    preserved = preserve_source_timing_ids or set()
-    adjusted = list(cues)
-    previous_by_speaker: dict[str, Cue] = {}
-    # Resolve same-speaker overlaps in acoustic order without changing the
-    # source-list order used by later reconciliation and source timing holds.
-    for position, cue in sorted(enumerate(cues), key=lambda item: item[1].start_ms):
-        if cue.index in preserved or is_bracketed_screen_text_cue(cue):
-            continue
-        speaker_key = _speaker_key(cue.speaker_id)
-        previous = previous_by_speaker.get(speaker_key)
-        if previous is not None and cue.start_ms < previous.end_ms:
-            start_ms = previous.end_ms if profile.allow_zero_gap else profile.snap_ceil(previous.end_ms + 1)
-            end_ms = max(cue.end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000))
-            following_start_ms = (next_start_by_cue or {}).get(cue.index)
-            if following_start_ms is not None:
-                cap_ms = (
-                    following_start_ms
-                    if profile.allow_zero_gap
-                    else profile.snap_floor(max(0, following_start_ms - 1))
-                )
-                end_ms = max(cue.end_ms, min(end_ms, cap_ms))
-            # Conflicting same-speaker anchors may leave no interval before
-            # another actor. Keep that real overlap reviewable instead of
-            # moving the cue beyond its evidence or inventing more padding.
-            next_cue = cue.with_timing(start_ms, end_ms) if end_ms > start_ms else cue
-        else:
-            next_cue = cue
-        adjusted[position] = next_cue
-        if previous is None or next_cue.end_ms >= previous.end_ms:
-            previous_by_speaker[speaker_key] = next_cue
-    return adjusted
-
-
-def _speaker_key(speaker_id: str | None) -> str:
-    return speaker_id or "__unknown__"

@@ -18,7 +18,6 @@ from .adjudication_regions import (
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
-from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
@@ -55,7 +54,7 @@ from .llm_providers import (
 from .models import AdjudicationDecision, AlignmentResult, AudioSnippet, Cue, CueContext, DivergenceSpan, ForcedAlignmentCue, QCFlag, Word
 from .observability import name_spelling_inconsistency_flags, span_coverage_flags
 from .output_order import finalize_cues_for_output, source_order_inversion_flags
-from .overlap import apply_overlap_policy
+from .overlap import apply_overlap_policy, reconcile_overlap_flags
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
 from .providers import (
     CachedASRAdapter,
@@ -67,7 +66,7 @@ from .providers import (
 )
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
-from .recue import preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
+from .recue import cue_spoken_spans, preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
 from .reports import write_change_log, write_qc_report
 from .srt_io import parse_srt_text, write_srt
 from .silence import silence_flags_for_cues
@@ -78,11 +77,12 @@ from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mappin
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
 from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text, speech_text_for_alignment
 from .timing_refinement import (
-    BoundaryRefinementConfig, boundary_refinement_config_from_config,
-    refine_cues_to_speech_activity,
+    BoundaryRefinementConfig, SpeechEvidence, boundary_refinement_config_from_config,
+    min_duration_policy_from_config, refine_cues_to_speech_activity, speech_evidence_for_words,
 )
 from .tokenize import alphanumeric_signature
 from .vad import (
+    cue_ids_with_audible_words,
     dropped_line_flags_for_unmatched_cues,
     min_coverage_from_config,
     speech_activity_adapter_from_config,
@@ -646,28 +646,37 @@ def sync_episode(
             ),
         )
         flags.extend(sync_line_flags)
+    # ASR word edges are repaired against the audio once, before any cue is
+    # timed; rebuild and verification share the same repaired words.
+    speech_evidence = speech_evidence_for_words(
+        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+        asr_artifact_path=episode_workdir / "asr.json",
+    )
+    timing_words = speech_evidence.words
     def rebuild(cue_list: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
         return rebuild_cues(
             cue_list,
-            words,
+            timing_words,
             alignment,
             profile,
             max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
             max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
             protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+            min_duration_policy=min_duration_policy_from_config(provider_config),
         )
 
     rebuilt, recue_flags = rebuild(adjudicated_cues)
     rebuilt, recue_flags, flags = settle_edits_with_held_timing(
         adjudicated_cues, rebuilt, recue_flags, flags,
-        source_cues=cues, words=words, alignment=alignment,
+        source_cues=cues, words=timing_words, alignment=alignment,
         rebuild=rebuild,
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
         max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
     )
     rebuilt, alignment, recue_flags, flags = settle_one_letter_residues(
         rebuilt, recue_flags, flags,
-        source_cues=cues, words=words, alignment=alignment,
+        source_cues=cues, words=timing_words, alignment=alignment,
         spans=alignment.divergence_spans, decisions=decisions, profile=profile,
         fixed_cue_ids=confidence_held_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids
         | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
@@ -675,7 +684,7 @@ def sync_episode(
     recue_flags, unconfirmed_source_timed_cue_ids = _fold_unconfirmed_evidence_holds(recue_flags, flags)
     source_timing_held_cue_ids |= unconfirmed_source_timed_cue_ids
     rebuilt, alignment, recue_flags, flags = _settle_collapsed_adlibs(
-        rebuilt, words, alignment, profile, recue_flags, flags,
+        rebuilt, timing_words, alignment, profile, recue_flags, flags,
         generated_cue_ids=_generated_cue_ids(generated_adlib_cue_ids, cue_id_expansions, speaker_expansions),
         fixed_cue_ids=confidence_held_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids
         | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
@@ -789,6 +798,7 @@ def sync_episode(
         decisions=decisions,
         fps_summary_metadata=fps_summary_metadata,
         source_timing_held_cue_ids=source_timing_held_cue_ids,
+        speech_evidence=speech_evidence,
     )
 
 
@@ -1933,6 +1943,7 @@ def _run_verify_stage(
     decisions: list[AdjudicationDecision] | None = None,
     fps_summary_metadata: dict[str, object] | None = None,
     source_timing_held_cue_ids: set[int] | None = None,
+    speech_evidence: SpeechEvidence | None = None,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     # A shared phrase timestamp cannot establish its internal cue boundary.
@@ -1994,10 +2005,15 @@ def _run_verify_stage(
         overlap_regions = overlap_detection_adapter.detect(audio_for_asr)
         _write_json(episode_workdir / "overlap.json", {"regions": [region.model_dump() for region in overlap_regions]})
         flags.extend(overlap_flags_for_regions(rebuilt, overlap_regions))
-    speech_activity_adapter = speech_activity_adapter_from_config(provider_config)
-    if speech_activity_adapter is not None:
-        speech_regions = speech_activity_adapter.detect(audio_for_asr)
-        if getattr(speech_activity_adapter, "fallback_used", False):
+    if speech_evidence is None:
+        speech_evidence = speech_evidence_for_words(
+            speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            asr_artifact_path=episode_workdir / "asr.json",
+        )
+    if speech_evidence.detected:
+        speech_regions = speech_evidence.regions
+        if speech_evidence.fallback_used:
             flags.append(
                 QCFlag(
                     kind="vad_provider_fallback",
@@ -2007,13 +2023,8 @@ def _run_verify_stage(
                 )
             )
         _write_json(episode_workdir / "vad.json", {"regions": [region.model_dump() for region in speech_regions]})
-        effective_words, word_clamp_flags = clamp_asr_word_durations(
-            words,
-            speech_regions,
-            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
-            max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
-        )
-        flags.extend(word_clamp_flags)
+        effective_words = speech_evidence.words
+        flags.extend(speech_evidence.word_flags)
         rebuilt, timing_flags = refine_cues_to_speech_activity(
             rebuilt,
             speech_regions,
@@ -2032,6 +2043,7 @@ def _run_verify_stage(
                     alignment.unmatched_cue_ids,
                     speech_regions,
                     min_coverage,
+                    cue_word_indices=alignment.cue_word_indices,
                 )
             )
     rebuilt, missing_audio_restore_flags = _restore_missing_audio_source_cues(
@@ -2061,14 +2073,25 @@ def _run_verify_stage(
         protected_cue_ids=protected_cue_ids,
         preserve_timing=bool(effective_words or forced_alignments or speech_regions),
         media_duration_ms=_known_audio_duration_ms(audio_for_asr),
+        spoken_spans=cue_spoken_spans(
+            rebuilt, effective_words, alignment,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        ),
     )
-    flags.extend(final_order_flags)
+    flags = [*reconcile_overlap_flags(flags, rebuilt, final_order_flags), *final_order_flags]
     if speech_regions:
-        activity_flags = speech_activity_flags_for_cues(rebuilt, speech_regions, min_coverage)
+        # A cue held for the minimum display time is not an overrun and its
+        # short utterance still counts as speech activity.
+        readability_floor_ms = round(profile.min_cue_dur * 1000 + profile.frame_ms)
+        activity_flags = speech_activity_flags_for_cues(
+            rebuilt, speech_regions, min_coverage, min_cue_duration_ms=readability_floor_ms,
+        )
         rebuilt, flags, activity_flags = _remove_silent_generated_adlibs(
             rebuilt,
             flags,
             activity_flags,
+            audible_cue_ids=cue_ids_with_audible_words(audio_for_asr, activity_flags, effective_words, alignment),
         )
         flags.extend(activity_flags)
         flags.extend(
@@ -2076,6 +2099,7 @@ def _run_verify_stage(
                 rebuilt,
                 speech_regions,
                 max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+                min_cue_duration_ms=readability_floor_ms,
             )
         )
     style_issues = lint_cues(rebuilt, profile)
@@ -2155,6 +2179,7 @@ def _remove_silent_generated_adlibs(
     cues: list[Cue],
     flags: list[QCFlag],
     activity_flags: list[QCFlag],
+    audible_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag], list[QCFlag]]:
     generated_cue_ids = {
         cue_id
@@ -2175,7 +2200,7 @@ def _remove_silent_generated_adlibs(
         )
         for cue_id in flag.cue_ids
         if cue_id in generated_cue_ids
-    }
+    } - (audible_cue_ids or set())
     if not silent_cue_ids:
         return cues, flags, activity_flags
 

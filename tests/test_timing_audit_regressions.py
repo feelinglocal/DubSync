@@ -69,6 +69,22 @@ def test_forced_alignment_invalid_timing_retains_source_instead_of_inventing_int
 
 
 def test_short_final_utterance_minimum_duration_cannot_create_silence_tail():
+    # The "acoustic" minimum-duration policy keeps the original rule.
+    cue = Cue(index=1, start_ms=1000, end_ms=1050, lines=["yes"])
+    profile = StyleProfile(fps=25.0, min_cue_dur=0.5)
+
+    updated, flags = refine_cues_to_speech_activity(
+        [cue], [SpeechRegion(start=1.0, end=1.05)], profile,
+        BoundaryRefinementConfig(min_duration_policy="acoustic"),
+    )
+
+    assert updated[0].end_ms <= profile.snap_ceil(1050 + 40)
+    assert any(flag.kind == "min_duration_unattainable" for flag in flags)
+
+
+def test_short_final_utterance_stays_visible_for_the_minimum_duration_in_silence():
+    # Default policy: nothing else is heard and no cue follows, so the short
+    # utterance keeps its readable display time and is not a QC error.
     cue = Cue(index=1, start_ms=1000, end_ms=1050, lines=["yes"])
     profile = StyleProfile(fps=25.0, min_cue_dur=0.5)
 
@@ -76,8 +92,8 @@ def test_short_final_utterance_minimum_duration_cannot_create_silence_tail():
         [cue], [SpeechRegion(start=1.0, end=1.05)], profile
     )
 
-    assert updated[0].end_ms <= profile.snap_ceil(1050 + 40)
-    assert any(flag.kind == "min_duration_unattainable" for flag in flags)
+    assert updated[0].end_ms == profile.snap_ceil(1500)
+    assert not any(flag.kind == "min_duration_unattainable" for flag in flags)
 
 
 def test_boundary_refinement_preserves_simultaneous_speech_instead_of_zero_duration():

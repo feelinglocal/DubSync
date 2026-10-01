@@ -1,16 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, field
 from math import isfinite
+from pathlib import Path
 
-from .asr_timing import clamp_asr_word_durations
+from .asr_timing import (
+    asr_model_from_artifact,
+    clamp_asr_word_durations,
+    phrase_edge_snap_from_config,
+    repair_asr_word_edges,
+)
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from .recue import select_cue_word_window
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
+from .vad import SpeechActivityAdapter
 
 
-MAX_INTRA_CUE_WORD_GAP_SECONDS = 1.5
+# Another word may begin this close to a burst offset without sharing the burst.
+_SHARED_BURST_TOLERANCE_SECONDS = 0.01
+MIN_DURATION_POLICIES = ("extend_into_silence", "acoustic")
 
 
 @dataclass(frozen=True)
@@ -22,6 +33,22 @@ class BoundaryRefinementConfig:
     max_leading_silence_ms: int = 150
     max_trailing_silence_ms: int = 300
     max_word_duration_ms: int = 2000
+    # Shared with rebuild (timing.max_intra_cue_gap, timing.min_duration_policy).
+    max_intra_cue_gap_ms: int = 1500
+    min_duration_policy: str = "extend_into_silence"
+
+
+def min_duration_policy_from_config(provider_config: dict[str, object]) -> str:
+    """How a cue shorter than the minimum display duration is finished.
+
+    ``extend_into_silence`` keeps it on screen up to the minimum while nothing
+    else is heard and no other cue starts; ``acoustic`` ends it with its speech.
+    """
+    timing_config = provider_config.get("timing", {}) if isinstance(provider_config, dict) else {}
+    value = timing_config.get("min_duration_policy", MIN_DURATION_POLICIES[0]) if isinstance(timing_config, dict) else MIN_DURATION_POLICIES[0]
+    if value not in MIN_DURATION_POLICIES:
+        raise ValueError(f"timing.min_duration_policy must be one of: {', '.join(MIN_DURATION_POLICIES)}")
+    return str(value)
 
 
 def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
@@ -39,13 +66,6 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
     if not isinstance(enabled, bool):
         raise ValueError("vad.boundary_refinement.enabled must be boolean")
     timing_config = provider_config.get("timing", {})
-    max_word_duration = timing_config.get("max_word_duration", 2.0) if isinstance(timing_config, dict) else 2.0
-    try:
-        max_word_duration = float(max_word_duration)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("timing.max_word_duration must be numeric") from exc
-    if not isfinite(max_word_duration) or max_word_duration <= 0:
-        raise ValueError("timing.max_word_duration must be finite and positive")
     return BoundaryRefinementConfig(
         enabled=enabled,
         start_pad_ms=_boundary_milliseconds(options, "start_pad_ms", 40),
@@ -53,7 +73,71 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
         max_end_extension_ms=_boundary_milliseconds(options, "max_end_extension_ms", 300),
         max_leading_silence_ms=_boundary_milliseconds(options, "max_leading_silence_ms", 150),
         max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
-        max_word_duration_ms=int(max_word_duration * 1000),
+        max_word_duration_ms=int(_timing_seconds(timing_config, "max_word_duration", 2.0) * 1000),
+        max_intra_cue_gap_ms=int(_timing_seconds(timing_config, "max_intra_cue_gap", 1.5) * 1000),
+        min_duration_policy=min_duration_policy_from_config(provider_config),
+    )
+
+
+def _timing_seconds(timing_config: object, key: str, default: float) -> float:
+    value = timing_config.get(key, default) if isinstance(timing_config, dict) else default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"timing.{key} must be numeric") from exc
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"timing.{key} must be finite and positive")
+    return seconds
+
+
+@dataclass(frozen=True)
+class SpeechEvidence:
+    """Speech bursts of one recording and the ASR words repaired against them.
+
+    Detected once before cues are timed so rebuild and verification use the
+    same word edges.
+    """
+
+    words: list[Word]
+    regions: list[SpeechRegion] = field(default_factory=list)
+    word_flags: list[QCFlag] = field(default_factory=list)
+    detected: bool = False
+    fallback_used: bool = False
+
+
+def speech_evidence_for_words(
+    adapter: SpeechActivityAdapter | None,
+    words: list[Word],
+    audio_path: Path,
+    provider_config: dict[str, object],
+    *,
+    max_word_duration: float = 2.0,
+    asr_artifact_path: Path | None = None,
+) -> SpeechEvidence:
+    """Run the configured VAD once and repair ASR word edges against its bursts."""
+    if adapter is None:
+        return SpeechEvidence(words=words)
+    regions = adapter.detect(audio_path)
+    boundary = boundary_refinement_config_from_config(provider_config)
+    repaired, word_flags = repair_asr_word_edges(
+        words,
+        regions,
+        max_word_duration=max_word_duration,
+        max_region_overrun=boundary.max_trailing_silence_ms / 1000.0,
+        snap=phrase_edge_snap_from_config(
+            provider_config,
+            asr_model_from_artifact(asr_artifact_path),
+            # Refinement follows a burst past the last word by the same limit;
+            # a different word-level limit would only make the stages disagree.
+            default_end_extension=boundary.max_end_extension_ms / 1000.0,
+        ),
+    )
+    return SpeechEvidence(
+        words=repaired,
+        regions=regions,
+        word_flags=word_flags,
+        detected=True,
+        fallback_used=bool(getattr(adapter, "fallback_used", False)),
     )
 
 
@@ -116,6 +200,8 @@ def refine_cues_to_speech_activity(
             flag for flag in word_repair_flags if (flag.start, flag.end) in retained_repairs
         ]
     region_index = SpeechRegionIndex(regions)
+    region_starts = [region.start for region in region_index.regions]
+    word_starts = sorted(word.start for word in words) if words else []
 
     for index, cue in enumerate(dialogue_cues):
         # Accepted per-cue alignment remains a neighbor cap but is not retimed.
@@ -127,6 +213,7 @@ def refine_cues_to_speech_activity(
             words,
             alignment,
             max_word_duration_seconds=options.max_word_duration_ms / 1000.0,
+            max_intra_cue_gap_seconds=options.max_intra_cue_gap_ms / 1000.0,
         )
         cue_regions = (
             _regions_from_word_window(word_window, region_index, options)
@@ -139,35 +226,51 @@ def refine_cues_to_speech_activity(
 
         start_region, end_region = cue_regions
         start_ms = _refined_start_ms(cue, start_region, profile, options)
-        end_ms = (
-            _word_refined_end_ms(cue, end_region, word_window, profile, options)
+        last_word_is_outlier = word_window is not None and _is_word_duration_outlier(word_window[-1], options)
+        # The cue's own voice ends with the burst that holds its last word.
+        acoustic_end = (
+            _acoustic_end_seconds(word_window[-1], end_region, options, word_starts)
             if word_window is not None
-            else _refined_end_ms(cue, end_region, profile, options)
+            else end_region.end
         )
+        if word_window is None:
+            end_ms = _refined_end_ms(cue, end_region, profile, options)
+        elif last_word_is_outlier:
+            end_ms = profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms)
+        else:
+            end_ms = _word_refined_end_ms(cue, acoustic_end, profile, options)
         end_cap_ms = None
         if index + 1 < len(dialogue_cues):
             # The following cue can limit display padding, but cannot erase
             # speech from a simultaneous speaker or collapse an inverted source
             # cue to zero length. Output policy handles real overlaps separately.
+            next_start_ms = dialogue_cues[index + 1].start_ms
             acoustic_floor_ms = min(cue.end_ms, end_ms)
-            if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
-                acoustic_floor_ms = profile.snap_ceil(word_window[-1].end * 1000)
-            end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
+            if word_window is not None and not last_word_is_outlier:
+                acoustic_floor_ms = profile.snap_ceil(acoustic_end * 1000)
+                if next_start_ms > start_ms and next_start_ms >= acoustic_end * 1000 - profile.frame_ms:
+                    # Words less than a frame apart share the next start as
+                    # their boundary, exactly as rebuild decided.
+                    acoustic_floor_ms = min(acoustic_floor_ms, next_start_ms)
+            end_cap_ms = max(next_start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
-        # Minimum display duration cannot add a silence tail beyond the
-        # acoustic endpoint. Preserve already accepted short tails, but do not
-        # manufacture more silence merely to reach the readability floor.
-        acoustic_end = end_region.end
-        if word_window is not None and not _is_word_duration_outlier(word_window[-1], options):
-            acoustic_end = min(acoustic_end, word_window[-1].end)
-        duration_extension_cap = max(
-            end_ms,
-            profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms),
-        )
-        end_ms = min(
-            max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)),
-            duration_extension_cap,
-        )
+        speech_end_ms = profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms)
+        minimum_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+        if options.min_duration_policy == "acoustic":
+            # Minimum display duration cannot add a silence tail beyond the
+            # acoustic endpoint. Preserve already accepted short tails, but do
+            # not manufacture more silence merely to reach the readability floor.
+            end_ms = min(max(end_ms, minimum_end_ms), max(end_ms, speech_end_ms))
+        elif start_ms < speech_end_ms < minimum_end_ms:
+            # A cue shorter than the readability floor stays up while nothing
+            # else is heard: up to the floor, the next sound or the next cue.
+            quiet_until = _quiet_until_seconds(
+                acoustic_end, end_region, region_index.regions, region_starts, word_starts,
+            )
+            quiet_limit_ms = profile.snap_floor(quiet_until * 1000) if isfinite(quiet_until) else minimum_end_ms
+            end_ms = max(speech_end_ms, min(minimum_end_ms, quiet_limit_ms))
+            if end_cap_ms is not None:
+                end_ms = min(end_ms, end_cap_ms)
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
@@ -194,7 +297,9 @@ def refine_cues_to_speech_activity(
             )
             continue
 
-        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000
+        # On the frame grid a cue within one frame of the minimum is at the
+        # minimum; only a real shortfall is reported.
+        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000 - profile.frame_ms
 
         if start_ms == cue.start_ms and end_ms == cue.end_ms:
             refined.append(cue)
@@ -259,6 +364,7 @@ def _word_window_for_cue(
     alignment: AlignmentResult | None,
     *,
     max_word_duration_seconds: float,
+    max_intra_cue_gap_seconds: float,
 ) -> list[Word] | None:
     if words is None or alignment is None:
         return None
@@ -269,41 +375,15 @@ def _word_window_for_cue(
     ]
     if not matched:
         return None
-    ordered = sorted(matched, key=lambda word: (word.start, word.end))
-    clusters: list[list[Word]] = []
-    current: list[Word] = []
-    previous: Word | None = None
-    for word in ordered:
-        word_is_outlier = word.end - word.start > max_word_duration_seconds
-        starts_new_cluster = previous is not None and (
-            word.start - previous.end > MAX_INTRA_CUE_WORD_GAP_SECONDS
-            or previous.end - previous.start > max_word_duration_seconds
-        )
-        if word_is_outlier and current:
-            clusters.append(current)
-            current = []
-        if starts_new_cluster and current:
-            clusters.append(current)
-            current = []
-        current.append(word)
-        if word_is_outlier:
-            clusters.append(current)
-            current = []
-        previous = word
-    if current:
-        clusters.append(current)
-    return max(
-        clusters,
-        key=lambda cluster: (
-            sum(
-                1
-                for word in cluster
-                if word.end - word.start <= max_word_duration_seconds
-            ),
-            len(cluster),
-            -(cluster[-1].end - cluster[0].start),
-        ),
+    # The same selection as rebuild, with the same configured gap, so the two
+    # stages cannot time one cue from different words.
+    selected, _ = select_cue_word_window(
+        cue,
+        sorted(matched, key=lambda word: (word.start, word.end)),
+        max_word_duration=max_word_duration_seconds,
+        max_intra_cue_gap=max_intra_cue_gap_seconds,
     )
+    return selected
 
 
 def _regions_from_word_window(
@@ -368,31 +448,72 @@ def _refined_end_ms(
     return cue.end_ms
 
 
+def _acoustic_end_seconds(
+    last_word: Word,
+    last_region: SpeechRegion,
+    config: BoundaryRefinementConfig,
+    word_starts: list[float],
+) -> float:
+    """Where the cue's own voice stops: the offset of the burst holding its last word.
+
+    A word that runs past its burst ends with the burst. A burst that runs
+    past the word is the same voice only while it is short and no other word
+    begins inside it; a longer or shared burst is another sound, and a later
+    separate burst (a breath) is never considered.
+    """
+    if _is_word_duration_outlier(last_word, config):
+        return last_region.end
+    if last_region.end <= last_word.start:
+        return last_word.end
+    if last_word.end >= last_region.end:
+        return last_region.end
+    following = bisect_right(word_starts, last_word.start)
+    next_word_start = word_starts[following] if following < len(word_starts) else float("inf")
+    if (
+        (last_region.end - last_word.end) * 1000 <= config.max_end_extension_ms
+        and next_word_start >= last_region.end - _SHARED_BURST_TOLERANCE_SECONDS
+    ):
+        return last_region.end
+    return last_word.end
+
+
+def _quiet_until_seconds(
+    acoustic_end: float,
+    end_region: SpeechRegion,
+    regions: tuple[SpeechRegion, ...],
+    region_starts: list[float],
+    word_starts: list[float],
+) -> float:
+    """When the silence after the cue's own voice ends (``inf`` when nothing follows).
+
+    Silence lasts until the next burst or the next ASR word, whichever begins
+    first. When the cue's burst keeps sounding, the next word spoken in it marks
+    the limit; a burst that continues without any word is another sound and
+    leaves no silence to extend into.
+    """
+    threshold = acoustic_end - _SHARED_BURST_TOLERANCE_SECONDS
+    following_word = bisect_left(word_starts, threshold)
+    next_word_start = word_starts[following_word] if following_word < len(word_starts) else float("inf")
+    if end_region.end - acoustic_end > _SHARED_BURST_TOLERANCE_SECONDS:
+        return next_word_start if next_word_start <= end_region.end else acoustic_end
+    next_region = bisect_left(region_starts, threshold)
+    while next_region < len(regions) and regions[next_region] is end_region:
+        next_region += 1
+    next_region_start = region_starts[next_region] if next_region < len(regions) else float("inf")
+    return min(next_region_start, next_word_start)
+
+
 def _word_refined_end_ms(
     cue: Cue,
-    last_region: SpeechRegion,
-    word_window: list[Word],
+    acoustic_end_seconds: float,
     profile: StyleProfile,
     config: BoundaryRefinementConfig,
 ) -> int:
-    last_word = word_window[-1]
-    speech_end_ms = int(last_region.end * 1000)
-    padded_region_end_ms = profile.snap_ceil(speech_end_ms + config.end_pad_ms)
-
-    if _is_word_duration_outlier(last_word, config):
-        return padded_region_end_ms
-
-    word_end_ms = profile.snap_ceil(last_word.end * 1000 + config.end_pad_ms)
-    if cue.end_ms < word_end_ms:
-        return word_end_ms
-
-    region_tail_ms = padded_region_end_ms - word_end_ms
-    if cue.end_ms < padded_region_end_ms and region_tail_ms <= config.max_trailing_silence_ms:
-        return padded_region_end_ms
-
-    if cue.end_ms - word_end_ms > config.max_trailing_silence_ms:
-        # VAD can remain active for another speaker or background sound. Its
-        # envelope cannot extend this cue beyond its own last reliable word.
-        return word_end_ms
-
+    speech_end_ms = profile.snap_ceil(acoustic_end_seconds * 1000 + config.end_pad_ms)
+    if cue.end_ms < speech_end_ms:
+        return speech_end_ms
+    if cue.end_ms - speech_end_ms > config.max_trailing_silence_ms:
+        # Display time far beyond the cue's own voice is an ASR overrun or
+        # padding; another speaker or sound in the tail cannot keep it.
+        return speech_end_ms
     return cue.end_ms

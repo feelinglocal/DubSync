@@ -201,7 +201,11 @@ def test_same_actor_monotonic_adjustment_cannot_pad_into_the_next_actor():
     )
     output, flags = apply_overlap_policy(rebuilt, policy="dash")
 
-    assert rebuilt[1].start_ms == rebuilt[0].end_ms
+    # The words of "First" and "Second" overlap by 100 ms. Neither cue is moved
+    # off its own speech: the second still starts on its first word and the
+    # first still ends with its last word.
+    assert rebuilt[0].end_ms == profile.snap_ceil(words[0].end * 1000)
+    assert rebuilt[1].start_ms == 1200
     assert rebuilt[1].end_ms >= profile.snap_ceil(words[1].end * 1000)
     assert rebuilt[1].end_ms <= rebuilt[2].start_ms
     assert [cue.plain_text for cue in output] == ["First", "Second", "Third"]
@@ -232,5 +236,7 @@ def test_held_overlap_keeps_prior_same_actor_boundary_for_following_cues():
     # The second cue cannot be shifted past the first without crossing B.
     assert rebuilt[1].start_ms == 1200
     assert rebuilt[1].end_ms <= rebuilt[2].start_ms
-    assert rebuilt[3].start_ms == rebuilt[0].end_ms
+    # "Fourth" is spoken at 1.5-2.0 s while "First" is still held: it keeps its
+    # own onset instead of being pushed to 2.0 s, after its speech has ended.
+    assert rebuilt[3].start_ms == 1500
     assert all(cue.end_ms > cue.start_ms for cue in rebuilt)
