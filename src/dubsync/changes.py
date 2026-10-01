@@ -730,6 +730,20 @@ def indexed_multi_cue_replacements(
         }
     if len(cue_ids) < 2:
         return None
+    leading = _leading_phrase_of_previous_cue(cues_by_id, bounds_by_cue, span, final_text, words)
+    if leading is not None:
+        # The phrase ends the previous cue's sentence; the rest of the wording
+        # is distributed over the case's own cues like any other replacement.
+        previous_id, previous_edit, word_count, rest_text, rest_span = leading
+        rest_ownership: dict[int, list[int]] = {}
+        rest_edits = indexed_multi_cue_replacements(
+            cues, rest_span, rest_text, replacement_target=replacement_target, words=words, ownership=rest_ownership,
+        )
+        if rest_edits is not None and previous_id not in rest_edits:
+            if ownership is not None and rest_ownership:
+                ownership.clear()
+                ownership.update({previous_id: span.asr_word_indices[:word_count], **rest_ownership})
+            return {previous_id: previous_edit, **rest_edits}
     spoken_placement = _spoken_phrase_placement(cues_by_id, bounds_by_cue, span, final_text, words)
     if spoken_placement is not None:
         edits, word_indices_by_cue = spoken_placement
@@ -937,6 +951,87 @@ def _spoken_phrase_placement(
         # The adjudicator left out the words of a phrase: nothing places its cue.
         return None
     return {cue_id: (*bounds_by_cue[cue_id], pieces.get(cue_id, "")) for cue_id in cue_ids}, owned
+
+
+_LEADING_PHRASE_MAX_TOKENS = 3
+
+
+def _leading_phrase_of_previous_cue(
+    cues_by_id: dict[int, Cue],
+    bounds_by_cue: dict[int, tuple[int, int]],
+    span: DivergenceSpan,
+    final_text: str,
+    words: list[Word] | None,
+    min_phrase_gap_seconds: float = 0.8,
+    max_anchor_gap_seconds: float = 0.2,
+) -> tuple[int, tuple[int, int, str], int, str, DivergenceSpan] | None:
+    """Find a short phrase that still belongs to the cue before the case.
+
+    The mirror of the acoustic tail transfer: "em casa." directly follows the
+    previous cue's last word and precedes a measured pause, while the case
+    starts with the next cue. It ends the previous cue's sentence. Returns the
+    previous cue, its insertion edit, the number of spoken words moved, the
+    remaining wording and the case reduced to the remaining words.
+    """
+    previous_id = span.left_anchor_cue_id
+    first_id = next(iter(bounds_by_cue))
+    indices = span.asr_word_indices
+    anchor_end = span.left_anchor_end
+    if (
+        words is None or previous_id is None or previous_id in bounds_by_cue or previous_id not in cues_by_id
+        or bounds_by_cue[first_id][0] != 0 or anchor_end is None or not isfinite(anchor_end)
+        or len(indices) < 2 or indices != list(range(indices[0], indices[-1] + 1))
+        or indices[0] < 0 or indices[-1] >= len(words)
+    ):
+        return None
+    previous = cues_by_id[previous_id]
+    spoken = [words[index] for index in indices]
+    if (
+        cue_has_bracketed_screen_text(previous) or any(mark in previous.text for mark in "♪♫")
+        or any(
+            not isfinite(word.start) or not isfinite(word.end) or word.end <= word.start
+            or not alphanumeric_signature(word.text)
+            for word in spoken
+        )
+        or any(right.start < left.end for left, right in zip(spoken, spoken[1:]))
+        or not 0 <= spoken[0].start - anchor_end <= max_anchor_gap_seconds
+    ):
+        return None
+    word_count = next(
+        (position for position in range(1, len(spoken))
+         if spoken[position].start - spoken[position - 1].end >= min_phrase_gap_seconds),
+        None,
+    )
+    if word_count is None:
+        return None
+    phrase = spoken[:word_count]
+    token_count = sum(len(alphanumeric_signature(word.text)) for word in phrase)
+    if (
+        token_count > _LEADING_PHRASE_MAX_TOKENS
+        or any(right.start - left.end > max_anchor_gap_seconds for left, right in zip(phrase, phrase[1:]))
+        or has_known_different_speakers([span.left_anchor_speaker_id, *(word.speaker_id for word in phrase)])
+    ):
+        return None
+    unit_spans = lexical_unit_spans(final_text)
+    token_spans = _token_character_spans(final_text)
+    if unit_spans is None or len(token_spans) != sum(len(alphanumeric_signature(word.text)) for word in spoken):
+        return None
+    cut = _token_cut_offset(final_text, token_spans, unit_spans, token_count)
+    if cut is None or not alphanumeric_signature(final_text[cut:]):
+        return None
+    rest = spoken[word_count:]
+    previous_count = len(alphanumeric_signature(speech_text_for_alignment(previous)))
+    rest_span = span.model_copy(update={
+        "asr_word_indices": indices[word_count:],
+        "asr_text": join_word_texts(word.text for word in rest),
+        "start": rest[0].start,
+        "left_anchor_end": phrase[-1].end,
+        "left_anchor_speaker_id": phrase[-1].speaker_id or span.left_anchor_speaker_id,
+    })
+    return (
+        previous_id, (previous_count, previous_count, final_text[:cut].strip()),
+        word_count, final_text[cut:].strip(), rest_span,
+    )
 
 
 def indexed_span_bounds(cues: list[Cue], span: DivergenceSpan) -> dict[int, tuple[int, int]] | None:
@@ -1940,6 +2035,10 @@ def _apply_token_edits_with_spans(
             if terminal is not None and not _TERMINAL_PUNCTUATION_RE.search(stripped_replacement):
                 start_character = terminal.start(1)
                 end_character = start_character
+            elif terminal is not None and terminal.group(1) == "." and stripped_replacement[0].islower():
+                # A lower-case continuation that brings its own ending carries
+                # the sentence on: the full stop moves to the new end.
+                start_character, end_character = terminal.span(1)
         ends_with_title = bounded_end > bounded_start and _is_title_abbreviation(source_text, *token_spans[bounded_end - 1])
         if ends_with_title and bounded_end == bounded_start + 1 and _is_spoken_title(
             source_text[start_character:end_character], stripped_replacement,
