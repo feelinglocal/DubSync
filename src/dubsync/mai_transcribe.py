@@ -94,8 +94,9 @@ class MAITranscribeAdapter:
     Five-minute chunks include one second of context on both sides. Matching
     words in that overlap are joined once using original provider timestamps;
     otherwise a word's midpoint selects its owning chunk. Diarization labels
-    are local to each API call, so namespacing prevents unrelated speakers from
-    being merged between independent chunks.
+    are local to each API call: they are namespaced per chunk and only linked
+    across a cut when the overlap words map one label to one label, so
+    unrelated speakers are never merged between independent chunks.
     """
 
     # Bump when word post-processing changes so stale ASR cache entries are not reused.
@@ -428,16 +429,20 @@ class MAITranscribeAdapter:
             raise ProviderError("MAI-Transcribe 2 returned missing or invalid word timing.")
         self.last_repair_flags.extend(rounding_flags)
         for item in invalid:
-            text = item.get("word") if isinstance(item, dict) else None
+            record = item if isinstance(item, dict) else {}
+            text, start, end = record.get("word"), record.get("start"), record.get("end")
+            # Locate the flag only by whatever timing the record itself carries.
+            flag_start = float(start) + chunk.offset if _nonnegative_number(start) else None
+            flag_end = float(end) + chunk.offset if _nonnegative_number(end) else flag_start
+            if flag_start is not None and flag_end is not None and flag_end < flag_start:
+                flag_end = flag_start
             self.last_repair_flags.append(QCFlag(
                 kind="asr_invalid_word_dropped", severity="warning",
                 message=(
                     f"MAI-Transcribe 2 chunk {index + 1} returned a word record with missing or invalid timing "
-                    f"({text!r} start={item.get('start') if isinstance(item, dict) else None!r} "
-                    f"end={item.get('end') if isinstance(item, dict) else None!r}); it was dropped and the rest "
-                    "of the chunk was kept."
+                    f"({text!r} start={start!r} end={end!r}); it was dropped and the rest of the chunk was kept."
                 )[:500],
-                start=chunk.offset, end=chunk.offset + chunk.duration,
+                start=flag_start, end=flag_end if flag_start is not None else None,
             ))
         # The provider's own word order is the only evidence of a re-decoded
         # run, so both filters must run before sorting by time.

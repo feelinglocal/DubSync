@@ -487,6 +487,8 @@ def test_one_invalid_word_record_is_dropped_with_a_flag(monkeypatch, tmp_path):
     assert [word.text for word in words] == ["eins", "drei"]
     assert [(flag.kind, flag.severity) for flag in adapter.last_repair_flags] == [("asr_invalid_word_dropped", "warning")]
     assert "kaputt" in adapter.last_repair_flags[0].message
+    # The flag points at the dropped record, not at the whole chunk.
+    assert (adapter.last_repair_flags[0].start, adapter.last_repair_flags[0].end) == (1.0, 1.0)
 
 
 @pytest.mark.parametrize("records", [
