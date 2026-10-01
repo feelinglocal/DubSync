@@ -761,6 +761,8 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
         atomic_word_indices=atomic_word_indices,
     )
 
+    original_counts = Counter(original_indices)
+
     def provider_text(unit_indices: list[int], unit_text: str) -> str:
         # Split spaced-script words are reviewed whole, so their spans show the
         # provider spelling (``geht's``) instead of the comparison units.
@@ -772,7 +774,6 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             return unit_text
         return join_word_texts(words[word_id].text for word_id in word_ids)
 
-    original_counts = Counter(original_indices)
     # All public ownership references address original provider words. Unit
     # timestamps never escape as invented character-level acoustic evidence.
     return result.model_copy(update={
@@ -957,14 +958,10 @@ def _compound_run_ops(
             group_words = audio[audio_position : audio_position + word_count]
             spelled = "".join(token.normalized for token in group_tokens)
             if (
-                len(spelled) < COMPOUND_MIN_CHARACTERS
+                not _is_eligible_compound_spelling(spelled)
                 or spelled != "".join(words_norm[index] for index in group_words)
                 or len({token.cue_id for token in group_tokens}) != 1
                 or splits_provider_word(group_words[0], group_words[-1])
-                or not _is_eligible_compound_group(
-                    [token.normalized for token in group_tokens],
-                    [words_norm[index] for index in group_words],
-                )
             ):
                 continue
             return token_count, word_count, False
@@ -1052,11 +1049,11 @@ def _compound_group_member_ops(
     return ops
 
 
-def _is_eligible_compound_group(token_keys: list[str], word_keys: list[str]) -> bool:
+def _is_eligible_compound_spelling(spelled: str) -> bool:
     # The same letters spelled open, hyphenated or closed are the same speech
-    # (Ano-Novo / Ano Novo, Ehefrau / Ehe Frau, zu Hause / Zuhause, Se n\u00e3o /
-    # Sen\u00e3o). Numbers pair by value in their own groups, never by digit strings.
-    return not "".join(token_keys).isdigit()
+    # (Ano-Novo / Ano Novo, Ehefrau / Ehe Frau, zu Hause / Zuhause, Se não /
+    # Senão). Numbers pair by value in their own groups, never by digit strings.
+    return len(spelled) >= COMPOUND_MIN_CHARACTERS and not spelled.isdigit()
 
 
 def _align_cues_to_units(

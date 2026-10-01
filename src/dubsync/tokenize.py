@@ -93,8 +93,8 @@ _GERMAN_TENS = {
 
 # Words that are also articles, ordinals or ordinary words in a supported
 # language ("ein", "um", "erste", French "neuf" = new, Portuguese "dos" = of
-# the). They never share a key with each other or with the number; they only
-# match a token written in digits (``eine`` / ``1``).
+# the). They never share a key with the number or with another number word;
+# they only match a token written in digits (``eine`` / ``1``).
 NUMBER_ALIASES: dict[str, str] = {}
 _ARTICLE_KEYS: dict[str, str] = {}
 # Joins a spoken multi-word number ("vinte e seis", "twenty and six").
@@ -323,7 +323,7 @@ def normalize_token(value: str) -> str:
     lowered = unicodedata.normalize("NFKC", value).lower()
     accented = unicodedata.normalize("NFC", "".join(TOKEN_RE.findall(lowered)))
     if accented in _ACCENT_SIGNIFICANT:
-        # Portuguese "é" (is) and "e" (and) sound different and are different words.
+        # "está" (is) and "esta" (this) sound different and are different words.
         return accented
     value = _without_glued_stutter(_fold_latin_number_text(lowered))
     if accented in _ACCENTED_NON_NUMBERS:
