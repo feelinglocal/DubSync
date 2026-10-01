@@ -176,9 +176,10 @@ def test_apply_adjudication_preserves_source_markup_outside_divergent_tokens():
 
     changed, flags = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
 
-    assert changed == cues
-    assert [flag.kind for flag in flags] == ["editorial_guard_rejected"]
-    assert "markup" in flags[0].message
+    # Tags are layout, not tokens: the spoken words change inside the
+    # unchanged italics instead of the edit being refused for eating a tag.
+    assert changed[0].lines == ["<i>Guten Tag</i>"]
+    assert [flag.kind for flag in flags] == ["text_changed"]
 
 
 def test_apply_adjudication_replaces_only_divergent_phrase_inside_single_cue():

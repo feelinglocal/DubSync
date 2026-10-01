@@ -319,7 +319,13 @@ def normalize_german_profanity_token(value: str) -> str | None:
     """Return an alignment key without discarding inflections or compounds."""
     if not value:
         return None
-    normalized = _normalize_form(value)
+    # Providers attach punctuation ("Scheiße,") that source tokens never carry;
+    # only letters, digits and censorship masks belong to the key.
+    normalized = "".join(
+        character for character in _normalize_form(value) if character.isalnum() or character == "*"
+    )
+    if not normalized:
+        return None
     if "*" not in normalized:
         return normalized if _match_uncensored_normalized(normalized) is not None else None
     candidates = {

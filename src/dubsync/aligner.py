@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from statistics import median
@@ -8,7 +9,13 @@ from typing import Literal
 
 from rapidfuzz import fuzz
 
-from .adjudication_regions import join_isolated_anchor_regions, split_protected_source_repetitions
+from .adjudication_regions import (
+    JOINT_REGION_PREFIX,
+    PROTECTED_SOURCE_PREFIX,
+    SPEECH_REPEAT_PREFIX,
+    join_isolated_anchor_regions,
+    split_protected_source_repetitions,
+)
 from .alignment_windows import (
     RETRY_MARGINS as ALIGNMENT_RETRY_MARGINS,
     band_cell_count as _band_cell_count,
@@ -18,6 +25,7 @@ from .alignment_windows import (
     reachability_centers as _reachability_centers,
     retry_margins as _retry_margins,
     row_offset as _row_offset,
+    supported_anchor_pairs as _supported_anchor_pairs,
     unique_exact_pairs as _unique_exact_pairs,
 )
 from .models import (
@@ -32,21 +40,50 @@ from .models import (
 )
 from .subtitle_annotations import cue_has_bracketed_screen_text
 from .text_metrics import contains_character_level_script, join_word_texts, token_texts
-from .tokenize import SRTToken, normalize_token, normalized_words, tokenize_cues
+from .tokenize import (
+    NUMBER_ALIASES,
+    SRTToken,
+    normalize_token,
+    normalized_words,
+    percent_suffix_length,
+    spoken_number_values,
+    tokenize_cues,
+)
 
 MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
 ALIGNMENT_CELL_BUDGET = 2_000_000
-LOCAL_TRANSPOSITION_RADIUS = 2
 IMPLAUSIBLE_MATCHED_WORD_SECONDS = 2.0
 IMPLAUSIBLE_WORD_TO_CUE_RATIO = 2.0
 NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-MISSING_AUDIO_GUARD_VERSION = 6
+MISSING_AUDIO_GUARD_VERSION = 7
+SONG_MARKERS = "♪♫"
+# The lyric part of a span that pooled unheard song lines with dialogue.
+SONG_SOURCE_PREFIX = "song-source-"
+_DERIVED_CASE_PREFIXES = (JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_SOURCE_PREFIX)
+# Concatenation-equal groups (``Ano-Novo`` / ``Ano Novo``) of at most this many
+# tokens or words per side, spelling at least this many characters.
+COMPOUND_MAX_PARTS = 3
+COMPOUND_MIN_CHARACTERS = 4
+COMPOUND_MAX_RUN_CELLS = 20_000
+# A spoken number ("mil quinhentos e vinte") may take this many words.
+NUMBER_GROUP_MAX_WORDS = 6
+# Below 1.0 so literal-only repairs never mistake a compound for an exact word.
+COMPOUND_MATCH_SCORE = 0.99
+UNTIMED_PUNCTUATION_SECONDS = 0.020
+# Provider words of one phrase may overlap by a few tens of milliseconds.
+OMISSION_WORD_OVERLAP_SECONDS = 0.05
+# Two copies of one re-decoded word follow each other this closely.
+REPEATED_WORD_GAP_SECONDS = 0.1
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
+# ``compound`` pairs a token of a concatenation-equal group with the provider
+# word it starts in; ``absorb`` hands a further word of that group to the cue.
+_MATCH_OP_KINDS = frozenset({"match", "compound"})
+_ANCHOR_OP_KINDS = frozenset({"match", "compound", "absorb"})
 
 @dataclass(frozen=True)
 class _Op:
@@ -68,6 +105,41 @@ class _TimingPriors:
     token_priors: list[tuple[float, float]]
     word_centers: list[float]
     transform: _TimeTransform | None = None
+
+
+@dataclass(frozen=True)
+class _DigitAliases:
+    """Article-like number words ("eine", "um") that match only a digit token."""
+
+    token_aliases: list[str | None]
+    token_digits: list[str | None]
+    word_aliases: list[str | None]
+    word_digits: list[str | None]
+
+    def equivalent(self, token_index: int, word_index: int) -> bool:
+        alias = self.token_aliases[token_index]
+        if alias is not None and alias == self.word_digits[word_index]:
+            return True
+        alias = self.word_aliases[word_index]
+        return alias is not None and alias == self.token_digits[token_index]
+
+
+def _digit_aliases(tokens: list[SRTToken], words: list[Word], words_norm: list[str]) -> _DigitAliases | None:
+    def written_digits(text: str, key: str) -> str | None:
+        return key if key.isdigit() and any(character.isdigit() for character in text) else None
+
+    aliases = _DigitAliases(
+        token_aliases=[NUMBER_ALIASES.get(token.normalized) for token in tokens],
+        token_digits=[written_digits(token.text, token.normalized) for token in tokens],
+        word_aliases=[NUMBER_ALIASES.get(key) for key in words_norm],
+        word_digits=[written_digits(word.text, key) for word, key in zip(words, words_norm)],
+    )
+    if (
+        any(aliases.token_aliases) and any(aliases.word_digits)
+        or any(aliases.word_aliases) and any(aliases.token_digits)
+    ):
+        return aliases
+    return None
 
 
 @dataclass(frozen=True)
@@ -301,21 +373,28 @@ def _align_tokens_detailed(
     *,
     token_time_priors: list[tuple[float, float]] | None = None,
     word_time_centers: list[float] | None = None,
+    digit_aliases: _DigitAliases | None = None,
 ) -> _AlignmentRun:
     n = len(tokens)
     m = len(words_norm)
     if n == m and n <= ALIGNMENT_CELL_BUDGET and all(token.normalized == word for token, word in zip(tokens, words_norm)):
         return _AlignmentRun(ops=[_Op("match", index, index, 1.0) for index in range(n)])
+    # The band follows the path through the longest consistent chain of
+    # confirmed unique exact pairs instead of the global diagonal. Every such
+    # pair is a band centre, so a pair the DP does not take is a scoring
+    # decision (an improvised or moved word), never a band artefact: a found
+    # path is kept instead of being discarded as unresolved.
     reachability = _reachability_centers(
         tokens,
         words_norm,
         token_time_priors,
         word_time_centers,
+        anchors=_supported_anchor_pairs(_unique_exact_pairs(tokens, words_norm)),
     )
     band_limited = False
     remaining_cells = ALIGNMENT_CELL_BUDGET
     for attempt_index, margin in enumerate(_retry_margins(band_margin, max(n, m))):
-        cell_count = _band_cell_count(n, m, margin, reachability)
+        cell_count = _band_cell_count(n, m, margin, reachability, diagonal=False)
         if cell_count > remaining_cells:
             band_limited = True
             continue
@@ -327,17 +406,15 @@ def _align_tokens_detailed(
             reachability,
             token_time_priors=token_time_priors,
             word_time_centers=word_time_centers,
+            digit_aliases=digit_aliases,
         )
         if ops is None:
             band_limited = band_limited or margin >= ALIGNMENT_RETRY_MARGINS[-1]
             continue
-        run = _AlignmentRun(
+        return _AlignmentRun(
             ops=ops,
             unbanded_fallback=attempt_index > 0 and margin >= max(n, m),
         )
-        if margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
-            continue
-        return run
     return _AlignmentRun(
         ops=_fully_divergent_ops(n, m),
         band_limited=True,
@@ -360,11 +437,12 @@ def _align_tokens_once(
     *,
     token_time_priors: list[tuple[float, float]] | None = None,
     word_time_centers: list[float] | None = None,
+    digit_aliases: _DigitAliases | None = None,
 ) -> list[_Op] | None:
     n = len(tokens)
     m = len(words_norm)
     gap = -0.75
-    first_intervals = _band_windows(0, n, m, band_margin, reachability.get(0, ()))
+    first_intervals = _band_windows(0, n, m, band_margin, reachability.get(0, ()), diagonal=False)
     previous_scores = [NEG_INF] * _interval_cell_count(first_intervals)
     first_back = bytearray(len(previous_scores))
     zero_offset = _row_offset(first_intervals, 0)
@@ -386,9 +464,11 @@ def _align_tokens_once(
     back_rows: list[tuple[list[tuple[int, int]], bytearray]] = [(first_intervals, first_back)]
 
     for i in range(1, n + 1):
-        current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()))
+        current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()), diagonal=False)
         current_scores = [NEG_INF] * _interval_cell_count(current_intervals)
         current_back = bytearray(len(current_scores))
+        row_alias = digit_aliases.token_aliases[i - 1] if digit_aliases is not None else None
+        row_digits = digit_aliases.token_digits[i - 1] if digit_aliases is not None else None
         for offset, j in _iter_interval_cells(current_intervals):
             best_score = NEG_INF
             best_op = _BACK_NONE
@@ -405,7 +485,12 @@ def _align_tokens_once(
                 best_op = _BACK_INSERT
             previous_diagonal_offset = _row_offset(previous_intervals, j - 1) if j > 0 else None
             if previous_diagonal_offset is not None:
-                similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
+                if (row_alias is not None and digit_aliases.word_digits[j - 1] == row_alias) or (
+                    row_digits is not None and digit_aliases.word_aliases[j - 1] == row_digits
+                ):
+                    similarity = 1.0
+                else:
+                    similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
                 match_score = 2.0 * similarity if similarity >= MATCH_THRESHOLD else -0.6
                 candidate = previous_scores[previous_diagonal_offset] + match_score
                 if similarity >= MATCH_THRESHOLD:
@@ -436,6 +521,11 @@ def _align_tokens_once(
         offset = _row_offset(intervals, j)
         op = _BACK_NONE if offset is None else row_back[offset]
         if op == _BACK_MATCH:
+            if digit_aliases is not None and digit_aliases.equivalent(i - 1, j - 1):
+                ops.append(_Op("match", i - 1, j - 1, 1.0))
+                i -= 1
+                j -= 1
+                continue
             score = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
             kind = "match" if tokens[i - 1].normalized == words_norm[j - 1] else "replace"
             ops.append(_Op(kind, i - 1, j - 1, score))
@@ -451,66 +541,6 @@ def _align_tokens_once(
             return None
     ops.reverse()
     return ops
-
-
-def _misses_unique_exact_pair(
-    ops: list[_Op],
-    tokens: list[SRTToken],
-    words_norm: list[str],
-) -> bool:
-    expected = set(_unique_exact_pairs(tokens, words_norm))
-    if not expected:
-        return False
-    matched = {
-        (op.srt_index, op.asr_index)
-        for op in ops
-        if op.kind == "match" and op.srt_index is not None and op.asr_index is not None
-    }
-    return any(
-        pair not in matched and not _is_locally_explained_transposition(pair, matched)
-        for pair in expected
-    )
-
-
-def _is_locally_explained_transposition(
-    missed_pair: tuple[int, int],
-    matched_pairs: set[tuple[int, int]],
-) -> bool:
-    """Allow one locally reordered word without discarding an otherwise sound run."""
-
-    missed_srt, missed_asr = missed_pair
-    for srt_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
-        if srt_delta == 0:
-            continue
-        for asr_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
-            if asr_delta == 0 or srt_delta * asr_delta >= 0:
-                continue
-            crossed_srt = missed_srt + srt_delta
-            crossed_asr = missed_asr + asr_delta
-            if (crossed_srt, crossed_asr) not in matched_pairs:
-                continue
-
-            srt_start, srt_end = sorted((missed_srt, crossed_srt))
-            asr_start, asr_end = sorted((missed_asr, crossed_asr))
-            has_left_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_start, asr_start, -1)
-            has_right_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_end, asr_end, 1)
-            if has_left_anchor and has_right_anchor:
-                return True
-    return False
-
-
-def _has_nearby_monotonic_anchor(
-    matched_pairs: set[tuple[int, int]],
-    srt_index: int,
-    asr_index: int,
-    direction: int,
-) -> bool:
-    for srt_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
-        for asr_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
-            candidate = (srt_index + direction * srt_delta, asr_index + direction * asr_delta)
-            if candidate in matched_pairs:
-                return True
-    return False
 
 
 def _span_text_from_tokens(tokens: list[SRTToken], indices: list[int]) -> str:
@@ -628,7 +658,7 @@ def _build_divergences(ops: list[_Op], tokens: list[SRTToken], words: list[Word]
         asr_indices.clear()
 
     for op in ops:
-        if op.kind == "match":
+        if op.kind in _ANCHOR_OP_KINDS:
             flush(op)
             previous_match = op
             continue
@@ -683,32 +713,69 @@ def _build_anchor_regions(
     return regions
 
 
-def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int]]:
-    """Compare unspaced scripts in shared units, retaining provider word ownership.
+def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int], frozenset[int]]:
+    """Compare provider words in the units used for source tokens.
 
-    Unit timestamps are the complete original word envelope. They are never
-    interpolated into invented character timestamps or persisted as ASR words.
+    Source text is split on apostrophes, ``%``, ``:``, ``/`` and spaces, and
+    unspaced scripts per character; a provider word such as ``geht's``,
+    ``J'ai``, ``10%`` or ``8:30`` is split the same way. Unit timestamps are
+    the complete original word envelope. They are never interpolated into
+    invented character timestamps or persisted as ASR words. The returned set
+    names spaced-script words that must stay atomic: a partly matched one is
+    reviewed whole instead of being cut between a cue and a span.
     """
     units: list[Word] = []
     word_indices: list[int] = []
+    atomic_word_indices: set[int] = set()
     for index, word in enumerate(words):
         if word.start == word.end and not normalize_token(word.text) and word.text.strip() and all(
             char.isspace() or char in "、。！？「」『』【】〈〉《》（）｢｣｡､･"
             for char in word.text
         ):
             continue
+        # French-style spaced "!" / "?" arrive as untimed punctuation words;
+        # they carry no speech and must not open an insertion review case.
+        if word.end - word.start <= UNTIMED_PUNCTUATION_SECONDS and word.text.strip() and all(
+            char.isspace() or unicodedata.category(char).startswith("P") for char in word.text
+        ) and not normalize_token(word.text):
+            continue
         parts = token_texts(word.text)
         if any(contains_character_level_script(part) for part in parts):
             units.extend(word.model_copy(update={"text": part}) for part in parts)
             word_indices.extend([index] * len(parts))
+            continue
+        spoken_parts = [part for part in parts if normalize_token(part)]
+        if len(spoken_parts) > 1:
+            units.extend(word.model_copy(update={"text": part}) for part in spoken_parts)
+            word_indices.extend([index] * len(spoken_parts))
+            atomic_word_indices.add(index)
         else:
             units.append(word)
             word_indices.append(index)
-    return units, word_indices
+    return units, word_indices, frozenset(atomic_word_indices)
 
 def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
-    units, original_indices = _alignment_word_units(words)
-    result = _align_cues_to_units(cues, units)
+    units, original_indices, atomic_word_indices = _alignment_word_units(words)
+    result = _align_cues_to_units(
+        cues,
+        units,
+        unit_word_indices=original_indices if atomic_word_indices else None,
+        atomic_word_indices=atomic_word_indices,
+    )
+
+    original_counts = Counter(original_indices)
+
+    def provider_text(unit_indices: list[int], unit_text: str) -> str:
+        # Split spaced-script words are reviewed whole, so their spans show the
+        # provider spelling (``geht's``) instead of the comparison units.
+        word_ids = sorted({original_indices[index] for index in unit_indices})
+        if not word_ids or not atomic_word_indices.intersection(word_ids):
+            return unit_text
+        unit_counts = Counter(original_indices[index] for index in set(unit_indices))
+        if any(unit_counts[word_id] != original_counts[word_id] for word_id in word_ids):
+            return unit_text
+        return join_word_texts(words[word_id].text for word_id in word_ids)
+
     # All public ownership references address original provider words. Unit
     # timestamps never escape as invented character-level acoustic evidence.
     return result.model_copy(update={
@@ -716,14 +783,343 @@ def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
                           for match in result.token_matches],
         "cue_word_indices": {cue_id: sorted({original_indices[index] for index in indices})
                              for cue_id, indices in result.cue_word_indices.items()},
-        "divergence_spans": [span.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in span.asr_word_indices})})
+        "divergence_spans": [span.model_copy(update={
+                                 "asr_word_indices": sorted({original_indices[index] for index in span.asr_word_indices}),
+                                 "asr_text": provider_text(span.asr_word_indices, span.asr_text),
+                             })
                              for span in result.divergence_spans],
-        "anchor_regions": [region.model_copy(update={"asr_word_indices": sorted({original_indices[index] for index in region.asr_word_indices})})
+        "anchor_regions": [region.model_copy(update={
+                               "asr_word_indices": sorted({original_indices[index] for index in region.asr_word_indices}),
+                               "asr_text": provider_text(region.asr_word_indices, region.asr_text),
+                           })
                            for region in result.anchor_regions],
     })
 
 
-def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
+def _atomic_provider_word_ops(
+    ops: list[_Op],
+    unit_word_indices: list[int],
+    atomic_word_indices: frozenset[int],
+) -> list[_Op]:
+    """Review a split provider word whole when only some of its units matched."""
+
+    unit_counts = Counter(
+        unit_word_indices[index]
+        for index, word_index in enumerate(unit_word_indices)
+        if word_index in atomic_word_indices
+    )
+    matched_counts = Counter(
+        unit_word_indices[op.asr_index]
+        for op in ops
+        if op.kind == "match" and op.asr_index is not None
+        and unit_word_indices[op.asr_index] in atomic_word_indices
+    )
+    partial = {word_index for word_index, count in matched_counts.items() if count != unit_counts[word_index]}
+    if not partial:
+        return ops
+    demoted: list[_Op] = []
+    for op in ops:
+        if op.kind == "match" and op.asr_index is not None and unit_word_indices[op.asr_index] in partial:
+            demoted.extend([_Op("delete", op.srt_index, None, 0.0), _Op("insert", None, op.asr_index, 0.0)])
+            continue
+        demoted.append(op)
+    return demoted
+
+
+def _compound_group_ops(
+    ops: list[_Op],
+    tokens: list[SRTToken],
+    words: list[Word],
+    words_norm: list[str],
+    *,
+    unit_word_indices: list[int] | None = None,
+    atomic_word_indices: frozenset[int] = frozenset(),
+) -> list[_Op]:
+    """Pair concatenation-equal token and word groups inside divergence runs.
+
+    ``Ano-Novo`` spoken as ``Ano Novo`` (or ``Drachen Evolutionssystem`` heard
+    as ``Drachen-Evolutionssystem``) is the same speech written another way;
+    it must not become a review case or leave the cue without its words. The
+    group stays within one cue, so every grouped word has one owner.
+    """
+
+    result: list[_Op] = []
+    run: list[_Op] = []
+
+    def flush() -> None:
+        result.extend(_compound_run_ops(
+            run, tokens, words, words_norm,
+            unit_word_indices=unit_word_indices, atomic_word_indices=atomic_word_indices,
+        ) if run else ())
+        run.clear()
+
+    for op in ops:
+        if op.kind in _ANCHOR_OP_KINDS:
+            flush()
+            result.append(op)
+        else:
+            run.append(op)
+    flush()
+    return result
+
+
+def _compound_run_ops(
+    run: list[_Op],
+    tokens: list[SRTToken],
+    words: list[Word],
+    words_norm: list[str],
+    *,
+    unit_word_indices: list[int] | None,
+    atomic_word_indices: frozenset[int],
+) -> list[_Op]:
+    source = [op.srt_index for op in run if op.srt_index is not None]
+    audio = [op.asr_index for op in run if op.asr_index is not None]
+    if (
+        not source or not audio or len(source) + len(audio) < 3
+        or len(source) * len(audio) > COMPOUND_MAX_RUN_CELLS
+    ):
+        return run
+
+    def splits_provider_word(first: int, last: int) -> bool:
+        if unit_word_indices is None:
+            return False
+        return any(
+            unit_word_indices[inner] in atomic_word_indices
+            and 0 <= outer < len(unit_word_indices)
+            and unit_word_indices[outer] == unit_word_indices[inner]
+            for inner, outer in ((first, first - 1), (last, last + 1))
+        )
+
+    def number_group_at(source_position: int, audio_position: int) -> tuple[int, int, bool] | None:
+        # A number written in digits on one side and spoken as words on the other
+        # ("26" / "vinte e seis", "30%" / "trinta por cento", "190" / "um nove zero").
+        source_window = source[source_position : source_position + NUMBER_GROUP_MAX_WORDS]
+        audio_window = audio[audio_position : audio_position + NUMBER_GROUP_MAX_WORDS]
+        sides = (
+            ([tokens[index].normalized for index in source_window], [tokens[index].text for index in source_window],
+             [words_norm[index] for index in audio_window], False),
+            ([words_norm[index] for index in audio_window], [words[index].text for index in audio_window],
+             [tokens[index].normalized for index in source_window], True),
+        )
+        for digit_keys, digit_texts, spoken_keys, swapped in sides:
+            if digit_keys[:1] == ["prozent"] and percent_suffix_length(spoken_keys[:2]) == 2:
+                # "%" after an already matched number, spoken "por cento".
+                token_count, word_count = (2, 1) if swapped else (1, 2)
+                group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+                group_words = audio[audio_position : audio_position + word_count]
+                if (
+                    len(group_tokens) == token_count and len(group_words) == word_count
+                    and len({token.cue_id for token in group_tokens}) == 1
+                    and not splits_provider_word(group_words[0], group_words[-1])
+                ):
+                    return token_count, word_count, True
+                continue
+            if not digit_keys or not digit_keys[0].isdigit() or not any(ch.isdigit() for ch in digit_texts[0]):
+                continue
+            digit_count = 2 if len(digit_keys) > 1 and digit_keys[1] == "prozent" else 1
+            for spoken_count in range(1, min(NUMBER_GROUP_MAX_WORDS, len(spoken_keys)) + 1):
+                keys = spoken_keys[:spoken_count]
+                percent = percent_suffix_length(keys)
+                if (digit_count == 2) != bool(percent) or len(keys) - percent < 1:
+                    continue
+                if digit_count + spoken_count <= 2 and not percent:
+                    continue
+                if int(digit_keys[0]) not in spoken_number_values(keys[: len(keys) - percent]):
+                    continue
+                token_count, word_count = (
+                    (spoken_count, digit_count) if swapped else (digit_count, spoken_count)
+                )
+                group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+                group_words = audio[audio_position : audio_position + word_count]
+                if (
+                    len({token.cue_id for token in group_tokens}) == 1
+                    and not splits_provider_word(group_words[0], group_words[-1])
+                ):
+                    return token_count, word_count, True
+        return None
+
+    def group_at(source_position: int, audio_position: int) -> tuple[int, int, bool] | None:
+        number_group = number_group_at(source_position, audio_position)
+        if number_group is not None:
+            return number_group
+        if tokens[source[source_position]].normalized[:1] != words_norm[audio[audio_position]][:1]:
+            return None
+        sizes = sorted(
+            (
+                (token_count, word_count)
+                for token_count in range(1, COMPOUND_MAX_PARTS + 1)
+                for word_count in range(1, COMPOUND_MAX_PARTS + 1)
+                if token_count + word_count > 2
+                and source_position + token_count <= len(source)
+                and audio_position + word_count <= len(audio)
+            ),
+            key=lambda size: -(size[0] + size[1]),
+        )
+        for token_count, word_count in sizes:
+            group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+            group_words = audio[audio_position : audio_position + word_count]
+            spelled = "".join(token.normalized for token in group_tokens)
+            if (
+                not _is_eligible_compound_spelling(spelled)
+                or spelled != "".join(words_norm[index] for index in group_words)
+                or len({token.cue_id for token in group_tokens}) != 1
+                or splits_provider_word(group_words[0], group_words[-1])
+            ):
+                continue
+            return token_count, word_count, False
+        return None
+
+    rebuilt: list[_Op] = []
+    source_cursor = 0
+    audio_cursor = 0
+    grouped = False
+    while source_cursor < len(source) and audio_cursor < len(audio):
+        found = next(
+            (
+                (source_position, audio_position, size)
+                for source_position in range(source_cursor, len(source))
+                for audio_position in range(audio_cursor, len(audio))
+                if (size := group_at(source_position, audio_position)) is not None
+            ),
+            None,
+        )
+        if found is None:
+            break
+        source_position, audio_position, (token_count, word_count, spoken_number) = found
+        grouped = True
+        rebuilt.extend(_Op("delete", index, None, 0.0) for index in source[source_cursor:source_position])
+        rebuilt.extend(_Op("insert", None, index, 0.0) for index in audio[audio_cursor:audio_position])
+        rebuilt.extend(_compound_group_member_ops(
+            source[source_position : source_position + token_count],
+            audio[audio_position : audio_position + word_count],
+            tokens,
+            words_norm,
+            proportional=spoken_number,
+        ))
+        source_cursor = source_position + token_count
+        audio_cursor = audio_position + word_count
+    if not grouped:
+        return run
+    rebuilt.extend(_Op("delete", index, None, 0.0) for index in source[source_cursor:])
+    rebuilt.extend(_Op("insert", None, index, 0.0) for index in audio[audio_cursor:])
+    return rebuilt
+
+
+def _compound_group_member_ops(
+    group_tokens: list[int],
+    group_words: list[int],
+    tokens: list[SRTToken],
+    words_norm: list[str],
+    *,
+    proportional: bool = False,
+) -> list[_Op]:
+    """Give each token the word its spelling starts in; other words are absorbed.
+
+    A spoken number has no shared spelling with its digits, so its tokens and
+    words are paired by position instead.
+    """
+
+    def owner(boundaries: list[int], offset: int) -> int:
+        return max(position for position, start in enumerate(boundaries) if start <= offset)
+
+    if proportional:
+        token_starts = [position * len(group_words) for position in range(len(group_tokens))]
+        word_starts = [position * len(group_tokens) for position in range(len(group_words))]
+    else:
+        token_starts = []
+        offset = 0
+        for index in group_tokens:
+            token_starts.append(offset)
+            offset += len(tokens[index].normalized)
+        word_starts = []
+        offset = 0
+        for index in group_words:
+            word_starts.append(offset)
+            offset += len(words_norm[index])
+    token_words = {
+        token_position: owner(word_starts, start) for token_position, start in enumerate(token_starts)
+    }
+    referenced = set(token_words.values())
+    ops: list[_Op] = []
+    for word_position, word_index in enumerate(group_words):
+        for token_position, owned_word in token_words.items():
+            if owned_word == word_position:
+                ops.append(_Op("compound", group_tokens[token_position], word_index, COMPOUND_MATCH_SCORE))
+        if word_position not in referenced:
+            absorbing = owner(token_starts, word_starts[word_position])
+            ops.append(_Op("absorb", group_tokens[absorbing], word_index, 0.0))
+    return ops
+
+
+def _absorb_touching_repeats(
+    ops: list[_Op],
+    words: list[Word],
+    words_norm: list[str],
+) -> list[_Op]:
+    """Give a word re-decoded twice back to the cue that owns its twin.
+
+    MAI sometimes emits one utterance as two touching copies ("7," 1932.20 and
+    "7," 1932.40). The cue matches one copy; the other used to open its own
+    insertion case and cut the cue's start. A pure-insertion word that touches
+    an exactly matched word with the same key joins that word's cue.
+    """
+
+    matched = {
+        op.asr_index: op
+        for op in ops
+        if op.kind == "match" and op.srt_index is not None and op.asr_index is not None
+    }
+    if not matched:
+        return ops
+    absorbed: list[_Op] = []
+    for position, op in enumerate(ops):
+        if op.kind != "insert" or op.asr_index is None or not words_norm[op.asr_index]:
+            absorbed.append(op)
+            continue
+        pure = all(
+            ops[index].kind in {"insert", *_ANCHOR_OP_KINDS}
+            for index in range(max(0, position - 1), min(len(ops), position + 2))
+        )
+        twin = next(
+            (
+                matched[neighbor]
+                for neighbor in (op.asr_index + 1, op.asr_index - 1)
+                if neighbor in matched
+                and words_norm[neighbor] == words_norm[op.asr_index]
+                and _words_touch(words[min(neighbor, op.asr_index)], words[max(neighbor, op.asr_index)])
+            ),
+            None,
+        )
+        if pure and twin is not None:
+            absorbed.append(_Op("absorb", twin.srt_index, op.asr_index, 0.0))
+        else:
+            absorbed.append(op)
+    return absorbed
+
+
+def _words_touch(left: Word, right: Word) -> bool:
+    # Comparison units of one provider word share its envelope; they are not copies.
+    return (
+        (left.start, left.end) != (right.start, right.end)
+        and math.isfinite(left.end) and math.isfinite(right.start)
+        and -IMPLAUSIBLE_MATCHED_WORD_SECONDS < right.start - left.end <= REPEATED_WORD_GAP_SECONDS
+    )
+
+
+def _is_eligible_compound_spelling(spelled: str) -> bool:
+    # The same letters spelled open, hyphenated or closed are the same speech
+    # (Ano-Novo / Ano Novo, Ehefrau / Ehe Frau, zu Hause / Zuhause, Se não /
+    # Senão). Numbers pair by value in their own groups, never by digit strings.
+    return len(spelled) >= COMPOUND_MIN_CHARACTERS and not spelled.isdigit()
+
+
+def _align_cues_to_units(
+    cues: list[Cue],
+    words: list[Word],
+    *,
+    unit_word_indices: list[int] | None = None,
+    atomic_word_indices: frozenset[int] = frozenset(),
+) -> AlignmentResult:
     tokens = tokenize_cues(cues)
     words_norm = normalized_words(words)
     excluded_screen_text_cue_ids = [
@@ -737,8 +1133,9 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             )
         )
     tokenized_cue_ids = {token.cue_id for token in tokens}
+    digit_aliases = _digit_aliases(tokens, words, words_norm)
 
-    preliminary_run = _align_tokens_detailed(tokens, words_norm)
+    preliminary_run = _align_tokens_detailed(tokens, words_norm, digit_aliases=digit_aliases)
     ops = preliminary_run.ops
     unbanded_fallback = preliminary_run.unbanded_fallback
     band_limited = preliminary_run.band_limited
@@ -755,20 +1152,42 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             preliminary_run.ops,
         )
         if timing_priors is not None:
-            prior_used = True
-            transform = timing_priors.transform
             prior_run = _align_tokens_detailed(
                 tokens,
                 words_norm,
                 token_time_priors=timing_priors.token_priors,
                 word_time_centers=timing_priors.word_centers,
+                digit_aliases=digit_aliases,
             )
-            ops = prior_run.ops
-            unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
-            band_limited = band_limited or prior_run.band_limited
-            unresolved = prior_run.unresolved
+            # The timed run only refines a resolved text alignment; it never
+            # replaces one with an unresolved artifact. Status describes the
+            # alignment that is actually kept.
+            if not prior_run.unresolved or unresolved:
+                prior_used = True
+                transform = timing_priors.transform
+                ops = prior_run.ops
+                unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
+                band_limited = prior_run.band_limited
+                unresolved = prior_run.unresolved
     if not unresolved:
         ops = _prefer_unique_full_cue_windows(ops, tokens, words_norm)
+    if unit_word_indices is not None and atomic_word_indices:
+        ops = _atomic_provider_word_ops(ops, unit_word_indices, atomic_word_indices)
+    if not unresolved:
+        ops = _compound_group_ops(
+            ops,
+            tokens,
+            words,
+            words_norm,
+            unit_word_indices=unit_word_indices,
+            atomic_word_indices=atomic_word_indices,
+        )
+        ops = _absorb_touching_repeats(ops, words, words_norm)
+    song_cue_ids = {cue.index for cue in cues if _is_song_lyric_cue(cue)}
+    if song_cue_ids:
+        # A lyric line is only timed by its words when the song itself was
+        # heard; a stray dialogue word must not pull it onto a conversation.
+        ops = _without_cue_matches(ops, tokens, _sparsely_matched_cue_ids(ops, tokens, song_cue_ids))
     provisional_matches = _token_matches_from_ops(ops, tokens)
     flags = [
         *_alignment_outlier_flags(provisional_matches, cues, tokens, words),
@@ -782,9 +1201,14 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     cue_word_indices: dict[int, list[int]] = {cue.index: [] for cue in cues}
     for match in matches:
         cue_word_indices.setdefault(match.cue_id, []).append(match.asr_word_index)
+    for cue_id, word_index in _absorbed_cue_words(ops, tokens):
+        cue_word_indices.setdefault(cue_id, []).append(word_index)
 
-    divergence_spans = _source_omissions_with_local_context(
-        _build_divergences(ops, tokens, words), matches, cues, tokens, words,
+    divergence_spans = _mostly_matched_omission_windows(
+        _source_omissions_with_local_context(
+            _build_divergences(ops, tokens, words), matches, cues, tokens, words,
+        ),
+        matches, cues, tokens, words,
     )
     anchor_regions = _build_anchor_regions(ops, tokens, words)
     unmatched_cue_ids = [
@@ -792,33 +1216,21 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
         for cue in cues
         if cue.index in tokenized_cue_ids and not cue_word_indices.get(cue.index)
     ]
-    anchor_coverage = len(matches) / len(tokens)
-    missing_audio_cue_ids = sorted(
+    # Unspoken song lyrics are expected silence in a voice-over, not missed speech.
+    unspoken_song_cue_ids = song_cue_ids & set(unmatched_cue_ids)
+    spoken_token_count = sum(1 for token in tokens if token.cue_id not in unspoken_song_cue_ids)
+    anchor_coverage = len(matches) / max(1, spoken_token_count)
+    missing_audio = (
         rejected_outlier_cue_ids
         | _source_only_unmatched_cue_ids(unmatched_cue_ids, divergence_spans)
         | _source_only_zero_window_cue_ids(divergence_spans)
     )
-    cue_by_id = {cue.index: cue for cue in cues}
-    for cue_id in missing_audio_cue_ids:
-        cue = cue_by_id.get(cue_id)
-        flags.append(
-            QCFlag(
-                kind="missing_audio_timing_held",
-                cue_ids=[cue_id],
-                message=(
-                    "No trustworthy local speech evidence was available for this source cue; "
-                    "its source text and timing are locked instead of borrowing another passage."
-                ),
-                severity="error",
-                old_text=cue.text if cue is not None else None,
-                start=cue.start_ms / 1000.0 if cue is not None else None,
-                end=cue.end_ms / 1000.0 if cue is not None else None,
-            )
-        )
+    missing_audio_cue_ids = sorted(missing_audio)
+    health_flags: list[QCFlag] = []
     if band_limited:
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
-        flags.append(
+        health_flags.append(
             QCFlag(
                 kind="alignment_band_limited",
                 cue_ids=[],
@@ -835,7 +1247,7 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
     if unresolved:
         episode_start = min((cue.start_ms for cue in cues), default=0) / 1000.0
         episode_end = max((cue.end_ms for cue in cues), default=0) / 1000.0
-        flags.append(
+        health_flags.append(
             QCFlag(
                 kind="alignment_unresolved",
                 cue_ids=[],
@@ -859,6 +1271,15 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             divergence_spans, matches, cues, tokens, words,
             protected_cue_ids=set(missing_audio_cue_ids),
         )
+        divergence_spans = _separate_unspoken_song_cues(divergence_spans, tokens, cues, unspoken_song_cue_ids)
+        missing_audio_cue_ids = sorted(missing_audio | {
+            cue_id
+            for span in divergence_spans
+            if span.case_id.startswith(SONG_SOURCE_PREFIX)
+            for cue_id in span.cue_ids
+        })
+    flags.extend(_missing_audio_flags(missing_audio_cue_ids, cues, song_cue_ids, tokenized_cue_ids))
+    flags.extend(health_flags)
     return AlignmentResult(
         token_matches=matches,
         anchor_regions=anchor_regions,
@@ -898,10 +1319,139 @@ def _token_matches_from_ops(
             score=round(op.score, 4),
         )
         for op in ops
-        if op.kind == "match"
+        if op.kind in _MATCH_OP_KINDS
         and op.srt_index is not None
         and op.asr_index is not None
     ]
+
+
+def _absorbed_cue_words(ops: list[_Op], tokens: list[SRTToken]) -> list[tuple[int, int]]:
+    return [
+        (tokens[op.srt_index].cue_id, op.asr_index)
+        for op in ops
+        if op.kind == "absorb" and op.srt_index is not None and op.asr_index is not None
+    ]
+
+
+def _is_song_lyric_cue(cue: Cue) -> bool:
+    return any(marker in cue.text for marker in SONG_MARKERS)
+
+
+def _sparsely_matched_cue_ids(ops: list[_Op], tokens: list[SRTToken], cue_ids: set[int]) -> set[int]:
+    token_counts = Counter(token.cue_id for token in tokens if token.cue_id in cue_ids)
+    matched_counts = Counter(
+        tokens[op.srt_index].cue_id
+        for op in ops
+        if op.kind in _MATCH_OP_KINDS and op.srt_index is not None and tokens[op.srt_index].cue_id in cue_ids
+    )
+    return {cue_id for cue_id, count in matched_counts.items() if count * 2 < token_counts[cue_id]}
+
+
+def _separate_unspoken_song_cues(
+    spans: list[DivergenceSpan],
+    tokens: list[SRTToken],
+    cues: list[Cue],
+    song_cue_ids: set[int],
+) -> list[DivergenceSpan]:
+    """Review unheard lyric lines apart from the dialogue they were pooled with.
+
+    A span runs from one exact match to the next, so an unsung lyric block
+    next to an improvised line would share its review case and could be
+    replaced by a dialogue word. The lyric part becomes a source-only case
+    (locked as missing audio); the rest keeps its case id and every word.
+    """
+
+    if not song_cue_ids:
+        return spans
+    cues_by_id = {cue.index: cue for cue in cues}
+    separated: list[DivergenceSpan] = []
+    for span in spans:
+        lyric = [index for index in span.srt_token_indices if tokens[index].cue_id in song_cue_ids]
+        rest = [index for index in span.srt_token_indices if tokens[index].cue_id not in song_cue_ids]
+        if (
+            not lyric
+            or (not rest and not span.asr_word_indices)
+            or span.case_id.startswith(_DERIVED_CASE_PREFIXES)
+        ):
+            separated.append(span)
+            continue
+        lyric_cue_ids = sorted({tokens[index].cue_id for index in lyric})
+        lyric_span = span.model_copy(update={
+            "case_id": SONG_SOURCE_PREFIX + span.case_id,
+            "cue_ids": lyric_cue_ids,
+            "srt_text": _span_text_from_tokens(tokens, lyric),
+            "asr_text": "",
+            "srt_token_indices": lyric,
+            "asr_word_indices": [],
+            "speaker_ids": [],
+            "confidence": 0.0,
+            "insertion_token_offset": None,
+            "start": min(cues_by_id[cue_id].start_ms for cue_id in lyric_cue_ids) / 1000.0,
+            "end": max(cues_by_id[cue_id].end_ms for cue_id in lyric_cue_ids) / 1000.0,
+        })
+        rest_span = span.model_copy(update={
+            "cue_ids": sorted({tokens[index].cue_id for index in rest}),
+            "srt_text": _span_text_from_tokens(tokens, rest),
+            "srt_token_indices": rest,
+        })
+        lyric_first = (lyric[0] < rest[0]) if rest else (
+            rest_span.start is None or lyric_span.start <= rest_span.start
+        )
+        separated.extend([lyric_span, rest_span] if lyric_first else [rest_span, lyric_span])
+    return separated
+
+
+def _missing_audio_flags(
+    missing_audio_cue_ids: list[int],
+    cues: list[Cue],
+    song_cue_ids: set[int],
+    tokenized_cue_ids: set[int],
+) -> list[QCFlag]:
+    """One hold per dialogue cue, one per contiguous block of unheard lyrics."""
+
+    missing = set(missing_audio_cue_ids)
+    groups: list[list[Cue]] = []
+    song_block: list[Cue] = []
+    emitted: set[int] = set()
+    for cue in cues:
+        if cue.index in emitted:
+            continue
+        if cue.index in missing and cue.index in song_cue_ids:
+            song_block.append(cue)
+            emitted.add(cue.index)
+            continue
+        if cue.index not in tokenized_cue_ids:
+            # Screen text between lyric lines does not interrupt the song.
+            continue
+        if song_block:
+            groups.append(song_block)
+            song_block = []
+        if cue.index in missing:
+            groups.append([cue])
+            emitted.add(cue.index)
+    if song_block:
+        groups.append(song_block)
+    flags: list[QCFlag] = []
+    for group in groups:
+        song = group[0].index in song_cue_ids
+        flags.append(
+            QCFlag(
+                kind="missing_audio_timing_held",
+                cue_ids=[cue.index for cue in group],
+                message=(
+                    "These song lyrics are not heard in the voice-over; their source text and "
+                    "timing are locked as one block."
+                    if song
+                    else "No trustworthy local speech evidence was available for this source cue; "
+                    "its source text and timing are locked instead of borrowing another passage."
+                ),
+                severity="error",
+                old_text="\n\n".join(cue.text for cue in group),
+                start=group[0].start_ms / 1000.0,
+                end=max(cue.end_ms for cue in group) / 1000.0,
+            )
+        )
+    return flags
 
 
 def _rejectable_outlier_cue_ids(
@@ -929,19 +1479,20 @@ def _without_cue_matches(
     cue_ids: set[int],
 ) -> list[_Op]:
     filtered: list[_Op] = []
+    reopened_words: set[int] = set()
     for op in ops:
         if (
-            op.kind == "match"
+            op.kind in _ANCHOR_OP_KINDS
             and op.srt_index is not None
             and op.asr_index is not None
             and tokens[op.srt_index].cue_id in cue_ids
         ):
-            filtered.extend(
-                [
-                    _Op("delete", op.srt_index, None, 0.0),
-                    _Op("insert", None, op.asr_index, 0.0),
-                ]
-            )
+            if op.kind != "absorb":
+                filtered.append(_Op("delete", op.srt_index, None, 0.0))
+            # Tokens of one compound group can share a provider word.
+            if op.asr_index not in reopened_words:
+                reopened_words.add(op.asr_index)
+                filtered.append(_Op("insert", None, op.asr_index, 0.0))
             continue
         filtered.append(op)
     return filtered
@@ -1027,6 +1578,72 @@ def _source_omissions_with_local_context(
             continue
         contextualized[-1] = span.model_copy(update={"start": flanks[0].start, "end": flanks[-1].end})
     return contextualized
+
+
+def _mostly_matched_omission_windows(
+    spans: list[DivergenceSpan],
+    matches: list[TokenMatch],
+    cues: list[Cue],
+    tokens: list[SRTToken],
+    words: list[Word],
+) -> list[DivergenceSpan]:
+    """Window an unspoken word of a well-matched cue with that cue's own speech.
+
+    At a file edge, or between touching or slightly overlapping words, a
+    source-only span has no positive window and used to lock the whole cue
+    as missing audio, discarding the timing of its other words. When at
+    least two thirds of the cue matched compact, trustworthy words of one
+    speaker, the omission is reviewed inside the cue's speech instead.
+    Sparse, annotated, song and unreliable cues stay locked.
+    """
+    cues_by_id = {cue.index: cue for cue in cues}
+    matched_counts = Counter(match.cue_id for match in matches)
+    token_counts = Counter(token.cue_id for token in tokens)
+    words_by_cue: dict[int, set[int]] = {}
+    for match in matches:
+        words_by_cue.setdefault(match.cue_id, set()).add(match.asr_word_index)
+    windowed: list[DivergenceSpan] = []
+    for span in spans:
+        windowed.append(span)
+        if (
+            len(span.cue_ids) != 1 or not span.srt_token_indices
+            or span.asr_word_indices or span.asr_text.strip()
+            or _has_positive_window(span)
+        ):
+            continue
+        cue_id = span.cue_ids[0]
+        cue = cues_by_id.get(cue_id)
+        if (
+            cue is None or cue_has_bracketed_screen_text(cue) or _is_song_lyric_cue(cue)
+            or matched_counts[cue_id] * 3 < token_counts[cue_id] * 2
+        ):
+            continue
+        cue_words = [words[index] for index in sorted(words_by_cue.get(cue_id, ()))]
+        if not cue_words or any(
+            not math.isfinite(word.start) or not math.isfinite(word.end) or word.start < 0
+            or not 0.020 + 1e-9 < word.end - word.start <= IMPLAUSIBLE_MATCHED_WORD_SECONDS
+            or word.confidence is not None and word.confidence < 0.8
+            for word in cue_words
+        ):
+            continue
+        if (
+            any(not -OMISSION_WORD_OVERLAP_SECONDS - 1e-9 <= right.start - left.end <= 0.5
+                for left, right in zip(cue_words, cue_words[1:]))
+            or len({word.speaker_id for word in cue_words if word.speaker_id}) > 1
+        ):
+            continue
+        windowed[-1] = span.model_copy(update={"start": cue_words[0].start, "end": cue_words[-1].end})
+    return windowed
+
+
+def _has_positive_window(span: DivergenceSpan) -> bool:
+    return (
+        span.start is not None
+        and span.end is not None
+        and math.isfinite(span.start)
+        and math.isfinite(span.end)
+        and span.end > span.start
+    )
 
 
 def _source_only_zero_window_cue_ids(spans: list[DivergenceSpan]) -> set[int]:
@@ -1242,7 +1859,12 @@ def _alignment_outlier_flags(
         cue = cue_by_id.get(cue_id)
         if cue is None:
             continue
-        matched_words = [words[match.asr_word_index] for match in cue_matches]
+        # Comparison units of one provider word share its envelope; the word
+        # is one piece of timing evidence however many units it was split into.
+        matched_words = list({
+            (words[match.asr_word_index].start, words[match.asr_word_index].end): words[match.asr_word_index]
+            for match in cue_matches
+        }.values())
         word_centers = [(word.start + word.end) / 2.0 for word in matched_words]
         word_center = median(word_centers)
         representative_index = min(
@@ -1352,7 +1974,8 @@ def _implausible_matched_word_duration_flags(
 
     flags: list[QCFlag] = []
     for cue_id, cue_matches in matches_by_cue.items():
-        if len(cue_matches) != 1:
+        # Units split from one provider word still make a single matched word.
+        if len({(words[match.asr_word_index].start, words[match.asr_word_index].end) for match in cue_matches}) != 1:
             continue
         cue = cue_by_id.get(cue_id)
         if cue is None:
