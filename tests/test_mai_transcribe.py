@@ -82,7 +82,7 @@ def test_request_uses_audio_endpoint_with_word_timing_and_usage(monkeypatch, tmp
     }
 
 
-def test_chunks_preserve_absolute_timing_and_do_not_merge_speakers(monkeypatch, tmp_path):
+def test_chunks_preserve_absolute_timing_and_link_speakers_through_overlap_words(monkeypatch, tmp_path):
     audio = _audio(tmp_path, seconds=9)
     # Chunks own [0, 4), [4, 8), [8, 9], with one second of context on each side.
     calls = _transport(monkeypatch, [
@@ -105,12 +105,83 @@ def test_chunks_preserve_absolute_timing_and_do_not_merge_speakers(monkeypatch, 
 
     assert [word.text for word in words] == ["one", "boundary", "two", "last"]
     assert [word.start for word in words] == pytest.approx([0.5, 3.9, 5, 7.9])
-    assert words[1].speaker_id == words[2].speaker_id
-    assert len({word.speaker_id for word in words}) == 3
+    # Each cut has a word both chunks heard, so one voice keeps one id across chunks.
+    assert {word.speaker_id for word in words} == {"chunk_1:0"}
     assert len(calls) == 3
     assert adapter.last_usage["seconds"] == 13
     assert adapter.last_usage["cost"] == pytest.approx(0.6)
     assert adapter.last_usage["request_count"] == 3
+
+
+def test_sentence_straddling_a_chunk_boundary_keeps_one_speaker_id(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [
+            {"word": "Ja.", "start": 1.0, "end": 1.3, "speaker": 1},
+            {"word": "Ich", "start": 3.0, "end": 3.2, "speaker": 0},
+            {"word": "gehe", "start": 3.3, "end": 3.6, "speaker": 0},
+            {"word": "jetzt", "start": 3.7, "end": 4.0, "speaker": 0},
+            {"word": "nach", "start": 4.1, "end": 4.3, "speaker": 0},
+        ]},
+        {"words": [
+            # The second call labels the same actor 1, and a new actor 0.
+            {"word": "gehe", "start": 0.3, "end": 0.6, "speaker": 1},
+            {"word": "jetzt", "start": 0.7, "end": 1.0, "speaker": 1},
+            {"word": "nach", "start": 1.1, "end": 1.3, "speaker": 1},
+            {"word": "Hause.", "start": 1.4, "end": 1.8, "speaker": 1},
+            {"word": "Tschüss.", "start": 3.0, "end": 3.4, "speaker": 0},
+        ]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    by_text = {word.text: word.speaker_id for word in words}
+    assert [word.text for word in words] == ["Ja.", "Ich", "gehe", "jetzt", "nach", "Hause.", "Tschüss."]
+    assert {by_text[text] for text in ("Ich", "gehe", "jetzt", "nach", "Hause.")} == {"chunk_1:0"}
+    # A label that no overlap word links stays scoped to its own chunk.
+    assert by_text["Tschüss."] == "chunk_2:0"
+    assert by_text["Ja."] == "chunk_1:1"
+
+
+def test_conflicting_overlap_speaker_evidence_keeps_labels_chunk_scoped(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [
+            {"word": "Du", "start": 3.3, "end": 3.5, "speaker": 0},
+            {"word": "nicht!", "start": 3.6, "end": 3.9, "speaker": 1},
+        ]},
+        {"words": [
+            # The second call merges both voices into one label.
+            {"word": "Du", "start": 0.3, "end": 0.5, "speaker": 0},
+            {"word": "nicht!", "start": 0.6, "end": 0.9, "speaker": 0},
+            {"word": "Doch.", "start": 1.5, "end": 1.8, "speaker": 0},
+        ]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    assert [(word.text, word.speaker_id) for word in words] == [
+        ("Du", "chunk_1:0"), ("nicht!", "chunk_1:1"), ("Doch.", "chunk_2:0"),
+    ]
+
+
+def test_speaker_links_chain_across_several_chunks(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [{"word": "eins", "start": 3.5, "end": 3.8, "speaker": 2}]},
+        {"words": [{"word": "eins", "start": 0.5, "end": 0.8, "speaker": 0}, {"word": "zwei", "start": 4.6, "end": 4.9, "speaker": 0}]},
+        {"words": [{"word": "zwei", "start": 0.6, "end": 0.9, "speaker": 5}, {"word": "drei", "start": 2.0, "end": 2.3, "speaker": 5}]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=12))
+
+    assert [(word.text, word.speaker_id) for word in words] == [
+        ("eins", "chunk_1:2"), ("zwei", "chunk_1:2"), ("drei", "chunk_1:2"),
+    ]
+
+
+def test_speakers_without_overlap_words_are_not_merged_between_chunks(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [{"word": "vorher", "start": 1.0, "end": 1.4, "speaker": 0}]},
+        {"words": [{"word": "nachher", "start": 3.0, "end": 3.4, "speaker": 0}]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    assert [word.speaker_id for word in words] == ["chunk_1:0", "chunk_2:0"]
 
 
 @pytest.mark.parametrize("payload", [

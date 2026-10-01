@@ -113,7 +113,12 @@ class MAITranscribeAdapter:
         for index, chunk in enumerate(self._chunks(audio_path)):
             payload = self._request(chunk.data)
             chunk_words = self._words(payload, chunk, index)
-            words = _join_words(words, chunk_words, chunk.owner_start) if index else chunk_words
+            if index:
+                pairs = _overlap_pairs(words, chunk_words, chunk.owner_start)
+                chunk_words = _stitch_speakers(words, chunk_words, pairs)
+                words = _join_paired_words(words, chunk_words, pairs, chunk.owner_start)
+            else:
+                words = chunk_words
         self.last_repair_flags.extend(self._word_run_summary_flags())
         return sorted(words, key=lambda word: (word.start, word.end))
 
@@ -498,6 +503,35 @@ def _overlap_pairs(left: list[Word], right: list[Word], boundary: float) -> dict
         else:
             col -= 1
     return pairs
+
+
+def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int]) -> list[Word]:
+    """Carry speaker identity across a chunk cut using words both chunks heard.
+
+    Labels are local to each API call. A right-chunk label is renamed to the
+    left label only when every matched overlap word links the two labels one
+    to one; labels without such evidence stay scoped to their own chunk.
+    """
+    links: dict[str, set[str]] = {}
+    reverse: dict[str, set[str]] = {}
+    for left_index, right_index in pairs.items():
+        left_speaker, right_speaker = left[left_index].speaker_id, right[right_index].speaker_id
+        if left_speaker is None or right_speaker is None:
+            continue
+        links.setdefault(right_speaker, set()).add(left_speaker)
+        reverse.setdefault(left_speaker, set()).add(right_speaker)
+    mapping = {}
+    for right_speaker, left_speakers in links.items():
+        if len(left_speakers) == 1:
+            left_speaker = next(iter(left_speakers))
+            if reverse[left_speaker] == {right_speaker}:
+                mapping[right_speaker] = left_speaker
+    if not mapping:
+        return right
+    return [
+        word.model_copy(update={"speaker_id": mapping[word.speaker_id]}) if word.speaker_id in mapping else word
+        for word in right
+    ]
 
 
 def _same_spoken_word(left: Word, right: Word, left_token: str, right_token: str, overlap: float) -> bool:
