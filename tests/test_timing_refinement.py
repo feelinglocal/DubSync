@@ -31,12 +31,12 @@ def test_refine_cues_to_speech_activity_tightens_obvious_silence_boundaries():
         ),
     )
 
-    assert refined[0].start_ms == 42333
+    assert refined[0].start_ms == 42334
     assert refined[0].end_ms == 43600
-    assert refined[1].start_ms == 120533
-    assert refined[1].end_ms == 121866
+    assert refined[1].start_ms == 120534
+    assert refined[1].end_ms == 121867
     assert refined[2].start_ms == 130000
-    assert refined[2].end_ms == 131066
+    assert refined[2].end_ms == 131067
     assert [flag.cue_ids for flag in flags] == [[13], [51], [60]]
     assert all(flag.kind == "timing_refined" for flag in flags)
 

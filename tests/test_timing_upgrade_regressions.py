@@ -4,6 +4,7 @@ import json
 import tracemalloc
 import wave
 from array import array
+from math import ceil, floor
 
 import pytest
 import yaml
@@ -15,7 +16,7 @@ from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from dubsync.output_order import finalize_cues_for_output
 from dubsync.overlap import apply_overlap_policy, reconcile_overlap_flags
 from dubsync.recue import rebuild_cues
-from dubsync.srt_io import parse_srt_text
+from dubsync.srt_io import format_timestamp, parse_srt_text
 from dubsync.style_profile import StyleProfile
 from dubsync.timing_refinement import (
     BoundaryRefinementConfig,
@@ -498,11 +499,12 @@ def test_cue_end_is_the_offset_of_the_burst_holding_its_last_word(burst_end, exp
 
 def test_cue_end_is_not_extended_over_another_speakers_word_in_the_same_burst():
     # The old rule padded to the region end whenever it was within 300 ms.
-    cue = Cue(index=1, start_ms=1000, end_ms=1866, lines=["Uau, que lindo!"])
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+    cue = Cue(index=1, start_ms=1000, end_ms=profile.snap_ceil(1840), lines=["Uau, que lindo!"])
     words = _words(("Uau,", 1.05, 1.3), ("que", 1.35, 1.5), ("lindo!", 1.55, 1.8), ("Outra", 1.85, 2.05))
 
     refined, flags = refine_cues_to_speech_activity(
-        [cue], [SpeechRegion(start=1.0, end=2.05)], StyleProfile(fps=30, min_cue_dur=0.5),
+        [cue], [SpeechRegion(start=1.0, end=2.05)], profile,
         words=words, alignment=AlignmentResult(cue_word_indices={1: [0, 1, 2]}),
     )
 
@@ -729,3 +731,54 @@ def test_final_order_does_not_shrink_a_source_hold_to_nothing():
     assert finalized == cues
     assert [flag.kind for flag in flags] == ["output_overlap_unresolved"]
     assert "source timing" in flags[0].message
+
+
+# --- Task 8: exported frame times ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fps", [23.976, 24.0, 25.0, 29.97, 30.0])
+def test_frame_times_survive_a_floor_based_import_at_the_same_frame_rate(fps):
+    # golden.md 4.1: frame 16177 was written as 539,233 and a 30 fps editor that
+    # floors read it back as frame 16176, one frame early.
+    profile = StyleProfile(fps=fps)
+
+    for frame in range(0, 200_000, 7):
+        written_ms = profile.frame_time_ms(frame)
+        assert floor(written_ms * fps / 1000 + 1e-9) == frame
+        assert 0 <= written_ms - frame * 1000 / fps < 1
+
+
+def test_snapped_start_and_end_stay_on_their_frame_after_export_and_reimport():
+    profile = StyleProfile(fps=30.0)
+    assert profile.snap_floor(539_250) == 539_234  # frame 16177, not 539,233
+    assert profile.snap_ceil(539_250) == 539_267  # frame 16178, not 539,266
+
+    for ms in range(0, 3_000_000, 977):
+        for snapped in (profile.snap_floor(ms), profile.snap_ceil(ms)):
+            reimported = parse_srt_text(f"1\n{format_timestamp(snapped)} --> {format_timestamp(snapped + 500)}\nx\n")[0]
+            # The editor floors the timestamp to a frame; writing that frame
+            # again must give the same timestamp, i.e. nothing moved.
+            assert profile.frame_time_ms(reimported.start_ms * 30 // 1000) == snapped
+        assert profile.snap_floor(ms) * 30 // 1000 == ms * 30 // 1000
+
+
+@pytest.mark.parametrize("fps", [23.976, 24.0, 25.0, 29.97, 30.0])
+def test_snap_helpers_are_idempotent_on_their_own_output(fps):
+    # rebuild.md BUG-13: snap_floor(66) was 33 and snap_floor(1301366) was 1301333.
+    profile = StyleProfile(fps=fps)
+
+    for ms in [0, 33, 34, 66, 67, 1_301_366, 1_301_367, *range(1, 2_000_000, 1009)]:
+        floored, ceiled = profile.snap_floor(ms), profile.snap_ceil(ms)
+        assert profile.snap_floor(floored) == floored == profile.snap_ceil(floored)
+        assert profile.snap_ceil(ceiled) == ceiled == profile.snap_floor(ceiled)
+        assert floored <= ms + 1 and ceiled >= ms
+        assert ceiled - floored <= ceil(1000 / fps) + 1
+
+
+def test_frame_grid_is_exact_at_24_fps():
+    # int(frame * 41.666...) was one millisecond low on 1 % of the frames (8125.0 -> 8124).
+    profile = StyleProfile(fps=24.0)
+
+    assert profile.snap_floor(8125) == 8125 == profile.snap_ceil(8125)
+    assert [profile.frame_time_ms(frame) for frame in (3, 24, 195, 240_000)] == [125, 1000, 8125, 10_000_000]
+    assert all(profile.frame_time_ms(frame) == -(-frame * 125 // 3) for frame in range(300_000))

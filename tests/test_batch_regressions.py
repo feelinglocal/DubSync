@@ -72,7 +72,7 @@ def test_recue_ceil_snaps_end_so_last_syllable_is_not_cut():
     rebuilt, flags = rebuild_cues(cues, words, alignment, profile)
 
     assert flags == []
-    assert rebuilt[0].end_ms == 533
+    assert rebuilt[0].end_ms == 534
 
 
 def test_recue_trims_impossible_word_cluster_before_timing():
@@ -94,7 +94,7 @@ def test_recue_trims_impossible_word_cluster_before_timing():
     )
 
     assert rebuilt[0].start_ms == 43800
-    assert rebuilt[0].end_ms == 45033
+    assert rebuilt[0].end_ms == 45034
     assert flags[0].kind == "timing_outlier_trimmed"
 
 

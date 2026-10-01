@@ -86,7 +86,8 @@ def test_snap_ceil_never_returns_before_fractional_millisecond_input():
     snapped = profile.snap_ceil(1033.4)
 
     assert snapped >= 1033.4
-    assert snapped == 1066
+    # Frame 31 (1033.33 ms) is written as 1034 ms, which already covers the input.
+    assert snapped == 1034
 
 
 def test_write_srt_rejects_blank_cue_instead_of_serializing_invalid_block():

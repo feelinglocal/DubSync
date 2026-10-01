@@ -16,6 +16,8 @@ _UPPER_STYLE_PERCENTILE = 0.95
 _LOWER_STYLE_TRIM_FRACTION = 0.05
 _FPS_CONFIDENT_MAX_ERROR_MS = 2.0
 _FPS_CONFIDENT_MIN_ADVANTAGE_MS = 0.25
+# Absorbs float error when converting between milliseconds and frames.
+_FRAME_EPSILON = 1e-6
 
 
 @dataclass(frozen=True)
@@ -51,19 +53,31 @@ class StyleProfile(BaseModel):
     def frame_ms(self) -> float:
         return 1000.0 / self.fps
 
+    def frame_time_ms(self, frame: int) -> int:
+        """Millisecond timestamp written for a frame boundary.
+
+        A boundary such as 1133.33 ms is rounded up to the next millisecond. A
+        truncated value (1133) lies just before its frame, so an editor that
+        floors timestamps to frames shows the cue one frame early; rounding up
+        also keeps the value stable when it is snapped again.
+        """
+        return ceil(frame * 1000.0 / self.fps - _FRAME_EPSILON)
+
     def snap_floor(self, ms: int | float) -> int:
-        frame = floor(float(ms) / self.frame_ms + 1e-9)
-        return int(frame * self.frame_ms)
+        return self.frame_time_ms(self._frame_at(float(ms)))
 
     def snap_ceil(self, ms: int | float) -> int:
         value = float(ms)
-        frame_ms = self.frame_ms
-        frame = floor(value / frame_ms + 1e-9)
-        snapped = int(frame * frame_ms)
-        if snapped < value - 1e-9:
-            frame += 1
-            snapped = int(frame * frame_ms)
+        frame = self._frame_at(value)
+        snapped = self.frame_time_ms(frame)
+        if snapped < value - _FRAME_EPSILON:
+            snapped = self.frame_time_ms(frame + 1)
         return snapped
+
+    def _frame_at(self, ms: float) -> int:
+        # Multiply before dividing: 8125 ms at 24 fps is exactly frame 195,
+        # while 8125 / 41.666... falls a hair short and loses a frame.
+        return floor(ms * self.fps / 1000.0 + _FRAME_EPSILON)
 
     def is_frame_aligned(self, ms: int, tolerance_ms: int = 1) -> bool:
         floor = self.snap_floor(ms)

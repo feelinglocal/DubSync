@@ -2284,7 +2284,7 @@ def test_cli_sync_fixture_llm_inserts_adlib_span(tmp_path):
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
     assert [cue.plain_text for cue in synced] == ["hello there", "surprise line"]
     assert synced[1].start_ms == 1000
-    assert synced[1].end_ms == 1766
+    assert synced[1].end_ms == 1767
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     adlib_flag = next(flag for flag in report["flags"] if flag["kind"] == "adlib_inserted")
     assert adlib_flag["cue_ids"] == [2]

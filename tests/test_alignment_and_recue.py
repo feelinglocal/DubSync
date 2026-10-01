@@ -495,7 +495,7 @@ def test_recue_preserves_unchanged_segmentation_and_snaps_to_grid(shifted_srt_te
     assert rebuilt[0].start_ms == 1000
     assert rebuilt[0].end_ms == 1500
     assert rebuilt[1].start_ms == 2000
-    assert rebuilt[1].end_ms == 2866
+    assert rebuilt[1].end_ms == 2867
     assert flags == []
     assert issues == []
 
