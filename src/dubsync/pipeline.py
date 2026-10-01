@@ -519,6 +519,7 @@ def sync_episode(
             _unique_flags([*_load_adjudication_artifact(episode_workdir / "adjudicate.json")[1], *confidence_flags]),
         )
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
+    source_timing_held_cue_ids = _source_timing_held_cue_ids(flags)
 
     adlib_cue_ids_by_case, adlib_reconciliation_flags = _adlib_cue_ids_by_case(
         cues,
@@ -616,14 +617,16 @@ def sync_episode(
         profile,
         max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
-        protected_cue_ids=confidence_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
     )
+    recue_flags, unconfirmed_source_timed_cue_ids = _fold_unconfirmed_evidence_holds(recue_flags, flags)
+    source_timing_held_cue_ids |= unconfirmed_source_timed_cue_ids
     flags.extend(recue_flags)
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
     flags.extend(source_order_inversion_flags(
         rebuilt,
         source_cue_ids=source_cue_ids,
-        protected_cue_ids=confidence_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
     ))
     # Accepted insertions can precede their source-list anchor acoustically.
     # Overlap and boundary policies must see temporal order, retaining cue IDs.
@@ -724,6 +727,7 @@ def sync_episode(
         include_dropped_line_flags=True,
         decisions=decisions,
         fps_summary_metadata=fps_summary_metadata,
+        source_timing_held_cue_ids=source_timing_held_cue_ids,
     )
 
 
@@ -747,7 +751,6 @@ def _confidence_gate_decisions(
     spans_by_id = {span.case_id: span for span in spans}
     selected: list[AdjudicationDecision] = []
     flags: list[QCFlag] = []
-    already_held = _confidence_held_source_cue_ids(existing_flags)
     for decision in decisions:
         span = spans_by_id.get(decision.case_id)
         if span is None:
@@ -757,16 +760,68 @@ def _confidence_gate_decisions(
             span, decision, _adjudication_confidence_gate(provider_config),
         )
         selected.append(gated)
-        # Do not replace an engine's reviewable proposal with the held source text.
-        if flag is not None and (decision.verdict != "keep_srt" or not set(span.cue_ids).issubset(already_held)):
+        # This pass only withholds rewrites that a changed gate no longer
+        # accepts. A keep already preserves the source: the engine reported
+        # any uncertain model keep itself, and deterministic pipeline holds
+        # carry their own flag instead of a second "low confidence" finding.
+        if flag is not None and decision.verdict != "keep_srt":
             flags.append(flag)
     return selected, flags
 
 
+_SOURCE_TIMING_HOLD_FLAG_KINDS = frozenset({
+    "unresolved_alignment_adjudication_held",
+    "oversized_adjudication_span_held",
+})
+
+
 def _confidence_held_source_cue_ids(flags: list[QCFlag]) -> set[int]:
+    """Cues whose source WORDING is held: no split, merge or ownership transfer."""
     return {cue_id for flag in flags
             if flag.kind in {"low_confidence_adjudication", "adjudication_audio_unavailable"}
+            or flag.kind in _SOURCE_TIMING_HOLD_FLAG_KINDS
             for cue_id in flag.cue_ids}
+
+
+def _source_timing_held_cue_ids(flags: list[QCFlag]) -> set[int]:
+    # An uncertain or unavailable wording decision keeps the source TEXT only:
+    # its cue still owns exactly matched words and is timed from them like any
+    # confident keep. Only holds that distrust the alignment itself retain the
+    # complete source cue, including its timing.
+    return {cue_id for flag in flags
+            if flag.kind in _SOURCE_TIMING_HOLD_FLAG_KINDS
+            for cue_id in flag.cue_ids}
+
+
+_UNCONFIRMED_WORDING_FLAG_KINDS = frozenset({
+    "low_confidence_adjudication",
+    "adjudication_audio_unavailable",
+    "llm_provider_unavailable",
+    "invalid_llm_response",
+    "divergence_unresolved",
+})
+
+
+def _fold_unconfirmed_evidence_holds(
+    recue_flags: list[QCFlag], flags: list[QCFlag],
+) -> tuple[list[QCFlag], set[int]]:
+    """Report an unconfirmed divergence once when its words cannot time the cue.
+
+    Source wording that no model confirmed rarely matches the spoken words, so
+    the rebuild keeps such a cue at source timing. The wording flag already
+    sends that cue to review; a second evidence error describes the same
+    unresolved divergence. The cue stays a source-timing hold.
+    """
+    unconfirmed = {cue_id for flag in flags
+                   if flag.kind in _UNCONFIRMED_WORDING_FLAG_KINDS for cue_id in flag.cue_ids}
+    retained: list[QCFlag] = []
+    held: set[int] = set()
+    for flag in recue_flags:
+        if flag.kind == "timing_evidence_held" and flag.cue_ids and set(flag.cue_ids) <= unconfirmed:
+            held.update(flag.cue_ids)
+            continue
+        retained.append(flag)
+    return retained, held
 
 
 def _timing_evidence_held_cue_ids(flags: list[QCFlag]) -> set[int]:
@@ -1627,6 +1682,7 @@ def _run_verify_stage(
     include_dropped_line_flags: bool,
     decisions: list[AdjudicationDecision] | None = None,
     fps_summary_metadata: dict[str, object] | None = None,
+    source_timing_held_cue_ids: set[int] | None = None,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     # A shared phrase timestamp cannot establish its internal cue boundary.
@@ -1642,11 +1698,11 @@ def _run_verify_stage(
     min_coverage = min_coverage_from_config(provider_config)
     boundary_refinement = _boundary_refinement_config(provider_config)
     missing_audio_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
-    confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
+    source_timing_held_cue_ids = _source_timing_held_cue_ids(flags) | set(source_timing_held_cue_ids or ())
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
     protected_source_regions = _protected_regions_for_alignment(alignment, source_cues, words)
     protected_source_cue_ids = {cue_id for ids in protected_source_regions.values() for cue_id in ids}
-    protected_cue_ids = missing_audio_cue_ids | confidence_held_cue_ids | timing_held_cue_ids | protected_source_cue_ids
+    protected_cue_ids = missing_audio_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids | protected_source_cue_ids
     unresolved_shared_cue_ids = set(shared_source_cue_ids)
     forced_alignment_adapter = forced_alignment_adapter_from_config(provider_config)
     if forced_alignment_adapter is not None:
@@ -1734,7 +1790,7 @@ def _run_verify_stage(
     )
     flags.extend(missing_audio_restore_flags)
     rebuilt, confidence_restore_flags = _restore_missing_audio_source_cues(
-        rebuilt, source_cues, confidence_held_cue_ids,
+        rebuilt, source_cues, source_timing_held_cue_ids,
         reason="low_confidence",
     )
     flags.extend(confidence_restore_flags)
@@ -3093,11 +3149,11 @@ def _indexed_replacement_word_indices(
                     continue
                 left_anchor = (
                     final_tokens[final_boundary - 1] == asr_tokens[asr_boundary - 1]
-                    and (token_confidences[asr_boundary - 1] or 0.0) >= 0.8
+                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary - 1])
                 )
                 right_anchor = (
                     final_tokens[final_boundary] == asr_tokens[asr_boundary]
-                    and (token_confidences[asr_boundary] or 0.0) >= 0.8
+                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary])
                 )
                 matching_separator = sentence_boundary and _ends_with_sentence_separator(word_texts[word_boundary - 1])
                 if left_anchor or right_anchor or matching_separator:
@@ -3135,6 +3191,12 @@ def _indexed_replacement_word_indices(
         previous_asr_boundary = candidates[0]
         previous_final_boundary = final_boundary
     return result
+
+
+def _anchor_confidence_is_acceptable(confidence: float | None) -> bool:
+    # Providers without word confidences (MAI) report None: unknown, not zero.
+    # Only a known low confidence disqualifies an exact lexical anchor.
+    return confidence is None or confidence >= 0.8
 
 
 def _ends_with_sentence_separator(text: str) -> bool:

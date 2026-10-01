@@ -15,6 +15,11 @@ from .tokenize import alphanumeric_signature
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
 _MAX_UNPACKED_SCENE_BATCHES = 16
+# A deterministic "keep the source" outcome is a policy, not a model opinion.
+# It never inherits the span's ASR confidence: providers without word
+# confidences (every MAI word is None) surface there as 0.0, which is
+# "unknown", not "certainly wrong".
+DETERMINISTIC_KEEP_CONFIDENCE = 1.0
 
 
 class LLMAdapter(Protocol):
@@ -58,7 +63,7 @@ class KeepSRTAdapter:
                 "case_id": span.case_id,
                 "verdict": "keep_srt",
                 "final_text": span.srt_text,
-                "confidence": span.confidence,
+                "confidence": DETERMINISTIC_KEEP_CONFIDENCE,
                 "speaker": span.speaker_ids[0] if span.speaker_ids else None,
                 "character": "unknown",
                 "reason": "LLM disabled; preserved source SRT for human review.",
@@ -505,7 +510,7 @@ def _keep_srt_decision(span: DivergenceSpan, reason: str) -> AdjudicationDecisio
         case_id=span.case_id,
         verdict="keep_srt",
         final_text=span.srt_text,
-        confidence=span.confidence,
+        confidence=DETERMINISTIC_KEEP_CONFIDENCE,
         speaker=span.speaker_ids[0] if span.speaker_ids else None,
         character="unknown",
         reason=reason,

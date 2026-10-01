@@ -1122,7 +1122,7 @@ def test_cli_sync_writes_overlap_detection_fixture_report(tmp_path):
     assert overlap_flags[0]["confidence"] == 0.88
 
 
-def test_cli_sync_holds_source_text_and_timing_below_adjudication_confidence_gate(tmp_path):
+def test_cli_sync_holds_source_text_but_follows_speech_below_adjudication_confidence_gate(tmp_path):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     providers_path = tmp_path / "providers.yaml"
@@ -1200,11 +1200,14 @@ def test_cli_sync_holds_source_text_and_timing_below_adjudication_confidence_gat
     assert result.exit_code == 0, result.output
     synced = parse_srt_text(out_path.read_text(encoding="utf-8"))
     assert synced[1].text == "old line"
+    # The uncertain wording is not applied, but the cue is still displayed
+    # with the speech it owns (1.00-1.80 s) instead of the unsynced source end.
     assert synced[1].start_ms == 1000
-    assert synced[1].end_ms == 2000
+    assert synced[1].end_ms == 1875
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     verify = json.loads((workdir / "episode" / "verify.json").read_text(encoding="utf-8"))
     assert not any(flag["kind"] == "text_changed" for flag in report["flags"])
+    assert not any(flag["kind"].endswith("_source_cue_restored") for flag in report["flags"])
     low_confidence_flag = next(flag for flag in report["flags"] if flag["kind"] == "low_confidence_adjudication")
     assert low_confidence_flag["confidence"] == 0.93
     assert low_confidence_flag["old_text"] == "old"
@@ -1594,7 +1597,11 @@ def test_cli_sync_preserves_source_when_required_audio_budget_is_exhausted(tmp_p
     assert result.exit_code == 0, result.output
     assert calls == []
     held_cue = parse_srt_text(out_path.read_text(encoding="utf-8"))[1]
-    assert (held_cue.plain_text, held_cue.start_ms, held_cue.end_ms) == ("old line", 1000, 2000)
+    # Unavailable case audio holds the source wording only; the cue keeps the
+    # acoustic timing of the words it owns (1.00-1.80 s).
+    assert held_cue.plain_text == "old line"
+    assert held_cue.start_ms == 1000
+    assert 1800 <= held_cue.end_ms < 2000
     artifact = json.loads((workdir / "episode" / "audio_snippets.json").read_text(encoding="utf-8"))
     assert artifact["storage_mode"] == "bounded_batches"
     assert artifact["candidate_count"] == 1
