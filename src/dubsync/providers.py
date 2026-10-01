@@ -235,6 +235,9 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
             raise ProviderError("Install dubsync[cloud] to use ElevenLabs Scribe.") from exc
 
         client = ElevenLabs(api_key=self.api_key)
+        # temperature=0 with a fixed seed is deliberately not sent: a paid
+        # probe on 2026-10-01 (3 runs each of a 70 s and a 169 s German clip)
+        # still returned different words, timings and speaker counts per run.
         convert_kwargs = {
             "model_id": self.model_id,
             "timestamps_granularity": "word",
