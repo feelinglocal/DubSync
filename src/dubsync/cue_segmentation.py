@@ -241,7 +241,6 @@ def _settle_placeless_cues(
     # ``own_interval``: the cue has real word timing (a spoken leftover), so it
     # is only ever joined, with its interval and words. Otherwise its timing
     # is a placeholder that may be padded or dropped.
-    collapsed_cue_ids = cue_ids
     fixed = fixed_cue_ids or set()
     cues_by_id = {cue.index: cue for cue in cues}
     cue_word_indices = {key: list(value) for key, value in alignment.cue_word_indices.items()}
@@ -258,7 +257,7 @@ def _settle_placeless_cues(
 
     def joinable(target: Cue | None, adlib: Cue) -> bool:
         return (
-            target is not None and target.index not in fixed and target.index not in collapsed_cue_ids
+            target is not None and target.index not in fixed and target.index not in cue_ids
             and not cue_has_bracketed_screen_text(target)
             and not any(mark in target.text for mark in "♪♫")
             and not re.match(r"^\s*[-–—]\s", target.text)
@@ -286,13 +285,13 @@ def _settle_placeless_cues(
             start=merged.start_ms / 1000.0, end=merged.end_ms / 1000.0,
         ))
 
-    for cue_id in sorted(collapsed_cue_ids, key=lambda item: (cues_by_id[item].start_ms, item) if item in cues_by_id else (0, item)):
+    for cue_id in sorted(cue_ids, key=lambda item: (cues_by_id[item].start_ms, item) if item in cues_by_id else (0, item)):
         adlib = cues_by_id.get(cue_id)
         if adlib is None:
             continue
         neighbours = sorted(
             (cue for cue in cues_by_id.values()
-             if cue.index != cue_id and cue.index not in collapsed_cue_ids
+             if cue.index != cue_id and cue.index not in cue_ids
              and not is_bracketed_screen_text_cue(cue)),
             key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
         )
