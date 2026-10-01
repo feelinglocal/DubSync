@@ -139,7 +139,8 @@ def test_one_ownership_failure_is_reported_once(tmp_path):
     holds = [flag for flag in flags if flag["kind"] in {
         "adjudication_replacement_ownership_held", "adjudication_word_mapping_held",
     }]
-    assert [(flag["kind"], flag["cue_ids"]) for flag in holds] == [("adjudication_replacement_ownership_held", [2])]
+    assert [(flag["kind"], flag["cue_ids"]) for flag in holds] == [("adjudication_word_mapping_held", [2])]
+    assert "text_changed" not in [flag["kind"] for flag in flags]
     assert not any(str(flag["kind"]).endswith("_source_cue_restored") for flag in flags)
 
 

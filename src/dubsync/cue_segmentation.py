@@ -187,6 +187,61 @@ def settle_collapsed_generated_adlibs(
     a known different actor is never joined. Returns the cue ids that no
     longer exist (merged or removed).
     """
+    return _settle_placeless_cues(
+        cues, words, alignment, profile, cue_ids=collapsed_cue_ids, fixed_cue_ids=fixed_cue_ids,
+        max_join_gap_ms=max_join_gap_ms, min_display_ms=min_display_ms, own_interval=False,
+        join_message=(
+            "A recognized ad-lib had collapsed ASR word timing and no interval of its own; "
+            "it was joined to the adjacent cue it is spoken with."
+        ),
+    )
+
+
+def join_one_letter_residues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    residue_cue_ids: set[int],
+    fixed_cue_ids: set[int] | None = None,
+    max_join_gap_ms: int = 300,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], set[int]]:
+    """Join the one-letter leftover of an approved deletion to its sentence.
+
+    When the actor drops a line but still says its first word ("e"), that
+    word belongs to the cue spoken right before or after it. It is joined
+    there with its word timing instead of flashing as a cue of its own.
+    Returns the joined cue ids; a leftover without such a neighbour stays
+    untouched for the caller to resolve.
+    """
+    return _settle_placeless_cues(
+        cues, words, alignment, profile, cue_ids=residue_cue_ids, fixed_cue_ids=fixed_cue_ids,
+        max_join_gap_ms=max_join_gap_ms, min_display_ms=0, own_interval=True,
+        join_message=(
+            "An approved deletion left one spoken letter of the cue; it was joined to the "
+            "adjacent cue it is spoken with."
+        ),
+    )
+
+
+def _settle_placeless_cues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    cue_ids: set[int],
+    fixed_cue_ids: set[int] | None,
+    max_join_gap_ms: int,
+    min_display_ms: int,
+    own_interval: bool,
+    join_message: str,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], set[int]]:
+    # ``own_interval``: the cue has real word timing (a spoken leftover), so it
+    # is only ever joined, with its interval and words. Otherwise its timing
+    # is a placeholder that may be padded or dropped.
+    collapsed_cue_ids = cue_ids
     fixed = fixed_cue_ids or set()
     cues_by_id = {cue.index: cue for cue in cues}
     cue_word_indices = {key: list(value) for key, value in alignment.cue_word_indices.items()}
@@ -218,16 +273,15 @@ def settle_collapsed_generated_adlibs(
         if len(lines) > profile.max_lines_per_cue:
             lines = [*lines[:profile.max_lines_per_cue - 1], join_word_texts(lines[profile.max_lines_per_cue - 1:])]
         merged = target.with_lines(lines)
+        moved_words = cue_word_indices.pop(adlib.index, [])
+        if own_interval:
+            merged = merged.with_timing(min(target.start_ms, adlib.start_ms), max(target.end_ms, adlib.end_ms))
+            cue_word_indices[target.index] = sorted({*cue_word_indices.get(target.index, []), *moved_words})
         cues_by_id[target.index] = merged
         cues_by_id.pop(adlib.index)
-        cue_word_indices.pop(adlib.index, None)
         gone.add(adlib.index)
         flags.append(QCFlag(
-            kind="text_changed", cue_ids=[target.index],
-            message=(
-                "A recognized ad-lib had collapsed ASR word timing and no interval of its own; "
-                "it was joined to the adjacent cue it is spoken with."
-            ),
+            kind="text_changed", cue_ids=[target.index], message=join_message,
             old_text=target.text, new_text=merged.text,
             start=merged.start_ms / 1000.0, end=merged.end_ms / 1000.0,
         ))
@@ -244,6 +298,12 @@ def settle_collapsed_generated_adlibs(
         )
         previous = next((cue for cue in reversed(neighbours) if cue.start_ms <= adlib.start_ms), None)
         following = next((cue for cue in neighbours if cue.start_ms > adlib.start_ms), None)
+        if own_interval:
+            if joinable(following, adlib) and following.start_ms - adlib.end_ms <= max_join_gap_ms:
+                join(following, adlib, before=True)
+            elif joinable(previous, adlib) and adlib.start_ms - previous.end_ms <= max_join_gap_ms:
+                join(previous, adlib, before=False)
+            continue
         if joinable(following, adlib) and following.start_ms - adlib.start_ms <= max_join_gap_ms:
             join(following, adlib, before=True)
             continue

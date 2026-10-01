@@ -33,6 +33,10 @@ from .cue_segmentation import (
     segment_generated_adlib_cues, settle_collapsed_generated_adlibs,
     split_overlong_existing_cues, split_speaker_turn_cues,
 )
+from .edit_consistency import (
+    held_decisions as decisions_with_held_cases, hold_fragmenting_replacements,
+    settle_edits_with_held_timing, settle_one_letter_residues,
+)
 from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config, usable_forced_alignments_by_cue
 from .gemini_audio_context import validate_audio_context_config
@@ -557,6 +561,26 @@ def sync_episode(
         for cue_id in adlib_cue_ids_by_case.values()
         if cue_id not in source_cue_ids
     }
+    def apply_text(text_decisions: list[AdjudicationDecision]) -> tuple[list[Cue], list[QCFlag]]:
+        return apply_adjudication_decisions(
+            cues,
+            alignment.divergence_spans,
+            text_decisions,
+            profile,
+            adlib_cue_ids_by_case=adlib_cue_ids_by_case,
+            protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
+            words=words,
+            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+            token_matches=alignment.token_matches,
+        )
+
+    # Text and word ownership are applied by two passes that must agree. A
+    # replacement that only one of them can apply is held as a whole.
+    decisions, fragment_hold_flags = hold_fragmenting_replacements(
+        cues, alignment.divergence_spans, decisions, apply_text,
+    )
+    flags.extend(fragment_hold_flags)
+    mapping_held_case_ids: set[str] = set()
     alignment = _alignment_with_decision_words(
         alignment,
         decisions,
@@ -566,21 +590,15 @@ def sync_episode(
         words=words,
         protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        held_case_ids=mapping_held_case_ids,
     )
     flags.extend(flag for flag in alignment.flags if flag.kind == "adjudication_word_mapping_held")
-    timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
-    adjudicated_cues, change_flags = apply_adjudication_decisions(
-        cues,
-        alignment.divergence_spans,
-        decisions,
-        profile,
-        adlib_cue_ids_by_case=adlib_cue_ids_by_case,
-        protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
-        words=words,
-        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
-        token_matches=alignment.token_matches,
+    decisions = decisions_with_held_cases(
+        decisions, alignment.divergence_spans, mapping_held_case_ids,
+        "The replacement has no unique word ownership; source text was kept for review.",
     )
-    flags = _without_duplicate_ownership_holds(flags, change_flags)
+    timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
+    adjudicated_cues, change_flags = apply_text(decisions)
     adjudicated_cues, alignment, segmentation_flags, cue_id_expansions = segment_generated_adlib_cues(
         adjudicated_cues,
         words,
@@ -628,14 +646,31 @@ def sync_episode(
             ),
         )
         flags.extend(sync_line_flags)
-    rebuilt, recue_flags = rebuild_cues(
-        adjudicated_cues,
-        words,
-        alignment,
-        profile,
-        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+    def rebuild(cue_list: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
+        return rebuild_cues(
+            cue_list,
+            words,
+            alignment,
+            profile,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+            protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        )
+
+    rebuilt, recue_flags = rebuild(adjudicated_cues)
+    rebuilt, recue_flags, flags = settle_edits_with_held_timing(
+        adjudicated_cues, rebuilt, recue_flags, flags,
+        source_cues=cues, words=words, alignment=alignment,
+        rebuild=rebuild,
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
-        protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+    )
+    rebuilt, alignment, recue_flags, flags = settle_one_letter_residues(
+        rebuilt, recue_flags, flags,
+        source_cues=cues, words=words, alignment=alignment,
+        spans=alignment.divergence_spans, decisions=decisions, profile=profile,
+        fixed_cue_ids=confidence_held_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids
+        | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
     )
     recue_flags, unconfirmed_source_timed_cue_ids = _fold_unconfirmed_evidence_holds(recue_flags, flags)
     source_timing_held_cue_ids |= unconfirmed_source_timed_cue_ids
@@ -861,29 +896,6 @@ def _fold_unconfirmed_evidence_holds(
             continue
         retained.append(flag)
     return retained, held
-
-
-def _without_duplicate_ownership_holds(flags: list[QCFlag], change_flags: list[QCFlag]) -> list[QCFlag]:
-    """Report one ownership failure once.
-
-    The text planner and the word-ownership planner reject the same replacement
-    for the same reason. The text hold is the actionable finding (the approved
-    wording is not shown); it keeps the cues timing-held on its own.
-    """
-    text_holds = {
-        (flag.start, flag.end, cue_id)
-        for flag in change_flags if flag.kind == "adjudication_replacement_ownership_held"
-        for cue_id in flag.cue_ids
-    }
-    if not text_holds:
-        return flags
-    return [
-        flag for flag in flags
-        if not (
-            flag.kind == "adjudication_word_mapping_held" and flag.cue_ids
-            and all((flag.start, flag.end, cue_id) in text_holds for cue_id in flag.cue_ids)
-        )
-    ]
 
 
 def _generated_cue_ids(generated_adlib_cue_ids: set[int], *expansions: dict[int, list[int]]) -> set[int]:
@@ -3308,8 +3320,11 @@ def _span_overlaps_cue_with_pad(span: DivergenceSpan, cue: Cue, pad_seconds: flo
 
 def _alignment_with_decision_words(
     alignment, decisions, spans, adlib_cue_ids_by_case=None, *, source_cues=None, words=None,
-    protected_cue_ids=None, max_intra_cue_gap=1.5,
+    protected_cue_ids=None, max_intra_cue_gap=1.5, held_case_ids=None,
 ):
+    # ``held_case_ids`` collects every decided case whose word mapping is held,
+    # so the caller holds its text edit too instead of showing new words at
+    # the old source time.
     timed_decisions = {
         decision.case_id: decision
         for decision in decisions
@@ -3328,6 +3343,12 @@ def _alignment_with_decision_words(
     protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     mapping_flags = list(alignment.flags)
+
+    def hold_mapping(flag: QCFlag) -> None:
+        mapping_flags.append(flag)
+        if held_case_ids is not None:
+            held_case_ids.add(span.case_id)
+
     for span in spans:
         decision = timed_decisions.get(span.case_id)
         if decision is None:
@@ -3342,7 +3363,7 @@ def _alignment_with_decision_words(
             decision.verdict == "keep_srt" or not source_cues or words is None
             or set(span.cue_ids) & protected_cue_ids
         ):
-            mapping_flags.append(QCFlag(
+            hold_mapping(QCFlag(
                 kind="adjudication_word_mapping_held", cue_ids=list(span.cue_ids), severity="warning",
                 message="The joint region was not approved with complete word evidence; its source text and timing were preserved.",
                 confidence=decision.confidence, old_text=span.srt_text,
@@ -3379,7 +3400,7 @@ def _alignment_with_decision_words(
                     token_matches=alignment.token_matches,
                 )
             except ReplacementOwnershipError as exc:
-                mapping_flags.append(QCFlag(
+                hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(span.cue_ids),
                     severity="warning", message=str(exc), confidence=decision.confidence,
                     old_text=span.asr_text, new_text=decision.final_text, start=span.start, end=span.end,
@@ -3404,7 +3425,7 @@ def _alignment_with_decision_words(
                 if edits is None and is_joint_region(span):
                     raise ReplacementOwnershipError("The joint source region could not be reconstructed; source evidence was held for review.")
             except ReplacementOwnershipError as exc:
-                mapping_flags.append(QCFlag(
+                hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held",
                     cue_ids=list(span.cue_ids),
                     severity="warning", message=str(exc), confidence=decision.confidence,
@@ -3415,7 +3436,7 @@ def _alignment_with_decision_words(
                 continue
         if edits is not None:
             if protected_replacement_targets(span, edits) & external_target_protection:
-                mapping_flags.append(QCFlag(
+                hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",
                     message=(
                         f"Adjudication {span.case_id} would transfer a word into a protected source cue. "
@@ -3427,12 +3448,12 @@ def _alignment_with_decision_words(
                 continue
             mapped_indices = whole_plan.word_indices_by_cue if whole_plan is not None else _indexed_replacement_word_indices(span, edits, words=words)
             if mapped_indices is None:
-                mapping_flags.append(QCFlag(
+                hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",
                     message=(
                         f"Adjudication {span.case_id} has no unique acoustic word boundary supported "
                         "by retained lexical anchors or sentence separators. Existing evidence ownership "
-                        "was preserved; proposed timing needs review."
+                        "and source text were preserved; the proposed wording needs review."
                     ),
                     confidence=decision.confidence, old_text=span.asr_text,
                     new_text=decision.final_text, start=span.start, end=span.end,
