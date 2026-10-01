@@ -11,6 +11,7 @@ import time
 import wave
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -33,6 +34,13 @@ _MAX_DOUBLED_GAP_SECONDS = 0.15
 _MAX_DOUBLED_RUN_LINK_SECONDS = 1.0
 _MIN_DOUBLED_RUN_PAIRS = 3
 _MAX_FLAG_EXAMPLES = 20
+_MAX_INVALID_WORDS_PER_CHUNK = 1
+# Bounded per-chunk retries: one chunk costs about $0.008, far less than
+# failing a long job after earlier chunks were already paid.
+_MAX_CHUNK_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (2.0, 5.0)
+_MAX_RATE_LIMIT_DELAY_SECONDS = 5.0
+_DIARIZED_TIMEOUTS_BEFORE_FALLBACK = 2
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -43,6 +51,32 @@ class _NoRedirects(HTTPRedirectHandler):
 
 def urlopen(request: Request, *, timeout: float):
     return build_opener(_NoRedirects()).open(request, timeout=timeout)
+
+
+class _AttemptFailure(Exception):
+    """One failed request; the chunk retry policy decides whether to repeat it."""
+
+    def __init__(
+        self, message: str, *, code: str | None = None, retryable: bool = False,
+        timeout: bool = False, retry_after: float = 1.0,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.timeout = timeout
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(value: object) -> float:
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(_MAX_RATE_LIMIT_DELAY_SECONDS, max(0.0, delay)) if math.isfinite(delay) else 1.0
+
+
+def _is_timeout(error: BaseException) -> bool:
+    return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
 
 
 @dataclass(frozen=True)
@@ -92,6 +126,7 @@ class MAITranscribeAdapter:
         self.last_repair_flags: list[QCFlag] = []
         self._dropped_runs: list[list[Word]] = []
         self._collapsed_pairs: list[tuple[Word, Word]] = []
+        self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
 
     @staticmethod
     def _empty_usage() -> dict[str, object]:
@@ -107,12 +142,13 @@ class MAITranscribeAdapter:
         self.last_repair_flags = []
         self._dropped_runs = []
         self._collapsed_pairs = []
+        self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
         if not self.api_key:
             raise ProviderError("OPENROUTER_API_KEY is required for MAI-Transcribe 2.", code="configuration")
         words: list[Word] = []
         for index, chunk in enumerate(self._chunks(audio_path)):
-            payload = self._request(chunk.data)
-            chunk_words = self._words(payload, chunk, index)
+            payload, diarized = self._request_chunk(chunk, index)
+            chunk_words = self._words(payload, chunk, index, diarized=diarized)
             if index:
                 pairs = _overlap_pairs(words, chunk_words, chunk.owner_start)
                 chunk_words = _stitch_speakers(words, chunk_words, pairs)
@@ -186,16 +222,60 @@ class MAITranscribeAdapter:
         except (OSError, wave.Error, EOFError):
             raise ProviderError("MAI-Transcribe 2 could not read normalized WAV audio.") from None
 
-    def _request(self, audio: bytes) -> dict:
+    def _request_chunk(self, chunk: _Chunk, index: int) -> tuple[dict, bool]:
+        """Request one chunk with bounded retries; return the payload and whether it was diarized.
+
+        Timeouts, connection failures, HTTP 408 and 5xx are retried with a
+        short backoff, at most three requests per chunk. A failed attempt may
+        still have been billed, so it is counted as uncertain usage rather than
+        failing a long job. Diarization is the slow path that times out on long
+        chunks: a chunk that keeps timing out is retried once without it.
+        """
         from .providers import ProviderError
 
+        diarize = self.diarize
+        failures = 0
+        diarized_timeouts = 0
+        rate_limit_retried = False
+        while True:
+            try:
+                payload = self._request(chunk.data, diarize=diarize, seconds=chunk.duration)
+            except _AttemptFailure as failure:
+                if failure.code == "rate_limit" and not rate_limit_retried:
+                    rate_limit_retried = True
+                    time.sleep(failure.retry_after)
+                    continue
+                failures += 1
+                if not failure.retryable or failures >= _MAX_CHUNK_ATTEMPTS:
+                    raise ProviderError(str(failure), code=failure.code) from None
+                if failure.timeout and diarize:
+                    diarized_timeouts += 1
+                    if diarized_timeouts >= self._diarization_timeouts_before_fallback:
+                        diarize = False
+                        # Later chunks of this job fall back after one diarized timeout.
+                        self._diarization_timeouts_before_fallback = 1
+                time.sleep(_RETRY_BACKOFF_SECONDS[min(failures, len(_RETRY_BACKOFF_SECONDS)) - 1])
+                continue
+            if self.diarize and not diarize:
+                self.last_repair_flags.append(QCFlag(
+                    kind="asr_diarization_unavailable", severity="info",
+                    message=(
+                        f"MAI-Transcribe 2 chunk {index + 1} kept timing out with diarization, so it was "
+                        "transcribed without speaker labels; speaker turns in this range are unknown."
+                    ),
+                    start=chunk.owner_start, end=chunk.owner_end,
+                ))
+            return payload, diarize
+
+    def _request(self, audio: bytes, *, diarize: bool, seconds: float) -> dict:
+        """Send one request. Failures raise ``_AttemptFailure`` for the retry policy."""
         body = {
             "model": self.model,
             "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "wav"},
             "response_format": "verbose_json",
             "timestamp_granularities": ["segment", "word"],
             "provider": {"options": {"azure": {
-                "diarization": {"enabled": self.diarize},
+                "diarization": {"enabled": diarize},
                 "enhancedMode": {"modelOptions": {"transcribeStyle": "verbatim"}},
             }}},
         }
@@ -207,58 +287,69 @@ class MAITranscribeAdapter:
             _ENDPOINT, data=json.dumps(body).encode("utf-8"), method="POST",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
-        for attempt in range(2):
-            self.last_usage["request_count"] += 1
-            try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
-                    generation_id = response.headers.get("X-Generation-Id")
-                    if generation_id:
-                        self.last_usage["generation_ids"].append(str(generation_id))
-                    raw = response.read(_MAX_RESPONSE_BYTES + 1)
-            except HTTPError as exc:
-                status = exc.code
-                retry_after = exc.headers.get("Retry-After", "1") if exc.headers else "1"
-                exc.close()
-                if status == 429 and attempt == 0:
-                    try:
-                        delay = float(retry_after)
-                    except (TypeError, ValueError):
-                        delay = 1.0
-                    time.sleep(min(5.0, max(0.0, delay)) if math.isfinite(delay) else 1.0)
-                    continue
-                if status == 402:
-                    message = "OpenRouter credits are insufficient for MAI-Transcribe 2. Add credits to the OpenRouter account."
-                    code = "credits"
-                elif status in (401, 403):
-                    message = "OpenRouter rejected MAI-Transcribe 2 authentication. Check OPENROUTER_API_KEY and model access."
-                    code = "authentication"
-                elif status == 429:
-                    message = "OpenRouter rate limited MAI-Transcribe 2. Try again later."
-                    code = "rate_limit"
-                else:
-                    self._record_usage({})
-                    message = f"MAI-Transcribe 2 request failed with HTTP {status}."
-                    code = None
-                raise ProviderError(message, code=code) from None
-            except (URLError, OSError, ValueError):
-                # Do not automatically repeat a request whose billing is unknown.
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.") from None
-            if len(raw) > _MAX_RESPONSE_BYTES:
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned an oversized response.")
-            try:
-                payload = json.loads(raw)
-            except (ValueError, UnicodeError):
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned invalid JSON.") from None
-            if not isinstance(payload, dict):
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned an invalid transcription response.")
-            # Record a paid response even if word validation subsequently rejects it.
-            self._record_usage(payload)
-            return payload
-        raise AssertionError("Unreachable retry state")  # pragma: no cover
+        self.last_usage["request_count"] += 1
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                generation_id = response.headers.get("X-Generation-Id")
+                if generation_id:
+                    self.last_usage["generation_ids"].append(str(generation_id))
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            status = exc.code
+            retry_after = exc.headers.get("Retry-After", "1") if exc.headers else "1"
+            exc.close()
+            if status == 429:
+                raise _AttemptFailure(
+                    "OpenRouter rate limited MAI-Transcribe 2. Try again later.",
+                    code="rate_limit", retry_after=_retry_after_seconds(retry_after),
+                ) from None
+            if status == 402:
+                raise _AttemptFailure(
+                    "OpenRouter credits are insufficient for MAI-Transcribe 2. Add credits to the OpenRouter account.",
+                    code="credits",
+                ) from None
+            if status in (401, 403):
+                raise _AttemptFailure(
+                    "OpenRouter rejected MAI-Transcribe 2 authentication. Check OPENROUTER_API_KEY and model access.",
+                    code="authentication",
+                ) from None
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                f"MAI-Transcribe 2 request failed with HTTP {status}.",
+                retryable=status == 408 or 500 <= status <= 599, timeout=status == 408,
+            ) from None
+        except (URLError, OSError, HTTPException) as exc:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                "MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.",
+                retryable=True, timeout=_is_timeout(exc),
+            ) from None
+        except ValueError:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                "MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.",
+            ) from None
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned an oversized response.")
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned invalid JSON.") from None
+        if not isinstance(payload, dict):
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned an invalid transcription response.")
+        # Record a paid response even if word validation subsequently rejects it.
+        self._record_usage(payload)
+        return payload
+
+    def _record_unknown_billing(self, seconds: float) -> None:
+        # The request may or may not have been charged: the total becomes
+        # unknown and the attempt is kept as an uncertain, estimable charge.
+        self._record_usage({})
+        self.last_usage["uncertain_request_count"] = int(self.last_usage.get("uncertain_request_count", 0)) + 1
+        self.last_usage["uncertain_seconds"] = float(self.last_usage.get("uncertain_seconds", 0.0)) + float(seconds)
 
     def _record_usage(self, payload: dict) -> None:
         usage = payload.get("usage")
@@ -271,9 +362,10 @@ class MAITranscribeAdapter:
                 if self.last_usage[field] is not None:
                     self.last_usage[field] += float(value)
 
-    def _words(self, payload: dict, chunk: _Chunk, index: int) -> list[Word]:
+    def _words(self, payload: dict, chunk: _Chunk, index: int, *, diarized: bool | None = None) -> list[Word]:
         from .providers import ProviderError
 
+        diarized = self.diarize if diarized is None else diarized
         raw_words = payload.get("words")
         if "words" not in payload and _explicit_empty_transcription(payload, chunk.duration):
             # MAI can omit words for a successful no-speech response. Accept
@@ -282,23 +374,24 @@ class MAITranscribeAdapter:
         if not isinstance(raw_words, list) or (not raw_words and str(payload.get("text", "")).strip()):
             raise ProviderError("MAI-Transcribe 2 did not return required word timestamps.")
         words = []
+        invalid: list[object] = []
+        rounding_flags: list[QCFlag] = []
         for item in raw_words:
-            if not isinstance(item, dict):
-                raise ProviderError("MAI-Transcribe 2 returned an invalid word timing record.")
-            text = item.get("word")
-            start, end = item.get("start"), item.get("end")
+            text = item.get("word") if isinstance(item, dict) else None
+            start, end = (item.get("start"), item.get("end")) if isinstance(item, dict) else (None, None)
             if (
                 not isinstance(text, str) or not text.strip()
                 or not _nonnegative_number(start) or not _nonnegative_number(end)
                 or end <= start or start >= chunk.duration
                 or end - chunk.duration > _MAX_END_ROUNDING_SECONDS + 1e-9
             ):
-                raise ProviderError("MAI-Transcribe 2 returned missing or invalid word timing.")
+                invalid.append(item)
+                continue
             if end > chunk.duration:
                 # Live MAI output can round the final endpoint 10 ms past the
                 # supplied WAV. Bound that repair to 20 ms and retain its source
                 # values for review; starts and larger errors remain untouched.
-                self.last_repair_flags.append(QCFlag(
+                rounding_flags.append(QCFlag(
                     kind="asr_timestamp_rounding_clamped", severity="info",
                     message=(
                         f"MAI-Transcribe 2 chunk {index + 1} endpoint rounding for {text!r}: "
@@ -312,9 +405,26 @@ class MAITranscribeAdapter:
             start, end = float(start) + chunk.offset, float(end) + chunk.offset
             speaker = item.get("speaker")
             speaker_id = None
-            if self.diarize and speaker is not None and str(speaker).strip():
+            if diarized and speaker is not None and str(speaker).strip():
                 speaker_id = f"chunk_{index + 1}:{speaker}"
             words.append(Word(text=text, start=start, end=end, confidence=None, speaker_id=speaker_id))
+        # One malformed record should not discard an otherwise valid paid
+        # chunk; anything more is a provider failure and stays fail-closed.
+        if len(invalid) > _MAX_INVALID_WORDS_PER_CHUNK or (invalid and not words):
+            raise ProviderError("MAI-Transcribe 2 returned missing or invalid word timing.")
+        self.last_repair_flags.extend(rounding_flags)
+        for item in invalid:
+            text = item.get("word") if isinstance(item, dict) else None
+            self.last_repair_flags.append(QCFlag(
+                kind="asr_invalid_word_dropped", severity="warning",
+                message=(
+                    f"MAI-Transcribe 2 chunk {index + 1} returned a word record with missing or invalid timing "
+                    f"({text!r} start={item.get('start') if isinstance(item, dict) else None!r} "
+                    f"end={item.get('end') if isinstance(item, dict) else None!r}); it was dropped and the rest "
+                    "of the chunk was kept."
+                )[:500],
+                start=chunk.offset, end=chunk.offset + chunk.duration,
+            ))
         # The provider's own word order is the only evidence of a re-decoded
         # run, so both filters must run before sorting by time.
         words, dropped_runs = _drop_redecoded_runs(words)

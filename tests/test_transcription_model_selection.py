@@ -161,6 +161,42 @@ def test_cached_words_from_an_older_adapter_version_are_not_reused(tmp_path):
     assert VersionedAdapter.cache_version
 
 
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_retried_requests_with_unknown_billing_are_metered_as_uncertain_cost(tmp_path, succeeded):
+    audio = tmp_path / "clip.wav"
+    with wave.open(str(audio), "wb") as out:
+        out.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        out.writeframes(b"\0\0" * 16000)
+
+    class RetriedAdapter:
+        last_usage = {}
+
+        def transcribe(self, path):
+            # One timed-out attempt (billing unknown), then a reported paid response.
+            self.last_usage = {
+                "seconds": None, "cost": None, "reported_seconds": 3.0, "reported_cost": 0.0001,
+                "request_count": 2, "uncertain_request_count": 1, "uncertain_seconds": 3.0, "generation_ids": [],
+            }
+            if not succeeded:
+                raise ProviderError("timed out")
+            return [Word(text="hello", start=0, end=0.5)]
+
+    meter = CostMeter()
+    adapter = CachedASRAdapter(RetriedAdapter(), JsonDiskCache(tmp_path / "cache"), MAI, {}, cost_meter=meter, dollars_per_hour=0.1)
+    if succeeded:
+        adapter.transcribe(audio)
+    else:
+        with pytest.raises(ProviderError):
+            adapter.transcribe(audio)
+
+    assert [item.kind for item in meter.items] == ["audio_billed_partial", "audio_uncertain_estimate"]
+    assert meter.items[0].usd == 0.0001
+    assert meter.items[1].units["seconds"] == 3.0
+    assert meter.items[1].usd == round(3.0 / 3600 * 0.1, 6)
+    assert adapter.last_usage["uncertain_request_count"] == 1
+    assert adapter.last_usage["uncertain_seconds"] == 3.0
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_cache_records_reported_cost_once_including_failed_paid_calls(tmp_path, failure):
     audio = tmp_path / "clip.wav"

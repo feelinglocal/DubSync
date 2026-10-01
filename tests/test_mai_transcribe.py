@@ -342,12 +342,131 @@ def test_paid_usage_survives_invalid_timing(monkeypatch, tmp_path):
 
 
 def test_timeout_does_not_claim_zero_bill(monkeypatch, tmp_path):
-    _transport(monkeypatch, [socket.timeout()])
+    _transport(monkeypatch, [socket.timeout()] * 3)
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
     adapter = MAITranscribeAdapter(api_key="test-key")
     with pytest.raises(ProviderError):
         adapter.transcribe(_audio(tmp_path))
     assert adapter.last_usage["cost"] is None
     assert adapter.last_usage["seconds"] is None
+    assert adapter.last_usage["uncertain_request_count"] == 3
+
+
+@pytest.mark.parametrize("failure", [
+    socket.timeout("timed out"),
+    URLError(socket.timeout("timed out")),
+    URLError(ConnectionResetError("reset")),
+    HTTPError("https://openrouter.ai", 408, "timeout", {}, io.BytesIO(b"")),
+    HTTPError("https://openrouter.ai", 500, "error", {}, io.BytesIO(b"")),
+    HTTPError("https://openrouter.ai", 502, "error", {}, io.BytesIO(b"")),
+    HTTPError("https://openrouter.ai", 503, "error", {}, io.BytesIO(b"")),
+    HTTPError("https://openrouter.ai", 504, "error", {}, io.BytesIO(b"")),
+], ids=["socket-timeout", "url-timeout", "connection-reset", "408", "500", "502", "503", "504"])
+def test_transient_chunk_failure_is_retried_and_its_possible_charge_recorded_as_uncertain(monkeypatch, tmp_path, failure):
+    calls = _transport(monkeypatch, [failure, {
+        "words": [{"word": "hello", "start": 0.2, "end": 0.6, "speaker": 0}], "usage": {"seconds": 3, "cost": 0.0001},
+    }])
+    delays = []
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", delays.append)
+    adapter = MAITranscribeAdapter(api_key="test-key")
+
+    words = adapter.transcribe(_audio(tmp_path))
+
+    assert [word.text for word in words] == ["hello"]
+    assert len(calls) == 2
+    assert len(delays) == 1 and 0 < delays[0] <= 10
+    # The failed attempt may have been billed: the total is unknown, the known part is kept.
+    assert adapter.last_usage["cost"] is None
+    assert adapter.last_usage["reported_cost"] == 0.0001
+    assert adapter.last_usage["uncertain_request_count"] == 1
+    assert adapter.last_usage["uncertain_seconds"] == 3.0
+    assert adapter.last_usage["request_count"] == 2
+
+
+def test_persistent_server_errors_stop_after_bounded_attempts(monkeypatch, tmp_path):
+    failure = HTTPError("https://openrouter.ai", 503, "test-key", {}, io.BytesIO(b"test-key"))
+    calls = _transport(monkeypatch, [failure] * 5)
+    delays = []
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", delays.append)
+    adapter = MAITranscribeAdapter(api_key="test-key")
+
+    with pytest.raises(ProviderError, match="HTTP 503") as caught:
+        adapter.transcribe(_audio(tmp_path))
+
+    assert "test-key" not in str(caught.value)
+    assert len(calls) == 3
+    assert len(delays) == 2
+    assert all(json.loads(request.data)["provider"]["options"]["azure"]["diarization"] == {"enabled": True} for request, _ in calls)
+
+
+def test_chunk_that_keeps_timing_out_with_diarization_is_retried_once_without_it(monkeypatch, tmp_path):
+    calls = _transport(monkeypatch, [
+        HTTPError("https://openrouter.ai", 408, "timeout", {}, io.BytesIO(b"")),
+        socket.timeout(),
+        {"words": [{"word": "hello", "start": 0.2, "end": 0.6}], "usage": {"seconds": 3, "cost": 0.0001}},
+    ])
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
+    adapter = MAITranscribeAdapter(api_key="test-key")
+
+    words = adapter.transcribe(_audio(tmp_path))
+
+    assert [json.loads(request.data)["provider"]["options"]["azure"]["diarization"]["enabled"] for request, _ in calls] == [
+        True, True, False,
+    ]
+    assert [(word.text, word.speaker_id) for word in words] == [("hello", None)]
+    flags = [flag for flag in adapter.last_repair_flags if flag.kind == "asr_diarization_unavailable"]
+    assert len(flags) == 1
+    assert flags[0].severity == "info"
+    assert (flags[0].start, flags[0].end) == (0.0, 3.0)
+    assert adapter.last_usage["uncertain_request_count"] == 2
+
+
+def test_later_chunks_fall_back_after_one_diarized_timeout(monkeypatch, tmp_path):
+    ok = {"words": [], "usage": {"seconds": 5, "cost": 0.0001}}
+    calls = _transport(monkeypatch, [socket.timeout(), socket.timeout(), ok, socket.timeout(), ok])
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
+    adapter = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4)
+
+    adapter.transcribe(_audio(tmp_path, seconds=8))
+
+    assert [json.loads(request.data)["provider"]["options"]["azure"]["diarization"]["enabled"] for request, _ in calls] == [
+        True, True, False, True, False,
+    ]
+
+
+def test_persistent_timeout_without_diarization_fails_after_bounded_attempts(monkeypatch, tmp_path):
+    calls = _transport(monkeypatch, [socket.timeout()] * 5)
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
+    with pytest.raises(ProviderError, match="timeout"):
+        MAITranscribeAdapter(api_key="test-key", diarize=False).transcribe(_audio(tmp_path))
+    assert len(calls) == 3
+
+
+def test_one_invalid_word_record_is_dropped_with_a_flag(monkeypatch, tmp_path):
+    _transport(monkeypatch, [{"words": [
+        {"word": "eins", "start": 0.2, "end": 0.5},
+        {"word": "kaputt", "start": 1.0, "end": 0.9},
+        {"word": "drei", "start": 1.2, "end": 1.5},
+    ]}])
+    adapter = MAITranscribeAdapter(api_key="test-key")
+
+    words = adapter.transcribe(_audio(tmp_path))
+
+    assert [word.text for word in words] == ["eins", "drei"]
+    assert [(flag.kind, flag.severity) for flag in adapter.last_repair_flags] == [("asr_invalid_word_dropped", "warning")]
+    assert "kaputt" in adapter.last_repair_flags[0].message
+
+
+@pytest.mark.parametrize("records", [
+    [{"word": "eins", "start": 0.2, "end": 0.5}, {"word": "zwei", "start": 1.0}, {"word": "drei", "start": 1.2, "end": 1.1}],
+    [{"word": "eins", "start": 0.2, "end": 0.5}, "garbage", {"word": " ", "start": 1.2, "end": 1.5}],
+], ids=["two-invalid-timings", "two-invalid-records"])
+def test_more_than_one_invalid_word_record_in_a_chunk_still_fails_closed(monkeypatch, tmp_path, records):
+    _transport(monkeypatch, [{"words": records}])
+    adapter = MAITranscribeAdapter(api_key="test-key")
+    with pytest.raises(ProviderError, match="invalid word"):
+        adapter.transcribe(_audio(tmp_path))
+    assert adapter.last_repair_flags == []
 
 
 def test_partial_chunk_usage_with_missing_cost_stays_unknown(monkeypatch, tmp_path):
@@ -457,8 +576,9 @@ def test_same_word_at_distinct_times_is_not_merged(monkeypatch, tmp_path):
 def test_paid_chunk_subtotal_survives_later_timeout(monkeypatch, tmp_path):
     _transport(monkeypatch, [
         {"words": [], "usage": {"seconds": 5, "cost": 0.1}},
-        socket.timeout(),
+        socket.timeout(), socket.timeout(), socket.timeout(),
     ])
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
     adapter = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4)
     with pytest.raises(ProviderError):
         adapter.transcribe(_audio(tmp_path, seconds=8))
@@ -468,18 +588,19 @@ def test_paid_chunk_subtotal_survives_later_timeout(monkeypatch, tmp_path):
     assert adapter.last_usage["reported_seconds"] == 5
 
 
-@pytest.mark.parametrize("failure", [
-    URLError("secret upstream detail test-key"),
-    socket.timeout("secret upstream detail test-key"),
-    HTTPError("https://openrouter.ai", 401, "test-key", {}, io.BytesIO(b"test-key")),
+@pytest.mark.parametrize("failure,attempts", [
+    (URLError("secret upstream detail test-key"), 3),
+    (socket.timeout("secret upstream detail test-key"), 3),
+    (HTTPError("https://openrouter.ai", 401, "test-key", {}, io.BytesIO(b"test-key")), 1),
 ])
-def test_errors_do_not_leak_request_credentials_or_upstream_body(monkeypatch, tmp_path, failure):
-    calls = _transport(monkeypatch, [failure])
+def test_errors_do_not_leak_request_credentials_or_upstream_body(monkeypatch, tmp_path, failure, attempts):
+    calls = _transport(monkeypatch, [failure] * 5)
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
     with pytest.raises(ProviderError) as caught:
         MAITranscribeAdapter(api_key="test-key").transcribe(_audio(tmp_path))
     assert "test-key" not in str(caught.value)
     assert caught.value.__suppress_context__
-    assert len(calls) == 1
+    assert len(calls) == attempts
 
 
 def test_rate_limit_retry_is_bounded_and_counted(monkeypatch, tmp_path):
@@ -531,16 +652,17 @@ def test_authentication_failure_has_safe_job_error_code_without_retry(monkeypatc
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("status", [302, 500, 502, 503, 504])
-def test_unexpected_http_response_is_not_replayed_and_billing_is_unknown(monkeypatch, tmp_path, status):
+@pytest.mark.parametrize("status,attempts", [(302, 1), (400, 1), (404, 1), (500, 3), (502, 3), (503, 3), (504, 3)])
+def test_unexpected_http_response_billing_is_unknown_and_only_server_errors_are_retried(monkeypatch, tmp_path, status, attempts):
     failure = HTTPError("https://openrouter.ai", status, "test-key", {}, io.BytesIO(b"test-key"))
-    calls = _transport(monkeypatch, [failure])
+    calls = _transport(monkeypatch, [failure] * 5)
+    monkeypatch.setattr("dubsync.mai_transcribe.time.sleep", lambda _seconds: None)
     adapter = MAITranscribeAdapter(api_key="test-key")
     with pytest.raises(ProviderError, match=f"HTTP {status}") as caught:
         adapter.transcribe(_audio(tmp_path))
     assert caught.value.code is None
     assert adapter.last_usage["cost"] is None
-    assert len(calls) == 1
+    assert len(calls) == attempts
 
 
 @pytest.mark.parametrize("raw, message", [

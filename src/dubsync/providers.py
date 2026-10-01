@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,13 +130,16 @@ class CachedASRAdapter:
             return
         billed_cost = self.last_usage.get("cost")
         seconds = self.last_usage.get("seconds")
+        uncertain_seconds = self.last_usage.get("uncertain_seconds")
+        uncertain_seconds = float(uncertain_seconds) if isinstance(uncertain_seconds, (int, float)) else 0.0
         if isinstance(billed_cost, (int, float)):
             self.cost_meter.add_audio_billed(
                 self.cost_provider,
                 float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
                 float(billed_cost),
             )
-        elif not succeeded and isinstance(self.last_usage.get("reported_cost"), (int, float)):
+        elif (not succeeded or uncertain_seconds > 0) and isinstance(self.last_usage.get("reported_cost"), (int, float)):
+            # Known charges whose total is uncertain (a failed or retried request).
             self.cost_meter.add_audio_billed(
                 self.cost_provider,
                 float(self.last_usage.get("reported_seconds", 0)),
@@ -148,13 +152,20 @@ class CachedASRAdapter:
                 float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
                 self.dollars_per_hour,
             )
+        if uncertain_seconds > 0 and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
+            # A retried request may have been billed twice; meter it as an
+            # explicit estimate rather than failing the job or hiding it.
+            self.cost_meter.add_audio_uncertain(self.cost_provider, uncertain_seconds, self.dollars_per_hour)
 
 
 def _safe_asr_usage(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         return {}
     result: dict[str, object] = {}
-    for name in ("seconds", "cost", "reported_seconds", "reported_cost", "request_count"):
+    for name in (
+        "seconds", "cost", "reported_seconds", "reported_cost", "request_count",
+        "uncertain_request_count", "uncertain_seconds",
+    ):
         number = value.get(name)
         if name in value and number is None:
             result[name] = None
@@ -185,10 +196,12 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
         self.diarize = diarize
         self.keyterms = list(keyterms or [])
         self.language_code = normalize_language_code(language_code)
+        self.last_usage: dict[str, object] = {}
 
     def transcribe(self, audio_path: Path) -> list[Word]:
+        self.last_usage = {"request_count": 0}
         if not self.api_key:
-            raise ProviderError("ELEVENLABS_API_KEY is required for ElevenLabs Scribe.")
+            raise ProviderError("ELEVENLABS_API_KEY is required for ElevenLabs Scribe.", code="configuration")
         try:
             from elevenlabs import ElevenLabs
         except ImportError as exc:
@@ -204,11 +217,7 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
             convert_kwargs["keyterms"] = self.keyterms
         if self.language_code:
             convert_kwargs["language_code"] = self.language_code
-        with audio_path.open("rb") as audio_file:
-            response = client.speech_to_text.convert(
-                file=audio_file,
-                **convert_kwargs,
-            )
+        response = self._convert_with_retries(client, audio_path, convert_kwargs)
         raw_words = _field(response, "words", [])
         normalized = []
         for item in raw_words:
@@ -226,6 +235,80 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
                 )
             )
         return normalized
+
+    def _convert_with_retries(self, client, audio_path: Path, convert_kwargs: dict[str, object]):
+        """Bounded retries for transient Scribe failures, mirroring the MAI policy.
+
+        The SDK does not retry by default and never retries timeouts. The file is
+        reopened for every attempt so a retry uploads the complete audio again.
+        """
+        rate_limit_retried = False
+        failures = 0
+        while True:
+            self.last_usage["request_count"] += 1
+            try:
+                with audio_path.open("rb") as audio_file:
+                    return client.speech_to_text.convert(file=audio_file, **convert_kwargs)
+            except Exception as exc:
+                failure = _scribe_failure(exc)
+                if failure is None:
+                    raise
+            message, code, retryable, billing_unknown, retry_after = failure
+            if billing_unknown:
+                self.last_usage["uncertain_request_count"] = int(self.last_usage.get("uncertain_request_count", 0)) + 1
+                self.last_usage["uncertain_seconds"] = (
+                    float(self.last_usage.get("uncertain_seconds", 0.0)) + audio_seconds(audio_path)
+                )
+            if code == "rate_limit" and not rate_limit_retried:
+                rate_limit_retried = True
+                time.sleep(retry_after)
+                continue
+            failures += 1
+            if not retryable or failures >= _SCRIBE_MAX_ATTEMPTS:
+                raise ProviderError(message, code=code) from None
+            time.sleep(_SCRIBE_RETRY_BACKOFF_SECONDS[min(failures, len(_SCRIBE_RETRY_BACKOFF_SECONDS)) - 1])
+
+
+_SCRIBE_MAX_ATTEMPTS = 3
+_SCRIBE_RETRY_BACKOFF_SECONDS = (2.0, 5.0)
+_SCRIBE_MAX_RATE_LIMIT_DELAY_SECONDS = 5.0
+
+
+def _scribe_failure(error: Exception) -> tuple[str, str | None, bool, bool, float] | None:
+    """Classify a Scribe SDK failure as (message, code, retryable, billing_unknown, retry_after).
+
+    Unknown exception types return None and propagate unchanged. Messages never
+    include the upstream body, which may echo request details.
+    """
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status in (401, 403):
+            return ("ElevenLabs rejected Scribe authentication. Check ELEVENLABS_API_KEY and model access.",
+                    "authentication", False, False, 0.0)
+        if status == 402:
+            return ("ElevenLabs credits are insufficient for Scribe. Add credits to the ElevenLabs account.",
+                    "credits", False, False, 0.0)
+        if status == 429:
+            headers = getattr(error, "headers", None) or {}
+            retry_after = headers.get("retry-after", headers.get("Retry-After", "1")) if isinstance(headers, dict) else "1"
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 1.0
+            delay = min(_SCRIBE_MAX_RATE_LIMIT_DELAY_SECONDS, max(0.0, delay)) if math.isfinite(delay) else 1.0
+            return ("ElevenLabs rate limited Scribe. Try again later.", "rate_limit", False, False, delay)
+        retryable = status == 408 or 500 <= status <= 599
+        return (f"ElevenLabs Scribe request failed with HTTP {status}.", None, retryable, retryable, 0.0)
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx ships with the ElevenLabs SDK
+        httpx = None
+    if httpx is not None and isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        # The request never reached the provider, so nothing can have been billed.
+        return ("ElevenLabs Scribe could not connect.", None, True, False, 0.0)
+    if (httpx is not None and isinstance(error, httpx.TransportError)) or isinstance(error, (TimeoutError, ConnectionError)):
+        return ("ElevenLabs Scribe did not complete the request within the connection timeout.", None, True, True, 0.0)
+    return None
 
 
 class OpenAIWhisperAdapter:  # pragma: no cover - live provider path
