@@ -12,6 +12,11 @@ from .subtitle_annotations import is_bracketed_screen_text_cue, speech_text_for_
 from .tokenize import alphanumeric_signature
 
 
+# A pause inside a cue may be this many ``max_intra_cue_gap`` long before the
+# words beyond it stop timing the cue, provided the cue's text contains them.
+LEXICAL_BRIDGE_GAP_FACTOR = 2.0
+
+
 @dataclass(frozen=True)
 class _CueTiming:
     start_ms: int
@@ -149,7 +154,8 @@ def _cue_timings(
         if not word_indices:
             continue
         matched_words = [words[index] for index in word_indices]
-        selected_words, trimmed = _largest_dense_cluster(
+        selected_words, trimmed = select_cue_word_window(
+            cue,
             matched_words,
             max_word_duration=max_word_duration,
             max_intra_cue_gap=max_intra_cue_gap,
@@ -243,12 +249,22 @@ def _ordered_lexical_support(source: list[str], evidence: list[str]) -> int:
     return previous[-1]
 
 
-def _largest_dense_cluster(
+def select_cue_word_window(
+    cue: Cue,
     words: list[Word],
     *,
     max_word_duration: float,
     max_intra_cue_gap: float,
 ) -> tuple[list[Word], bool]:
+    """Choose the owned words that time a cue; shared by rebuild and refinement.
+
+    Words are grouped at gaps above ``max_intra_cue_gap`` and around impossible
+    word durations. The group with the most usable evidence anchors the cue. A
+    neighbouring group is kept as well when the cue's own text contains its
+    words and the pause is at most ``LEXICAL_BRIDGE_GAP_FACTOR`` gaps long, so
+    a cue with a mid-sentence pause still starts on its first spoken word.
+    Returns the selected words in time order and whether any word was left out.
+    """
     if len(words) <= 1:
         return words, False
     sorted_words = sorted(words, key=lambda word: (word.start, word.end))
@@ -275,14 +291,62 @@ def _largest_dense_cluster(
         clusters.append(current)
     if len(clusters) <= 1:
         return sorted_words, False
-    selected = max(clusters, key=lambda cluster: _cluster_score(cluster, max_word_duration))
+
+    supported = _lexically_supported_words(cue, sorted_words)
+    # Equal evidence must not pick an arbitrary half: the earliest group wins,
+    # because a cue is read from its first words.
+    anchor = max(
+        range(len(clusters)),
+        key=lambda index: (*_cluster_score(clusters[index], supported, max_word_duration), -index),
+    )
+    def belongs(cluster: list[Word], gap: float) -> bool:
+        return gap <= max_intra_cue_gap * LEXICAL_BRIDGE_GAP_FACTOR and all(
+            _word_duration(word) <= max_word_duration and id(word) in supported for word in cluster
+        )
+
+    first = last = anchor
+    while first > 0 and belongs(clusters[first - 1], clusters[first][0].start - clusters[first - 1][-1].end):
+        first -= 1
+    while last + 1 < len(clusters) and belongs(clusters[last + 1], clusters[last + 1][0].start - clusters[last][-1].end):
+        last += 1
+    selected = [word for cluster in clusters[first:last + 1] for word in cluster]
     return selected, len(selected) != len(sorted_words)
 
 
-def _cluster_score(words: list[Word], max_word_duration: float) -> tuple[int, int, float]:
-    normal_count = sum(1 for word in words if _word_duration(word) <= max_word_duration)
-    span = max(word.end for word in words) - min(word.start for word in words)
-    return normal_count, len(words), -span
+def _cluster_score(words: list[Word], supported: set[int], max_word_duration: float) -> tuple[int, int, int]:
+    normal = [word for word in words if _word_duration(word) <= max_word_duration]
+    return sum(1 for word in normal if id(word) in supported), len(normal), len(words)
+
+
+def _lexically_supported_words(cue: Cue, words: list[Word]) -> set[int]:
+    """Identities of the words whose text appears, in order, in the cue's own dialogue."""
+    source = alphanumeric_signature(speech_text_for_alignment(cue))
+    evidence: list[tuple[str, int]] = [
+        (token, id(word)) for word in words for token in alphanumeric_signature(word.text)
+    ]
+    if not source or not evidence:
+        return set()
+    # Longest ordered match with the aligner's spelling tolerance, then walk it
+    # back to learn which timestamped words took part.
+    table = [[0] * (len(evidence) + 1) for _ in range(len(source) + 1)]
+    for row, token in enumerate(source, start=1):
+        for column, (candidate, _) in enumerate(evidence, start=1):
+            matches = token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
+            table[row][column] = max(
+                table[row - 1][column], table[row][column - 1], table[row - 1][column - 1] + int(matches),
+            )
+    supported: set[int] = set()
+    row, column = len(source), len(evidence)
+    while row > 0 and column > 0:
+        if table[row][column] == table[row - 1][column]:
+            row -= 1
+        elif table[row][column] == table[row][column - 1]:
+            column -= 1
+        else:
+            supported.add(evidence[column - 1][1])
+            row -= 1
+            column -= 1
+    return supported
 
 
 def _word_duration(word: Word) -> float:

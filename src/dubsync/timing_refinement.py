@@ -11,13 +11,11 @@ from .asr_timing import (
     repair_asr_word_edges,
 )
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from .recue import select_cue_word_window
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
 from .vad import SpeechActivityAdapter
-
-
-MAX_INTRA_CUE_WORD_GAP_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -29,6 +27,8 @@ class BoundaryRefinementConfig:
     max_leading_silence_ms: int = 150
     max_trailing_silence_ms: int = 300
     max_word_duration_ms: int = 2000
+    # Shared with rebuild (timing.max_intra_cue_gap).
+    max_intra_cue_gap_ms: int = 1500
 
 
 def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
@@ -46,13 +46,6 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
     if not isinstance(enabled, bool):
         raise ValueError("vad.boundary_refinement.enabled must be boolean")
     timing_config = provider_config.get("timing", {})
-    max_word_duration = timing_config.get("max_word_duration", 2.0) if isinstance(timing_config, dict) else 2.0
-    try:
-        max_word_duration = float(max_word_duration)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("timing.max_word_duration must be numeric") from exc
-    if not isfinite(max_word_duration) or max_word_duration <= 0:
-        raise ValueError("timing.max_word_duration must be finite and positive")
     return BoundaryRefinementConfig(
         enabled=enabled,
         start_pad_ms=_boundary_milliseconds(options, "start_pad_ms", 40),
@@ -60,16 +53,28 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
         max_end_extension_ms=_boundary_milliseconds(options, "max_end_extension_ms", 300),
         max_leading_silence_ms=_boundary_milliseconds(options, "max_leading_silence_ms", 150),
         max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
-        max_word_duration_ms=int(max_word_duration * 1000),
+        max_word_duration_ms=int(_timing_seconds(timing_config, "max_word_duration", 2.0) * 1000),
+        max_intra_cue_gap_ms=int(_timing_seconds(timing_config, "max_intra_cue_gap", 1.5) * 1000),
     )
+
+
+def _timing_seconds(timing_config: object, key: str, default: float) -> float:
+    value = timing_config.get(key, default) if isinstance(timing_config, dict) else default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"timing.{key} must be numeric") from exc
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"timing.{key} must be finite and positive")
+    return seconds
 
 
 @dataclass(frozen=True)
 class SpeechEvidence:
     """Speech bursts of one recording and the ASR words repaired against them.
 
-    Detected once after transcription so alignment, rebuild and verification
-    all time cues from the same word edges.
+    Detected once before cues are timed so rebuild and verification use the
+    same word edges.
     """
 
     words: list[Word]
@@ -178,6 +183,7 @@ def refine_cues_to_speech_activity(
             words,
             alignment,
             max_word_duration_seconds=options.max_word_duration_ms / 1000.0,
+            max_intra_cue_gap_seconds=options.max_intra_cue_gap_ms / 1000.0,
         )
         cue_regions = (
             _regions_from_word_window(word_window, region_index, options)
@@ -310,6 +316,7 @@ def _word_window_for_cue(
     alignment: AlignmentResult | None,
     *,
     max_word_duration_seconds: float,
+    max_intra_cue_gap_seconds: float,
 ) -> list[Word] | None:
     if words is None or alignment is None:
         return None
@@ -320,41 +327,15 @@ def _word_window_for_cue(
     ]
     if not matched:
         return None
-    ordered = sorted(matched, key=lambda word: (word.start, word.end))
-    clusters: list[list[Word]] = []
-    current: list[Word] = []
-    previous: Word | None = None
-    for word in ordered:
-        word_is_outlier = word.end - word.start > max_word_duration_seconds
-        starts_new_cluster = previous is not None and (
-            word.start - previous.end > MAX_INTRA_CUE_WORD_GAP_SECONDS
-            or previous.end - previous.start > max_word_duration_seconds
-        )
-        if word_is_outlier and current:
-            clusters.append(current)
-            current = []
-        if starts_new_cluster and current:
-            clusters.append(current)
-            current = []
-        current.append(word)
-        if word_is_outlier:
-            clusters.append(current)
-            current = []
-        previous = word
-    if current:
-        clusters.append(current)
-    return max(
-        clusters,
-        key=lambda cluster: (
-            sum(
-                1
-                for word in cluster
-                if word.end - word.start <= max_word_duration_seconds
-            ),
-            len(cluster),
-            -(cluster[-1].end - cluster[0].start),
-        ),
+    # The same selection as rebuild, with the same configured gap, so the two
+    # stages cannot time one cue from different words.
+    selected, _ = select_cue_word_window(
+        cue,
+        sorted(matched, key=lambda word: (word.start, word.end)),
+        max_word_duration=max_word_duration_seconds,
+        max_intra_cue_gap=max_intra_cue_gap_seconds,
     )
+    return selected
 
 
 def _regions_from_word_window(

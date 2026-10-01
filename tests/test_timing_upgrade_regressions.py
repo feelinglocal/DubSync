@@ -12,8 +12,10 @@ from dubsync import pipeline
 from dubsync.asr_timing import PhraseEdgeSnap, phrase_edge_snap_from_config, repair_asr_word_edges
 from dubsync.cost import CostMeter
 from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from dubsync.recue import rebuild_cues
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
+from dubsync.timing_refinement import boundary_refinement_config_from_config, refine_cues_to_speech_activity
 from dubsync.vad import (
     EnergySpeechActivityAdapter,
     cue_ids_with_audible_words,
@@ -387,3 +389,75 @@ def test_sync_starts_a_cue_at_the_real_onset_of_its_stretched_first_word(tmp_pat
     kinds = [flag["kind"] for flag in result.report["flags"]]
     assert "timing_outlier_trimmed" not in kinds
     assert kinds.count("asr_word_clamped") == 1
+
+
+# --- Task 4: one word-window rule for rebuild and refinement ------------------------------------
+
+
+def _words(*rows: tuple[str, float, float]) -> list[Word]:
+    return [Word(text=text, start=start, end=end) for text, start, end in rows]
+
+
+def test_cue_with_a_mid_sentence_pause_starts_on_its_first_spoken_word():
+    # Episode 11 cue 479: the first "Hum." is 1.72 s before the rest and was
+    # dropped, so the cue appeared 1.9 s after the actor started.
+    cue = Cue(index=479, start_ms=1_376_000, end_ms=1_380_000, lines=["Hum. Hum, Não precisa esperar."])
+    words = _words(
+        ("Hum.", 1376.325, 1376.495), ("Hum,", 1378.215, 1378.415), ("não", 1379.155, 1379.278),
+        ("precisa", 1379.298, 1379.578), ("esperar.", 1379.618, 1379.935),
+    )
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+
+    rebuilt, flags = rebuild_cues([cue], words, AlignmentResult(cue_word_indices={479: [0, 1, 2, 3, 4]}), profile)
+
+    assert rebuilt[0].start_ms == profile.snap_floor(1_376_325)
+    assert rebuilt[0].end_ms == profile.snap_ceil(1_379_935 + 40)
+    assert flags == []
+
+
+def test_far_away_word_does_not_stretch_the_cue_even_when_its_text_is_in_the_cue():
+    cue = Cue(index=403, start_ms=1_184_000, end_ms=1_186_000, lines=["na nossa viagem anual? Ah,"])
+    words = _words(
+        ("na", 1184.538, 1184.618), ("nossa", 1184.638, 1184.818), ("viagem", 1184.898, 1185.218),
+        ("anual?", 1185.258, 1185.735), ("Ah,", 1206.375, 1206.925),
+    )
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+
+    rebuilt, flags = rebuild_cues([cue], words, AlignmentResult(cue_word_indices={403: [0, 1, 2, 3, 4]}), profile)
+
+    assert rebuilt[0].start_ms == profile.snap_floor(1_184_538)
+    assert rebuilt[0].end_ms == profile.snap_ceil(1_185_735 + 40)
+    assert [flag.kind for flag in flags] == ["timing_outlier_trimmed"]
+
+
+@pytest.mark.parametrize(("second_start", "expected_end"), [(4.0, 4.4), (9.0, 1.3)])
+def test_two_part_cue_is_never_timed_to_an_arbitrary_half(second_start, expected_end):
+    # rebuild.md BUG-12: two one-word groups tied and the shorter word won.
+    cue = Cue(index=1, start_ms=1000, end_ms=5000, lines=["Sim. Vamos."])
+    words = _words(("Sim.", 1.0, 1.3), ("Vamos.", second_start, second_start + 0.4))
+    profile = StyleProfile(fps=30, min_cue_dur=0.1, tail_ms=0)
+
+    rebuilt, flags = rebuild_cues([cue], words, AlignmentResult(cue_word_indices={1: [0, 1]}), profile)
+
+    assert rebuilt[0].start_ms == 1000
+    assert rebuilt[0].end_ms == profile.snap_ceil(expected_end * 1000)
+    assert [flag.kind for flag in flags] == ([] if second_start == 4.0 else ["timing_outlier_trimmed"])
+
+
+def test_refinement_uses_the_configured_intra_cue_gap_like_rebuild():
+    # timing.md B6: with timing.max_intra_cue_gap 2.0 rebuild kept "A B",
+    # refinement used a hard-coded 1.5 s and moved the start to "C".
+    cue = Cue(index=1, start_ms=1000, end_ms=4333, lines=["Unrelated script wording here."])
+    words = _words(("A", 1.0, 1.2), ("B", 1.25, 1.5), ("C", 3.2, 3.5), ("D", 3.55, 3.9), ("E", 3.95, 4.3))
+    regions = [SpeechRegion(start=1.0, end=1.5), SpeechRegion(start=3.2, end=4.3)]
+    configured = boundary_refinement_config_from_config(
+        {"vad": {"boundary_refinement": True}, "timing": {"max_intra_cue_gap": 2.0}}
+    )
+
+    refined, _ = refine_cues_to_speech_activity(
+        [cue], regions, StyleProfile(fps=30, min_cue_dur=0.5), configured,
+        words=words, alignment=AlignmentResult(cue_word_indices={1: [0, 1, 2, 3, 4]}),
+    )
+
+    assert configured.max_intra_cue_gap_ms == 2000
+    assert refined[0].start_ms == 1000
