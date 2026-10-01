@@ -116,7 +116,9 @@ def _separate(
     if (kept and (insertion or len(set(span.cue_ids)) != 1)) or (not kept and not decision.final_text.strip()):
         return None
     groups = _acoustic_groups(span, words, max_gap)
-    if groups is None or len(groups) < 2:
+    # Kept text can lose even a single far word; an approved wording is only
+    # divided where its words are seconds apart.
+    if groups is None or (len(groups) < 2 and not kept):
         return None
     spoken = [words[index] for index in span.asr_word_indices]
     boundaries = [group.indices[0] - span.asr_word_indices[0] for group in groups[1:]]
@@ -131,7 +133,7 @@ def _separate(
 def _acoustic_groups(span: DivergenceSpan, words: list[Word], max_gap: float) -> list[_Group] | None:
     indices = span.asr_word_indices
     if (
-        len(indices) < 2 or indices != list(range(indices[0], indices[-1] + 1))
+        not indices or indices != list(range(indices[0], indices[-1] + 1))
         or indices[0] < 0 or indices[-1] >= len(words)
     ):
         return None
@@ -219,7 +221,14 @@ def _separated_replacement(
     if not any(home):
         # Only complete cues: the whole-cue planner selects one exact word
         # window or holds. A partly retained cue has no approved word nearby.
-        return None if whole_cues_only or kept else _held(span, decision)
+        if whole_cues_only:
+            return None
+        if kept:
+            # None of the words is spoken with the kept cue: they time nothing.
+            return _Separation([span.model_copy(update={
+                "asr_word_indices": [], "asr_text": "", "speaker_ids": [], "confidence": 0.0,
+            })], [decision], [])
+        return _held(span, decision)
     first, last = home.index(True), len(home) - 1 - home[::-1].index(True)
     if first == 0 and last == len(groups) - 1:
         return None

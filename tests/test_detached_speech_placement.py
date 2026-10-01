@@ -315,6 +315,25 @@ def test_far_word_running_into_the_next_line_is_not_kept_with_the_earlier_cue():
     assert (detached.left_anchor_cue_id, detached.right_anchor_cue_id, detached.right_anchor_start) == (330, 331, 1009.48)
 
 
+def test_single_far_word_does_not_time_the_kept_cue(tmp_path):
+    # ep17 cue 140: 'Vou voltar primeiro.' is kept; the case's only ASR word is
+    # "Ah!" 5.3 s later. It was assigned to the cue and reported as a trimmed outlier.
+    srt = (
+        "1\n00:00:05,110 --> 00:00:05,870\nVou voltar primeiro.\n\n"
+        "2\n00:00:13,000 --> 00:00:14,000\nAté amanhã então.\n"
+    )
+    words = [
+        ("Vou", 5.255, 5.379), ("voltar.", 5.480, 5.715), ("Ah!", 11.245, 11.435),
+        ("Até", 13.00, 13.20), ("amanhã", 13.22, 13.60), ("então.", 13.62, 13.95),
+    ]
+
+    cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "primeiro", "keep_srt")})
+
+    assert [cue.plain_text for cue in cues] == ["Vou voltar primeiro.", "Até amanhã então."]
+    assert _near(cues[0].start_ms, 5.255) and cues[0].end_ms < 7000
+    assert "timing_outlier_trimmed" not in _kinds(flags)
+
+
 def test_span_without_a_large_gap_is_left_alone():
     near = _span(asr_text="ano novo.", asr_word_indices=[4, 5], end=2.48)
     alignment, decisions, flags = _separate(near, "ano novo.")
