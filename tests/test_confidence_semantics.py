@@ -173,6 +173,19 @@ def test_unknown_word_confidence_is_an_acceptable_lexical_anchor(anchor_confiden
     assert not aligned.flags
 
 
+@pytest.mark.parametrize("word_confidence, shown", [(None, None), (0.4, 0.4)])
+def test_adjudication_prompt_does_not_present_unknown_confidence_as_zero(word_confidence, shown):
+    from dubsync.llm_providers import _adjudication_span_payload
+
+    words = [Word(text="laufen", start=1.64, end=1.90, confidence=word_confidence)]
+    span = DivergenceSpan(
+        case_id="case-1", cue_ids=[1], srt_text="gehen", asr_text="laufen", start=1.64, end=1.90,
+        confidence=0.0 if word_confidence is None else word_confidence, asr_word_indices=[0],
+    )
+
+    assert _adjudication_span_payload(span, episode_words=words)["confidence"] == shown
+
+
 _SPARSE_SRT = "1\n00:00:01,000 --> 00:00:03,000\nWir gehen jetzt nach Hause.\n"
 _SPARSE_WORDS = _mai_words([
     ("Ich", 1.50, 1.62), ("laufe", 1.64, 1.90), ("heute", 1.92, 2.10),

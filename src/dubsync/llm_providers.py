@@ -955,6 +955,15 @@ def _adjudication_span_payload(
 ) -> dict[str, object]:
     payload = span.model_dump()
     if episode_words is not None:
+        # A span confidence of 0.0 without any scored word (every MAI word,
+        # every delete-only span) means "unknown". Do not tell the model that
+        # the ASR was certainly wrong.
+        if not any(
+            episode_words[index].confidence is not None
+            for index in span.asr_word_indices
+            if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(episode_words)
+        ):
+            payload["confidence"] = None
         payload["asr_word_evidence"] = [
             {
                 "word_index": index,

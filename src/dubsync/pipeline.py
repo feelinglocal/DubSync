@@ -1258,7 +1258,7 @@ def _spoken_anchor_coverage(alignment: AlignmentResult, source_cues: list[Cue] |
     matched_cue_ids = {match.cue_id for match in alignment.token_matches}
     unsung_cue_ids = {
         cue.index for cue in source_cues
-        if cue.index not in matched_cue_ids and any(mark in cue.text for mark in "♪♫")
+        if cue.index not in matched_cue_ids and is_song_caption_cue(cue)
     }
     if not unsung_cue_ids:
         return alignment.anchor_coverage
