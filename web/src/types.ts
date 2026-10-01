@@ -70,6 +70,8 @@ export interface PublicConfig {
   sync_style_limits: Pick<Record<GenerationStyleValueKey, GenerationStyleLimit>, 'max_lines_per_cue'>
 }
 
+export type QcVerdict = 'clean' | 'check' | 'attention'
+
 export interface JobResult {
   cue_count: number
   cost_usd: number
@@ -77,11 +79,22 @@ export interface JobResult {
   fps_source?: 'detected' | 'fallback' | 'explicit'
   fps_detection_confident?: boolean
   qc_summary?: {
+    // Raw finding counts (every emitted flag and style issue).
     flags: number
     style_violations: number
     error_count?: number
     warning_count?: number
     info_count?: number
+    // Customer view: the verdict and counts come from review items only.
+    verdict?: QcVerdict
+    review_item_count?: number
+    review_error_count?: number
+    review_warning_count?: number
+    review_cue_count?: number
+    change_count?: number
+    text_change_count?: number
+    timing_change_count?: number
+    note_count?: number
   }
 }
 

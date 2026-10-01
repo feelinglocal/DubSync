@@ -99,6 +99,12 @@ ARCHIVE_COPY_CHUNK_BYTES = 1024 * 1024
 MAX_SINGLE_PARSER_FILES = 3
 MAX_SINGLE_PARSER_FIELDS = 6
 MAX_QC_RESULT_METADATA_BYTES = 16 * 1024 * 1024
+QC_RESULT_COUNT_KEYS = (
+    "flags", "style_violations", "error_count", "warning_count", "info_count",
+    "review_item_count", "review_error_count", "review_warning_count", "review_cue_count",
+    "change_count", "text_change_count", "timing_change_count", "note_count",
+)
+QC_VERDICTS = frozenset({"clean", "check", "attention"})
 FPS_RESULT_SOURCES = frozenset({"detected", "fallback", "explicit"})
 DEFAULT_TRANSCRIPTION_PROVIDER = SCRIBE_TRANSCRIBE_MODEL
 TRANSCRIPTION_PROVIDER_VALUES = frozenset({
@@ -1120,13 +1126,16 @@ def _qc_result_metadata(qc_json: Path | None) -> dict[str, object]:
 
     summary = payload["summary"]
     metadata: dict[str, object] = {}
-    qc_summary = {
+    qc_summary: dict[str, object] = {
         key: value
-        for key in ("flags", "style_violations", "error_count", "warning_count", "info_count")
+        for key in QC_RESULT_COUNT_KEYS
         if isinstance(value := summary.get(key), int)
         and not isinstance(value, bool)
         and 0 <= value <= 9_007_199_254_740_991
     }
+    # The verdict comes from review items only (dubsync.qc_review), not raw flags.
+    if summary.get("verdict") in QC_VERDICTS:
+        qc_summary["verdict"] = summary["verdict"]
     if "flags" in qc_summary and "style_violations" in qc_summary:
         metadata["qc_summary"] = qc_summary
     raw_fps = summary.get("fps")

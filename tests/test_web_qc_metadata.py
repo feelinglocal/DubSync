@@ -57,6 +57,40 @@ def test_legacy_qc_counts_do_not_invent_missing_severities(tmp_path):
     assert _qc_result_metadata(qc_json) == {"qc_summary": {"flags": 2, "style_violations": 0}}
 
 
+def test_qc_metadata_exposes_review_tiers_and_change_counts(tmp_path):
+    qc_json = tmp_path / "qc_report.json"
+    summary = {
+        "flags": 854, "style_violations": 176, "error_count": 117, "warning_count": 911, "info_count": 2,
+        "verdict": "check", "review_item_count": 3, "review_error_count": 0, "review_warning_count": 3,
+        "review_cue_count": 5, "review_cue_ratio": 0.005, "change_count": 280, "text_change_count": 275,
+        "timing_change_count": 5, "note_count": 4, "diagnostic_count": 121,
+    }
+    qc_json.write_text(json.dumps({"summary": summary}), encoding="utf-8")
+
+    qc_summary = _qc_result_metadata(qc_json)["qc_summary"]
+
+    assert qc_summary["verdict"] == "check"
+    assert qc_summary["review_item_count"] == 3
+    assert qc_summary["review_error_count"] == 0
+    assert qc_summary["review_warning_count"] == 3
+    assert qc_summary["review_cue_count"] == 5
+    assert qc_summary["change_count"] == 280
+    assert qc_summary["text_change_count"] == 275
+    assert qc_summary["note_count"] == 4
+    assert qc_summary["error_count"] == 117
+
+
+@pytest.mark.parametrize("verdict", ["green", "", None, 1, True])
+def test_qc_metadata_drops_unknown_verdicts_and_invalid_review_counts(tmp_path, verdict):
+    qc_json = tmp_path / "qc_report.json"
+    qc_json.write_text(json.dumps({"summary": {
+        "flags": 2, "style_violations": 0, "verdict": verdict,
+        "review_item_count": True, "review_error_count": -1, "change_count": "4",
+    }}), encoding="utf-8")
+
+    assert _qc_result_metadata(qc_json) == {"qc_summary": {"flags": 2, "style_violations": 0}}
+
+
 def test_invalid_severity_counts_remain_unavailable(tmp_path):
     qc_json = tmp_path / "qc_report.json"
     qc_json.write_text(json.dumps({"summary": {

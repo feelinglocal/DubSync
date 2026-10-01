@@ -21,6 +21,7 @@
   --color-error: #b42318;
   --color-error-surface: #fff4f2;
   --color-error-border: #d48a82;
+  --color-warning: #7a5a00;
   --color-warning-surface: #fffde3;
   --color-warning-border: #e3d226;
   --color-primary-border: #9ec4ff;
@@ -49,6 +50,7 @@
   --color-error: #ff9b90;
   --color-error-surface: #321d1d;
   --color-error-border: #8f4f49;
+  --color-warning: #f0d264;
   --color-warning-surface: #292710;
   --color-warning-border: #8b7e2c;
   --color-primary-border: #315d91;
@@ -793,6 +795,16 @@ p {
   color: var(--color-error);
 }
 
+.status-icon.is-warning {
+  background: var(--color-warning-surface);
+  color: var(--color-warning);
+}
+
+.status-icon.is-neutral {
+  background: var(--color-surface);
+  color: var(--color-muted);
+}
+
 .status-icon svg {
   width: 21px;
   height: 21px;
@@ -830,6 +842,10 @@ p {
 
 .job-message.is-error {
   color: var(--color-error);
+}
+
+.job-message.is-warning {
+  color: var(--color-warning);
 }
 
 .job-detail {
