@@ -17,6 +17,11 @@ class AudioSnippetError(RuntimeError):
 DEFAULT_MAX_AUDIO_SNIPPET_BYTES = 32 * 1024 * 1024
 SNIPPET_WAV_ALLOWANCE_BYTES = 64 * 1024
 SNIPPET_CAP_SENTINEL_BYTES = 4096
+# A case longer than the ordinary clip still gets one continuous clip that
+# covers it completely, so its timestamps stay valid for the reviewer. Two
+# minutes of 16 kHz mono PCM is under 4 MB; longer cases remain held.
+DEFAULT_MAX_COVERING_SNIPPET_SECONDS = 120.0
+_COVERING_PAD_SECONDS = 0.5
 
 
 def extract_audio_snippets(
@@ -30,6 +35,7 @@ def extract_audio_snippets(
     max_total_bytes: int | None = None,
     fail_on_budget_exceeded: bool = True,
     max_snippets: int | None = None,
+    max_covering_duration_seconds: float | None = DEFAULT_MAX_COVERING_SNIPPET_SECONDS,
 ) -> list[AudioSnippet]:
     try:
         resolved_timeout = resolve_ffmpeg_timeout_seconds(ffmpeg_timeout_seconds)
@@ -44,7 +50,9 @@ def extract_audio_snippets(
             break
         if span.start is None or span.end is None or span.end <= span.start:
             continue
-        start, end = _snippet_window(span.start, span.end, pad_seconds, max_duration_seconds)
+        start, end = _snippet_window(
+            span.start, span.end, pad_seconds, max_duration_seconds, max_covering_duration_seconds,
+        )
         output_path = output_dir / f"{_safe_case_id(span.case_id)}.wav"
         predicted_bytes = math.ceil((end - start) * 32_000) + SNIPPET_WAV_ALLOWANCE_BYTES
         remaining_bytes = resolved_max_bytes - used_bytes
@@ -83,12 +91,21 @@ def _snippet_window(
     span_end: float,
     pad_seconds: float,
     max_duration_seconds: float,
+    max_covering_duration_seconds: float | None = DEFAULT_MAX_COVERING_SNIPPET_SECONDS,
 ) -> tuple[float, float]:
     pad = max(0.0, pad_seconds)
     start = max(0.0, span_start - pad)
     end = span_end + pad
     max_duration = max(0.0, max_duration_seconds)
     if max_duration and end - start > max_duration:
+        span_duration = span_end - span_start
+        covering_limit = max(0.0, max_covering_duration_seconds or 0.0)
+        if max_duration < span_duration <= covering_limit:
+            # A long case (speech far apart, or a deleted line before a long
+            # gap) cannot be judged from a cropped middle. Cover the complete
+            # case with minimal padding instead of holding it without audio.
+            covering_pad = min(pad, _COVERING_PAD_SECONDS, (covering_limit - span_duration) / 2.0)
+            return max(0.0, span_start - covering_pad), span_end + covering_pad
         midpoint = (span_start + span_end) / 2.0
         start = max(0.0, midpoint - (max_duration / 2.0))
         end = start + max_duration

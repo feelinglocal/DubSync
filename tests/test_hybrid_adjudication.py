@@ -230,7 +230,9 @@ def test_primary_without_audio_method_uses_configured_fallback_once(tmp_path):
     assert len(seen) == 1
 
 
-@pytest.mark.parametrize("failure", ["missing", "duplicate", "extra", "invalid", "low_confidence", "provider"])
+# An extra decision for an unrelated id no longer holds a case that has exactly
+# one valid decision of its own; see tests/test_hybrid_review_robustness.py.
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "invalid", "low_confidence", "provider"])
 def test_invalid_or_failed_review_preserves_source_once(tmp_path, failure):
     item = span()
     calls = []
@@ -239,7 +241,6 @@ def test_invalid_or_failed_review_preserves_source_once(tmp_path, failure):
         if failure == "provider":
             raise ProviderError("Synthetic provider error")
         data = {"missing": [], "duplicate": [decision(item), decision(item)],
-                "extra": [decision(item), decision(span("unknown"))],
                 "invalid": [dict(decision(item), confidence=float("nan"))],
                 "low_confidence": [decision(item, confidence=.6)]}[failure]
         return data, [{"usage_metadata": {"prompt_token_count": 2}}]

@@ -158,7 +158,8 @@ def test_resume_verify_rejects_prior_rebuild_policy_before_overwriting(tmp_path,
     assert json.loads(path.read_text(encoding="utf-8"))["policy_version"] > 6
 
 
-def test_resume_verify_rechecks_new_confidence_gate_even_for_keep_srt(tmp_path):
+@pytest.mark.parametrize("verdict, final_text", [("use_audio", "Hello again."), ("keep_srt", "Hello there.")])
+def test_resume_verify_rechecks_new_confidence_gate_for_stored_rewrites(tmp_path, verdict, final_text):
     options, first = _sync_fixture(tmp_path)
     align_path = first.episode_workdir / "align.json"
     alignment = json.loads(align_path.read_text(encoding="utf-8"))
@@ -166,14 +167,21 @@ def test_resume_verify_rechecks_new_confidence_gate_even_for_keep_srt(tmp_path):
                           asr_text="Hello again.", asr_word_indices=[1])
     alignment["divergence_spans"] = [span.model_dump()]
     align_path.write_text(json.dumps(alignment), encoding="utf-8")
-    decision = AdjudicationDecision(case_id="case-1", verdict="keep_srt", final_text="Hello there.",
-                                    confidence=0.8, reason="source judged right")
+    decision = AdjudicationDecision(case_id="case-1", verdict=verdict, final_text=final_text,
+                                    confidence=0.8, reason="judged from audio")
     (first.episode_workdir / "adjudicate.json").write_text(
         json.dumps({"decisions": [decision.model_dump()], "flags": []}), encoding="utf-8")
     providers = yaml.safe_load(options["providers_path"].read_text(encoding="utf-8"))
     providers["llm"] = {"adjudication": {"confidence_gate": 0.9}}
     options["providers_path"].write_text(yaml.safe_dump(providers), encoding="utf-8")
 
+    if verdict == "keep_srt":
+        # A stored keep changes neither wording nor timing under any gate, so
+        # the already rebuilt cues remain valid for verification.
+        before = first.output_srt.read_bytes()
+        resumed = sync_episode(**options, resume="verify")
+        assert resumed.output_srt.read_bytes() == before
+        return
     with pytest.raises(ValueError, match="confidence gate.*resume from rebuild"):
         sync_episode(**options, resume="verify")
 

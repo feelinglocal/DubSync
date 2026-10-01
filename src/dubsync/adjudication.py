@@ -15,6 +15,11 @@ from .tokenize import alphanumeric_signature
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
 _MAX_UNPACKED_SCENE_BATCHES = 16
+# A deterministic "keep the source" outcome is a policy, not a model opinion.
+# It never inherits the span's ASR confidence: providers without word
+# confidences (every MAI word is None) surface there as 0.0, which is
+# "unknown", not "certainly wrong".
+DETERMINISTIC_KEEP_CONFIDENCE = 1.0
 
 
 class LLMAdapter(Protocol):
@@ -58,7 +63,7 @@ class KeepSRTAdapter:
                 "case_id": span.case_id,
                 "verdict": "keep_srt",
                 "final_text": span.srt_text,
-                "confidence": span.confidence,
+                "confidence": DETERMINISTIC_KEEP_CONFIDENCE,
                 "speaker": span.speaker_ids[0] if span.speaker_ids else None,
                 "character": "unknown",
                 "reason": "LLM disabled; preserved source SRT for human review.",
@@ -157,7 +162,12 @@ class AdjudicationEngine:
 
         for span in spans:
             decision = decisions_by_case.get(span.case_id)
+            # A hold created here already carries its own specific finding.
+            # It is not a model opinion, so it is never reported a second
+            # time as a low-confidence answer.
+            held_by_engine = False
             if span.case_id in audio_unavailable_case_ids:
+                held_by_engine = True
                 decision = AdjudicationDecision.model_validate(_unavailable_audio_decision(span))
                 flags.append(QCFlag(
                     kind="adjudication_audio_unavailable", cue_ids=span.cue_ids,
@@ -166,6 +176,7 @@ class AdjudicationEngine:
                     new_text=span.asr_text, start=span.start, end=span.end,
                 ))
             if decision is None:
+                held_by_engine = True
                 provider_failed = span.case_id in provider_failed_case_ids
                 decision = AdjudicationDecision(
                     case_id=span.case_id,
@@ -201,11 +212,12 @@ class AdjudicationEngine:
                     )
                 )
 
-            decision, confidence_flag = confidence_gated_decision(
-                span, decision, self.confidence_gate
-            )
-            if confidence_flag is not None:
-                flags.append(confidence_flag)
+            if not held_by_engine:
+                decision, confidence_flag = confidence_gated_decision(
+                    span, decision, self.confidence_gate
+                )
+                if confidence_flag is not None:
+                    flags.append(confidence_flag)
             decisions.append(decision)
 
         return decisions, flags
@@ -505,7 +517,7 @@ def _keep_srt_decision(span: DivergenceSpan, reason: str) -> AdjudicationDecisio
         case_id=span.case_id,
         verdict="keep_srt",
         final_text=span.srt_text,
-        confidence=span.confidence,
+        confidence=DETERMINISTIC_KEEP_CONFIDENCE,
         speaker=span.speaker_ids[0] if span.speaker_ids else None,
         character="unknown",
         reason=reason,

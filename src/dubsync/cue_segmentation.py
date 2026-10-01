@@ -7,9 +7,11 @@ from math import isfinite
 
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .recue import timing_evidence_issue
+from .speaker_evidence import has_known_different_speakers, speakers_known_different
 from .style_profile import StyleProfile
 from .subtitle_annotations import (
     cue_has_bracketed_screen_text,
+    is_bracketed_screen_text_cue,
     text_without_bracketed_screen_text,
 )
 from .text_metrics import contains_character_level_script, join_word_texts, wrap_visual_width
@@ -47,7 +49,8 @@ def split_speaker_turn_cues(
             output.append(cue)
             continue
         candidate_indices = _ordered_valid_word_indices(words, cue_word_indices.get(cue.index, []))
-        if len({words[index].speaker_id for index in candidate_indices if words[index].speaker_id}) < 2:
+        # Labels of unrelated scopes (two MAI chunks) are no speaker change.
+        if not has_known_different_speakers(words[index].speaker_id for index in candidate_indices):
             output.append(cue)
             continue
         retained, mapping_status = _retained_word_window(cue.plain_text, words, candidate_indices)
@@ -163,10 +166,187 @@ def split_speaker_turn_cues(
     return output, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, expansions
 
 
+def settle_collapsed_generated_adlibs(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    collapsed_cue_ids: set[int],
+    fixed_cue_ids: set[int] | None = None,
+    max_join_gap_ms: int = 300,
+    min_display_ms: int = 200,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], set[int]]:
+    """Give a generated ad-lib without usable word timing a displayable place.
+
+    Its ASR words are placeholders (1 ms, or several words in a few
+    milliseconds), so the cue's envelope cannot be exported: it would flash
+    for one frame or fail the export with a non-positive duration. In order:
+    join the sentence that starts right after it, pad the cue inside the free
+    gap, join the cue it directly follows, and otherwise remove it. Speech of
+    a known different actor is never joined. Returns the cue ids that no
+    longer exist (merged or removed).
+    """
+    return _settle_placeless_cues(
+        cues, words, alignment, profile, cue_ids=collapsed_cue_ids, fixed_cue_ids=fixed_cue_ids,
+        max_join_gap_ms=max_join_gap_ms, min_display_ms=min_display_ms, own_interval=False,
+        join_message=(
+            "A recognized ad-lib had collapsed ASR word timing and no interval of its own; "
+            "it was joined to the adjacent cue it is spoken with."
+        ),
+    )
+
+
+def join_one_letter_residues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    residue_cue_ids: set[int],
+    fixed_cue_ids: set[int] | None = None,
+    max_join_gap_ms: int = 300,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], set[int]]:
+    """Join the one-letter leftover of an approved deletion to its sentence.
+
+    When the actor drops a line but still says its first word ("e"), that
+    word belongs to the cue spoken right before or after it. It is joined
+    there with its word timing instead of flashing as a cue of its own.
+    Returns the joined cue ids; a leftover without such a neighbour stays
+    untouched for the caller to resolve.
+    """
+    return _settle_placeless_cues(
+        cues, words, alignment, profile, cue_ids=residue_cue_ids, fixed_cue_ids=fixed_cue_ids,
+        max_join_gap_ms=max_join_gap_ms, min_display_ms=0, own_interval=True,
+        join_message=(
+            "An approved deletion left one spoken letter of the cue; it was joined to the "
+            "adjacent cue it is spoken with."
+        ),
+    )
+
+
+def _settle_placeless_cues(
+    cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    profile: StyleProfile,
+    *,
+    cue_ids: set[int],
+    fixed_cue_ids: set[int] | None,
+    max_join_gap_ms: int,
+    min_display_ms: int,
+    own_interval: bool,
+    join_message: str,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], set[int]]:
+    # ``own_interval``: the cue has real word timing (a spoken leftover), so it
+    # is only ever joined, with its interval and words. Otherwise its timing
+    # is a placeholder that may be padded or dropped.
+    fixed = fixed_cue_ids or set()
+    cues_by_id = {cue.index: cue for cue in cues}
+    cue_word_indices = {key: list(value) for key, value in alignment.cue_word_indices.items()}
+    flags: list[QCFlag] = []
+    gone: set[int] = set()
+
+    def speaker_of(adlib: Cue) -> str | None:
+        # The words carry the diarized actor; the decision's label is a guess.
+        speakers = [
+            words[index].speaker_id for index in cue_word_indices.get(adlib.index, [])
+            if 0 <= index < len(words) and words[index].speaker_id
+        ]
+        return Counter(speakers).most_common(1)[0][0] if speakers else adlib.speaker_id
+
+    def joinable(target: Cue | None, adlib: Cue) -> bool:
+        return (
+            target is not None and target.index not in fixed and target.index not in cue_ids
+            and not cue_has_bracketed_screen_text(target)
+            and not any(mark in target.text for mark in "♪♫")
+            and not re.match(r"^\s*[-–—]\s", target.text)
+            and not _has_inline_subtitle_markup(target.text)
+            and not speakers_known_different(speaker_of(adlib), target.speaker_id)
+        )
+
+    def join(target: Cue, adlib: Cue, *, before: bool) -> None:
+        parts = [adlib.plain_text, target.plain_text] if before else [target.plain_text, adlib.plain_text]
+        text = join_word_texts(parts)
+        lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
+        if len(lines) > profile.max_lines_per_cue:
+            lines = [*lines[:profile.max_lines_per_cue - 1], join_word_texts(lines[profile.max_lines_per_cue - 1:])]
+        merged = target.with_lines(lines)
+        moved_words = cue_word_indices.pop(adlib.index, [])
+        if own_interval:
+            merged = merged.with_timing(min(target.start_ms, adlib.start_ms), max(target.end_ms, adlib.end_ms))
+            cue_word_indices[target.index] = sorted({*cue_word_indices.get(target.index, []), *moved_words})
+        cues_by_id[target.index] = merged
+        cues_by_id.pop(adlib.index)
+        gone.add(adlib.index)
+        flags.append(QCFlag(
+            kind="text_changed", cue_ids=[target.index], message=join_message,
+            old_text=target.text, new_text=merged.text,
+            start=merged.start_ms / 1000.0, end=merged.end_ms / 1000.0,
+        ))
+
+    for cue_id in sorted(cue_ids, key=lambda item: (cues_by_id[item].start_ms, item) if item in cues_by_id else (0, item)):
+        adlib = cues_by_id.get(cue_id)
+        if adlib is None:
+            continue
+        neighbours = sorted(
+            (cue for cue in cues_by_id.values()
+             if cue.index != cue_id and cue.index not in cue_ids
+             and not is_bracketed_screen_text_cue(cue)),
+            key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
+        )
+        previous = next((cue for cue in reversed(neighbours) if cue.start_ms <= adlib.start_ms), None)
+        following = next((cue for cue in neighbours if cue.start_ms > adlib.start_ms), None)
+        if own_interval:
+            if joinable(following, adlib) and following.start_ms - adlib.end_ms <= max_join_gap_ms:
+                join(following, adlib, before=True)
+            elif joinable(previous, adlib) and adlib.start_ms - previous.end_ms <= max_join_gap_ms:
+                join(previous, adlib, before=False)
+            continue
+        if joinable(following, adlib) and following.start_ms - adlib.start_ms <= max_join_gap_ms:
+            join(following, adlib, before=True)
+            continue
+        start_ms = profile.snap_floor(adlib.start_ms)
+        if previous is not None:
+            start_ms = max(start_ms, previous.end_ms)
+        end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+        if following is not None:
+            end_ms = min(end_ms, following.start_ms)
+        if end_ms - start_ms >= min(min_display_ms, round(profile.min_cue_dur * 1000)):
+            cues_by_id[cue_id] = adlib.with_timing(start_ms, end_ms)
+            flags.append(QCFlag(
+                kind="adlib_timing_estimated", cue_ids=[cue_id], severity="warning",
+                message=(
+                    "A recognized ad-lib had collapsed ASR word timing; it is shown from its "
+                    "word onset for the minimum display time inside the free gap."
+                ),
+                new_text=adlib.text, start=start_ms / 1000.0, end=end_ms / 1000.0,
+            ))
+            continue
+        if joinable(previous, adlib) and adlib.start_ms - previous.end_ms <= max_join_gap_ms:
+            join(previous, adlib, before=False)
+            continue
+        cues_by_id.pop(cue_id)
+        cue_word_indices.pop(cue_id, None)
+        gone.add(cue_id)
+        flags.append(QCFlag(
+            kind="adlib_removed_collapsed_timing", cue_ids=[cue_id], severity="warning",
+            message=(
+                "A recognized ad-lib had collapsed ASR word timing and neither a free interval nor "
+                "an adjacent cue of the same speaker; it was removed instead of exporting a one-frame cue."
+            ),
+            old_text=adlib.text, new_text="",
+            start=adlib.start_ms / 1000.0, end=adlib.end_ms / 1000.0,
+        ))
+
+    settled = [cues_by_id[cue.index] for cue in cues if cue.index in cues_by_id]
+    return settled, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, gone
+
+
 def _speaker_word_runs(words: list[Word], word_indices: list[int]) -> list[list[int]]:
     groups: list[list[int]] = []
     for index in word_indices:
-        if not groups or words[groups[-1][-1]].speaker_id != words[index].speaker_id:
+        if not groups or speakers_known_different(words[groups[-1][-1]].speaker_id, words[index].speaker_id):
             groups.append([])
         groups[-1].append(index)
     return groups
@@ -265,7 +445,7 @@ def _word_index_units(words: list[Word], ordered: list[int], *, max_gap_seconds:
                 (words[index].speaker_id for index in reversed(units[-1]) if words[index].speaker_id),
                 None,
             )
-            same_speaker = not (previous_speaker and word.speaker_id and previous_speaker != word.speaker_id)
+            same_speaker = not speakers_known_different(previous_speaker, word.speaker_id)
             close_in_time = word.start - previous.end <= max_gap_seconds
             if same_speaker and close_in_time and (
                 pending_openers or _only_punctuation(word.text, _SENTENCE_CLOSERS + ".?!…。、,;:")
@@ -653,7 +833,7 @@ def _starts_new_source_line_cue(
         (words[index].speaker_id for index in next_words if words[index].speaker_id),
         None,
     )
-    if previous_speaker and next_speaker and previous_speaker != next_speaker:
+    if speakers_known_different(previous_speaker, next_speaker):
         return True
     if _ends_sentence(_text_without_subtitle_markup(current_lines[-1])):
         return True
@@ -880,7 +1060,7 @@ def _starts_new_cue(
         None,
     )
     next_speaker = next((words[index].speaker_id for index in unit if words[index].speaker_id), None)
-    if previous_speaker and next_speaker and previous_speaker != next_speaker:
+    if speakers_known_different(previous_speaker, next_speaker):
         return True
     last_word = max((words[index] for index in unit), key=lambda item: item.end)
     if _snapped_duration_ms(words[current[0]], last_word, profile) > max_cue_duration_seconds * 1000:
