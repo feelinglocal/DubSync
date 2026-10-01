@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .forced_alignment import usable_forced_alignments_by_cue
 from .models import AlignmentResult, Cue, CueScore, ForcedAlignmentCue, QCFlag, StyleIssue, Word
+from .speaker_evidence import speakers_known_different
 from .style_profile import StyleProfile
 from .subtitle_annotations import cue_has_spoken_text, speech_text_for_alignment
 from .text_metrics import display_width
@@ -154,4 +155,5 @@ def _cue_cps(cue: Cue) -> float:
 
 
 def _same_or_unknown_speaker(previous: Cue, cue: Cue) -> bool:
-    return previous.speaker_id is None or cue.speaker_id is None or previous.speaker_id == cue.speaker_id
+    # Labels of unrelated scopes (two MAI chunks) do not prove two actors.
+    return not speakers_known_different(previous.speaker_id, cue.speaker_id)

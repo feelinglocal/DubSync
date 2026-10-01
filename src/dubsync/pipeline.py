@@ -17,13 +17,13 @@ from .adjudication_regions import (
     validated_protected_source_regions,
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
-from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
+from .aligner import MISSING_AUDIO_GUARD_VERSION, _words_touch, align_cues_to_words
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
 from .changes import (
-    ReplacementOwnershipError, apply_adjudication_decisions, indexed_multi_cue_replacements,
-    whole_cue_replacement_plan,
+    ReplacementOwnershipError, anchor_confidence_is_acceptable, apply_adjudication_decisions,
+    indexed_multi_cue_replacements, lexical_edit_costs, whole_cue_replacement_plan,
     protected_replacement_targets, single_token_prefix_replacement_targets,
 )
 from .config import load_style_profile, load_yaml
@@ -32,6 +32,7 @@ from .cue_segmentation import (
     segment_generated_adlib_cues, settle_collapsed_generated_adlibs,
     split_overlong_existing_cues, split_speaker_turn_cues,
 )
+from .detached_speech import separate_detached_speech
 from .edit_consistency import (
     held_decisions as decisions_with_held_cases, hold_fragmenting_replacements,
     settle_edits_with_held_timing, settle_one_letter_residues,
@@ -60,6 +61,7 @@ from .providers import (
     CachedASRAdapter,
     adapter_from_config,
     apply_asr_language,
+    asr_language_code,
     apply_local_asr_config,
     apply_transcription_provider_config,
     repair_word_stream,
@@ -80,7 +82,7 @@ from .timing_refinement import (
     BoundaryRefinementConfig, SpeechEvidence, boundary_refinement_config_from_config,
     min_duration_policy_from_config, refine_cues_to_speech_activity, speech_evidence_for_words,
 )
-from .tokenize import alphanumeric_signature
+from .tokenize import alphanumeric_signature, normalize_token
 from .vad import (
     cue_ids_with_audible_words,
     dropped_line_flags_for_unmatched_cues,
@@ -134,7 +136,7 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
-_REBUILD_POLICY_VERSION = 9
+_REBUILD_POLICY_VERSION = 10
 _ADJUDICATION_POLICY_VERSION = 3
 _PUNCTUATION_POLICY_VERSION = 1
 
@@ -265,23 +267,29 @@ def sync_episode(
                 write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
             raise
         asr_repair_flags = list(adapter.last_repair_flags)
+        asr_metadata: dict[str, object] = {
+            "provider": asr_provider,
+            "model": model_name,
+            "usage": adapter.last_usage,
+            "cache_hit": adapter.last_cache_hit,
+            "audio_provenance": {
+                "source_sha256": source_audio_sha256 or adapter.last_cache_key.audio_sha256,
+                "asr_input_sha256": adapter.last_cache_key.audio_sha256,
+                "normalized": audio_for_asr != audio_path,
+            },
+            "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
+        }
+        # Evidence that is not part of a word (Scribe logprob and audio events,
+        # MAI chunk languages and speaker links) stays with the transcript.
+        provider_evidence = getattr(adapter, "last_evidence", None)
+        if provider_evidence is not None:
+            asr_metadata["provider_evidence"] = provider_evidence
         _write_json(
             episode_workdir / "asr.json",
             {
                 "words": [word.model_dump() for word in words],
                 "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
-                "metadata": {
-                    "provider": asr_provider,
-                    "model": model_name,
-                    "usage": adapter.last_usage,
-                    "cache_hit": adapter.last_cache_hit,
-                    "audio_provenance": {
-                        "source_sha256": source_audio_sha256 or adapter.last_cache_key.audio_sha256,
-                        "asr_input_sha256": adapter.last_cache_key.audio_sha256,
-                        "normalized": audio_for_asr != audio_path,
-                    },
-                    "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
-                },
+                "metadata": asr_metadata,
             },
         )
     long_audio_llm_flag = None if no_llm else _long_audio_llm_skip_flag(audio_for_asr, provider_config)
@@ -349,7 +357,12 @@ def sync_episode(
         alignment = _load_alignment_artifact(episode_workdir / "align.json")
         _validate_alignment_screen_text_provenance(alignment, cues)
     else:
-        alignment = align_cues_to_words(cues, words)
+        episode_language = _episode_language_code(provider_config, language)
+        # A known language decides which article-like words are numbers.
+        alignment = (
+            align_cues_to_words(cues, words, language=episode_language) if episode_language
+            else align_cues_to_words(cues, words)
+        )
         alignment = _alignment_with_adjudication_context(alignment, cues)
         alignment = _alignment_with_song_caption_guard(alignment, cues, words)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
@@ -541,6 +554,27 @@ def sync_episode(
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     source_timing_held_cue_ids = _source_timing_held_cue_ids(flags)
 
+    alignment, decisions = _absorb_redecoded_insertions(alignment, decisions, words)
+
+    # ASR word edges are repaired against the audio once, before any cue is
+    # timed; rebuild and verification share the same repaired words.
+    speech_evidence = speech_evidence_for_words(
+        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+        asr_artifact_path=episode_workdir / "asr.json",
+    )
+    timing_words = speech_evidence.words
+
+    # One case can hold words that are seconds apart. Only the group spoken at
+    # a cue's own time may edit that cue; the others are placed on their own.
+    alignment, decisions, detached_speech_flags = separate_detached_speech(
+        cues, alignment, decisions, words,
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+        speech_regions=speech_evidence.regions if speech_evidence.detected else None,
+    )
+    flags.extend(detached_speech_flags)
+
     adlib_cue_ids_by_case, adlib_reconciliation_flags = _adlib_cue_ids_by_case(
         cues,
         alignment.divergence_spans,
@@ -646,14 +680,6 @@ def sync_episode(
             ),
         )
         flags.extend(sync_line_flags)
-    # ASR word edges are repaired against the audio once, before any cue is
-    # timed; rebuild and verification share the same repaired words.
-    speech_evidence = speech_evidence_for_words(
-        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
-        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
-        asr_artifact_path=episode_workdir / "asr.json",
-    )
-    timing_words = speech_evidence.words
     def rebuild(cue_list: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
         return rebuild_cues(
             cue_list,
@@ -805,6 +831,19 @@ def sync_episode(
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     write_json_atomic(path, payload)
+
+
+def _episode_language_code(provider_config: dict[str, object], language: str | None) -> str | None:
+    """ISO-639-1 code of the episode language, when the job or the ASR config names one."""
+    asr_config = provider_config.get("asr", {}) if isinstance(provider_config, dict) else {}
+    configured: object = None
+    if isinstance(asr_config, dict):
+        codes = asr_config.get("language_codes")
+        configured = (
+            asr_config.get("language") or asr_config.get("language_code")
+            or (codes[0] if isinstance(codes, list) and len(codes) == 1 else None)
+        )
+    return asr_language_code(language) or asr_language_code(configured if isinstance(configured, str) else None)
 
 
 def _is_punctuation_only_span(span: DivergenceSpan) -> bool:
@@ -2067,6 +2106,7 @@ def _run_verify_stage(
         rebuilt, source_cues, protected_source_cue_ids, reason="protected_region",
     )
     flags.extend(protected_source_restore_flags)
+    rebuilt, flags = _remove_leftover_duplicate_cues(rebuilt, source_cues, effective_words, alignment, flags)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
@@ -2174,6 +2214,96 @@ def _run_verify_stage(
 def _known_audio_duration_ms(audio_path: Path) -> int | None:
     duration = audio_seconds(audio_path)
     return int(round(duration * 1000)) if isfinite(duration) and duration > 0 else None
+
+
+_LEFTOVER_DUPLICATE_MAX_TOKENS = 4
+# Findings about a cue alone that are moot once the cue is gone.
+_LEFTOVER_CUE_FLAG_KINDS = frozenset({
+    "missing_audio_timing_held", "missing_audio_source_cue_held", "missing_audio_source_cue_restored",
+    "unmatched_cue", "dropped_line_candidate", "divergence_unresolved", "low_confidence_adjudication",
+    "cue_without_speech_activity", "overlap_stacked", "overlap_flag_only",
+})
+
+
+def _remove_leftover_duplicate_cues(
+    cues: list[Cue],
+    source_cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    flags: list[QCFlag],
+) -> tuple[list[Cue], list[QCFlag]]:
+    """Remove an unspoken source cue that repeats words of the cue shown at its time.
+
+    The script says "Claro," and then "É claro que a empresa ..."; the actor
+    says the phrase once. The first cue has no audio and stayed at its source
+    time inside the second, which shows the same word: a doubled line and an
+    overlap. A short source cue without any owned word whose complete wording
+    is spoken inside an overlapping, acoustically timed cue is a duplicate.
+    """
+    source_by_id = {cue.index: cue for cue in source_cues}
+
+    def spoken_signature(cue: Cue) -> list[str]:
+        owned = sorted(
+            (words[index] for index in alignment.cue_word_indices.get(cue.index, []) if 0 <= index < len(words)),
+            key=lambda word: (word.start, word.end),
+        )
+        return alphanumeric_signature(" ".join(word.text for word in owned))
+
+    def contains(whole: list[str], part: list[str]) -> bool:
+        # The aligner's spelling tolerance: "Vamos" is spoken as "vamo".
+        return any(
+            all(
+                token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
+                for token, candidate in zip(part, whole[start:start + len(part)])
+            )
+            for start in range(len(whole) - len(part) + 1)
+        )
+
+    removed: dict[int, Cue] = {}
+    merge_flags: list[QCFlag] = []
+    for cue in cues:
+        source = source_by_id.get(cue.index)
+        signature = alphanumeric_signature(speech_text_for_alignment(cue))
+        if (
+            source is None or alignment.cue_word_indices.get(cue.index)
+            or (cue.start_ms, cue.end_ms, cue.text) != (source.start_ms, source.end_ms, source.text)
+            or not 1 <= len(signature) <= _LEFTOVER_DUPLICATE_MAX_TOKENS
+            or cue_has_bracketed_screen_text(cue) or is_song_caption_cue(cue)
+        ):
+            continue
+        for other in cues:
+            overlap_ms = min(cue.end_ms, other.end_ms) - max(cue.start_ms, other.start_ms)
+            if (
+                other.index == cue.index or other.index in removed
+                or overlap_ms * 2 < cue.duration_ms
+                or cue_has_bracketed_screen_text(other) or is_song_caption_cue(other)
+                or speakers_known_different(cue.speaker_id, other.speaker_id)
+                or not contains(alphanumeric_signature(speech_text_for_alignment(other)), signature)
+                or not contains(spoken_signature(other), signature)
+            ):
+                continue
+            removed[cue.index] = cue
+            merge_flags.append(QCFlag(
+                kind="duplicate_cue_merged", cue_ids=[other.index, cue.index],
+                message=(
+                    "A source cue without audio repeats words spoken in the cue shown at the same time; "
+                    "the unspoken duplicate was removed."
+                ),
+                old_text=f"{other.text}\n\n{cue.text}", new_text=other.text,
+                start=other.start_ms / 1000.0, end=other.end_ms / 1000.0,
+            ))
+            break
+    if not removed:
+        return cues, flags
+    kept_flags: list[QCFlag] = []
+    for flag in flags:
+        if flag.kind in _LEFTOVER_CUE_FLAG_KINDS and removed.keys() & set(flag.cue_ids):
+            remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in removed]
+            if not remaining or flag.kind in {"overlap_stacked", "overlap_flag_only"}:
+                continue
+            flag = flag.model_copy(update={"cue_ids": remaining})
+        kept_flags.append(flag)
+    return [cue for cue in cues if cue.index not in removed], [*kept_flags, *merge_flags]
 
 
 def _remove_silent_generated_adlibs(
@@ -3034,6 +3164,82 @@ def _adlib_cue_ids_by_case(
     return cue_ids, flags
 
 
+def _absorb_redecoded_insertions(
+    alignment: AlignmentResult, decisions: list[AdjudicationDecision], words: list[Word],
+) -> tuple[AlignmentResult, list[AdjudicationDecision]]:
+    """Never insert words that only repeat the adjacent owned words at the same time.
+
+    A provider can decode one utterance twice ('manda umas flores. Manda umas
+    flores', "Você..." / "Você..." with overlapping timestamps). The aligner
+    gives a single touching copy back to the cue of its exactly matched twin;
+    a copied phrase, or a copy left as its own case, reached the adjudicator
+    and came back as approved new dialogue. Such a copy is an ASR artefact,
+    not speech: nothing is inserted or reported, and its words time the cue
+    that owns the twin, because both copies are that cue's utterance.
+    """
+    owners: dict[int, set[int]] = {}
+    for cue_id, indices in alignment.cue_word_indices.items():
+        for index in indices:
+            owners.setdefault(index, set()).add(cue_id)
+    protected = set(alignment.diagnostics.missing_audio_cue_ids)
+    by_case = {decision.case_id: decision for decision in decisions}
+    cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
+    dropped: dict[str, AdjudicationDecision] = {}
+    absorbed = False
+    for span in alignment.divergence_spans:
+        indices = span.asr_word_indices
+        if (
+            span.cue_ids or span.srt_token_indices or not indices
+            or indices != list(range(indices[0], indices[-1] + 1))
+            or indices[0] < 0 or indices[-1] >= len(words)
+        ):
+            continue
+        keys = [normalize_token(words[index].text) for index in indices]
+        decision = by_case.get(span.case_id)
+        approved = decision is not None and decision.verdict != "keep_srt" and bool(decision.final_text.strip())
+        if not all(keys) or (
+            approved and alphanumeric_signature(decision.final_text) != alphanumeric_signature(span.asr_text)
+        ):
+            continue
+        length = len(indices)
+        # The case and the owned words around it are two touching copies of
+        # one phrase; alignment may have matched any part of either copy.
+        for first in range(indices[0] - length, indices[0] + 1):
+            if first < 0 or first + 2 * length > len(words):
+                continue
+            twin = [index for index in range(first, first + 2 * length) if not indices[0] <= index <= indices[-1]]
+            twin_owners = [owners.get(index, set()) for index in twin]
+            if (
+                any(len(owner) != 1 for owner in twin_owners)
+                or len(set().union(*twin_owners)) != 1
+                or any(
+                    normalize_token(words[index].text) != normalize_token(words[index + length].text)
+                    for index in range(first, first + length)
+                )
+                or not _words_touch(words[first + length - 1], words[first + length])
+            ):
+                continue
+            (owner,) = twin_owners[0]
+            if owner not in protected:
+                cue_word_indices[owner] = sorted({*cue_word_indices.get(owner, []), *indices})
+                absorbed = True
+            if approved:
+                dropped[span.case_id] = decision.model_copy(update={
+                    "verdict": "keep_srt", "final_text": span.srt_text,
+                    "reason": (
+                        "The words repeat the adjacent words at the same time (the provider decoded one "
+                        f"utterance twice); nothing was inserted. Proposed {decision.verdict}: {decision.final_text!r}."
+                    ),
+                })
+            break
+    if not absorbed and not dropped:
+        return alignment, decisions
+    return (
+        alignment.model_copy(update={"cue_word_indices": cue_word_indices}),
+        [dropped.get(decision.case_id, decision) for decision in decisions],
+    )
+
+
 def _reconciled_cue_ids(flags: list[QCFlag]) -> set[int]:
     return {cue_id for flag in flags if flag.kind == "adlib_reconciled" for cue_id in flag.cue_ids}
 
@@ -3185,6 +3391,10 @@ def _is_repetitive_generated_text(text: str) -> bool:
     return len(set(trigrams)) < len(trigrams)
 
 
+# Word times are decimal seconds: 234.84 - 234.64 must count as a 0.2 s gap.
+_GAP_EPSILON_SECONDS = 1e-6
+
+
 def _anchored_adlib_cue_id(
     cues_by_id: dict[int, Cue],
     span: DivergenceSpan,
@@ -3258,7 +3468,7 @@ def _anchored_adlib_cue_id(
         )
     ):
         gap = span.right_anchor_start - span.end
-        if -0.05 <= gap <= max_gap_seconds:
+        if -0.05 <= gap <= max_gap_seconds + _GAP_EPSILON_SECONDS:
             return right_id
         if (
             0 <= gap <= max_continuation_gap_seconds
@@ -3291,7 +3501,7 @@ def _anchored_adlib_cue_id(
             )
         )
         if (
-            -0.05 <= gap <= max_gap_seconds
+            -0.05 <= gap <= max_gap_seconds + _GAP_EPSILON_SECONDS
             and (
                 not left_has_terminal_punctuation
                 or narrow_confirmed_continuation
@@ -3420,6 +3630,9 @@ def _alignment_with_decision_words(
         word_indices_by_cue = _span_word_indices_by_cue(span, replacement_target=replacement_target)
         edits = None
         whole_plan = None
+        # Filled when the text pieces were placed from word timing: the same
+        # phrases then time the cues that show them.
+        placed_word_indices: dict[int, list[int]] = {}
         if source_cues and decision.verdict in {"use_audio", "hybrid"}:
             try:
                 whole_plan = whole_cue_replacement_plan(
@@ -3448,6 +3661,7 @@ def _alignment_with_decision_words(
             try:
                 edits = indexed_multi_cue_replacements(
                     source_cues, span, decision.final_text, replacement_target=replacement_target, words=words,
+                    ownership=placed_word_indices,
                 )
                 if edits is None and is_joint_region(span):
                     raise ReplacementOwnershipError("The joint source region could not be reconstructed; source evidence was held for review.")
@@ -3473,7 +3687,10 @@ def _alignment_with_decision_words(
                     new_text=decision.final_text, start=span.start, end=span.end,
                 ))
                 continue
-            mapped_indices = whole_plan.word_indices_by_cue if whole_plan is not None else _indexed_replacement_word_indices(span, edits, words=words)
+            mapped_indices = (
+                whole_plan.word_indices_by_cue if whole_plan is not None
+                else placed_word_indices or _indexed_replacement_word_indices(span, edits, words=words)
+            )
             if mapped_indices is None:
                 hold_mapping(QCFlag(
                     kind="adjudication_word_mapping_held", cue_ids=list(edits), severity="warning",
@@ -3556,8 +3773,8 @@ def _indexed_replacement_word_indices(
         return None
 
     exact_text = final_tokens == asr_tokens
-    forward = [] if exact_text else _lexical_edit_costs(final_tokens, asr_tokens)
-    backward = [] if exact_text else _lexical_edit_costs(final_tokens[::-1], asr_tokens[::-1])
+    forward = [] if exact_text else lexical_edit_costs(final_tokens, asr_tokens)
+    backward = [] if exact_text else lexical_edit_costs(final_tokens[::-1], asr_tokens[::-1])
     total_cost = 0 if exact_text else forward[-1][-1]
     result: dict[int, list[int]] = {}
     previous_word_boundary = 0
@@ -3583,11 +3800,11 @@ def _indexed_replacement_word_indices(
                     continue
                 left_anchor = (
                     final_tokens[final_boundary - 1] == asr_tokens[asr_boundary - 1]
-                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary - 1])
+                    and anchor_confidence_is_acceptable(token_confidences[asr_boundary - 1])
                 )
                 right_anchor = (
                     final_tokens[final_boundary] == asr_tokens[asr_boundary]
-                    and _anchor_confidence_is_acceptable(token_confidences[asr_boundary])
+                    and anchor_confidence_is_acceptable(token_confidences[asr_boundary])
                 )
                 matching_separator = sentence_boundary and _ends_with_sentence_separator(word_texts[word_boundary - 1])
                 if left_anchor or right_anchor or matching_separator:
@@ -3627,29 +3844,8 @@ def _indexed_replacement_word_indices(
     return result
 
 
-def _anchor_confidence_is_acceptable(confidence: float | None) -> bool:
-    # Providers without word confidences (MAI) report None: unknown, not zero.
-    # Only a known low confidence disqualifies an exact lexical anchor.
-    return confidence is None or confidence >= 0.8
-
-
 def _ends_with_sentence_separator(text: str) -> bool:
     return re.search(r"[.!?\u2026][\"'\u2019\u201d\u00bb\)\]]*\s*$", text) is not None
-
-
-def _lexical_edit_costs(left: list[str], right: list[str]) -> list[list[int]]:
-    rows = [list(range(len(right) + 1))]
-    for left_position, left_token in enumerate(left, start=1):
-        previous = rows[-1]
-        row = [left_position]
-        for right_position, right_token in enumerate(right, start=1):
-            row.append(min(
-                previous[right_position - 1] + (left_token != right_token),
-                previous[right_position] + 1,
-                row[-1] + 1,
-            ))
-        rows.append(row)
-    return rows
 
 
 def _span_word_indices_by_cue(

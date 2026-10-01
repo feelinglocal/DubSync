@@ -70,11 +70,12 @@ def test_approved_wording_is_timed_from_the_words_the_adjudicator_heard(tmp_path
     assert not [flag for flag in flags if flag["severity"] == "error"]
 
 
-def test_wording_without_a_place_of_its_own_is_held_with_its_timing(tmp_path):
+def test_word_spoken_far_from_the_cue_gets_a_place_of_its_own(tmp_path):
     # ep11 cue 761: 'no Ano-Novo.' became 'no Ano-Novo. Alô?' at source timing,
     # although "Alô?" is spoken 14 s later by another actor. The scripted word
     # here differs from the spoken one, because the aligner now matches the
-    # closed and open spellings of a compound without opening a case.
+    # closed and open spellings of a compound without opening a case. The part
+    # spoken with the cue edits it; "Alô?" is placed where it is spoken.
     srt = (
         "1\n00:00:01,000 --> 00:00:01,600\nRealizem seus desejos\n\n"
         "2\n00:00:01,640 --> 00:00:02,670\nno Natal.\n\n"
@@ -89,12 +90,13 @@ def test_wording_without_a_place_of_its_own_is_held_with_its_timing(tmp_path):
 
     cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "Ano-Novo. Alô?", "use_audio")})
 
-    held = cues[1]
-    assert (held.plain_text, held.start_ms, held.end_ms) == ("no Natal.", 1640, 2670)
+    edited, interjection = cues[1], cues[2]
+    assert edited.plain_text == "no Ano-Novo."
+    assert abs(edited.start_ms - 1680) <= 34 and abs(edited.end_ms - 2520) <= 34
+    assert interjection.plain_text == "Alô?" and abs(interjection.start_ms - 15900) <= 34
     kinds = _kinds(flags)
-    assert "text_changed" not in kinds and "timing_evidence_held" not in kinds
-    holds = [flag for flag in flags if flag["kind"] == "adjudication_replacement_ownership_held"]
-    assert [(flag["cue_ids"], flag["severity"]) for flag in holds] == [([2], "warning")]
+    assert kinds.count("text_changed") == 1 and kinds.count("adlib_inserted") == 1
+    assert "timing_evidence_held" not in kinds and "adjudication_replacement_ownership_held" not in kinds
     assert not any(kind.endswith("_source_cue_restored") for kind in kinds)
 
 

@@ -117,6 +117,8 @@ def test_punctuation_only_span_is_not_an_unresolved_divergence_without_llm(tmp_p
 def test_one_ownership_failure_is_reported_once(tmp_path):
     # MAI ep11 cue 114 (case-32): the approved replacement spans three speech
     # groups. The text hold and the word-mapping hold describe the same failure.
+    # (A wording that names each group is divided between them instead, see
+    # test_detached_speech_placement; this one cannot be divided.)
     srt = (
         "1\n00:00:01,000 --> 00:00:02,000\nAntes disso tudo.\n\n"
         "2\n00:00:09,960 --> 00:00:10,880\nLuan Nian!\n\n"
@@ -128,7 +130,7 @@ def test_one_ownership_failure_is_reported_once(tmp_path):
         ("Depois", 18.00, 18.25), ("disso", 18.27, 18.55), ("tudo.", 18.57, 18.95),
     ]]
     responses = {"case-1": {
-        "case_id": "case-1", "verdict": "hybrid", "final_text": "Hã? Luan Nian! Ei,",
+        "case_id": "case-1", "verdict": "hybrid", "final_text": "Olha aqui, Luan Nian, vem!",
         "confidence": 0.95, "reason": "audible reaction, name and interjection",
     }}
 

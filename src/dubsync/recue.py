@@ -9,7 +9,7 @@ from rapidfuzz import fuzz
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue, speech_text_for_alignment
-from .tokenize import alphanumeric_signature
+from .tokenize import alphanumeric_signature, number_alias, spoken_number_values
 
 
 # A pause inside a cue may be this many ``max_intra_cue_gap`` long before the
@@ -273,17 +273,56 @@ def timing_evidence_issue(cue: Cue, words: list[Word]) -> str | None:
     return None
 
 
+# The aligner pairs the same speech written another way; such words are owned
+# evidence. Limits mirror its compound and spoken-number groups.
+_COMPOUND_MAX_PARTS = 3
+_COMPOUND_MIN_CHARACTERS = 4
+_NUMBER_GROUP_MAX_WORDS = 6
+
+
 def _ordered_lexical_support(source: list[str], evidence: list[str]) -> int:
-    # Use each timestamped token once. Normalization handles numeric/accent
-    # aliases; the aligner's 85% spelling tolerance retains minor name variants.
-    previous = [0] * (len(evidence) + 1)
-    for token in source:
-        current = [0]
-        for index, candidate in enumerate(evidence, start=1):
-            matches = token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
-            current.append(max(previous[index], current[-1], previous[index - 1] + int(matches)))
-        previous = current
-    return previous[-1]
+    """How many source tokens the timestamped tokens support, in order.
+
+    Each timestamped token is used once. Normalization handles numeric and
+    accent aliases; the aligner's 85% spelling tolerance retains minor name
+    variants. A compound written open on one side and closed on the other
+    ("Drachen Evolutionssystem" / "Drachen-Evolutionssystem") and a number
+    written in digits on one side and spoken in words on the other
+    ("vinte e seis" / "26") support every source token of the group.
+    """
+    def same_word(token: str, candidate: str) -> bool:
+        return (
+            token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
+            or (candidate.isdigit() and number_alias(token) == candidate)
+            or (token.isdigit() and number_alias(candidate) == token)
+        )
+
+    def same_group(tokens: list[str], candidates: list[str]) -> bool:
+        if len(tokens) + len(candidates) <= 2:
+            return False
+        for digits, spoken in ((tokens, candidates), (candidates, tokens)):
+            if len(digits) == 1 and digits[0].isdigit() and int(digits[0]) in spoken_number_values(spoken):
+                return True
+        spelled = "".join(tokens)
+        return (
+            max(len(tokens), len(candidates)) <= _COMPOUND_MAX_PARTS
+            and len(spelled) >= _COMPOUND_MIN_CHARACTERS and not spelled.isdigit()
+            and spelled == "".join(candidates)
+        )
+
+    support = [[0] * (len(evidence) + 1) for _ in range(len(source) + 1)]
+    for row in range(1, len(source) + 1):
+        for column in range(1, len(evidence) + 1):
+            best = max(
+                support[row - 1][column], support[row][column - 1],
+                support[row - 1][column - 1] + int(same_word(source[row - 1], evidence[column - 1])),
+            )
+            for token_count in range(1, min(row, _NUMBER_GROUP_MAX_WORDS) + 1):
+                for word_count in range(1, min(column, _NUMBER_GROUP_MAX_WORDS) + 1):
+                    if same_group(source[row - token_count:row], evidence[column - word_count:column]):
+                        best = max(best, support[row - token_count][column - word_count] + token_count)
+            support[row][column] = best
+    return support[-1][-1]
 
 
 def select_cue_word_window(

@@ -239,15 +239,44 @@ _add_german_numbers()
 _add_other_numbers()
 
 
-def number_value(key: str) -> int | None:
+# The languages in which an alias really is a number word. With a known episode
+# language the others are ordinary words: German "um" (at) is not Portuguese
+# "um" (one), Portuguese "dos" (of the) is not Spanish "dos" (two).
+_NUMBER_ALIAS_LANGUAGES: dict[str, frozenset[str]] = {
+    "um": frozenset({"pt"}), "uma": frozenset({"pt"}),
+    "un": frozenset({"fr", "es", "it", "ca"}), "une": frozenset({"fr"}),
+    "uno": frozenset({"es", "it"}), "una": frozenset({"es", "it", "ca"}),
+    "dos": frozenset({"es", "ca"}), "doce": frozenset({"es"}), "once": frozenset({"es"}),
+    "neuf": frozenset({"fr"}), "seize": frozenset({"fr"}), "cent": frozenset({"fr", "ca"}),
+}
+_GERMAN = frozenset({"de"})
+
+
+def number_alias(key: str, language: str | None = None) -> str | None:
+    """The digits an article-like number word stands for in the episode language.
+
+    ``language`` is an ISO-639-1 code, optionally with a region (``pt-BR``).
+    Without one every alias of every supported language applies.
+    """
+    alias = NUMBER_ALIASES.get(key)
+    if alias is None or not language:
+        return alias
+    primary = language.strip().lower().replace("_", "-").split("-", 1)[0]
+    if not primary or primary == "auto":
+        return alias
+    # Every alias without an entry is a German article or ordinal.
+    return alias if primary in _NUMBER_ALIAS_LANGUAGES.get(key, _GERMAN) else None
+
+
+def number_value(key: str, language: str | None = None) -> int | None:
     """The cardinal a comparison key spells, including article-like aliases."""
     if key.isdigit():
         return int(key)
-    alias = NUMBER_ALIASES.get(key)
+    alias = number_alias(key, language)
     return int(alias) if alias is not None else None
 
 
-def spoken_number_values(keys: list[str]) -> frozenset[int]:
+def spoken_number_values(keys: list[str], language: str | None = None) -> frozenset[int]:
     """Values a sequence of spoken number keys can denote (``20 e 6`` -> 26).
 
     Additive readings must name strictly smaller parts after each multiplier
@@ -262,7 +291,7 @@ def spoken_number_values(keys: list[str]) -> frozenset[int]:
                 return frozenset()
             connectors += 1
             continue
-        value = number_value(key)
+        value = number_value(key, language)
         if value is None:
             return frozenset()
         values.append(value)

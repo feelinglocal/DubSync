@@ -119,6 +119,42 @@ def test_repetition_after_a_pause_stays_reviewable():
     assert len(span.asr_word_indices) == 1
 
 
+@pytest.mark.parametrize(
+    ("language", "source", "spoken"),
+    [
+        # German "um" (at) is Portuguese "um" (one); Portuguese "dos" (of the) is Spanish "dos" (two).
+        ("de", "Er kommt um acht.", ["Er", "kommt", "1", "acht."]),
+        ("pt", "O carro dos pais.", ["O", "carro", "2", "pais."]),
+        ("en", "We met once there.", ["We", "met", "11", "there."]),
+    ],
+)
+def test_number_word_of_another_language_is_an_ordinary_word(language, source, spoken):
+    cue = Cue(index=1, start_ms=1_000, end_ms=6_000, lines=[source])
+
+    assert align_cues_to_words([cue], _words(spoken)).divergence_spans == []  # language unknown: every alias
+    span, = align_cues_to_words([cue], _words(spoken), language=language).divergence_spans
+    assert span.asr_text == spoken[2]
+
+
+@pytest.mark.parametrize(
+    ("language", "source", "spoken"),
+    [
+        ("pt", "Um, dois, três, vamos!", ["1,", "2,", "3,", "vamos!"]),
+        ("pt", "O voo um nove zero saiu.", ["O", "voo", "190", "saiu."]),
+        ("es", "Son las once en punto.", ["Son", "las", "11", "en", "punto."]),
+        ("de", "Ich habe eine Frage.", ["Ich", "habe", "1", "Frage."]),
+        ("pt-BR", "Tenho um carro.", ["Tenho", "1", "carro."]),
+    ],
+)
+def test_number_words_of_the_episode_language_still_match_digits(language, source, spoken):
+    result = align_cues_to_words(
+        [Cue(index=1, start_ms=1_000, end_ms=6_000, lines=[source])], _words(spoken), language=language,
+    )
+
+    assert result.divergence_spans == []
+    assert result.cue_word_indices == {1: list(range(len(spoken)))}
+
+
 def test_article_inflections_share_a_key_that_is_not_a_number():
     keys = {normalize_token(article) for article in ("ein", "eine", "einen", "einem", "einer", "eines")}
 
