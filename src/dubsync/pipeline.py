@@ -19,7 +19,7 @@ from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
 from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
-from .audio_snippets import extract_audio_snippets
+from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
 from .changes import (
     ReplacementOwnershipError, apply_adjudication_decisions, indexed_multi_cue_replacements,
@@ -1575,16 +1575,34 @@ def _adjudication_audio_snippet_source(
         max_audio_duration_seconds=max_audio_duration_seconds,
         extractor=extract_audio_snippets,
         max_concurrent_batches=llm_config_for_pass(provider_config, "adjudication").get("max_concurrent_batches", 1),
+        max_covering_duration_seconds=_adjudication_covering_snippet_seconds(provider_config),
     )
 
 
-def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> tuple[bool, float, float, int, float]:
+def _adjudication_covering_snippet_seconds(provider_config: dict[str, object]) -> float:
+    value = llm_config_for_pass(provider_config, "adjudication").get("audio_snippet_double_check", False)
+    label = "llm.adjudication.audio_snippet_double_check.max_long_span_duration_seconds"
+    seconds = (
+        _float_config(value, "max_long_span_duration_seconds", DEFAULT_MAX_COVERING_SNIPPET_SECONDS, label)
+        if isinstance(value, dict) else DEFAULT_MAX_COVERING_SNIPPET_SECONDS
+    )
+    if not isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{label} must be finite and positive")
+    return seconds
+
+
+def _adjudication_audio_snippet_options(
+    provider_config: dict[str, object],
+) -> tuple[bool, float, float, int, float | None]:
+    # Clips are cut for one batch at a time, so the episode length does not
+    # bound the work. The former 90-minute default disabled every case of a
+    # feature-length job; a limit now applies only when explicitly configured.
     llm_config = llm_config_for_pass(provider_config, "adjudication")
     value = llm_config.get("audio_snippet_double_check", False)
     if value in (False, None):
-        return (False, 2.0, 20.0, 25, 90 * 60.0)
+        return (False, 2.0, 20.0, 25, None)
     if value is True:
-        return (True, 2.0, 20.0, 25, 90 * 60.0)
+        return (True, 2.0, 20.0, 25, None)
     if not isinstance(value, dict):
         raise ValueError("llm.adjudication.audio_snippet_double_check must be a mapping or boolean")
     enabled = value.get("enabled", False)
@@ -1608,11 +1626,15 @@ def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> t
         25,
         "llm.adjudication.audio_snippet_double_check.max_snippets_per_batch",
     )
-    max_audio_duration_seconds = _float_config(
-        value,
-        "max_audio_duration_seconds",
-        90 * 60.0,
-        "llm.adjudication.audio_snippet_double_check.max_audio_duration_seconds",
+    max_audio_duration_seconds = (
+        _float_config(
+            value,
+            "max_audio_duration_seconds",
+            0.0,
+            "llm.adjudication.audio_snippet_double_check.max_audio_duration_seconds",
+        )
+        if value.get("max_audio_duration_seconds") is not None
+        else None
     )
     if pad_seconds < 0:
         raise ValueError("llm.adjudication.audio_snippet_double_check.pad_seconds must be non-negative")
@@ -1620,7 +1642,7 @@ def _adjudication_audio_snippet_options(provider_config: dict[str, object]) -> t
         raise ValueError("llm.adjudication.audio_snippet_double_check.max_duration_seconds must be positive")
     if max_snippets_per_batch <= 0:
         raise ValueError("llm.adjudication.audio_snippet_double_check.max_snippets_per_batch must be positive")
-    if max_audio_duration_seconds <= 0:
+    if max_audio_duration_seconds is not None and max_audio_duration_seconds <= 0:
         raise ValueError("llm.adjudication.audio_snippet_double_check.max_audio_duration_seconds must be positive")
     return (
         enabled,

@@ -241,7 +241,8 @@ def test_audio_snippet_defaults_cover_supported_long_jobs_and_full_adjudication_
 
     assert enabled is True
     assert max_snippets == 25
-    assert max_audio_duration >= 90 * 60.0
+    # No episode-length cap: the web accepts 4 h audio and every length is covered.
+    assert max_audio_duration is None
 
 
 def test_punctuation_scene_gap_uses_llm_pass_override():

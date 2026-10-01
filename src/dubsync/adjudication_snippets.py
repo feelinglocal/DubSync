@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Condition, RLock
 
 from .audio_snippets import (
+    DEFAULT_MAX_COVERING_SNIPPET_SECONDS,
     SNIPPET_WAV_ALLOWANCE_BYTES,
     AudioSnippetError,
     _max_snippet_bytes,
@@ -18,7 +19,7 @@ from .cost import audio_seconds
 from .models import AudioSnippet, DivergenceSpan, QCFlag
 
 
-SNIPPET_BATCH_STRATEGY_VERSION = "bounded_batches_v2"
+SNIPPET_BATCH_STRATEGY_VERSION = "bounded_batches_v3"
 AudioSnippetExtractor = Callable[..., list[AudioSnippet]]
 
 
@@ -33,9 +34,10 @@ class BoundedAudioSnippetBatchSource:
         pad_seconds: float,
         max_duration_seconds: float,
         max_snippets_per_batch: int,
-        max_audio_duration_seconds: float,
+        max_audio_duration_seconds: float | None,
         extractor: AudioSnippetExtractor = extract_audio_snippets,
         max_concurrent_batches: int = 1,
+        max_covering_duration_seconds: float = DEFAULT_MAX_COVERING_SNIPPET_SECONDS,
     ) -> None:
         if (
             isinstance(max_concurrent_batches, bool)
@@ -48,7 +50,10 @@ class BoundedAudioSnippetBatchSource:
         self.pad_seconds = pad_seconds
         self.max_duration_seconds = max_duration_seconds
         self.max_snippets_per_batch = max_snippets_per_batch
+        # None means no episode-length limit: clips are cut per batch, so the
+        # work is bounded by the batch and not by the length of the episode.
         self.max_audio_duration_seconds = max_audio_duration_seconds
+        self.max_covering_duration_seconds = max_covering_duration_seconds
         self.extractor = extractor
         self.max_concurrent_batches = max_concurrent_batches
         self.max_total_bytes = _max_snippet_bytes(None)
@@ -80,7 +85,8 @@ class BoundedAudioSnippetBatchSource:
                 (span.case_id for span in batch),
             )
         if (
-            self.audio_duration_seconds > 0
+            self.max_audio_duration_seconds is not None
+            and self.audio_duration_seconds > 0
             and self.audio_duration_seconds > self.max_audio_duration_seconds
         ):
             self._record_fallback(batch)
@@ -101,6 +107,7 @@ class BoundedAudioSnippetBatchSource:
                     fail_on_budget_exceeded=False,
                     max_snippets=self.max_snippets_per_batch,
                     max_total_bytes=reservation,
+                    max_covering_duration_seconds=self.max_covering_duration_seconds,
                 )
                 records, batch_bytes = _snippet_records(snippets, batch_dir)
                 if batch_bytes > reservation:
@@ -134,6 +141,7 @@ class BoundedAudioSnippetBatchSource:
                 continue
             start, end = _snippet_window(
                 span.start, span.end, self.pad_seconds, self.max_duration_seconds,
+                self.max_covering_duration_seconds,
             )
             predicted += math.ceil((end - start) * 32_000) + SNIPPET_WAV_ALLOWANCE_BYTES
             count += 1
@@ -191,6 +199,7 @@ class BoundedAudioSnippetBatchSource:
             "audio_sha256": self._audio_sha256,
             "pad_seconds": self.pad_seconds,
             "max_duration_seconds": self.max_duration_seconds,
+            "max_covering_duration_seconds": self.max_covering_duration_seconds,
             "max_snippets_per_batch": self.max_snippets_per_batch,
             "max_audio_duration_seconds": self.max_audio_duration_seconds,
             "max_total_bytes": self.max_total_bytes,
