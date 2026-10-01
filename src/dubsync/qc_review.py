@@ -68,19 +68,21 @@ class KindSpec:
     episode: bool = False
 
 
-def _review(title: str, action: str, priority: int, severity: Severity | None = None, *, episode: bool = False) -> KindSpec:
+def _review_kind(
+    title: str, action: str, priority: int, severity: Severity | None = None, *, episode: bool = False,
+) -> KindSpec:
     return KindSpec("review", title, action, priority, severity, episode)
 
 
-def _change(title: str) -> KindSpec:
+def _change_kind(title: str) -> KindSpec:
     return KindSpec("change", title, priority=90)
 
 
-def _note(title: str) -> KindSpec:
+def _note_kind(title: str) -> KindSpec:
     return KindSpec("note", title, priority=95)
 
 
-def _diagnostic(title: str) -> KindSpec:
+def _diagnostic_kind(title: str) -> KindSpec:
     return KindSpec("diagnostic", title, priority=99)
 
 
@@ -90,174 +92,174 @@ _LISTEN = "Listen to this passage and correct the subtitle if needed."
 # meaning depends on the cue (song caption, held cue, untouched customer cue).
 KIND_REGISTRY: dict[str, KindSpec] = {
     # Problems a human must look at.
-    "missing_audio_timing_held": _review(
+    "missing_audio_timing_held": _review_kind(
         "No matching speech in the audio",
         "Check whether the dub omits or replaces these lines; fix or delete the subtitles.", 10, "error"),
-    "invalid_cue_duration": _review("Cue has no readable duration", "Retime the cue.", 5, "error"),
-    "cue_outside_media": _review("Cue lies outside the audio", "Retime or delete the cue.", 5, "error"),
-    "output_order_inversion": _review(
+    "invalid_cue_duration": _review_kind("Cue has no readable duration", "Retime the cue.", 5, "error"),
+    "cue_outside_media": _review_kind("Cue lies outside the audio", "Retime or delete the cue.", 5, "error"),
+    "output_order_inversion": _review_kind(
         "Cue order differs from the script order", "Check the word order of these cues against the audio.", 8, "error"),
-    "adjudication_span_edit_held": _review(
+    "adjudication_span_edit_held": _review_kind(
         "Approved wording could not be applied", "Compare the cue with the audio and type the spoken words.", 12, "error"),
-    "editorial_guard_rejected": _review(
+    "editorial_guard_rejected": _review_kind(
         "Wording edit was rejected to protect quotes or styling", _LISTEN, 12, "error"),
-    "screen_text_adjudication_held": _review(
+    "screen_text_adjudication_held": _review_kind(
         "Spoken change touches on-screen text", "Edit the spoken part without changing the bracketed text.", 12, "error"),
-    "timing_evidence_held": _review(
+    "timing_evidence_held": _review_kind(
         "Timing could not be confirmed from the audio", "Check the cue timing against the audio; script timing was kept.",
         15, "error"),
-    "timing_refinement_held": _review(
+    "timing_refinement_held": _review_kind(
         "Timing refinement was not possible", "Check the cue timing against the audio.", 15, "error"),
-    "forced_alignment_unresolved": _review(
+    "forced_alignment_unresolved": _review_kind(
         "Forced alignment found no unique timing", "Check the cue timing against the audio.", 15, "error"),
-    "generated_adlib_rejected_incomplete_source": _review(
+    "generated_adlib_rejected_incomplete_source": _review_kind(
         "Speech in the audio is missing from the script", "Listen and add subtitles for the missing speech.", 18, "error"),
-    "span_coverage_low": _review(
+    "span_coverage_low": _review_kind(
         "Much of the scripted line was replaced or removed", "Check that no spoken words are missing.", 20),
-    "implausible_matched_word_duration": _review(
+    "implausible_matched_word_duration": _review_kind(
         "Implausible word timing", "Check the cue timing against the audio.", 25),
-    "alignment_outlier": _review(
+    "alignment_outlier": _review_kind(
         "Cue timing disagrees with the rest of the episode", "Check the cue timing against the audio.", 25),
-    "adjudication_word_mapping_held": _review(
+    "adjudication_word_mapping_held": _review_kind(
         "New wording kept at script timing", "Check the cue timing: the approved words could not be located exactly.",
         30, "warning"),
-    "adjudication_replacement_ownership_held": _review(
+    "adjudication_replacement_ownership_held": _review_kind(
         "Spoken words could not be placed in a cue", "Listen and add the missing words.", 30, "warning"),
-    "adlib_removed_without_speech_activity": _review(
+    "adlib_removed_without_speech_activity": _review_kind(
         "Added line removed: no speech detected", "Listen at this time and restore the line if it is spoken.",
         32, "warning"),
-    "text_redistributed": _review(
+    "text_redistributed": _review_kind(
         "Wording moved between cues", "Check word order and line breaks across these cues.", 33, "warning"),
-    "adjudication_audio_unavailable": _review(
+    "adjudication_audio_unavailable": _review_kind(
         "AI review had no audio for this passage", _LISTEN, 35, "warning"),
-    "low_confidence_adjudication": _review(
+    "low_confidence_adjudication": _review_kind(
         "AI review was not confident; script wording kept", _LISTEN, 35, "warning"),
-    "generated_adlib_word_window_refined": _review(
+    "generated_adlib_word_window_refined": _review_kind(
         "Some spoken words were left out of an added line", "Listen and add the missing words.", 35, "warning"),
-    "dropped_line_candidate": _review(
+    "dropped_line_candidate": _review_kind(
         "Line may not be spoken", "Listen; delete the subtitle if the actor dropped the line.", 36, "warning"),
-    "missing_audio_source_cue_held": _review(
+    "missing_audio_source_cue_held": _review_kind(
         "Script wording kept without AI review", _LISTEN, 37, "warning"),
-    "unmatched_cue": _review(
+    "unmatched_cue": _review_kind(
         "No spoken words matched this cue", "Check that the line is spoken and timed correctly.", 38, "warning"),
-    "speaker_turn_split_held": _review(
+    "speaker_turn_split_held": _review_kind(
         "Speaker change inside a cue", "Check whether the cue should be split between speakers.", 40, "warning"),
-    "shared_word_timing_preserved": _review(
+    "shared_word_timing_preserved": _review_kind(
         "Cue boundary falls inside one recognised word", "Check the boundary between these cues.", 40, "warning"),
-    "generated_adlib_word_mapping_unavailable": _review(
+    "generated_adlib_word_mapping_unavailable": _review_kind(
         "Added line timing is approximate", "Check the timing of the added line.", 40, "warning"),
-    "cue_without_speech_activity": _review(
+    "cue_without_speech_activity": _review_kind(
         "No speech detected under this cue", _LISTEN, 42, "warning"),
-    "cue_on_silence": _review("Cue is on silence", _LISTEN, 42, "warning"),
-    "output_overlap_unresolved": _review(
+    "cue_on_silence": _review_kind("Cue is on silence", _LISTEN, 42, "warning"),
+    "output_overlap_unresolved": _review_kind(
         "Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
-    "output_overlap_preserved": _review("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
-    "overlap_stacked": _review("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
-    "overlap_flag_only": _review("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
-    "overlap_detected": _review("Overlapping speech detected", "Check both speakers are subtitled.", 45, "warning"),
-    "min_duration_unattainable": _review(
+    "output_overlap_preserved": _review_kind("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
+    "overlap_stacked": _review_kind("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
+    "overlap_flag_only": _review_kind("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
+    "overlap_detected": _review_kind("Overlapping speech detected", "Check both speakers are subtitled.", 45, "warning"),
+    "min_duration_unattainable": _review_kind(
         "Very short cue", "Check the cue is readable; merge it with a neighbour if needed.", 50, "warning"),
-    "sync_cue_line_limit_markup_unsupported": _review(
+    "sync_cue_line_limit_markup_unsupported": _review_kind(
         "Cue exceeds the line limit (styled text)", "Split the cue by hand.", 50, "warning"),
-    "sync_cue_line_limit_timing_unavailable": _review(
+    "sync_cue_line_limit_timing_unavailable": _review_kind(
         "Cue exceeds the line limit (no safe split point)", "Split the cue by hand.", 50, "warning"),
-    "impossible_cps_fast": _review(
+    "impossible_cps_fast": _review_kind(
         "Cue reads extremely fast", "Check the timing; merge or shorten if needed.", 55, "warning"),
-    "impossible_cps_slow": _review(
+    "impossible_cps_slow": _review_kind(
         "Cue stays on screen far longer than its text", "Check the cue timing.", 55, "warning"),
-    "cue_with_excessive_trailing_silence": _review(
+    "cue_with_excessive_trailing_silence": _review_kind(
         "Cue stays on screen long after the speech ends", "Check the cue end.", 55, "warning"),
-    "name_spelling_inconsistency": _review(
+    "name_spelling_inconsistency": _review_kind(
         "Possible name spelling drift", "Check the spelling against the script.", 60, "warning"),
-    "unsourced_word_substitution": _review(
+    "unsourced_word_substitution": _review_kind(
         "Word not found in the script", "Check the word against the audio.", 60, "warning"),
     # Episode-level problems: one item per kind.
-    "alignment_unresolved": _review(
+    "alignment_unresolved": _review_kind(
         "The script could not be aligned to the audio", "Check that the SRT belongs to this audio.", 1, "error",
         episode=True),
-    "unresolved_alignment_adjudication_held": _review(
+    "unresolved_alignment_adjudication_held": _review_kind(
         "Wording differences were not reviewed because alignment failed", _LISTEN, 2, "error", episode=True),
-    "alignment_model_unavailable": _review(
+    "alignment_model_unavailable": _review_kind(
         "No stable timing model for this episode", "Spot-check timing across the episode.", 3, "warning",
         episode=True),
-    "alignment_anchor_coverage_low": _review(
+    "alignment_anchor_coverage_low": _review_kind(
         "Little of the script matched the audio", "Check that the SRT belongs to this audio.", 3, episode=True),
-    "oversized_adjudication_span_held": _review(
+    "oversized_adjudication_span_held": _review_kind(
         "A long passage was not AI-reviewed", _LISTEN, 4, "error", episode=True),
-    "editorial_signature_unexplained": _review(
+    "editorial_signature_unexplained": _review_kind(
         "Output has quotes, styling or masks not in the script", "Search the SRT for the added marks.", 6, "error",
         episode=True),
-    "divergence_unresolved": _review(
+    "divergence_unresolved": _review_kind(
         "Script and audio differences were not AI-reviewed", _LISTEN, 7, "warning", episode=True),
-    "llm_provider_unavailable": _review(
+    "llm_provider_unavailable": _review_kind(
         "AI review failed for some passages", _LISTEN, 7, "warning", episode=True),
-    "invalid_llm_response": _review(
+    "invalid_llm_response": _review_kind(
         "AI review failed for some passages", _LISTEN, 7, "warning", episode=True),
     # Normal successful operations.
-    "text_changed": _change("Wording changed to match the audio"),
-    "adlib_inserted": _change("Added line spoken in the audio"),
-    "adlib_reconciled": _change("Added line matched to a script cue"),
-    "dropped_adjudicated_cue": _change("Line removed"),
-    "dropped_unmatched_cue": _change("Line removed"),
-    "speaker_turn_split": _change("Cue split at a speaker change"),
-    "generated_adlib_segmented": _change("Added speech split into cues"),
-    "sync_cue_line_limit_split": _change("Cue split to the line limit"),
-    "duplicate_cue_merged": _change("Duplicate cue merged"),
-    "overlap_dash_merge": _change("Overlapping lines merged into a dash cue"),
-    "german_profanity_censored": _change("Profanity masked"),
-    "cps_cue_merged": _change("Cues merged for reading speed"),
-    "timing_refined": _change("Cue boundary moved to the speech"),
-    "forced_alignment_refined": _change("Cue retimed by forced alignment"),
-    "media_boundary_clamped": _change("Cue end capped at the end of the audio"),
-    "cps_duration_extended": _change("Cue extended for reading speed"),
-    "output_overlap_resolved": _change("Overlap resolved"),
-    "speaker_transition_gap_inserted": _change("Gap inserted at a speaker change"),
+    "text_changed": _change_kind("Wording changed to match the audio"),
+    "adlib_inserted": _change_kind("Added line spoken in the audio"),
+    "adlib_reconciled": _change_kind("Added line matched to a script cue"),
+    "dropped_adjudicated_cue": _change_kind("Line removed"),
+    "dropped_unmatched_cue": _change_kind("Line removed"),
+    "speaker_turn_split": _change_kind("Cue split at a speaker change"),
+    "generated_adlib_segmented": _change_kind("Added speech split into cues"),
+    "sync_cue_line_limit_split": _change_kind("Cue split to the line limit"),
+    "duplicate_cue_merged": _change_kind("Duplicate cue merged"),
+    "overlap_dash_merge": _change_kind("Overlapping lines merged into a dash cue"),
+    "german_profanity_censored": _change_kind("Profanity masked"),
+    "cps_cue_merged": _change_kind("Cues merged for reading speed"),
+    "timing_refined": _change_kind("Cue boundary moved to the speech"),
+    "forced_alignment_refined": _change_kind("Cue retimed by forced alignment"),
+    "media_boundary_clamped": _change_kind("Cue end capped at the end of the audio"),
+    "cps_duration_extended": _change_kind("Cue extended for reading speed"),
+    "output_overlap_resolved": _change_kind("Overlap resolved"),
+    "speaker_transition_gap_inserted": _change_kind("Gap inserted at a speaker change"),
     # Episode-level notes.
-    "fps_detection_low_confidence": _note("Frame rate guessed"),
-    "fps_override_mismatch": _note("Selected frame rate differs from the script"),
-    "punctuation_skipped_for_long_audio": _note("AI punctuation skipped for long audio"),
-    "punctuation_provider_unavailable": _note("AI punctuation unavailable; script punctuation kept"),
-    "source_out_of_order": _note("Script cues were re-sorted by time"),
-    "adlib_rejected_repetitive_content": _note("Repetitive speech outside the script was not subtitled"),
-    "adlib_rejected_outside_source_span": _note("Speech outside the script range was not subtitled"),
+    "fps_detection_low_confidence": _note_kind("Frame rate guessed"),
+    "fps_override_mismatch": _note_kind("Selected frame rate differs from the script"),
+    "punctuation_skipped_for_long_audio": _note_kind("AI punctuation skipped for long audio"),
+    "punctuation_provider_unavailable": _note_kind("AI punctuation unavailable; script punctuation kept"),
+    "source_out_of_order": _note_kind("Script cues were re-sorted by time"),
+    "adlib_rejected_repetitive_content": _note_kind("Repetitive speech outside the script was not subtitled"),
+    "adlib_rejected_outside_source_span": _note_kind("Speech outside the script range was not subtitled"),
     # Operator-only bookkeeping.
-    "asr_word_clamped": _diagnostic("ASR word end clamped"),
-    "asr_timestamp_rounding_clamped": _diagnostic("ASR timestamp rounding clamped"),
-    "word_stream_repaired": _diagnostic("ASR word stream repaired"),
-    "asr_audio_provenance_unverified": _diagnostic("ASR checkpoint provenance unverified"),
-    "hybrid_adjudication_summary": _diagnostic("AI review routing summary"),
-    "cost_estimate_uncertain": _diagnostic("Cost estimate uncertain"),
-    "cost_unmetered": _diagnostic("Cost not metered"),
-    "gemini_audio_context_warning": _diagnostic("Audio context warning"),
-    "audio_snippet_unavailable": _diagnostic("Optional audio clip unavailable"),
-    "vad_provider_fallback": _diagnostic("Speech detector fallback"),
-    "forced_alignment_unavailable": _diagnostic("Forced alignment unavailable"),
-    "alignment_band_limited": _diagnostic("Alignment search was bounded"),
-    "protected_source_region_held": _diagnostic("Song captions protected"),
-    "adlib_speaker_ownership_held": _diagnostic("Added line kept as its own cue"),
-    "speaker_turn_word_window_refined": _diagnostic("Speaker-turn word window refined"),
+    "asr_word_clamped": _diagnostic_kind("ASR word end clamped"),
+    "asr_timestamp_rounding_clamped": _diagnostic_kind("ASR timestamp rounding clamped"),
+    "word_stream_repaired": _diagnostic_kind("ASR word stream repaired"),
+    "asr_audio_provenance_unverified": _diagnostic_kind("ASR checkpoint provenance unverified"),
+    "hybrid_adjudication_summary": _diagnostic_kind("AI review routing summary"),
+    "cost_estimate_uncertain": _diagnostic_kind("Cost estimate uncertain"),
+    "cost_unmetered": _diagnostic_kind("Cost not metered"),
+    "gemini_audio_context_warning": _diagnostic_kind("Audio context warning"),
+    "audio_snippet_unavailable": _diagnostic_kind("Optional audio clip unavailable"),
+    "vad_provider_fallback": _diagnostic_kind("Speech detector fallback"),
+    "forced_alignment_unavailable": _diagnostic_kind("Forced alignment unavailable"),
+    "alignment_band_limited": _diagnostic_kind("Alignment search was bounded"),
+    "protected_source_region_held": _diagnostic_kind("Song captions protected"),
+    "adlib_speaker_ownership_held": _diagnostic_kind("Added line kept as its own cue"),
+    "speaker_turn_word_window_refined": _diagnostic_kind("Speaker-turn word window refined"),
     # 1 of 6 such items was a human fix on ep11 that no other item already covered.
-    "timing_outlier_trimmed": _diagnostic("Outlier word ignored for timing"),
-    "source_error": _diagnostic("Repeated phrase in adjacent script cues"),
-    "invalid_punctuation_change": _diagnostic("Invalid punctuation change reverted"),
-    "punctuation_source_structure_preserved": _diagnostic("Punctuation kept script line structure"),
-    "speaker_character_mapped": _diagnostic("Speaker mapped to character"),
-    "missing_audio_source_cue_restored": _diagnostic("Held cue restored to script"),
-    "low_confidence_source_cue_restored": _diagnostic("Held cue restored to script"),
-    "timing_evidence_source_cue_restored": _diagnostic("Held cue restored to script"),
-    "protected_region_source_cue_restored": _diagnostic("Held cue restored to script"),
-    "interpolated_timing": _diagnostic("Interpolated timing (legacy)"),
+    "timing_outlier_trimmed": _diagnostic_kind("Outlier word ignored for timing"),
+    "source_error": _diagnostic_kind("Repeated phrase in adjacent script cues"),
+    "invalid_punctuation_change": _diagnostic_kind("Invalid punctuation change reverted"),
+    "punctuation_source_structure_preserved": _diagnostic_kind("Punctuation kept script line structure"),
+    "speaker_character_mapped": _diagnostic_kind("Speaker mapped to character"),
+    "missing_audio_source_cue_restored": _diagnostic_kind("Held cue restored to script"),
+    "low_confidence_source_cue_restored": _diagnostic_kind("Held cue restored to script"),
+    "timing_evidence_source_cue_restored": _diagnostic_kind("Held cue restored to script"),
+    "protected_region_source_cue_restored": _diagnostic_kind("Held cue restored to script"),
+    "interpolated_timing": _diagnostic_kind("Interpolated timing (legacy)"),
 }
 
 STYLE_REGISTRY: dict[str, KindSpec] = {
-    "negative_duration": _review("Cue ends before it starts", "Retime the cue.", 5, "error"),
-    "zero_duration": _review("Cue has no display duration", "Retime the cue.", 5, "error"),
-    "min_duration": _review(
+    "negative_duration": _review_kind("Cue ends before it starts", "Retime the cue.", 5, "error"),
+    "zero_duration": _review_kind("Cue has no display duration", "Retime the cue.", 5, "error"),
+    "min_duration": _review_kind(
         "Very short cue", "Check the cue is readable; merge it with a neighbour if needed.", 50, "warning"),
-    "frame_grid": _review("Timecode is off the frame grid", "Snap the cue to frames.", 70, "warning"),
-    "line_count": _review("Too many lines", "Re-break the cue.", 65, "warning"),
-    "line_length": _review("Line too long", "Re-break the cue.", 65, "warning"),
-    "overlap": _review("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
+    "frame_grid": _review_kind("Timecode is off the frame grid", "Snap the cue to frames.", 70, "warning"),
+    "line_count": _review_kind("Too many lines", "Re-break the cue.", 65, "warning"),
+    "line_length": _review_kind("Line too long", "Re-break the cue.", 65, "warning"),
+    "overlap": _review_kind("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
 }
 
 _OVERLAP_KINDS = frozenset({"output_overlap_unresolved", "output_overlap_preserved", "overlap_stacked", "overlap_flag_only"})
@@ -1394,8 +1396,8 @@ def _verdict(review: list[ReviewItem], counts: Mapping[str, int | float]) -> Ver
 
 def _spec(kind: str) -> KindSpec:
     if kind.startswith("style:"):
-        return STYLE_REGISTRY.get(kind[len("style:"):], _review(kind, _LISTEN, 80))
-    return KIND_REGISTRY.get(kind, _review(kind.replace("_", " ").capitalize(), _LISTEN, 80))
+        return STYLE_REGISTRY.get(kind[len("style:"):], _review_kind(kind, _LISTEN, 80))
+    return KIND_REGISTRY.get(kind, _review_kind(kind.replace("_", " ").capitalize(), _LISTEN, 80))
 
 
 def _priority(kind: str) -> int:
