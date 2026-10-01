@@ -122,6 +122,7 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
     {
         "audio_snippet_unavailable",
         "adjudication_audio_unavailable",
+        "adjudication_review_unavailable",
         "invalid_llm_response",
         "llm_provider_unavailable",
     }
@@ -129,8 +130,8 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
-_REBUILD_POLICY_VERSION = 8
-_ADJUDICATION_POLICY_VERSION = 2
+_REBUILD_POLICY_VERSION = 9
+_ADJUDICATION_POLICY_VERSION = 3
 _PUNCTUATION_POLICY_VERSION = 1
 
 
@@ -1577,6 +1578,22 @@ def _write_hybrid_adjudication_report(adapter: object, episode_workdir: Path, fl
             f"and held {counts.get('held', 0)}. See hybrid_adjudication.json for case routes."
         ),
     ))
+    # The hybrid route turns a failed review call into ordinary held
+    # decisions. Without this transient marker the hold would be cached and
+    # replayed by every later run although the outage is long over.
+    outage_held = sum(
+        1 for item in report.get("decisions", [])
+        if isinstance(item, dict) and item.get("route") == "held"
+        and any(str(reason).endswith("_provider_failure") for reason in item.get("reasons", []))
+    )
+    if outage_held:
+        flags.append(QCFlag(
+            kind="adjudication_review_unavailable", severity="warning", cue_ids=[],
+            message=(
+                f"The adjudication review provider failed for {outage_held} cases; their source text "
+                "was preserved for review and the result was not cached, so a re-run asks again."
+            ),
+        ))
 
 
 def _adjudication_cache_key(

@@ -17,7 +17,7 @@ from .providers import ProviderError
 from .tokenize import alphanumeric_signature
 
 
-HYBRID_POLICY_VERSION = 1
+HYBRID_POLICY_VERSION = 2
 Reviewer = Callable[..., tuple[list[dict[str, object]], list[dict[str, object]]]]
 
 
@@ -28,9 +28,14 @@ def _confidence_gate(value: float) -> float:
 
 
 def _indexed_decisions(
-    spans: Sequence[DivergenceSpan], raw: object, *, prefix: str,
+    spans: Sequence[DivergenceSpan], raw: object, *, prefix: str, tolerate_stray: bool = False,
 ) -> tuple[dict[str, dict[str, object]], dict[str, list[str]]]:
-    """Bind by exact ID only; never infer identity from response order."""
+    """Bind by exact ID only; never infer identity from response order.
+
+    With ``tolerate_stray`` an entry for an id outside this batch (the review
+    prompt lists read-only sibling cases) faults only the cases that lack
+    exactly one valid decision of their own, instead of the whole batch.
+    """
     ids = {span.case_id for span in spans}
     if len(ids) != len(spans):
         raise ValueError("Hybrid adjudication requires unique input case IDs")
@@ -69,8 +74,17 @@ def _indexed_decisions(
         decisions[cid] = parsed.model_dump(mode="json")
     if batch_fault:
         for cid in ids:
+            if tolerate_stray and cid not in faults:
+                continue
             faults[cid] = list(dict.fromkeys([batch_fault, *faults.get(cid, [])]))
     return decisions, faults
+
+
+def _has_stray_entries(spans: Sequence[DivergenceSpan], raw: object) -> bool:
+    ids = {span.case_id for span in spans}
+    return isinstance(raw, list) and any(
+        not isinstance(payload, dict) or payload.get("case_id") not in ids for payload in raw
+    )
 
 
 def triage_decisions(
@@ -268,6 +282,7 @@ class HybridAdjudicationAdapter:
             selected_clips = {span.case_id: exact_clips[span.case_id] for span in selected}
             with self._lock:
                 context, words = self._episode_context, self._episode_words
+            stray_review_entries = False
             try:
                 review_raw, events = self.reviewer(
                     spans=tuple(_frozen(span, _ReadOnlySpan) for span in selected),
@@ -278,7 +293,8 @@ class HybridAdjudicationAdapter:
                     episode_context=deepcopy(context), episode_words=deepcopy(words),
                 )
                 self._record_usage(events, "fallback")
-                reviewed, invalid = _indexed_decisions(selected, review_raw, prefix="review")
+                reviewed, invalid = _indexed_decisions(selected, review_raw, prefix="review", tolerate_stray=True)
+                stray_review_entries = _has_stray_entries(selected, review_raw)
             except ProviderError:
                 reviewed = {}
                 invalid = {span.case_id: ["review_provider_failure"] for span in selected}
@@ -291,7 +307,8 @@ class HybridAdjudicationAdapter:
                 if failure:
                     record(span, _held(span, ", ".join(failure), proposal), "held", reasons[cid] + failure, True)
                 else:
-                    record(span, _routed(proposal, "fallback"), "fallback", reasons[cid], True)
+                    accepted_reasons = reasons[cid] + (["review_stray_decision_ignored"] if stray_review_entries else [])
+                    record(span, _routed(proposal, "fallback"), "fallback", accepted_reasons, True)
         with self._lock:
             self._routes.extend(traces[span.case_id] for span in batch)
         return [results[span.case_id] for span in batch]
