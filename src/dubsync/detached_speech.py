@@ -193,13 +193,13 @@ def _separated_replacement(
     consumed = [cue_id for cue_id in cue_ids if bounds[cue_id] == (0, token_counts[cue_id])]
     # A cue that keeps matched words before or after the case is spoken where
     # those words are; a completely replaced cue near its source time.
-    left_home = (
-        bounds[cue_ids[0]][0] > 0 and span.left_anchor_cue_id == cue_ids[0] and _finite(span.left_anchor_end)
-    )
-    right_home = (
-        bounds[cue_ids[-1]][1] < token_counts[cue_ids[-1]]
-        and span.right_anchor_cue_id == cue_ids[-1] and _finite(span.right_anchor_start)
-    )
+    keeps_prefix = bounds[cue_ids[0]][0] > 0
+    keeps_suffix = bounds[cue_ids[-1]][1] < token_counts[cue_ids[-1]]
+    left_home = keeps_prefix and span.left_anchor_cue_id == cue_ids[0] and _finite(span.left_anchor_end)
+    right_home = keeps_suffix and span.right_anchor_cue_id == cue_ids[-1] and _finite(span.right_anchor_start)
+    if (keeps_prefix and not left_home) or (keeps_suffix and not right_home):
+        # The retained words carry no timing: nothing says where the cue is spoken.
+        return None
     if len(cue_ids) == 1 and left_home and right_home:
         # The cue's own retained words surround the gap: the pause is its own.
         return None

@@ -3390,6 +3390,10 @@ def _is_repetitive_generated_text(text: str) -> bool:
     return len(set(trigrams)) < len(trigrams)
 
 
+# Word times are decimal seconds: 234.84 - 234.64 must count as a 0.2 s gap.
+_GAP_EPSILON_SECONDS = 1e-6
+
+
 def _anchored_adlib_cue_id(
     cues_by_id: dict[int, Cue],
     span: DivergenceSpan,
@@ -3463,7 +3467,7 @@ def _anchored_adlib_cue_id(
         )
     ):
         gap = span.right_anchor_start - span.end
-        if -0.05 <= gap <= max_gap_seconds:
+        if -0.05 <= gap <= max_gap_seconds + _GAP_EPSILON_SECONDS:
             return right_id
         if (
             0 <= gap <= max_continuation_gap_seconds
@@ -3496,7 +3500,7 @@ def _anchored_adlib_cue_id(
             )
         )
         if (
-            -0.05 <= gap <= max_gap_seconds
+            -0.05 <= gap <= max_gap_seconds + _GAP_EPSILON_SECONDS
             and (
                 not left_has_terminal_punctuation
                 or narrow_confirmed_continuation

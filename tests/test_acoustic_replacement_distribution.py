@@ -105,6 +105,27 @@ def test_single_word_goes_to_the_cue_whose_words_it_touches(tmp_path):
     assert _near(cues[0].end_ms, 5.48) and _near(cues[1].start_ms, 5.80)
 
 
+def test_connector_exactly_at_the_attach_gap_joins_the_line_it_introduces(tmp_path):
+    # ep17: "E" (234.56-234.64) before 'qual é o seu plano?' (234.84). In binary
+    # floats 234.84 - 234.64 is a hair above 0.2 s, so "E" became a cue of its own.
+    srt = (
+        "1\n00:03:52,150 --> 00:03:53,400\nVocê é muito cuidadosa.\n\n"
+        "2\n00:03:54,400 --> 00:03:55,800\nQual é o seu plano?\n"
+    )
+    words = [
+        ("Você", 232.28, 232.46), ("é", 232.50, 232.56), ("muito", 232.60, 232.78), ("cuidadosa.", 232.84, 233.44),
+        ("E", 234.56, 234.64),
+        ("qual", 234.84, 234.96), ("é", 234.98, 235.02), ("o", 235.06, 235.08), ("seu", 235.12, 235.26),
+        ("plano?", 235.36, 235.64),
+    ]
+
+    cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "E")})
+
+    assert [cue.plain_text for cue in cues] == ["Você é muito cuidadosa.", "E Qual é o seu plano?"]
+    assert _near(cues[1].start_ms, 234.56)
+    assert "adlib_inserted" not in [flag["kind"] for flag in flags]
+
+
 def _case114():
     cues = [
         Cue(index=319, start_ms=991_400, end_ms=992_470, lines=["Água, água, água, toma."]),
