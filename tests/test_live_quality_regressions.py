@@ -41,8 +41,10 @@ def test_profanity_compound_suffix_remains_visible_to_alignment() -> None:
 
 
 def test_masked_productive_profanity_compound_matches_uncensored_asr() -> None:
-    assert normalize_token("Sch*iss-Wetter") == "scheiss-wetter"
+    # The alignment key keeps letters and masks only, like every other token.
+    assert normalize_token("Sch*iss-Wetter") == "scheisswetter"
     assert normalize_token("Sch*iss-Wetter") == normalize_token("Scheiss-Wetter")
+    assert normalize_token("Sch*iss-Wetter") == normalize_token("Scheisswetter.")
 
     cues = [
         Cue(

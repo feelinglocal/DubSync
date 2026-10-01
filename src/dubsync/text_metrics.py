@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from collections.abc import Iterable
+
+# SRT/WebVTT inline tags and ASS/SSA override blocks. Only known tag names are
+# hidden, so dialogue such as "a < b" keeps every word.
+_MARKUP_RE = re.compile(
+    r"</?(?:i|b|u|s|em|strong|font|c|v|lang|ruby|rt|span)(?:[\s.][^<>]*)?>"
+    r"|<\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?>"
+    r"|\{\\[^{}]*\}",
+    re.IGNORECASE,
+)
 
 
 _UNSPACED_RANGES = (
@@ -33,7 +43,11 @@ _JAPANESE_PUNCTUATION = frozenset("〈《「『【〔〖〘〚（［｛｟〉》
 
 def display_width(text: str) -> int:
     width = 0
-    for char in text:
+    hidden = _markup_mask(text)
+    for index, char in enumerate(text):
+        # Inline tags are not displayed.
+        if hidden is not None and hidden[index]:
+            continue
         if unicodedata.combining(char) or unicodedata.category(char) in {"Mn", "Me"}:
             continue
         width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
@@ -60,7 +74,12 @@ def token_texts(text: str) -> list[str]:
 
     # Comparison tokens canonicalize width variants; callers retain source text.
     normalized_text = unicodedata.normalize("NFKC", text)
+    hidden = _markup_mask(normalized_text)
     for index, char in enumerate(normalized_text):
+        if hidden is not None and hidden[index]:
+            # Inline tags are layout, never speech.
+            flush()
+            continue
         if is_character_level_script(char) and char.isalnum():
             flush()
             tokens.append(char)
@@ -89,6 +108,21 @@ def token_texts(text: str) -> list[str]:
 
     flush()
     return tokens
+
+
+def markup_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of inline subtitle tags (``<i>``, ``<font ...>``, ``{\\an8}``)."""
+    return [match.span() for match in _MARKUP_RE.finditer(text)] if ("<" in text or "{" in text) else []
+
+
+def _markup_mask(text: str) -> list[bool] | None:
+    spans = markup_spans(text)
+    if not spans:
+        return None
+    mask = [False] * len(text)
+    for start, end in spans:
+        mask[start:end] = [True] * (end - start)
+    return mask
 
 
 def join_word_texts(texts: Iterable[str]) -> str:
@@ -283,6 +317,9 @@ def token_character_spans(text: str, tokens: list[str] | None = None) -> list[tu
         start = end
 
     normalized = "".join(normalized_parts)
+    for markup_start, markup_end in markup_spans(normalized):
+        # A tag attribute such as color="red" must not be found as the word.
+        normalized = normalized[:markup_start] + " " * (markup_end - markup_start) + normalized[markup_end:]
     bounds: list[tuple[int, int]] = []
     cursor = 0
     for token in tokens:
