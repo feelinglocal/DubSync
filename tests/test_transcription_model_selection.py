@@ -129,6 +129,38 @@ def test_provider_timing_correction_remains_reviewable_on_cache_hit(tmp_path):
     assert cached.last_cache_hit
 
 
+def test_cached_words_from_an_older_adapter_version_are_not_reused(tmp_path):
+    from dubsync.cache import CacheKey
+    from dubsync.mai_transcribe import MAITranscribeAdapter
+
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"example")
+
+    class VersionedAdapter:
+        cache_version = MAITranscribeAdapter(api_key="test-key").cache_version
+        calls = 0
+
+        def transcribe(self, path):
+            self.calls += 1
+            return [Word(text="once", start=0.1, end=0.4)]
+
+    cache = JsonDiskCache(tmp_path / "cache")
+    # An entry written before the raw-order word filters existed still holds the duplicate copy.
+    cache.write(CacheKey.from_audio(audio, MAI, {"diarize": False}), {"words": [
+        {"text": "once", "start": 0.1, "end": 0.45}, {"text": "once", "start": 0.1, "end": 0.4},
+    ]})
+    inner = VersionedAdapter()
+    adapter = CachedASRAdapter(inner, cache, MAI, {"diarize": False})
+
+    assert [word.text for word in adapter.transcribe(audio)] == ["once"]
+    assert inner.calls == 1
+    assert adapter.last_cache_hit is False
+    assert [word.text for word in adapter.transcribe(audio)] == ["once"]
+    assert inner.calls == 1
+    assert adapter.last_cache_hit is True
+    assert VersionedAdapter.cache_version
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_cache_records_reported_cost_once_including_failed_paid_calls(tmp_path, failure):
     audio = tmp_path / "clip.wav"

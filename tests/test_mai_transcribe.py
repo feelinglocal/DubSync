@@ -479,3 +479,154 @@ def test_only_normalized_wav_is_accepted(monkeypatch, tmp_path):
 def test_unbounded_or_invalid_options_are_rejected(option, value):
     with pytest.raises(ValueError):
         MAITranscribeAdapter(api_key="test-key", **{option: value})
+
+
+def _raw_payload(raw, base):
+    words = []
+    for item in raw:
+        text, start, end = item[:3]
+        record = {"word": text, "start": round(start - base, 3), "end": round(end - base, 3)}
+        if len(item) > 3:
+            record["speaker"] = item[3]
+        words.append(record)
+    return {"words": words}
+
+
+def _replay_raw(monkeypatch, tmp_path, raw, *, diarize=False):
+    """Replay one raw MAI word list (absolute episode times) as a single short chunk."""
+    base = raw[0][1] - 0.5
+    _transport(monkeypatch, [_raw_payload(raw, base)])
+    adapter = MAITranscribeAdapter(api_key="test-key", diarize=diarize)
+    words = adapter.transcribe(_audio(tmp_path, seconds=max(item[2] for item in raw) - base + 1))
+    return [(word.text, round(word.start + base, 3), round(word.end + base, 3)) for word in words], adapter
+
+
+# Raw word lists copied from the ep11 / ep17 MAI chunk responses (2026-09-14 benchmark).
+# MAI re-emits a run with (nearly) the same timestamps; the later copy continues the
+# sentence in every observed case, so it is the one kept.
+_REDECODED_RUNS = [
+    pytest.param(
+        [("comigo.", 244.92, 245.279), ("Você...", 253.52, 254.199), ("Você...", 253.52, 254.159), ("deu", 255.12, 255.259)],
+        [("comigo.", 244.92, 245.279), ("Você...", 253.52, 254.159), ("deu", 255.12, 255.259)], id="ep11-253-voce"),
+    pytest.param(
+        [("carro.", 497.16, 497.44), ("Entra.", 500.88, 501.319), ("Entra.", 500.88, 501.28), ("Senhor", 507.68, 507.899)],
+        [("carro.", 497.16, 497.44), ("Entra.", 500.88, 501.28), ("Senhor", 507.68, 507.899)], id="ep11-500-entra"),
+    pytest.param(
+        [("lindo.", 1212.76, 1213.28), ("Queria.", 1228.6, 1228.999), ("Queria", 1228.6, 1228.92),
+         ("pular", 1229.04, 1229.28), ("nas", 1229.36, 1229.5), ("nuvens.", 1229.64, 1230.079)],
+        [("lindo.", 1212.76, 1213.28), ("Queria", 1228.6, 1228.92), ("pular", 1229.04, 1229.28),
+         ("nas", 1229.36, 1229.5), ("nuvens.", 1229.64, 1230.079)], id="ep11-1228-queria"),
+    pytest.param(
+        [("aqui?", 1323.46, 1323.579), ("Vamos,", 1323.6, 1323.78), ("vamos,", 1323.8, 1324.039),
+         ("vamos", 1324.08, 1324.22), ("lá.", 1324.26, 1324.439), ("Vamos", 1324.08, 1324.22),
+         ("lá.", 1324.26, 1324.439), ("Hoje,", 1332.56, 1332.819)],
+        [("aqui?", 1323.46, 1323.579), ("Vamos,", 1323.6, 1323.78), ("vamos,", 1323.8, 1324.039),
+         ("Vamos", 1324.08, 1324.22), ("lá.", 1324.26, 1324.439), ("Hoje,", 1332.56, 1332.819)], id="ep11-1324-vamos-la"),
+    pytest.param(
+        [("ver.", 1770.52, 1770.76), ("E", 1778.4, 1778.48), ("eu", 1778.56, 1778.699), ("e", 1778.72, 1778.779),
+         ("ela.", 1778.82, 1779.0), ("E", 1778.4, 1778.48), ("eu", 1778.62, 1778.699), ("ia", 1778.76, 1778.88),
+         ("lá", 1778.92, 1779.04), ("saber", 1779.12, 1779.279)],
+        [("ver.", 1770.52, 1770.76), ("E", 1778.4, 1778.48), ("eu", 1778.62, 1778.699), ("ia", 1778.76, 1778.88),
+         ("lá", 1778.92, 1779.04), ("saber", 1779.12, 1779.279)], id="ep11-1778-e-eu-ia-la"),
+    pytest.param(
+        [("namorada?", 1870.44, 1870.879), ("Sim.", 1875.16, 1875.519), ("Sim.", 1875.16, 1875.48), ("Tudo", 1881.4, 1881.619)],
+        [("namorada?", 1870.44, 1870.879), ("Sim.", 1875.16, 1875.48), ("Tudo", 1881.4, 1881.619)], id="ep11-1875-sim"),
+    pytest.param(
+        [("porta.", 1970.48, 1970.8), ("Tá.", 1974.36, 1974.759), ("Tá.", 1974.4, 1974.759), ("Feliz", 1992.32, 1992.5)],
+        [("porta.", 1970.48, 1970.8), ("Tá.", 1974.4, 1974.759), ("Feliz", 1992.32, 1992.5)], id="ep11-1974-ta"),
+    pytest.param(
+        [("está", 1998.82, 1999.0), ("melhor?", 1999.08, 1999.479), ("Melhor.", 1999.12, 1999.479), ("Vocês", 2008.72, 2009.02)],
+        [("está", 1998.82, 1999.0), ("Melhor.", 1999.12, 1999.479), ("Vocês", 2008.72, 2009.02)], id="ep11-1999-melhor"),
+    pytest.param(
+        [("Hum.", 712.28, 712.659), ("Flora.", 727.44, 728.0), ("Flora.", 727.44, 728.039), ("Ele", 774.36, 774.519)],
+        [("Hum.", 712.28, 712.659), ("Flora.", 727.44, 728.039), ("Ele", 774.36, 774.519)], id="ep17-727-flora"),
+    pytest.param(
+        [("Luki,", 2428.44, 2428.74), ("quando", 2428.8, 2428.999), ("Luke,", 2428.44, 2428.799),
+         ("quando", 2428.88, 2429.079), ("você", 2429.12, 2429.28)],
+        [("Luke,", 2428.44, 2428.799), ("quando", 2428.88, 2429.079), ("você", 2429.12, 2429.28)], id="ep17-2428-luke"),
+]
+
+
+@pytest.mark.parametrize("raw,expected", _REDECODED_RUNS)
+def test_redecoded_word_run_keeps_only_the_later_copy(monkeypatch, tmp_path, raw, expected):
+    words, adapter = _replay_raw(monkeypatch, tmp_path, raw)
+
+    assert words == expected
+    flags = [flag for flag in adapter.last_repair_flags if flag.kind == "asr_duplicate_words_dropped"]
+    assert len(flags) == 1
+    assert flags[0].severity == "info"
+
+
+# ep11 1928.7: "Dez, nove, ..." was transcribed with a re-decoded "De-" and every
+# number twice; the energy has one burst per spoken number.
+_COUNTDOWN = [
+    ("regressiva.", 1918.16, 1918.96), ("De-", 1928.72, 1929.0), ("10,", 1928.72, 1929.419), ("10,", 1929.44, 1929.819),
+    ("9,", 1929.84, 1929.9), ("9,", 1929.919, 1930.579), ("8,", 1930.88, 1931.039), ("8,", 1931.08, 1931.779),
+    ("7,", 1932.2, 1932.38), ("7,", 1932.4, 1932.979), ("6,", 1933.4, 1933.819), ("6,", 1933.84, 1934.059),
+    ("5,", 1934.16, 1934.479), ("5,", 1934.6, 1935.139), ("4,", 1935.68, 1936.18), ("3,", 1936.32, 1936.6),
+    ("3,", 1936.72, 1937.22), ("2,", 1937.44, 1937.56), ("2,", 1937.6, 1938.1), ("1.", 1938.56, 1939.159),
+    ("Uou!", 1939.48, 1940.3),
+]
+
+
+def test_doubled_countdown_numbers_collapse_to_one_copy_each(monkeypatch, tmp_path):
+    words, adapter = _replay_raw(monkeypatch, tmp_path, _COUNTDOWN)
+
+    assert [text for text, _start, _end in words] == [
+        "regressiva.", "10,", "9,", "8,", "7,", "6,", "5,", "4,", "3,", "2,", "1.", "Uou!",
+    ]
+    # The longer copy of each pair is kept; the short or pause-filling copy is dropped.
+    assert words[1] == ("10,", 1928.72, 1929.419)
+    assert words[2] == ("9,", 1929.919, 1930.579)
+    assert words[8] == ("3,", 1936.72, 1937.22)
+    assert all(left[2] <= right[1] for left, right in zip(words, words[1:]))
+    kinds = sorted(flag.kind for flag in adapter.last_repair_flags)
+    assert kinds == ["asr_doubled_words_collapsed", "asr_duplicate_words_dropped"]
+    assert all(flag.severity == "info" for flag in adapter.last_repair_flags)
+
+
+def test_doubled_chorus_words_are_kept_with_an_informational_flag(monkeypatch, tmp_path):
+    raw = [
+        ("Feliz", 1992.32, 1992.5), ("Feliz", 1992.639, 1992.819), ("Ano", 1992.84, 1992.939), ("Ano", 1992.96, 1993.199),
+        ("Novo.", 1993.24, 1993.339), ("Novo.", 1993.36, 1993.739), ("Feliz", 1994.36, 1994.579),
+        ("Ano", 1994.639, 1994.839), ("Novo.", 1994.92, 1995.239),
+    ]
+    words, adapter = _replay_raw(monkeypatch, tmp_path, raw)
+
+    assert words == [(text, start, end) for text, start, end in raw]
+    assert [(flag.kind, flag.severity) for flag in adapter.last_repair_flags] == [("asr_doubled_word_run_kept", "info")]
+    # The replay shifts the clip so its first word starts at 0.5 s.
+    assert adapter.last_repair_flags[0].start == pytest.approx(0.5)
+    assert adapter.last_repair_flags[0].end == pytest.approx(1993.739 - 1991.82)
+
+
+@pytest.mark.parametrize("raw", [
+    pytest.param([("Nein,", 1.0, 1.3), ("nein,", 1.36, 1.7), ("bitte", 1.8, 2.1)], id="nein-nein"),
+    pytest.param([("que", 1181.72, 1181.82), ("que", 1181.84, 1181.92), ("eu", 1182.0, 1182.1)], id="ep11-que-que"),
+    pytest.param([("eu,", 1691.76, 1691.94), ("eu,", 1692.0, 1692.2), ("eu", 1692.48, 1692.56)], id="ep11-eu-eu-eu"),
+    pytest.param([("Ja,", 1.0, 1.2), ("ja.", 1.26, 1.5), ("Nein,", 1.6, 1.9), ("nein.", 1.96, 2.3)], id="two-doubled-pairs"),
+    pytest.param([("10,", 1.0, 1.4), ("10,", 1.46, 1.9), ("Fertig.", 2.0, 2.4)], id="single-number-pair"),
+    pytest.param([("Rápido,", 1300.56, 1300.86), ("rápido.", 1300.88, 1301.1)], id="ep11-rapido"),
+])
+def test_genuine_repetitions_are_never_removed_or_flagged(monkeypatch, tmp_path, raw):
+    words, adapter = _replay_raw(monkeypatch, tmp_path, raw)
+
+    assert words == [(text, start, end) for text, start, end in raw]
+    assert adapter.last_repair_flags == []
+
+
+def test_overlapping_speech_of_different_diarized_speakers_is_not_treated_as_a_duplicate(monkeypatch, tmp_path):
+    raw = [("Hallo", 1.0, 1.5, 0), ("du", 1.6, 1.9, 0), ("Nein!", 1.2, 1.6, 1), ("Geh.", 1.7, 2.0, 1)]
+    words, adapter = _replay_raw(monkeypatch, tmp_path, raw, diarize=True)
+
+    assert [text for text, _start, _end in words] == ["Hallo", "Nein!", "du", "Geh."]
+    assert adapter.last_repair_flags == []
+
+
+def test_redecoded_run_that_does_not_cover_the_earlier_words_is_kept(monkeypatch, tmp_path):
+    # A rewind whose later words do not re-cover the earlier run is not a re-decode.
+    raw = [("Eins", 1.0, 1.4), ("zwei", 2.0, 3.0), ("drei", 1.5, 1.7), ("vier", 3.4, 3.8)]
+    words, adapter = _replay_raw(monkeypatch, tmp_path, raw)
+
+    assert [text for text, _start, _end in words] == ["Eins", "drei", "zwei", "vier"]
+    assert adapter.last_repair_flags == []

@@ -73,7 +73,13 @@ class CachedASRAdapter:
         self.last_repair_flags = []
         self.last_usage = {}
         self.last_cache_hit = False
-        key = CacheKey.from_audio(audio_path, self.model, self.params)
+        params = self.params
+        adapter_version = getattr(self.inner, "cache_version", None)
+        if adapter_version is not None:
+            # Word-stream post-processing inside an adapter changes cached
+            # results, so entries written by an older adapter are not reused.
+            params = {**params, "adapter_version": adapter_version}
+        key = CacheKey.from_audio(audio_path, self.model, params)
         self.last_cache_key = key
         cached = self.cache.read(key)
         if cached is not None:

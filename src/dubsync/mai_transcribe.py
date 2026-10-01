@@ -23,6 +23,15 @@ _MAX_CHUNK_SECONDS = 300.0
 _CONTEXT_SECONDS = 1.0
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_END_ROUNDING_SECONDS = 0.020
+# MAI word timestamps sit on a 20 ms grid; a rewind is a start well before the
+# previous end, never grid rounding.
+_REWIND_EPSILON_SECONDS = 0.005
+_MAX_REDECODED_RUN_WORDS = 12
+# Adjacent identical tokens closer than this are candidate decoder doubling.
+_MAX_DOUBLED_GAP_SECONDS = 0.15
+_MAX_DOUBLED_RUN_LINK_SECONDS = 1.0
+_MIN_DOUBLED_RUN_PAIRS = 3
+_MAX_FLAG_EXAMPLES = 20
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -54,6 +63,9 @@ class MAITranscribeAdapter:
     being merged between independent chunks.
     """
 
+    # Bump when word post-processing changes so stale ASR cache entries are not reused.
+    cache_version = "mai-words-2"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -77,6 +89,8 @@ class MAITranscribeAdapter:
         self.chunk_seconds = float(chunk_seconds)
         self.last_usage: dict[str, object] = self._empty_usage()
         self.last_repair_flags: list[QCFlag] = []
+        self._dropped_runs: list[list[Word]] = []
+        self._collapsed_pairs: list[tuple[Word, Word]] = []
 
     @staticmethod
     def _empty_usage() -> dict[str, object]:
@@ -90,6 +104,8 @@ class MAITranscribeAdapter:
 
         self.last_usage = self._empty_usage()
         self.last_repair_flags = []
+        self._dropped_runs = []
+        self._collapsed_pairs = []
         if not self.api_key:
             raise ProviderError("OPENROUTER_API_KEY is required for MAI-Transcribe 2.", code="configuration")
         words: list[Word] = []
@@ -97,7 +113,37 @@ class MAITranscribeAdapter:
             payload = self._request(chunk.data)
             chunk_words = self._words(payload, chunk, index)
             words = _join_words(words, chunk_words, chunk.owner_start) if index else chunk_words
+        self.last_repair_flags.extend(self._word_run_summary_flags())
         return sorted(words, key=lambda word: (word.start, word.end))
+
+    def _word_run_summary_flags(self) -> list[QCFlag]:
+        # One aggregated flag per repair kind keeps a long episode reviewable
+        # without attaching provider housekeeping to individual cues.
+        flags = []
+        if self._dropped_runs:
+            examples = "; ".join(
+                f"{run[0].start:.2f}s {' '.join(word.text for word in run)!r}"
+                for run in self._dropped_runs[:_MAX_FLAG_EXAMPLES]
+            )
+            flags.append(QCFlag(
+                kind="asr_duplicate_words_dropped", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 re-emitted {len(self._dropped_runs)} word run(s) over already transcribed "
+                    f"audio; the earlier overlapping copy was dropped and the later copy kept: {examples}."
+                ),
+            ))
+        if self._collapsed_pairs:
+            examples = "; ".join(
+                f"{dropped.start:.2f}s {dropped.text!r}" for dropped, _kept in self._collapsed_pairs[:_MAX_FLAG_EXAMPLES]
+            )
+            flags.append(QCFlag(
+                kind="asr_doubled_words_collapsed", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 doubled {len(self._collapsed_pairs)} adjacent number token(s) in a counted "
+                    f"sequence; the shorter copy of each pair was dropped: {examples}."
+                ),
+            ))
+        return flags
 
     def _chunks(self, audio_path: Path):
         from .providers import ProviderError
@@ -263,6 +309,22 @@ class MAITranscribeAdapter:
             if self.diarize and speaker is not None and str(speaker).strip():
                 speaker_id = f"chunk_{index + 1}:{speaker}"
             words.append(Word(text=text, start=start, end=end, confidence=None, speaker_id=speaker_id))
+        # The provider's own word order is the only evidence of a re-decoded
+        # run, so both filters must run before sorting by time.
+        words, dropped_runs = _drop_redecoded_runs(words)
+        self._dropped_runs.extend(dropped_runs)
+        words, collapsed_pairs, kept_runs = _collapse_doubled_number_runs(words)
+        self._collapsed_pairs.extend(collapsed_pairs)
+        for run in kept_runs:
+            self.last_repair_flags.append(QCFlag(
+                kind="asr_doubled_word_run_kept", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 wrote {len(run)} consecutive doubled words "
+                    f"({' '.join(word.text for word in run)!r}); this can be decoder doubling of sung or "
+                    "chanted lines, but the words were kept because a genuine repetition cannot be ruled out."
+                ),
+                start=run[0].start, end=run[-1].end,
+            ))
         return sorted(words, key=lambda word: (word.start, word.end))
 
 
@@ -283,6 +345,105 @@ def _explicit_empty_transcription(payload: dict, duration: float) -> bool:
         ):
             return False
     return True
+
+
+def _drop_redecoded_runs(words: list[Word]) -> tuple[list[Word], list[list[Word]]]:
+    """Drop the earlier copy when MAI rewinds and re-emits words it already wrote.
+
+    In raw provider order, a word that starts well before the previous word's
+    end begins a re-decoded run. The earlier run is the maximal suffix of kept
+    words that end after that start. Every observed case (ep11/ep17) re-emits
+    the same speech with a corrected continuation, so the later copy is kept.
+    The run is only dropped when the later words re-cover at least half of it,
+    it is short, and diarization does not attribute the two runs to different
+    speakers (overlapping dialogue is not a re-decode).
+    """
+    kept: list[int] = []
+    dropped: list[list[Word]] = []
+    for position, word in enumerate(words):
+        if kept and word.start < words[kept[-1]].end - _REWIND_EPSILON_SECONDS:
+            cut = len(kept)
+            while cut and words[kept[cut - 1]].end > word.start + _REWIND_EPSILON_SECONDS:
+                cut -= 1
+            earlier = [words[index] for index in kept[cut:]]
+            earlier_end = max(item.end for item in earlier)
+            later = []
+            for item in words[position:]:
+                if item.start >= earlier_end:
+                    break
+                later.append(item)
+            if _later_run_recovers(earlier, later):
+                dropped.append(earlier)
+                del kept[cut:]
+        kept.append(position)
+    return [words[index] for index in kept], dropped
+
+
+def _later_run_recovers(earlier: list[Word], later: list[Word]) -> bool:
+    if not earlier or not later or len(earlier) > _MAX_REDECODED_RUN_WORDS:
+        return False
+    earlier_start = min(word.start for word in earlier)
+    earlier_end = max(word.end for word in earlier)
+    later_start = min(word.start for word in later)
+    later_end = max(word.end for word in later)
+    covered = min(earlier_end, later_end) - max(earlier_start, later_start)
+    if covered < 0.5 * (earlier_end - earlier_start):
+        return False
+    earlier_speakers = {word.speaker_id for word in earlier}
+    later_speakers = {word.speaker_id for word in later}
+    if None not in earlier_speakers and None not in later_speakers and earlier_speakers.isdisjoint(later_speakers):
+        return False
+    return True
+
+
+def _collapse_doubled_number_runs(
+    words: list[Word],
+) -> tuple[list[Word], list[tuple[Word, Word]], list[list[Word]]]:
+    """Collapse MAI's AABBCC doubling only where it cannot be genuine speech.
+
+    A doubled pair is two adjacent identical tokens (not three) with a short
+    gap. Pairs linked by at most one other token form a run. A run of three or
+    more pairs made only of numbers is a counted sequence (``10, 10, 9, 9, ...``)
+    and keeps the longer copy of each pair. Any other run is left untouched and
+    reported, because doubled words can be real (``nein, nein``; a chorus).
+    """
+    tokens = [_normalized_word(word) for word in words]
+    pairs = []
+    for index in range(len(words) - 1):
+        if (
+            tokens[index] == tokens[index + 1]
+            and 0.0 <= words[index + 1].start - words[index].end + _REWIND_EPSILON_SECONDS
+            and words[index + 1].start - words[index].end <= _MAX_DOUBLED_GAP_SECONDS
+            and (index == 0 or tokens[index - 1] != tokens[index])
+            and (index + 2 >= len(words) or tokens[index + 2] != tokens[index])
+        ):
+            pairs.append(index)
+    runs: list[list[int]] = []
+    for index in pairs:
+        if runs:
+            previous = runs[-1][-1]
+            between = words[previous + 1:index + 1]
+            if index - (previous + 2) <= 1 and all(
+                right.start - left.end <= _MAX_DOUBLED_RUN_LINK_SECONDS for left, right in zip(between, between[1:])
+            ):
+                runs[-1].append(index)
+                continue
+        runs.append([index])
+    drop: set[int] = set()
+    collapsed: list[tuple[Word, Word]] = []
+    kept_runs: list[list[Word]] = []
+    for run in runs:
+        if len(run) < _MIN_DOUBLED_RUN_PAIRS:
+            continue
+        if all(tokens[index].isdigit() for index in run):
+            for index in run:
+                first, second = words[index], words[index + 1]
+                keep_first = first.end - first.start >= second.end - second.start
+                drop.add(index + 1 if keep_first else index)
+                collapsed.append((second, first) if keep_first else (first, second))
+        else:
+            kept_runs.append(words[run[0]:run[-1] + 2])
+    return [word for index, word in enumerate(words) if index not in drop], collapsed, kept_runs
 
 
 def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Word]:
