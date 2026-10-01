@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import pytest
+
+from dubsync.changes import apply_adjudication_decisions
+from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, Word
+from dubsync.pipeline import _alignment_with_decision_words
+from dubsync.recue import rebuild_cues
+from dubsync.style_profile import StyleProfile
+
+
+def _keep(span):
+    return AdjudicationDecision(
+        case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text,
+        confidence=0.95, reason="The source wording is retained.",
+    )
+
+
+def test_scribe_episode_11_keep_does_not_lend_a_cue_the_interjection_21_seconds_later():
+    # Saved Scribe case-142. Word and token indices are rebased to these two cues.
+    cues = [
+        Cue(index=403, start_ms=1183990, end_ms=1185210, lines=["na nossa viagem anual", "deste ano?"]),
+        Cue(index=406, start_ms=1207920, end_ms=1209200, lines=["Essa vista é linda."]),
+    ]
+    words = [Word(text=text, start=start, end=end, speaker_id=speaker) for text, start, end, speaker in [
+        ("na", 1184.538, 1184.618, "speaker_4"),
+        ("nossa", 1184.638, 1184.818, "speaker_4"),
+        ("viagem", 1184.898, 1185.218, "speaker_4"),
+        ("anual?", 1185.258, 1185.578, "speaker_4"),
+        ("Ah,", 1206.398, 1208.158, "speaker_5"),
+        ("que", 1208.168, 1208.318, "speaker_5"),
+        ("vista", 1208.378, 1208.738, "speaker_5"),
+        ("linda.", 1208.758, 1209.078, "speaker_5"),
+    ]]
+    span = DivergenceSpan(
+        case_id="case-142", cue_ids=[403, 406], srt_text="deste ano Essa", asr_text="Ah, que",
+        start=1206.398, end=1208.318, confidence=1.0, srt_token_indices=[4, 5, 6],
+        asr_word_indices=[4, 5], left_anchor_cue_id=403, right_anchor_cue_id=406,
+        left_anchor_end=1185.578, right_anchor_start=1208.378,
+        left_anchor_speaker_id="speaker_4", right_anchor_speaker_id="speaker_5", speaker_ids=["speaker_5"],
+    )
+    alignment = AlignmentResult(cue_word_indices={403: [0, 1, 2, 3], 406: [6, 7]})
+    decision = _keep(span)
+
+    updated = _alignment_with_decision_words(alignment, [decision], [span], source_cues=cues, words=words)
+    unchanged, _ = apply_adjudication_decisions(cues, [span], [decision], StyleProfile())
+    _, flags = rebuild_cues(unchanged, words, updated, StyleProfile())
+
+    assert updated.cue_word_indices == {403: [0, 1, 2, 3], 406: [4, 5, 6, 7]}
+    assert alignment.cue_word_indices == {403: [0, 1, 2, 3], 406: [6, 7]}
+    assert unchanged == cues
+    assert not any(flag.kind == "timing_outlier_trimmed" and 403 in flag.cue_ids for flag in flags)
+
+
+def test_continuous_kept_words_follow_unequal_source_lexical_contributions():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=2000, lines=["Alpha one two three."]),
+        Cue(index=2, start_ms=2000, end_ms=3000, lines=["Four omega."]),
+    ]
+    words = [Word(text=text, start=1 + i * 0.2, end=1.15 + i * 0.2) for i, text in enumerate(["Alpha", "one", "two", "three", "four", "omega."])]
+    span = DivergenceSpan(
+        case_id="unequal", cue_ids=[1, 2], srt_text="one two three Four", asr_text="one two three four",
+        srt_token_indices=[1, 2, 3, 4], asr_word_indices=[1, 2, 3, 4],
+        start=words[1].start, end=words[4].end,
+        left_anchor_cue_id=1, left_anchor_end=words[0].end,
+        right_anchor_cue_id=2, right_anchor_start=words[5].start,
+    )
+    updated = _alignment_with_decision_words(
+        AlignmentResult(cue_word_indices={1: [0], 2: [5]}), [_keep(span)], [span], source_cues=cues, words=words,
+    )
+
+    assert updated.cue_word_indices == {1: [0, 1, 2, 3], 2: [4, 5]}
+    assert not updated.flags
+
+
+def test_kept_words_use_separate_acoustic_groups_when_the_text_does_not_match():
+    cues = [Cue(index=1, start_ms=1000, end_ms=2200, lines=["Alpha old."]), Cue(index=2, start_ms=9000, end_ms=11000, lines=["Other omega."])]
+    words = [Word(text=text, start=start, end=start + 0.15) for text, start in [
+        ("Alpha", 1.0), ("one", 1.2), ("two", 1.4), ("three.", 1.6), ("four", 10.0), ("omega.", 10.2),
+    ]]
+    span = DivergenceSpan(
+        case_id="two-groups", cue_ids=[1, 2], srt_text="old Other", asr_text="one two three. four",
+        srt_token_indices=[1, 2], asr_word_indices=[1, 2, 3, 4], start=1.2, end=10.15,
+        left_anchor_cue_id=1, left_anchor_end=1.15, right_anchor_cue_id=2, right_anchor_start=10.2,
+    )
+    updated = _alignment_with_decision_words(
+        AlignmentResult(cue_word_indices={1: [0], 2: [5]}), [_keep(span)], [span], source_cues=cues, words=words,
+    )
+
+    assert updated.cue_word_indices == {1: [0, 1, 2, 3], 2: [4, 5]}
+
+
+def test_ambiguous_kept_boundary_preserves_anchors_without_assigning_uncertain_words():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1600, lines=["Alpha old"]), Cue(index=2, start_ms=1600, end_ms=2200, lines=["other omega."])]
+    words = [Word(text=text, start=1 + i * 0.2, end=1.15 + i * 0.2) for i, text in enumerate(["Alpha", "yes", "yes", "yes", "omega."])]
+    span = DivergenceSpan(
+        case_id="ambiguous", cue_ids=[1, 2], srt_text="old other", asr_text="yes yes yes",
+        srt_token_indices=[1, 2], asr_word_indices=[1, 2, 3], start=1.2, end=1.75,
+        left_anchor_cue_id=1, left_anchor_end=1.15, right_anchor_cue_id=2, right_anchor_start=1.8,
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [0], 2: [4]})
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == alignment.cue_word_indices
+    assert not updated.flags
+
+
+def test_one_provider_word_cannot_be_divided_between_kept_cues():
+    cues = [Cue(index=1, start_ms=1000, end_ms=1600, lines=["Alpha one"]), Cue(index=2, start_ms=1600, end_ms=2200, lines=["two omega."])]
+    words = [Word(text="Alpha", start=1, end=1.15), Word(text="one two", start=1.2, end=1.7), Word(text="omega", start=1.8, end=2)]
+    span = DivergenceSpan(
+        case_id="shared-word", cue_ids=[1, 2], srt_text="one two", asr_text="one two",
+        srt_token_indices=[1, 2], asr_word_indices=[1], start=1.2, end=1.7,
+        left_anchor_cue_id=1, left_anchor_end=1.15, right_anchor_cue_id=2, right_anchor_start=1.8,
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [0], 2: [2]})
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == alignment.cue_word_indices
+    assert not updated.flags
+
+
+def test_ambiguous_kept_span_does_not_freeze_its_existing_matched_word_timing():
+    cues = [
+        Cue(index=1, start_ms=10000, end_ms=11000, lines=["Alpha beta gamma old"]),
+        Cue(index=2, start_ms=11000, end_ms=12000, lines=["other delta epsilon omega."]),
+    ]
+    words = [Word(text=text, start=1 + i * 0.2, end=1.15 + i * 0.2) for i, text in enumerate([
+        "Alpha", "beta", "gamma", "yes", "yes", "yes", "delta", "epsilon", "omega.",
+    ])]
+    span = DivergenceSpan(
+        case_id="ambiguous-existing", cue_ids=[1, 2], srt_text="old other", asr_text="yes yes yes",
+        srt_token_indices=[3, 4], asr_word_indices=[3, 4, 5], start=1.6, end=2.15,
+        left_anchor_cue_id=1, left_anchor_end=1.55, right_anchor_cue_id=2, right_anchor_start=2.2,
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [0, 1, 2], 2: [6, 7, 8]})
+
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+    rebuilt, _ = rebuild_cues(cues, words, updated, StyleProfile(), protected_cue_ids={
+        cue_id for flag in updated.flags if flag.kind == "adjudication_word_mapping_held" for cue_id in flag.cue_ids
+    })
+
+    assert updated.cue_word_indices == alignment.cue_word_indices
+    assert all(cue.start_ms < 3000 for cue in rebuilt)
+
+
+def test_unmatched_neighbor_does_not_block_a_kept_cues_measured_own_words():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=1500, lines=["Today,"]),
+        Cue(index=2, start_ms=2500, end_ms=4500, lines=["I really thank Luke."]),
+    ]
+    words = [Word(text=text, start=start, end=start + 0.2) for text, start in [
+        ("Tonight,", 1.0), ("I", 2.5), ("would", 2.75), ("like", 3.0), ("to", 3.25),
+        ("thank", 3.5), ("Luke.", 3.75),
+    ]]
+    span = DivergenceSpan(
+        case_id="whole-and-prefix", cue_ids=[1, 2], srt_text="Today I really", asr_text="Tonight, I would like to",
+        srt_token_indices=[0, 1, 2], asr_word_indices=[0, 1, 2, 3, 4], start=1.0, end=3.45,
+        right_anchor_cue_id=2, right_anchor_start=3.5,
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [], 2: [5, 6]})
+
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == {1: [], 2: [1, 2, 3, 4, 5, 6]}
+    assert not updated.flags
+
+
+def test_unmatched_canonical_names_keep_their_normal_acoustic_fallback():
+    cues = [
+        Cue(index=244, start_ms=1012470, end_ms=1013360, lines=["Luan Nian."]),
+        Cue(index=245, start_ms=1017790, end_ms=1018880, lines=["Luan Nian..."]),
+    ]
+    words = [Word(text="Luanyan.", start=1012.705, end=1013.205),
+             Word(text="Luanyan.", start=1018.115, end=1018.615)]
+    span = DivergenceSpan(
+        case_id="repeated-name", cue_ids=[244, 245], srt_text="Luan Nian Luan Nian", asr_text="Luanyan. Luanyan.",
+        srt_token_indices=[0, 1, 2, 3], asr_word_indices=[0, 1], start=1012.705, end=1018.615,
+    )
+    alignment = AlignmentResult(cue_word_indices={244: [], 245: []})
+
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == alignment.cue_word_indices
+    assert not updated.flags
+
+
+@pytest.mark.parametrize("first_name_speaker", ["speaker_0", "speaker_5"])
+def test_testlong_kept_name_uses_only_its_own_continuous_speaker_group(first_name_speaker):
+    # Saved testlong case-83; the next speaker repeats the name, followed by
+    # an acknowledgement absent from the source. Ratio partitioning lent
+    # the second speaker's first word to cue251; a whole-span hold cut its
+    # own name off. The existing Me/chamo anchors distinguish the first name.
+    cues = [
+        Cue(index=251, start_ms=765190, end_ms=766480, lines=["Me chamo Shang Zhitao."]),
+        Cue(index=252, start_ms=766710, end_ms=768000, lines=["Shang Zhitao..."]),
+    ]
+    words = [Word(text=text, start=start, end=end, speaker_id=speaker) for text, start, end, speaker in [
+        ("Me", 765.24, 765.34, "speaker_0"),
+        ("chamo", 765.36, 765.58, "speaker_0"),
+        ("Zhang", 765.62, 765.8, first_name_speaker),
+        ("Zitao.", 765.86, 766.235, first_name_speaker),
+        ("Zhang", 766.615, 766.9, "speaker_5"),
+        ("Zitao?", 766.98, 767.38, "speaker_5"),
+        ("Uhum.", 767.48, 767.755, "speaker_0"),
+    ]]
+    span = DivergenceSpan(
+        case_id="repeated-name-and-reply", cue_ids=[251, 252], srt_text="Shang Zhitao Shang Zhitao",
+        asr_text="Zhang Zitao. Zhang Zitao? Uhum.", srt_token_indices=[2, 3, 4, 5],
+        asr_word_indices=[2, 3, 4, 5, 6], start=765.62, end=767.755,
+        left_anchor_cue_id=251, left_anchor_end=765.58, left_anchor_speaker_id="speaker_0",
+        right_anchor_cue_id=253, right_anchor_start=771.125, right_anchor_speaker_id="speaker_5",
+        speaker_ids=["speaker_0", "speaker_5"],
+    )
+    alignment = AlignmentResult(cue_word_indices={251: [0, 1], 252: []})
+
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == {251: [0, 1, 2, 3] if first_name_speaker == "speaker_0" else [0, 1], 252: []}
+    assert not updated.flags
+    assert alignment.cue_word_indices == {251: [0, 1], 252: []}
+
+
+def test_composite_stutter_is_not_lent_to_the_only_anchored_neighbor():
+    cues = [Cue(index=309, start_ms=934710, end_ms=935360, lines=["Conseguiu..."]),
+            Cue(index=310, start_ms=935360, end_ms=936640, lines=["Conseguiu um emprego!"])]
+    words = [Word(text="Consegui-conseguiu", start=934.795, end=935.71),
+             Word(text="um", start=935.72, end=935.74), Word(text="emprego?", start=935.78, end=936.3)]
+    span = DivergenceSpan(
+        case_id="indivisible-stutter", cue_ids=[309, 310], srt_text="Conseguiu Conseguiu",
+        asr_text="Consegui-conseguiu", srt_token_indices=[0, 1], asr_word_indices=[0],
+        start=934.795, end=935.71, right_anchor_cue_id=310, right_anchor_start=935.72,
+    )
+    alignment = AlignmentResult(cue_word_indices={309: [], 310: [1, 2]})
+
+    updated = _alignment_with_decision_words(alignment, [_keep(span)], [span], source_cues=cues, words=words)
+
+    assert updated.cue_word_indices == alignment.cue_word_indices
+    assert not updated.flags

@@ -169,7 +169,7 @@ test('audio-only job uploads, processes, and downloads an SRT', async ({ page })
   await expect(submit).toBeEnabled()
   await submit.click()
   await expect(page.getByText(/2 cues (?:ready|processed)/)).toBeVisible({ timeout: 15_000 })
-  await expect(page.getByText('Transcription: Scribe v2', { exact: true })).toBeVisible()
+  await expect(page.getByText('Transcription: MAI-Transcribe 2', { exact: true })).toBeVisible()
 
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download SRT' }).click()

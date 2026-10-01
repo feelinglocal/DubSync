@@ -36,6 +36,30 @@ def shared_word_cue_ids(alignment: AlignmentResult) -> set[int]:
     return {cue_id for cue_ids in owners.values() if len(cue_ids) > 1 for cue_id in cue_ids}
 
 
+def ambiguous_word_cue_ids(alignment: AlignmentResult, word_indices: set[int] | None) -> set[int]:
+    """Find every cue owning a word whose speech burst could not be identified."""
+    if not word_indices:
+        return set()
+    return {
+        cue_id for cue_id, owned in alignment.cue_word_indices.items()
+        if any(index in word_indices for index in owned)
+    }
+
+
+def ambiguous_word_timing_flags(cues: list[Cue], cue_ids: set[int]) -> list[QCFlag]:
+    return [
+        QCFlag(
+            kind="timing_evidence_held", cue_ids=[cue.index], severity="error",
+            message=(
+                "An ASR word overlaps multiple plausible speech bursts, so its position is uncertain. "
+                "The complete cue and its input timing were preserved for review."
+            ),
+            old_text=cue.text, start=cue.start_ms / 1000.0, end=cue.end_ms / 1000.0,
+        )
+        for cue in cues if cue.index in cue_ids and not is_bracketed_screen_text_cue(cue)
+    ]
+
+
 def preserve_source_timings(cues: list[Cue], source_cues: list[Cue], cue_ids: set[int]) -> list[Cue]:
     sources = {cue.index: cue for cue in source_cues if cue.index in cue_ids}
     return [
@@ -71,11 +95,15 @@ def rebuild_cues(
     max_intra_cue_gap: float = 1.5,
     protected_cue_ids: set[int] | None = None,
     min_duration_policy: str = "extend_into_silence",
+    ambiguous_word_indices: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     rebuilt: list[Cue] = []
     flags: list[QCFlag] = []
     shared_cue_ids = shared_word_cue_ids(alignment)
     protected = set(protected_cue_ids or ()) | shared_cue_ids
+    ambiguous = ambiguous_word_cue_ids(alignment, ambiguous_word_indices)
+    flags.extend(ambiguous_word_timing_flags(cues, ambiguous - protected))
+    protected |= ambiguous
     timings, timing_flags = _cue_timings(
         cues,
         words,
@@ -145,6 +173,7 @@ def cue_spoken_spans(
     *,
     max_word_duration: float = 2.0,
     max_intra_cue_gap: float = 1.5,
+    ambiguous_word_indices: set[int] | None = None,
 ) -> dict[int, tuple[int, int]]:
     """First-word onset and last-word offset (ms) of every cue that owns timed words.
 
@@ -152,7 +181,10 @@ def cue_spoken_spans(
     trimmed, from a cue's own speech, which may not.
     """
     spans: dict[int, tuple[int, int]] = {}
+    ambiguous = ambiguous_word_cue_ids(alignment, ambiguous_word_indices)
     for cue in cues:
+        if cue.index in ambiguous:
+            continue
         owned = [
             words[index]
             for index in alignment.cue_word_indices.get(cue.index, [])

@@ -6,13 +6,14 @@ from math import isfinite
 from pathlib import Path
 
 from .asr_timing import (
+    ambiguous_word_indices_from_regions,
     asr_model_from_artifact,
     clamp_asr_word_durations,
     phrase_edge_snap_from_config,
     repair_asr_word_edges,
 )
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
-from .recue import select_cue_word_window
+from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags, select_cue_word_window
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
@@ -161,16 +162,25 @@ def refine_cues_to_speech_activity(
     alignment: AlignmentResult | None = None,
     protected_cue_ids: set[int] | None = None,
     fixed_cue_ids: set[int] | None = None,
+    ambiguous_word_indices: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     options = config or BoundaryRefinementConfig()
+    ambiguous_indices = set(ambiguous_word_indices or ())
+    if ambiguous_word_indices is None and words and alignment is not None and options.enabled and regions:
+        # The pipeline passes its once-computed repair evidence. Standalone
+        # callers still must not select a burst after retaining an unsure word.
+        ambiguous_indices = ambiguous_word_indices_from_regions(words, regions)
+    ambiguous = ambiguous_word_cue_ids(alignment, ambiguous_indices) if alignment is not None else set()
     if not options.enabled or not regions:
-        return cues, []
+        return cues, ambiguous_word_timing_flags(cues, ambiguous - (protected_cue_ids or set()))
 
     protected = (
         set(alignment.diagnostics.missing_audio_cue_ids)
         if alignment is not None
         else set()
     ) | (protected_cue_ids or set())
+    ambiguity_flags = ambiguous_word_timing_flags(cues, ambiguous - protected)
+    protected |= ambiguous
     # Acoustic retiming can put dialogue before a source-held cue that was
     # earlier in the script. Caps follow playback order, not source order.
     dialogue_cues = sorted(
@@ -178,9 +188,12 @@ def refine_cues_to_speech_activity(
         key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
     )
     refined: list[Cue] = []
-    flags: list[QCFlag] = []
+    flags: list[QCFlag] = list(ambiguity_flags)
     word_repair_flags: list[QCFlag] = []
-    if words and any(_is_word_duration_outlier(word, options) for word in words):
+    if words and any(
+        index not in ambiguous_indices and _is_word_duration_outlier(word, options)
+        for index, word in enumerate(words)
+    ):
         # Repair a corrupt endpoint before choosing a lexical word cluster;
         # otherwise a real final word can be discarded as a separate cluster.
         clamped_words, word_repair_flags = clamp_asr_word_durations(

@@ -74,45 +74,6 @@ def _cue_score_payload(score: CueScore) -> dict[str, object]:
     return payload
 
 
-def write_changes_diff(path: Path, flags: list[QCFlag]) -> None:
-    """Dump every flag that carries old/new text as SRT review markers.
-
-    Kept for callers that want a raw flag view; the pipeline's customer change
-    log is ``write_change_log`` (text changes only, delivered numbering).
-    """
-
-    cues: list[Cue] = []
-    for flag in flags:
-        if flag.old_text is None and flag.new_text is None:
-            continue
-        cue_ids = ", ".join(str(cue_id) for cue_id in flag.cue_ids) or "ad-lib"
-        lines = [f"# {flag.kind} cue={cue_ids}"]
-        if flag.old_text is not None:
-            lines.extend(f"- {line}" for line in flag.old_text.splitlines())
-        if flag.new_text is not None:
-            lines.extend(f"+ {line}" for line in flag.new_text.splitlines())
-        start_ms = _flag_seconds_to_ms(flag.start)
-        end_ms = _flag_seconds_to_ms(flag.end)
-        if end_ms <= start_ms:
-            # These are review markers, not dialogue. A point finding needs a
-            # representable interval while its actual evidence stays visible.
-            lines.insert(
-                1,
-                "# 1 ms diagnostic marker; original timing (seconds): "
-                f"{flag.start} --> {flag.end}",
-            )
-            end_ms = start_ms + 1
-        cues.append(
-            Cue(
-                index=len(cues) + 1,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                lines=lines,
-            )
-        )
-    write_text_atomic(path, write_srt(cues, renumber=True) if cues else "")
-
-
 def write_change_log(path: Path, changes: Sequence[Mapping[str, object]]) -> None:
     """Write the text change log (``changes.diff.srt``) from the report's ``changes`` list.
 

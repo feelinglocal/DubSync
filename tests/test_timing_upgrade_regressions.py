@@ -287,16 +287,18 @@ def test_end_stretched_word_is_cut_at_the_end_of_its_own_burst():
     assert [flag.kind for flag in flags] == ["asr_word_clamped"]
 
 
-def test_stretch_that_reaches_the_next_phrase_keeps_the_side_that_can_hold_the_word():
+def test_stretch_with_two_plausible_bursts_is_held_but_a_short_tail_is_repaired():
     regions = [SpeechRegion(start=48.2, end=48.9), SpeechRegion(start=67.0, end=69.0)]
     end_stretched = [Word(text="Los", start=48.299, end=48.5), Word(text="geht's.", start=48.599, end=67.379)]
     start_stretched = [Word(text="aqui.", start=48.3, end=48.8), Word(text="Obrigada,", start=48.84, end=67.5)]
 
-    repaired_end, _ = repair_asr_word_edges(end_stretched, regions)
+    repaired_end, end_flags = repair_asr_word_edges(end_stretched, regions)
     repaired_start, _ = repair_asr_word_edges(start_stretched, regions)
 
-    # 0.3 s of speech after "Los" is the whole word "geht's."
-    assert (repaired_end[1].start, repaired_end[1].end) == (48.599, 48.9)
+    # Both bursts can contain "geht's.". Energy cannot prove which contains it;
+    # the old first-burst preference moved test-long's "Luke" six seconds early.
+    assert repaired_end[1] is end_stretched[1]
+    assert [flag.kind for flag in end_flags] == ["asr_word_timing_ambiguous"]
     # 60 ms after "aqui." cannot be "Obrigada,": it was spoken where it ends.
     assert (repaired_start[1].start, repaired_start[1].end) == (67.0, 67.5)
 

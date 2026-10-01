@@ -120,10 +120,12 @@ def test_spoken_letter_left_by_a_deletion_joins_the_sentence_it_is_spoken_with(t
     # 'e' (824.00-824.10) directly before 'Ele ainda tentou me acalmar,' (824.10).
     cues, flags = _sync(tmp_path, _RESIDUE_SRT, _residue_words(5.80), {"case-1": _decide("case-1", "", "use_audio")})
 
-    assert [cue.plain_text for cue in cues] == ["Eu vi tudo ontem", "e Ele tentou de novo."]
+    # This fixture's ASR keeps "Ele" capitalized, unlike the real ep17 "ele".
+    # Transfer the sentence initial to "E" while preserving that ASR evidence.
+    assert [cue.plain_text for cue in cues] == ["Eu vi tudo ontem", "E Ele tentou de novo."]
     assert abs(cues[1].start_ms - 5800) <= 34 and abs(cues[1].end_ms - 7240) <= 34
     changed = [flag for flag in flags if flag["kind"] == "text_changed"]
-    assert [(flag["cue_ids"], flag["new_text"]) for flag in changed] == [([3], "e Ele tentou de novo.")]
+    assert [(flag["cue_ids"], flag["new_text"]) for flag in changed] == [([3], "E Ele tentou de novo.")]
     assert not [flag for flag in flags if flag["severity"] == "error"]
 
 

@@ -583,7 +583,12 @@ def apply_adjudication_decisions(
 
     final_token_edit_text_by_cue: dict[int, str] = {}
     unchanged_cue_ids: set[int] = set()
+    capitalized_source_words = source_capitalized_words(cues)
     for cue_id, edits in token_edits_by_cue.items():
+        edits = _recase_prefixed_token_edits(
+            cues_by_id[cue_id], edits, words, token_matches or [],
+            cue_token_offsets[cue_id], capitalized_source_words,
+        )
         changed_text = _apply_cue_token_edits(cues_by_id[cue_id], edits)
         if changed_text is None:
             continue
@@ -675,6 +680,106 @@ def _remove_deleted_dialogue_turn_markers(source: Cue, text: str) -> str:
     candidate = (retained[0][1] if len(retained) == 1 else
                  separator.join(f"{dash} {content}" for dash, content in retained))
     return candidate if alphanumeric_signature(candidate) == alphanumeric_signature(text) else text
+
+
+def source_capitalized_words(cues: list[Cue]) -> frozenset[str]:
+    """Source capitals inside a sentence protect names and German nouns."""
+    protected: set[str] = set()
+    for cue in cues:
+        text = speech_text_for_alignment(cue)
+        for position, (start, end) in enumerate(_token_character_spans(text)):
+            token = text[start:end]
+            # A dialogue marker can follow a completed sentence ("foto. -").
+            # Its next initial is sentence casing, not source-name evidence.
+            preceding = re.sub(r"(?<!\S)[-–—]\s*$", "", text[:start])
+            if position and token[:1].isupper() and not _has_sentence_terminal(preceding):
+                protected.add(token.casefold())
+    return frozenset(protected)
+
+
+def recase_prefix_join(
+    prefix: str, retained: str, *, matched_initial: str | None,
+    capitalized_source_words: frozenset[str],
+) -> tuple[str, str]:
+    """Transfer an authored initial capital without guessing the next word's case.
+
+    Only the two boundary initials can change. Quoted or styled openings do
+    not establish a new sentence here; source names, interior capitals and
+    capitalized/missing ASR evidence keep the retained word's authored case.
+    """
+    prefix_spans, retained_spans = _token_character_spans(prefix), _token_character_spans(retained)
+    if not prefix_spans or not retained_spans:
+        return prefix, retained
+    prefix_start, _ = prefix_spans[0]
+    start, end = retained_spans[0]
+    initial = retained[start:end]
+    if (
+        prefix[:prefix_start].strip() or retained[:start].strip()
+        or not initial[:1].isupper()
+        or any(mark in prefix for mark in _DOUBLE_QUOTATION_MARKS)
+    ):
+        return prefix, retained
+    capital = prefix[prefix_start].upper()
+    candidate = prefix[:prefix_start] + capital + prefix[prefix_start + 1:]
+    if len(capital) == 1 and alphanumeric_signature(candidate) == alphanumeric_signature(prefix):
+        prefix = candidate
+
+    if (
+        matched_initial is None or _has_sentence_terminal(prefix)
+        or initial == "I" or any(character.isupper() for character in initial[1:])
+        or initial.casefold() in capitalized_source_words
+    ):
+        return prefix, retained
+    spoken_spans = _token_character_spans(matched_initial)
+    if len(spoken_spans) != 1:
+        return prefix, retained
+    spoken = matched_initial[slice(*spoken_spans[0])]
+    lower = initial[0].lower()
+    candidate = retained[:start] + lower + retained[start + 1:]
+    if (
+        spoken.islower() and spoken.casefold() == initial.casefold() and len(lower) == 1
+        and alphanumeric_signature(candidate) == alphanumeric_signature(retained)
+    ):
+        retained = candidate
+    return prefix, retained
+
+
+def _recase_prefixed_token_edits(
+    cue: Cue, edits: list[tuple[int, int, str]], words: list[Word] | None,
+    token_matches: list[TokenMatch], cue_token_offset: int,
+    capitalized_source_words: frozenset[str],
+) -> list[tuple[int, int, str]]:
+    prefix_positions = [position for position, (start, end, text) in enumerate(edits)
+                        if start == end == 0 and alphanumeric_signature(text)]
+    if not prefix_positions or cue_has_bracketed_screen_text(cue):
+        return edits
+    source = cue.plain_text
+    source_spans = _token_character_spans(source)
+    if not source_spans:
+        return edits
+    matches = [match for match in token_matches
+               if match.cue_id == cue.index and match.srt_token_index == cue_token_offset]
+    matched_initial = None
+    if (
+        words is not None and len(matches) == 1 and matches[0].score == 1.0
+        and 0 <= matches[0].asr_word_index < len(words)
+        and not any(start <= 0 < end for start, end, _ in edits)
+    ):
+        matched_initial = words[matches[0].asr_word_index].text
+    prefix = join_word_texts(edits[position][2] for position in prefix_positions)
+    recased_prefix, retained = recase_prefix_join(
+        prefix, source, matched_initial=matched_initial,
+        capitalized_source_words=capitalized_source_words,
+    )
+    recased = list(edits)
+    if recased_prefix != prefix:
+        position = prefix_positions[0]
+        start, end, text = recased[position]
+        character = _token_character_spans(text)[0][0]
+        recased[position] = (start, end, text[:character] + text[character].upper() + text[character + 1:])
+    if retained != source:
+        recased.append((0, 1, retained[slice(*source_spans[0])]))
+    return recased
 
 
 def indexed_multi_cue_replacements(
@@ -1221,7 +1326,11 @@ def _anchored_prefix_replacement_target(
     ):
         return None
     if (
-        not span.left_anchor_end < span.start < span.end <= span.right_anchor_start
+        not span.left_anchor_end < span.start < span.end
+        or span.start >= span.right_anchor_start
+        # Independently repaired edges can share one 10 ms detector hop.
+        # This changes word ownership only, never either acoustic timestamp.
+        or span.end - span.right_anchor_start > 0.010 + 1e-9
         or span.start - span.left_anchor_end <= max_gap_seconds
         or span.right_anchor_start - span.end > max_gap_seconds
     ):

@@ -261,7 +261,7 @@ def test_adlib_reconciliation_does_not_reuse_unrelated_nearby_unmatched_cue():
     assert not flags
 
 
-def test_word_anchored_vad_refinement_ignores_later_regions_from_bad_word_end():
+def test_word_anchored_vad_refinement_holds_bad_word_end_across_plausible_bursts():
     cue = Cue(index=16, start_ms=48266, end_ms=67400, lines=["Los geht's."])
     words = [
         Word(text="Los", start=48.299, end=48.5, confidence=0.96),
@@ -282,9 +282,9 @@ def test_word_anchored_vad_refinement_ignores_later_regions_from_bad_word_end():
         alignment=alignment,
     )
 
-    assert refined[0].end_ms <= 49000
-    assert refined[0].duration_ms < 1000
-    assert flags[0].kind == "timing_refined"
+    assert refined == [cue]
+    assert [flag.kind for flag in flags] == ["timing_evidence_held"]
+    assert flags[0].cue_ids == [16]
 
 
 def test_source_cues_are_sorted_chronologically_and_flag_moved_cues():

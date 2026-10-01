@@ -122,7 +122,7 @@ def test_connector_exactly_at_the_attach_gap_joins_the_line_it_introduces(tmp_pa
 
     cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "E")})
 
-    assert [cue.plain_text for cue in cues] == ["Você é muito cuidadosa.", "E Qual é o seu plano?"]
+    assert [cue.plain_text for cue in cues] == ["Você é muito cuidadosa.", "E qual é o seu plano?"]
     assert _near(cues[1].start_ms, 234.56)
     assert "adlib_inserted" not in [flag["kind"] for flag in flags]
 

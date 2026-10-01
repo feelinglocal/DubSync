@@ -79,7 +79,7 @@ def test_ep9_keep_srt_number_spans_cover_spoken_word_ends():
     assert cps_sanity_flags(rebuilt, max_cps=30, min_cps=2) == []
 
 
-def test_ep10_bad_asr_word_end_trims_to_own_vad_region_and_passes_cps_net():
+def test_ep10_bad_asr_word_end_with_two_bursts_keeps_reviewable_source_timing():
     data = _fixture()["ep10"]
     cue = Cue.model_validate(data["cue"])
     words = [Word.model_validate(row) for row in data["words"]]
@@ -95,9 +95,33 @@ def test_ep10_bad_asr_word_end_trims_to_own_vad_region_and_passes_cps_net():
         alignment=alignment,
     )
 
+    # The raw end straddles two plausible bursts. VAD alone cannot establish
+    # which contains geht's, so the old first-burst shortcut is not evidence.
+    assert refined == [cue]
+    assert [flag.kind for flag in flags] == ["timing_evidence_held"]
+    assert flags[0].cue_ids == [16]
+    assert [flag.kind for flag in cps_sanity_flags(refined, max_cps=30, min_cps=2)] == [
+        "impossible_cps_slow"
+    ]
+
+
+def test_ep10_unique_burst_still_trims_bad_word_end_and_passes_cps_net():
+    data = _fixture()["ep10"]
+    cue = Cue.model_validate(data["cue"])
+    words = [Word.model_validate(row) for row in data["words"]]
+    regions = [SpeechRegion.model_validate(data["vad"][0])]
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue],
+        regions,
+        StyleProfile(fps=30.0, min_cue_dur=0.5),
+        BoundaryRefinementConfig(start_pad_ms=40, end_pad_ms=40),
+        words=words,
+        alignment=AlignmentResult(cue_word_indices={16: [0, 1]}),
+    )
+
     assert refined[0].end_ms <= 49000
-    assert all(left.start_ms <= right.start_ms for left, right in zip(refined, refined[1:]))
-    assert flags[0].kind == "timing_refined"
+    assert any(flag.kind == "timing_refined" for flag in flags)
     assert cps_sanity_flags(refined, max_cps=30, min_cps=2) == []
 
 

@@ -96,6 +96,49 @@ def asr_model_from_artifact(asr_artifact_path: Path | None) -> str | None:
     return str(model) if model else None
 
 
+def ambiguous_word_indices(words: list[Word], flags: list[QCFlag]) -> set[int]:
+    """Locate retained ambiguous words using exact provider edges and their text.
+
+    Indices are derived for the supplied stream, so callers do not rely on a
+    mutable marker on Word or on rounded display timestamps alone.
+    """
+    evidence = {
+        (flag.start, flag.end, flag.old_text)
+        for flag in flags if flag.kind == "asr_word_timing_ambiguous"
+    }
+    return {
+        index for index, word in enumerate(words)
+        if (word.start, word.end, f"{word.text} {word.start:.3f} --> {word.end:.3f}") in evidence
+    }
+
+
+def ambiguous_word_indices_from_regions(
+    words: list[Word], regions: list[SpeechRegion], *, max_region_gap: float = 0.2,
+) -> set[int]:
+    """Detect ambiguity for standalone timing callers that lack repair flags."""
+    ordered_regions, region_starts, prefix_max_ends = _region_lookup(regions)
+    return {
+        index for index, word in enumerate(words)
+        if isfinite(word.start) and isfinite(word.end) and word.end > word.start
+        and len(_anchor_candidates(
+            word, _speech_chains(word, ordered_regions, region_starts, prefix_max_ends, max_region_gap),
+        )) > 1
+    }
+
+
+def _region_lookup(
+    regions: list[SpeechRegion],
+) -> tuple[list[SpeechRegion], list[float], list[float]]:
+    ordered_regions = sorted(regions, key=lambda region: (region.start, region.end))
+    region_starts = [region.start for region in ordered_regions]
+    prefix_max_ends: list[float] = []
+    maximum = float("-inf")
+    for region in ordered_regions:
+        maximum = max(maximum, region.end)
+        prefix_max_ends.append(maximum)
+    return ordered_regions, region_starts, prefix_max_ends
+
+
 def repair_asr_word_edges(
     words: list[Word],
     regions: list[SpeechRegion],
@@ -114,10 +157,14 @@ def repair_asr_word_edges(
     burst edge (from the side that has speech, so a start-stretched word keeps
     its real end), and phrase edges inside a burst are snapped as described by
     ``PhraseEdgeSnap``. Without acoustic evidence only the duration limit
-    applies. The returned list keeps the order and length of ``words``.
+    applies. When several separate bursts can each contain the word, its raw
+    interval is retained for downstream uncertainty handling; energy cannot
+    identify which burst contains that word. The returned list keeps the order
+    and length of ``words``.
 
     A word whose edge moved by more than ``max_region_overrun`` seconds, or that
-    needed the duration limit, is reported as ``asr_word_clamped``.
+    needed the duration limit, is reported as ``asr_word_clamped``. Retained
+    ambiguous intervals are reported as ``asr_word_timing_ambiguous`` instead.
     """
     if max_word_duration <= 0:
         raise ValueError("timing.max_word_duration must be positive")
@@ -125,25 +172,27 @@ def repair_asr_word_edges(
         raise ValueError("speech-region timing limits must be non-negative")
     snap = snap or PhraseEdgeSnap()
 
-    ordered_regions = sorted(regions, key=lambda region: (region.start, region.end))
-    region_starts = [region.start for region in ordered_regions]
-    prefix_max_ends: list[float] = []
-    maximum = float("-inf")
-    for region in ordered_regions:
-        maximum = max(maximum, region.end)
-        prefix_max_ends.append(maximum)
+    ordered_regions, region_starts, prefix_max_ends = _region_lookup(regions)
 
     # First pass: edges in silence and the duration limit. These depend only
     # on the word itself, so neighbours can be consulted afterwards.
     repaired: list[tuple[float, float]] = []
-    for word in words:
+    ambiguous: dict[int, list[tuple[float, float]]] = {}
+    for index, word in enumerate(words):
         start, end = word.start, word.end
         if isfinite(start) and isfinite(end) and end > start and ordered_regions:
-            anchor = _anchor_chain(
+            candidates = _anchor_candidates(
                 word,
                 _speech_chains(word, ordered_regions, region_starts, prefix_max_ends, max_region_gap),
             )
-            if anchor is not None:
+            if len(candidates) > 1:
+                # A duration cap or phrase snap would silently pick one of the
+                # possible utterances too. Preserve both provider edges.
+                ambiguous[index] = candidates
+                repaired.append((start, end))
+                continue
+            if candidates:
+                anchor = candidates[0]
                 anchored_start = max(start, anchor[0])
                 anchored_end = min(end, anchor[1])
                 if anchored_end > anchored_start:
@@ -155,6 +204,25 @@ def repair_asr_word_edges(
     result: list[Word] = []
     flags: list[QCFlag] = []
     for index, word in enumerate(words):
+        if index in ambiguous:
+            candidates = ambiguous[index]
+            windows = ", ".join(f"{start:.3f} --> {end:.3f}" for start, end in candidates[:4])
+            if len(candidates) > 4:
+                windows += f", and {len(candidates) - 4} more"
+            result.append(word)
+            flags.append(QCFlag(
+                kind="asr_word_timing_ambiguous",
+                cue_ids=[],
+                severity="warning",
+                message=(
+                    "ASR word overlaps several plausible speech bursts; provider timing was retained "
+                    f"because energy alone cannot identify the spoken word. Bursts: {windows}."
+                ),
+                old_text=f"{word.text} {word.start:.3f} --> {word.end:.3f}",
+                start=word.start,
+                end=word.end,
+            ))
+            continue
         start, end = repaired[index]
         if isfinite(start) and isfinite(end) and end > start and ordered_regions:
             previous_end = repaired[index - 1][1] if index > 0 else float("-inf")
@@ -245,28 +313,28 @@ def _speech_chains(
     return chains
 
 
-def _anchor_chain(word: Word, chains: list[tuple[float, float]]) -> tuple[float, float] | None:
-    """Choose the speech the word was spoken in.
+def _anchor_candidates(word: Word, chains: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Return plausible speech locations without choosing between utterances.
 
-    A stretched word normally touches speech on one side only. When speech lies
-    at both ends of the interval, the stretch reached the neighbouring phrase:
-    the word keeps its start (the edge Scribe stretches least often) if the
-    speech there is long enough to be the whole word, otherwise its end.
+    A stretched word often touches speech on one side only, or includes a short
+    tail of the previous word. Multiple bursts long enough to contain the whole
+    word are ambiguous: a preferred provider edge is not lexical evidence.
     """
     needed = min(MIN_OWNED_OVERLAP_SECONDS, (word.end - word.start) / 2)
     owned = [chain for chain in chains if _overlap(word, chain) >= needed]
     if not owned:
-        return None
+        return []
     first, last = owned[0], owned[-1]
     if first == last:
-        return first
+        return [first]
     letters = sum(character.isalnum() for character in word.text)
     plausible = max(MIN_WHOLE_WORD_SECONDS, MIN_SECONDS_PER_LETTER * letters)
-    if _overlap(word, first) >= plausible:
-        return first
-    if _overlap(word, last) >= plausible:
-        return last
-    return first if _overlap(word, first) >= _overlap(word, last) else last
+    candidates = [chain for chain in owned if _overlap(word, chain) >= plausible]
+    if candidates:
+        return candidates
+    # Several short overlaps may be separate utterances or split phonemes.
+    # Choosing the longest would still guess the word's acoustic ownership.
+    return owned
 
 
 def _overlap(word: Word, chain: tuple[float, float]) -> float:

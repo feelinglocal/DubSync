@@ -5,6 +5,7 @@ import unicodedata
 from collections import Counter
 from math import isfinite
 
+from .changes import recase_prefix_join, source_capitalized_words
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .recue import timing_evidence_issue
 from .speaker_evidence import has_known_different_speakers, speakers_known_different
@@ -246,6 +247,7 @@ def _settle_placeless_cues(
     cue_word_indices = {key: list(value) for key, value in alignment.cue_word_indices.items()}
     flags: list[QCFlag] = []
     gone: set[int] = set()
+    capitalized_source_words = source_capitalized_words(cues)
 
     def speaker_of(adlib: Cue) -> str | None:
         # The words carry the diarized actor; the decision's label is a guess.
@@ -267,6 +269,17 @@ def _settle_placeless_cues(
 
     def join(target: Cue, adlib: Cue, *, before: bool) -> None:
         parts = [adlib.plain_text, target.plain_text] if before else [target.plain_text, adlib.plain_text]
+        if before:
+            indices = _ordered_valid_word_indices(words, cue_word_indices.get(target.index, []))
+            matched_initial = (
+                words[indices[0]].text
+                if indices and _has_unique_exact_text_window(target.plain_text, words, indices)
+                else None
+            )
+            parts = list(recase_prefix_join(
+                *parts, matched_initial=matched_initial,
+                capitalized_source_words=capitalized_source_words,
+            ))
         text = join_word_texts(parts)
         lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
         if len(lines) > profile.max_lines_per_cue:

@@ -19,6 +19,7 @@ def finalize_cues_for_output(
     max_cps: float | None = None,
     max_cue_duration_seconds: float | None = None,
     protected_cue_ids: set[int] | None = None,
+    fixed_cue_ids: set[int] | None = None,
     preserve_timing: bool = False,
     media_duration_ms: int | None = None,
     merge_duplicates: bool = True,
@@ -37,13 +38,18 @@ def finalize_cues_for_output(
     frame snapping or an unsynchronized source hold; a hold may then be clipped
     at its acoustic neighbour (``_resolve_overlaps_with_speech_evidence``).
     Without it nothing is moved.
+
+    ``fixed_cue_ids`` retains unresolved word-ambiguity intervals even when
+    ordinary source holds could be clipped at a neighbor. Any overlap remains
+    an uncertainty finding, not a claim of simultaneous speech.
     """
     if media_duration_ms is not None and media_duration_ms < 0:
         raise ValueError("media_duration_ms must be non-negative")
     # Validate before readability extension or merging can conceal an invalid
     # upstream boundary. Only the creating stage has evidence to repair it.
     validate_cue_timings_for_export(cues)
-    protected = protected_cue_ids or set()
+    fixed = fixed_cue_ids or set()
+    protected = (protected_cue_ids or set()) | fixed
     untouched_cues = [
         cue
         for cue in cues
@@ -90,7 +96,7 @@ def finalize_cues_for_output(
         key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
     )
     if no_overlaps and preserve_timing and spoken_spans is not None:
-        combined = _resolve_overlaps_with_speech_evidence(combined, profile, protected, spoken_spans)
+        combined = _resolve_overlaps_with_speech_evidence(combined, profile, protected, spoken_spans, fixed)
     remaining_overlaps = (
         _unresolved_acoustic_overlap_flags([cue for cue in combined if not is_bracketed_screen_text_cue(cue)])
         if no_overlaps
@@ -101,6 +107,9 @@ def finalize_cues_for_output(
             # One finding per remaining pair. A pair that involves a source
             # hold says so instead of claiming both cues are acoustically timed.
             flags.append(
+                flag.model_copy(update={"message": _AMBIGUOUS_OVERLAP_MESSAGE})
+                if fixed.intersection(flag.cue_ids)
+                else
                 flag.model_copy(update={"message": _HELD_OVERLAP_MESSAGE})
                 if protected.intersection(flag.cue_ids)
                 else flag
@@ -122,6 +131,10 @@ _HELD_OVERLAP_MESSAGE = (
     "A cue kept at its source timing overlaps its neighbour and could not be separated "
     "without hiding speech; review the held cue's timing."
 )
+_AMBIGUOUS_OVERLAP_MESSAGE = (
+    "An ASR word overlaps multiple possible speech bursts. Its retained cue interval overlaps "
+    "a neighbor; review the uncertain timing before selecting a speech boundary."
+)
 # A cue without word timing is only clipped while at least this many frames,
 # and half of its duration, remain; anything less is left for review.
 _MIN_CLIPPED_HOLD_FRAMES = 3
@@ -133,6 +146,7 @@ def _resolve_overlaps_with_speech_evidence(
     profile: StyleProfile,
     protected: set[int],
     spoken_spans: dict[int, tuple[int, int]],
+    fixed_cue_ids: set[int] | None = None,
 ) -> list[Cue]:
     """Separate overlapping cues without delaying or hiding anyone's speech.
 
@@ -179,6 +193,10 @@ def _resolve_overlaps_with_speech_evidence(
             boundary = earlier.end_ms if earlier.end_ms <= latest else profile.snap_floor(latest)
             boundary = max(boundary, later.start_ms)
         if boundary < earliest or not earlier.start_ms < boundary < later.end_ms:
+            return None
+        if (earlier.index in (fixed_cue_ids or set()) and boundary < earlier.end_ms) or (
+            later.index in (fixed_cue_ids or set()) and boundary > later.start_ms
+        ):
             return None
         return boundary
 

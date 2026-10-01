@@ -201,8 +201,12 @@ def test_forced_minimum_duration_cannot_cross_next_trusted_speech_onset():
     assert any(flag.kind == "min_duration_unattainable" and flag.cue_ids == [1] for flag in flags)
 
 
-def test_region_duration_clamping_keeps_short_connected_regions_and_stops_at_silence():
-    word = Word(text="hello", start=1.0, end=2.9)
+@pytest.mark.parametrize("end,expected_end,flag_kind", [
+    (2.9, 2.9, "asr_word_timing_ambiguous"),
+    (2.53, 1.5, "asr_word_clamped"),
+])
+def test_region_repair_joins_short_gaps_without_guessing_between_whole_bursts(end, expected_end, flag_kind):
+    word = Word(text="hello", start=1.0, end=end)
     regions = [
         SpeechRegion(start=1.0, end=1.2),
         SpeechRegion(start=1.3, end=1.5),
@@ -211,9 +215,11 @@ def test_region_duration_clamping_keeps_short_connected_regions_and_stops_at_sil
 
     clamped, flags = clamp_asr_word_durations([word], regions)
 
-    assert clamped[0].end == 1.5
-    assert word.end == 2.9
-    assert flags[0].kind == "asr_word_clamped"
+    # The connected first regions form one candidate. Substantial overlap with
+    # the later burst is ambiguous; a 30 ms tail there is not a second word.
+    assert clamped[0].end == expected_end
+    assert word.end == end
+    assert flags[0].kind == flag_kind
 
 
 def test_shared_boundary_policy_keeps_sync_defaults_and_provider_overrides():

@@ -22,6 +22,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -55,6 +56,7 @@ REDISTRIBUTED_CHANGE_MIN_CUES = 2
 _LYRIC_MARKS = ("♪", "♫")
 _ROUTE_TAG = re.compile(r"\[hybrid:([a-z_]+)\]\s*")
 _VERDICT_PREFIX = re.compile(r"^Adjudication verdict [a-z_]+:\s*")
+_WORD_TIMING_WINDOW = re.compile(r"(-?\d+(?:\.\d+)?)\s*-->\s*(-?\d+(?:\.\d+)?)\s*$")
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 
 
@@ -234,7 +236,8 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     "adlib_rejected_repetitive_content": _note_kind("Repetitive speech outside the script was not subtitled"),
     "adlib_rejected_outside_source_span": _note_kind("Speech outside the script range was not subtitled"),
     # Operator-only bookkeeping.
-    "asr_word_clamped": _diagnostic_kind("ASR word end clamped"),
+    "asr_word_clamped": _diagnostic_kind("ASR word timing clamped"),
+    "asr_word_timing_ambiguous": _diagnostic_kind("ASR word spans multiple speech bursts"),
     "asr_timestamp_rounding_clamped": _diagnostic_kind("ASR timestamp rounding clamped"),
     "asr_duplicate_words_dropped": _diagnostic_kind("ASR repeated word run dropped"),
     "asr_doubled_words_collapsed": _diagnostic_kind("ASR doubled countdown words collapsed"),
@@ -606,7 +609,11 @@ class _FindingSorter:
                 self.deferred_spelling.append(index)
             return
         if cue_ids and kind in _HOLD_ECHO_KINDS and self.all_held(cue_ids) and not self._real_proposal(flag):
-            self._absorb(self._first_held(cue_ids), flag=index)
+            # One span can cover separate dialogue/lyric blocks. Retain its
+            # evidence on every affected hold, not just the first block.
+            for cue_id in cue_ids:
+                if cue_id in self.held:
+                    self._absorb(cue_id, flag=index)
             return
         if cue_ids and kind in _LYRIC_ABSENCE_KINDS and all(self.is_lyric(cue_id) for cue_id in cue_ids):
             self.lyric_absent.update(cue_ids)
@@ -643,6 +650,12 @@ class _FindingSorter:
                 self._diagnostic(kind, index, flag)
                 return
         if kind == "missing_audio_source_cue_held":
+            # Mixed spans can contain a timing-held cue and a cue whose source
+            # wording alone was held. Fold only the duplicate part; the other
+            # cue still needs a review item.
+            for cue_id in cue_ids:
+                if cue_id in self.held:
+                    self._absorb(cue_id, flag=index)
             unheld = [cue_id for cue_id in self.delivered_ids(cue_ids) if cue_id not in self.held]
             if not unheld:
                 self._diagnostic(kind, index, flag)
@@ -1356,18 +1369,50 @@ class _FindingSorter:
             title = _DIAGNOSTIC_TITLES.get(key) or (spec.title if spec is not None else key)
             if key.endswith(":not_delivered"):
                 title = f"{title} (later undone; not in the delivered SRT)"
+            message = clean_customer_text(bucket.messages[0]) if bucket.messages else ""
+            if key == "asr_word_clamped":
+                message = self._word_clamp_summary(bucket)
             items.append(DiagnosticItem(
                 id=f"D{len(items) + 1}",
                 kind=key,
                 title=title,
                 count=len(bucket.raw_flags) + len(bucket.raw_style),
                 severity=bucket.severity if bucket.severity in ("info", "warning", "error") else "info",
-                message=clean_customer_text(bucket.messages[0]) if bucket.messages else "",
+                message=message,
                 cue_ids=sorted(bucket.cue_ids),
                 raw_flags=sorted(set(bucket.raw_flags)),
                 raw_style=sorted(set(bucket.raw_style)),
             ))
         return items
+
+    def _word_clamp_summary(self, bucket: _Bucket) -> str:
+        flags = [self.flags[index] for index in sorted(set(bucket.raw_flags))]
+        count = len(flags)
+        message = (
+            f"{count} ASR word timing correction was recorded."
+            if count == 1 else f"{count} ASR word timing corrections were recorded."
+        )
+        windows = [
+            (flag.start, flag.end) for flag in flags
+            if flag.start is not None and flag.end is not None
+            and isfinite(flag.start) and isfinite(flag.end) and flag.end >= flag.start
+        ]
+        if windows:
+            start_ms = max(0, round(min(start for start, _ in windows) * 1000))
+            end_ms = max(0, round(max(end for _, end in windows) * 1000))
+            message += f" Corrected words span {format_timestamp(start_ms)}–{format_timestamp(end_ms)}."
+        shifts: list[tuple[float, float]] = []
+        for flag in flags:
+            old = _parse_word_timing_window(flag.old_text)
+            new = _parse_word_timing_window(flag.new_text)
+            if old is not None and new is not None:
+                shifts.append((abs(new[0] - old[0]), abs(new[1] - old[1])))
+        if shifts:
+            message += (
+                f" Largest start change: {max(start for start, _ in shifts) * 1000:.0f} ms;"
+                f" largest end change: {max(end for _, end in shifts) * 1000:.0f} ms."
+            )
+        return message
 
     # Counts -------------------------------------------------------------------
 
@@ -1464,6 +1509,14 @@ def _parse_seconds_window(text: str | None) -> tuple[float, float] | None:
         return float(left.strip()), float(right.strip())
     except ValueError:
         return None
+
+
+def _parse_word_timing_window(text: str | None) -> tuple[float, float] | None:
+    match = _WORD_TIMING_WINDOW.search(text or "")
+    if match is None:
+        return None
+    start, end = (float(value) for value in match.groups())
+    return (start, end) if isfinite(start) and isfinite(end) and end >= start else None
 
 
 def _timing_label(window: tuple[float, float]) -> str:

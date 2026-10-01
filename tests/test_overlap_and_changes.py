@@ -4,8 +4,7 @@ from dubsync.changes import apply_adjudication_decisions, flow_text_to_lines
 from dubsync.editorial_guard import episode_editorial_addition_flags
 from dubsync.models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
 from dubsync.overlap import apply_overlap_policy
-from dubsync.reports import write_changes_diff, write_qc_report
-from dubsync.srt_io import parse_srt_text
+from dubsync.reports import write_qc_report
 from dubsync.style_profile import StyleProfile
 
 
@@ -347,51 +346,6 @@ def test_overlap_flag_only_records_overlap_timestamp_window():
     assert flags[0].cue_ids == [1, 2]
     assert flags[0].start == 1.5
     assert flags[0].end == 2.0
-
-
-def test_changes_diff_lists_old_and_new_text(tmp_path):
-    path = tmp_path / "changes.diff.srt"
-    write_changes_diff(
-        path,
-        [
-            QCFlag(
-                kind="text_changed",
-                cue_ids=[1],
-                message="changed",
-                old_text="old",
-                new_text="new",
-                start=1.0,
-                end=2.0,
-            )
-        ],
-    )
-
-    assert "- old" in path.read_text(encoding="utf-8")
-    assert "+ new" in path.read_text(encoding="utf-8")
-
-
-def test_changes_diff_is_valid_srt_review_file(tmp_path):
-    path = tmp_path / "changes.diff.srt"
-    write_changes_diff(
-        path,
-        [
-            QCFlag(
-                kind="text_changed",
-                cue_ids=[1],
-                message="changed",
-                old_text="old",
-                new_text="new",
-                start=1.0,
-                end=2.0,
-            )
-        ],
-    )
-
-    diff_cues = parse_srt_text(path.read_text(encoding="utf-8"))
-    assert len(diff_cues) == 1
-    assert diff_cues[0].start_ms == 1000
-    assert diff_cues[0].end_ms == 2000
-    assert diff_cues[0].lines == ["# text_changed cue=1", "- old", "+ new"]
 
 
 def test_qc_html_report_lists_flag_timestamps_and_text_changes(tmp_path):

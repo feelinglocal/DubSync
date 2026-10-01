@@ -351,7 +351,7 @@ def test_far_word_directly_before_the_next_line_still_joins_that_line(tmp_path):
 
     cues, _ = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "E")})
 
-    assert [cue.plain_text for cue in cues] == ["eu vou estar ferrada.", "E Se não for só eu a vítima,"]
+    assert [cue.plain_text for cue in cues] == ["eu vou estar ferrada.", "E se não for só eu a vítima,"]
     assert _near(cues[0].end_ms, 8.96) and _near(cues[1].start_ms, 13.04)
 
 

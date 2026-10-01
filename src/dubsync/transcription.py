@@ -4,7 +4,7 @@ from math import isfinite
 from pathlib import Path
 
 from .audio import AudioNormalizationLimits, normalize_audio
-from .asr_timing import phrase_edge_snap_from_config, repair_asr_word_edges
+from .asr_timing import ambiguous_word_indices, phrase_edge_snap_from_config, repair_asr_word_edges
 from .cache import JsonDiskCache, write_json_atomic, write_text_atomic
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
@@ -21,6 +21,7 @@ from .providers import (
 )
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
+from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags
 from .reports import write_qc_report
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
@@ -204,6 +205,7 @@ def generate_srt_from_audio(
         ),
     )
     flags.extend(word_clamp_flags)
+    uncertain_word_indices = ambiguous_word_indices(words, word_clamp_flags)
 
     generation_config = provider_config.get("generation", {})
     if not isinstance(generation_config, dict):
@@ -220,6 +222,8 @@ def generate_srt_from_audio(
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
         preserve_timing=True,
     )
+    ambiguous_cue_ids = ambiguous_word_cue_ids(alignment, uncertain_word_indices)
+    flags.extend(ambiguous_word_timing_flags(cues, ambiguous_cue_ids))
     if speech_regions:
         cues, timing_flags = refine_cues_to_speech_activity(
             cues,
@@ -228,6 +232,8 @@ def generate_srt_from_audio(
             boundary_refinement,
             words=words,
             alignment=alignment,
+            protected_cue_ids=ambiguous_cue_ids,
+            ambiguous_word_indices=uncertain_word_indices,
         )
         flags.extend(timing_flags)
 
@@ -256,6 +262,8 @@ def generate_srt_from_audio(
         max_cps=constraints.max_cps,
         max_cue_duration_seconds=constraints.max_cue_duration_seconds,
         preserve_timing=True,
+        protected_cue_ids=ambiguous_cue_ids,
+        fixed_cue_ids=ambiguous_cue_ids,
         media_duration_ms=round(duration_seconds * 1000) if duration_seconds > 0 else None,
         merge_duplicates=False,
     )
@@ -273,7 +281,7 @@ def generate_srt_from_audio(
     flags = censor_german_profanity_flags(flags)
 
     style_issues = lint_cues(cues, profile)
-    cue_scores = score_cues(cues, words, alignment)
+    cue_scores = score_cues(cues, words, alignment, protected_cue_ids=ambiguous_cue_ids)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(output_path, write_srt(cues, renumber=True))
     _write_json(

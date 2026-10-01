@@ -11,7 +11,9 @@ from .text_metrics import display_width
 def lint_cues(cues: list[Cue], profile: StyleProfile) -> list[StyleIssue]:
     issues: list[StyleIssue] = []
     previous: Cue | None = None
-    min_duration_ms = int(profile.min_cue_dur * 1000)
+    # Match boundary refinement: one frame of slack is a rounding tolerance,
+    # not a reason to extend a cue past its acoustic or neighbour boundary.
+    min_duration_ms = profile.min_cue_dur * 1000 - profile.frame_ms
 
     for cue in cues:
         if cue.start_ms > cue.end_ms:

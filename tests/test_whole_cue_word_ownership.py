@@ -166,7 +166,7 @@ def test_actual_whole_cue_improvisation_keeps_its_phrase_and_moves_only_the_prov
     before = [cue.model_dump() for cue in cues]
     changed, mapped, rebuilt, flags, held, profile = continuation_replay(cues, words, spans, matches)
 
-    assert [cue.plain_text for cue in changed] == ["Tá bom, então vamos lá.", "Eu Vou esperar um pouco."]
+    assert [cue.plain_text for cue in changed] == ["Tá bom, então vamos lá.", "Eu vou esperar um pouco."]
     assert mapped.cue_word_indices == {330: list(range(5)), 331: list(range(5, 10))}
     assert [index for cue in changed for index in mapped.cue_word_indices[cue.index]] == list(range(10))
     assert alphanumeric_signature(" ".join(cue.plain_text for cue in changed)) == alphanumeric_signature(
@@ -247,6 +247,6 @@ def test_whole_cue_continuation_does_not_require_the_model_to_copy_asr_punctuati
     )
 
     assert changed[0].plain_text == "Tá bom então vamos lá."
-    assert changed[1].plain_text == "Eu Vou esperar um pouco."
+    assert changed[1].plain_text == "Eu vou esperar um pouco."
     assert mapped.cue_word_indices == {330: list(range(5)), 331: list(range(5, 10))}
     assert held == set()
