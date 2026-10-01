@@ -17,7 +17,7 @@ from .adjudication_regions import (
     validated_protected_source_regions,
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
-from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
+from .aligner import MISSING_AUDIO_GUARD_VERSION, _words_touch, align_cues_to_words
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
@@ -81,7 +81,7 @@ from .timing_refinement import (
     BoundaryRefinementConfig, SpeechEvidence, boundary_refinement_config_from_config,
     min_duration_policy_from_config, refine_cues_to_speech_activity, speech_evidence_for_words,
 )
-from .tokenize import alphanumeric_signature
+from .tokenize import alphanumeric_signature, normalize_token
 from .vad import (
     cue_ids_with_audible_words,
     dropped_line_flags_for_unmatched_cues,
@@ -541,6 +541,8 @@ def sync_episode(
         )
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     source_timing_held_cue_ids = _source_timing_held_cue_ids(flags)
+
+    alignment, decisions = _absorb_redecoded_insertions(alignment, decisions, words)
 
     # ASR word edges are repaired against the audio once, before any cue is
     # timed; rebuild and verification share the same repaired words.
@@ -3043,6 +3045,82 @@ def _adlib_cue_ids_by_case(
         cue_ids[span.case_id] = next_index
         next_index += 1
     return cue_ids, flags
+
+
+def _absorb_redecoded_insertions(
+    alignment: AlignmentResult, decisions: list[AdjudicationDecision], words: list[Word],
+) -> tuple[AlignmentResult, list[AdjudicationDecision]]:
+    """Never insert words that only repeat the adjacent owned words at the same time.
+
+    A provider can decode one utterance twice ('manda umas flores. Manda umas
+    flores', "Você..." / "Você..." with overlapping timestamps). The aligner
+    gives a single touching copy back to the cue of its exactly matched twin;
+    a copied phrase, or a copy left as its own case, reached the adjudicator
+    and came back as approved new dialogue. Such a copy is an ASR artefact,
+    not speech: nothing is inserted or reported, and its words time the cue
+    that owns the twin, because both copies are that cue's utterance.
+    """
+    owners: dict[int, set[int]] = {}
+    for cue_id, indices in alignment.cue_word_indices.items():
+        for index in indices:
+            owners.setdefault(index, set()).add(cue_id)
+    protected = set(alignment.diagnostics.missing_audio_cue_ids)
+    by_case = {decision.case_id: decision for decision in decisions}
+    cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
+    dropped: dict[str, AdjudicationDecision] = {}
+    absorbed = False
+    for span in alignment.divergence_spans:
+        indices = span.asr_word_indices
+        if (
+            span.cue_ids or span.srt_token_indices or not indices
+            or indices != list(range(indices[0], indices[-1] + 1))
+            or indices[0] < 0 or indices[-1] >= len(words)
+        ):
+            continue
+        keys = [normalize_token(words[index].text) for index in indices]
+        decision = by_case.get(span.case_id)
+        approved = decision is not None and decision.verdict != "keep_srt" and bool(decision.final_text.strip())
+        if not all(keys) or (
+            approved and alphanumeric_signature(decision.final_text) != alphanumeric_signature(span.asr_text)
+        ):
+            continue
+        length = len(indices)
+        # The case and the owned words around it are two touching copies of
+        # one phrase; alignment may have matched any part of either copy.
+        for first in range(indices[0] - length, indices[0] + 1):
+            if first < 0 or first + 2 * length > len(words):
+                continue
+            twin = [index for index in range(first, first + 2 * length) if not indices[0] <= index <= indices[-1]]
+            twin_owners = [owners.get(index, set()) for index in twin]
+            if (
+                any(len(owner) != 1 for owner in twin_owners)
+                or len(set().union(*twin_owners)) != 1
+                or any(
+                    normalize_token(words[index].text) != normalize_token(words[index + length].text)
+                    for index in range(first, first + length)
+                )
+                or not _words_touch(words[first + length - 1], words[first + length])
+            ):
+                continue
+            (owner,) = twin_owners[0]
+            if owner not in protected:
+                cue_word_indices[owner] = sorted({*cue_word_indices.get(owner, []), *indices})
+                absorbed = True
+            if approved:
+                dropped[span.case_id] = decision.model_copy(update={
+                    "verdict": "keep_srt", "final_text": span.srt_text,
+                    "reason": (
+                        "The words repeat the adjacent words at the same time (the provider decoded one "
+                        f"utterance twice); nothing was inserted. Proposed {decision.verdict}: {decision.final_text!r}."
+                    ),
+                })
+            break
+    if not absorbed and not dropped:
+        return alignment, decisions
+    return (
+        alignment.model_copy(update={"cue_word_indices": cue_word_indices}),
+        [dropped.get(decision.case_id, decision) for decision in decisions],
+    )
 
 
 def _reconciled_cue_ids(flags: list[QCFlag]) -> set[int]:
