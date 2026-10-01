@@ -10,6 +10,7 @@ import os
 import time
 import wave
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -447,12 +448,17 @@ def _collapse_doubled_number_runs(
 
 
 def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Word]:
+    return _join_paired_words(left, right, _overlap_pairs(left, right, boundary), boundary)
+
+
+def _overlap_pairs(left: list[Word], right: list[Word], boundary: float) -> dict[int, int]:
     """Match overlapping occurrences before ownership so timing jitter cannot split a pair.
 
     The monotonic one-to-one match keeps repeated words distinct. Requiring
     overlapping intervals avoids merging repetitions at clearly different times.
-    A matched pair always contributes one real provider record, even when its
-    two midpoints disagree about which chunk owns it.
+    The two chunks can spell one spoken word differently (``vamo``/``vamos``),
+    so a strongly overlapping, similar word also pairs; exact text pairs are
+    preferred over such spelling pairs.
     """
     from .providers import ProviderError
 
@@ -462,20 +468,23 @@ def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Wo
         raise ProviderError("MAI-Transcribe 2 returned too many overlapping word timestamps.")
     left_tokens = [_normalized_word(left[i]) for i in left_overlap]
     right_tokens = [_normalized_word(right[i]) for i in right_overlap]
-    scores = [[(0, 0.0) for _ in range(len(right_overlap) + 1)] for _ in range(len(left_overlap) + 1)]
+    # Score: (exact text pairs, all pairs, summed overlap similarity).
+    scores = [[(0, 0, 0.0) for _ in range(len(right_overlap) + 1)] for _ in range(len(left_overlap) + 1)]
     matches = {}
     for row, left_index in enumerate(left_overlap, start=1):
         for col, right_index in enumerate(right_overlap, start=1):
             lword, rword = left[left_index], right[right_index]
             overlap = min(lword.end, rword.end) - max(lword.start, rword.start)
             score = max(scores[row - 1][col], scores[row][col - 1])
-            if left_tokens[row - 1] == right_tokens[col - 1] and overlap > 0:
+            if overlap > 0:
                 similarity = overlap / min(lword.end - lword.start, rword.end - rword.start)
-                diagonal = scores[row - 1][col - 1]
-                candidate = (diagonal[0] + 1, diagonal[1] + similarity)
-                if candidate >= score:
-                    score = candidate
-                    matches[(row, col)] = True
+                exact = left_tokens[row - 1] == right_tokens[col - 1]
+                if exact or _same_spoken_word(lword, rword, left_tokens[row - 1], right_tokens[col - 1], overlap):
+                    diagonal = scores[row - 1][col - 1]
+                    candidate = (diagonal[0] + int(exact), diagonal[1] + 1, diagonal[2] + similarity)
+                    if candidate >= score:
+                        score = candidate
+                        matches[(row, col)] = True
             scores[row][col] = score
     pairs = {}
     row, col = len(left_overlap), len(right_overlap)
@@ -488,6 +497,21 @@ def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Wo
             row -= 1
         else:
             col -= 1
+    return pairs
+
+
+def _same_spoken_word(left: Word, right: Word, left_token: str, right_token: str, overlap: float) -> bool:
+    # MAI never lets two different words touch, so a substantial overlap
+    # between the two chunks' words means they transcribe the same speech.
+    if SequenceMatcher(None, left_token, right_token).ratio() >= 0.5:
+        return overlap >= 0.4 * min(left.end - left.start, right.end - right.start)
+    return overlap >= 0.6 * (max(left.end, right.end) - min(left.start, right.start))
+
+
+def _join_paired_words(left: list[Word], right: list[Word], pairs: dict[int, int], boundary: float) -> list[Word]:
+    """A matched pair always contributes one real provider record, even when
+    its two midpoints disagree about which chunk owns it; unmatched words are
+    owned by their own midpoint."""
     paired_right = set(pairs.values())
     joined = []
     for index, word in enumerate(left):

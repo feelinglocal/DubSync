@@ -336,6 +336,43 @@ def test_chunk_overlap_preserves_actual_repeated_words(monkeypatch, tmp_path):
     assert [word.start for word in words] == [3.5, 3.85]
 
 
+@pytest.mark.parametrize("left,right", [
+    ((3.9, 4.2), (0.85, 1.1)),   # asr.md bug 6: crossed midpoints used to lose the word
+    ((3.8, 4.1), (0.95, 1.25)),  # ... and these used to keep both spellings
+])
+def test_boundary_word_spelled_differently_by_the_two_chunks_is_kept_once(monkeypatch, tmp_path, left, right):
+    _transport(monkeypatch, [
+        {"words": [{"word": "Ok,", "start": 3.2, "end": 3.5}, {"word": "vamo", "start": left[0], "end": left[1]}]},
+        {"words": [{"word": "vamos", "start": right[0], "end": right[1]}, {"word": "embora.", "start": 1.5, "end": 1.9}]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    assert [word.text for word in words][0] == "Ok,"
+    assert [word.text for word in words][-1] == "embora."
+    assert len(words) == 3
+    assert (words[1].text, words[1].start) in [("vamo", left[0]), ("vamos", pytest.approx(right[0] + 3))]
+
+
+def test_boundary_pairing_prefers_exact_text_over_a_different_spelling(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [{"word": "pra", "start": 3.7, "end": 3.9}, {"word": "casa.", "start": 3.95, "end": 4.3}]},
+        {"words": [{"word": "para", "start": 0.68, "end": 0.92}, {"word": "casa.", "start": 0.96, "end": 1.31}]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    assert [word.text for word in words] == ["pra", "casa."]
+
+
+def test_weakly_overlapping_different_boundary_words_keep_midpoint_ownership(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [{"word": "Haus", "start": 3.7, "end": 3.95}]},
+        {"words": [{"word": "jetzt", "start": 0.9, "end": 1.3}]},
+    ])
+    words = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4).transcribe(_audio(tmp_path, seconds=8))
+
+    assert [word.text for word in words] == ["Haus", "jetzt"]
+
+
 def test_same_word_at_distinct_times_is_not_merged(monkeypatch, tmp_path):
     _transport(monkeypatch, [
         {"words": [{"word": "no", "start": 3.5, "end": 3.75}]},
