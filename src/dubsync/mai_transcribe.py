@@ -657,8 +657,19 @@ def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int])
                 mapping[right_speaker] = left_speaker
     if not mapping:
         return right, mapping
+    # The chunk's other speakers move into the same label scope under a name
+    # of their own, so a turn between a linked and an unlinked speaker inside
+    # this chunk remains a known speaker change.
+    scopes = {label.partition(":")[0] for label in mapping.values()}
+    renamed = dict(mapping)
+    if len(scopes) == 1:
+        scope = next(iter(scopes))
+        for word in right:
+            label = word.speaker_id
+            if label is not None and label not in renamed and not label.startswith(f"{scope}:"):
+                renamed[label] = f"{scope}:{label.replace(':', '.')}"
     return [
-        word.model_copy(update={"speaker_id": mapping[word.speaker_id]}) if word.speaker_id in mapping else word
+        word.model_copy(update={"speaker_id": renamed[word.speaker_id]}) if word.speaker_id in renamed else word
         for word in right
     ], mapping
 

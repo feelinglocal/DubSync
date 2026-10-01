@@ -9,6 +9,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
+from dubsync.speaker_evidence import speakers_known_different
 from dubsync.mai_transcribe import MAITranscribeAdapter
 from dubsync.providers import ProviderError
 
@@ -136,8 +137,10 @@ def test_sentence_straddling_a_chunk_boundary_keeps_one_speaker_id(monkeypatch, 
     by_text = {word.text: word.speaker_id for word in words}
     assert [word.text for word in words] == ["Ja.", "Ich", "gehe", "jetzt", "nach", "Hause.", "Tschüss."]
     assert {by_text[text] for text in ("Ich", "gehe", "jetzt", "nach", "Hause.")} == {"chunk_1:0"}
-    # A label that no overlap word links stays scoped to its own chunk.
-    assert by_text["Tschüss."] == "chunk_2:0"
+    # A label that no overlap word links keeps a name of its own, in the same
+    # scope as its chunk-mates, so a turn inside the chunk stays provable.
+    assert by_text["Tschüss."] == "chunk_1:chunk_2.0"
+    assert speakers_known_different(by_text["Hause."], by_text["Tschüss."])
     assert by_text["Ja."] == "chunk_1:1"
 
 

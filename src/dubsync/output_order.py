@@ -165,10 +165,16 @@ def _resolve_overlaps_with_speech_evidence(
         if earlier_span is None and later_span is None:
             return None
         earliest = earlier_span[1] - snap_slack_ms if earlier_span is not None else earlier.start_ms + kept_ms(earlier)
+        if not acoustic(earlier):
+            # A hold can own words spoken outside the interval it is shown in;
+            # with or without known words it is never clipped to a sliver.
+            earliest = max(earliest, earlier.start_ms + kept_ms(earlier))
         if acoustic(later):
             boundary = later.start_ms
         else:
-            latest = later_span[0] + snap_slack_ms if later_span is not None else later.end_ms - kept_ms(later)
+            latest = later.end_ms - kept_ms(later)
+            if later_span is not None:
+                latest = min(latest, later_span[0] + snap_slack_ms)
             boundary = earlier.end_ms if earlier.end_ms <= latest else profile.snap_floor(latest)
             boundary = max(boundary, later.start_ms)
         if boundary < earliest or not earlier.start_ms < boundary < later.end_ms:

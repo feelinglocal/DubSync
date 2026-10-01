@@ -228,3 +228,43 @@ def test_cue_that_only_lost_words_keeps_its_approved_deletion_at_held_timing():
     )
 
     assert result == (edited, recue_flags, flags)
+
+
+def test_one_letter_speaker_turn_is_not_a_deletion_residue(tmp_path):
+    # A cue split at a speaker turn starts with the complete turn "É."; with an
+    # approved edit elsewhere in the cue it was mistaken for a deletion residue
+    # and the source cue was restored next to the split, doubling the dialogue.
+    source = tmp_path / "episode.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,400\nVamos para casa agora.\n\n"
+        "2\n00:00:03,000 --> 00:00:05,000\nÉ. Então vamos embora.\n\n"
+        "3\n00:00:06,000 --> 00:00:07,500\nAté amanhã.\n",
+        encoding="utf-8",
+    )
+    audio = tmp_path / "episode.wav"
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    words = [
+        ("Vamos", 1.0, 1.3, "speaker_0"), ("para", 1.35, 1.6, "speaker_0"), ("casa", 1.65, 1.95, "speaker_0"),
+        ("agora.", 2.0, 2.35, "speaker_0"), ("É.", 3.0, 3.2, "speaker_0"),
+        ("Então", 3.6, 3.9, "speaker_1"), ("bora", 3.95, 4.2, "speaker_1"), ("embora.", 4.25, 4.7, "speaker_1"),
+        ("Até", 6.0, 6.3, "speaker_0"), ("amanhã.", 6.35, 6.9, "speaker_0"),
+    ]
+    fixture = tmp_path / "words.json"
+    fixture.write_text(json.dumps({"words": [
+        {"text": text, "start": start, "end": end, "confidence": None, "speaker_id": speaker}
+        for text, start, end, speaker in words
+    ]}, ensure_ascii=False), encoding="utf-8")
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(fixture)},
+        "llm": {"provider": "fixture", "responses": {"case-1": _decide("case-1", "bora", "use_audio")}},
+    }, allow_unicode=True), encoding="utf-8")
+    output = tmp_path / "episode.synced.srt"
+
+    pipeline.sync_episode(
+        source, audio, output, tmp_path / "work", providers_path=providers,
+        style_profile=StyleProfile(fps=30, min_cue_dur=0.5),
+    )
+
+    texts = [cue.plain_text for cue in parse_srt_text(output.read_text(encoding="utf-8"))]
+    assert texts == ["Vamos para casa agora.", "É.", "Então bora embora.", "Até amanhã."]

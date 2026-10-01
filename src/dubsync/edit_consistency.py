@@ -171,14 +171,19 @@ def settle_one_letter_residues(
     decisions: list[AdjudicationDecision],
     profile: StyleProfile,
     fixed_cue_ids: set[int],
+    split_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], AlignmentResult, list[QCFlag], list[QCFlag]]:
     """Never export the one-letter residue of an approved deletion as a cue.
 
     'e não deixei que ele conseguisse' was delivered as the cue "e" for 100 ms.
     The spoken letter is joined to the cue it is spoken with; without such a
     neighbour the deletion is not applied and the source cue is kept.
+
+    ``split_cue_ids`` names source cues that were divided into several cues
+    (a speaker turn): a short first piece such as "É." is a complete turn
+    there, not what a deletion left behind.
     """
-    leftovers = _one_letter_leftovers(source_cues, rebuilt)
+    leftovers = _one_letter_leftovers(source_cues, rebuilt) - (split_cue_ids or set())
     if not leftovers:
         return rebuilt, alignment, recue_flags, flags
     by_case = {decision.case_id: decision for decision in decisions}

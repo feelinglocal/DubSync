@@ -856,3 +856,20 @@ def test_frame_grid_is_exact_at_24_fps():
     assert profile.snap_floor(8125) == 8125 == profile.snap_ceil(8125)
     assert [profile.frame_time_ms(frame) for frame in (3, 24, 195, 240_000)] == [125, 1000, 8125, 10_000_000]
     assert all(profile.frame_time_ms(frame) == -(-frame * 125 // 3) for frame in range(300_000))
+
+
+def test_overlap_pass_never_clips_a_held_cue_to_a_sliver():
+    # ep17 MAI: a cue held at source timing owned one word spoken after its
+    # display window and was delivered 20-153 ms long.
+    profile = StyleProfile(fps=30.0)
+    spoken = Cue(index=1, start_ms=1000, end_ms=4100, lines=["Eu lutei com todas as minhas forças"])
+    held = Cue(index=2, start_ms=2830, end_ms=4120, lines=["e não deixei que ele conseguisse"])
+
+    cues, _ = finalize_cues_for_output(
+        [spoken, held], profile, no_overlaps=True, protected_cue_ids={2},
+        preserve_timing=True, spoken_spans={1: (1320, 4090), 2: (5000, 5080)},
+    )
+
+    delivered = {cue.index: cue for cue in cues}
+    assert delivered[2].duration_ms >= (4120 - 2830) / 2
+    assert delivered[1].start_ms == 1000

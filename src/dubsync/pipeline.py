@@ -680,6 +680,7 @@ def sync_episode(
         spans=alignment.divergence_spans, decisions=decisions, profile=profile,
         fixed_cue_ids=confidence_held_cue_ids | source_timing_held_cue_ids | timing_held_cue_ids
         | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        split_cue_ids={cue_id for cue_id, children in speaker_expansions.items() if len(children) > 1},
     )
     recue_flags, unconfirmed_source_timed_cue_ids = _fold_unconfirmed_evidence_holds(recue_flags, flags)
     source_timing_held_cue_ids |= unconfirmed_source_timed_cue_ids
