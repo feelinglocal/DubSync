@@ -18,6 +18,7 @@ from .alignment_windows import (
     reachability_centers as _reachability_centers,
     retry_margins as _retry_margins,
     row_offset as _row_offset,
+    supported_anchor_pairs as _supported_anchor_pairs,
     unique_exact_pairs as _unique_exact_pairs,
 )
 from .models import (
@@ -38,7 +39,6 @@ MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
 BAND_MARGIN = 64
 ALIGNMENT_CELL_BUDGET = 2_000_000
-LOCAL_TRANSPOSITION_RADIUS = 2
 IMPLAUSIBLE_MATCHED_WORD_SECONDS = 2.0
 IMPLAUSIBLE_WORD_TO_CUE_RATIO = 2.0
 NEG_INF = -1_000_000_000.0
@@ -306,16 +306,22 @@ def _align_tokens_detailed(
     m = len(words_norm)
     if n == m and n <= ALIGNMENT_CELL_BUDGET and all(token.normalized == word for token, word in zip(tokens, words_norm)):
         return _AlignmentRun(ops=[_Op("match", index, index, 1.0) for index in range(n)])
+    # The band follows the path through the longest consistent chain of
+    # confirmed unique exact pairs instead of the global diagonal. Every such
+    # pair is a band centre, so a pair the DP does not take is a scoring
+    # decision (an improvised or moved word), never a band artefact: a found
+    # path is kept instead of being discarded as unresolved.
     reachability = _reachability_centers(
         tokens,
         words_norm,
         token_time_priors,
         word_time_centers,
+        anchors=_supported_anchor_pairs(_unique_exact_pairs(tokens, words_norm)),
     )
     band_limited = False
     remaining_cells = ALIGNMENT_CELL_BUDGET
     for attempt_index, margin in enumerate(_retry_margins(band_margin, max(n, m))):
-        cell_count = _band_cell_count(n, m, margin, reachability)
+        cell_count = _band_cell_count(n, m, margin, reachability, diagonal=False)
         if cell_count > remaining_cells:
             band_limited = True
             continue
@@ -331,13 +337,10 @@ def _align_tokens_detailed(
         if ops is None:
             band_limited = band_limited or margin >= ALIGNMENT_RETRY_MARGINS[-1]
             continue
-        run = _AlignmentRun(
+        return _AlignmentRun(
             ops=ops,
             unbanded_fallback=attempt_index > 0 and margin >= max(n, m),
         )
-        if margin < max(n, m) and _misses_unique_exact_pair(ops, tokens, words_norm):
-            continue
-        return run
     return _AlignmentRun(
         ops=_fully_divergent_ops(n, m),
         band_limited=True,
@@ -364,7 +367,7 @@ def _align_tokens_once(
     n = len(tokens)
     m = len(words_norm)
     gap = -0.75
-    first_intervals = _band_windows(0, n, m, band_margin, reachability.get(0, ()))
+    first_intervals = _band_windows(0, n, m, band_margin, reachability.get(0, ()), diagonal=False)
     previous_scores = [NEG_INF] * _interval_cell_count(first_intervals)
     first_back = bytearray(len(previous_scores))
     zero_offset = _row_offset(first_intervals, 0)
@@ -386,7 +389,7 @@ def _align_tokens_once(
     back_rows: list[tuple[list[tuple[int, int]], bytearray]] = [(first_intervals, first_back)]
 
     for i in range(1, n + 1):
-        current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()))
+        current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()), diagonal=False)
         current_scores = [NEG_INF] * _interval_cell_count(current_intervals)
         current_back = bytearray(len(current_scores))
         for offset, j in _iter_interval_cells(current_intervals):
@@ -451,66 +454,6 @@ def _align_tokens_once(
             return None
     ops.reverse()
     return ops
-
-
-def _misses_unique_exact_pair(
-    ops: list[_Op],
-    tokens: list[SRTToken],
-    words_norm: list[str],
-) -> bool:
-    expected = set(_unique_exact_pairs(tokens, words_norm))
-    if not expected:
-        return False
-    matched = {
-        (op.srt_index, op.asr_index)
-        for op in ops
-        if op.kind == "match" and op.srt_index is not None and op.asr_index is not None
-    }
-    return any(
-        pair not in matched and not _is_locally_explained_transposition(pair, matched)
-        for pair in expected
-    )
-
-
-def _is_locally_explained_transposition(
-    missed_pair: tuple[int, int],
-    matched_pairs: set[tuple[int, int]],
-) -> bool:
-    """Allow one locally reordered word without discarding an otherwise sound run."""
-
-    missed_srt, missed_asr = missed_pair
-    for srt_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
-        if srt_delta == 0:
-            continue
-        for asr_delta in range(-LOCAL_TRANSPOSITION_RADIUS, LOCAL_TRANSPOSITION_RADIUS + 1):
-            if asr_delta == 0 or srt_delta * asr_delta >= 0:
-                continue
-            crossed_srt = missed_srt + srt_delta
-            crossed_asr = missed_asr + asr_delta
-            if (crossed_srt, crossed_asr) not in matched_pairs:
-                continue
-
-            srt_start, srt_end = sorted((missed_srt, crossed_srt))
-            asr_start, asr_end = sorted((missed_asr, crossed_asr))
-            has_left_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_start, asr_start, -1)
-            has_right_anchor = _has_nearby_monotonic_anchor(matched_pairs, srt_end, asr_end, 1)
-            if has_left_anchor and has_right_anchor:
-                return True
-    return False
-
-
-def _has_nearby_monotonic_anchor(
-    matched_pairs: set[tuple[int, int]],
-    srt_index: int,
-    asr_index: int,
-    direction: int,
-) -> bool:
-    for srt_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
-        for asr_delta in range(1, LOCAL_TRANSPOSITION_RADIUS + 1):
-            candidate = (srt_index + direction * srt_delta, asr_index + direction * asr_delta)
-            if candidate in matched_pairs:
-                return True
-    return False
 
 
 def _span_text_from_tokens(tokens: list[SRTToken], indices: list[int]) -> str:
@@ -755,18 +698,22 @@ def _align_cues_to_units(cues: list[Cue], words: list[Word]) -> AlignmentResult:
             preliminary_run.ops,
         )
         if timing_priors is not None:
-            prior_used = True
-            transform = timing_priors.transform
             prior_run = _align_tokens_detailed(
                 tokens,
                 words_norm,
                 token_time_priors=timing_priors.token_priors,
                 word_time_centers=timing_priors.word_centers,
             )
-            ops = prior_run.ops
-            unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
-            band_limited = band_limited or prior_run.band_limited
-            unresolved = prior_run.unresolved
+            # The timed run only refines a resolved text alignment; it never
+            # replaces one with an unresolved artifact. Status describes the
+            # alignment that is actually kept.
+            if not prior_run.unresolved or unresolved:
+                prior_used = True
+                transform = timing_priors.transform
+                ops = prior_run.ops
+                unbanded_fallback = unbanded_fallback or prior_run.unbanded_fallback
+                band_limited = prior_run.band_limited
+                unresolved = prior_run.unresolved
     if not unresolved:
         ops = _prefer_unique_full_cue_windows(ops, tokens, words_norm)
     provisional_matches = _token_matches_from_ops(ops, tokens)

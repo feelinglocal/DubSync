@@ -255,7 +255,10 @@ def test_alignment_uses_banded_dp_for_long_same_text_episode(monkeypatch):
     assert calls < (token_count * token_count) // 2
 
 
-def test_alignment_budget_exhaustion_rejects_a_bounded_run_that_misses_a_unique_exact_pair(monkeypatch):
+def test_a_missed_isolated_unique_pair_never_discards_a_bounded_alignment(monkeypatch):
+    # A missed unique pair used to force an unaffordable retry and then replace
+    # the whole episode with one unresolved span. An isolated coincidental pair
+    # is now a scoring decision: both sides stay reviewable as local spans.
     monkeypatch.setattr(aligner, "ALIGNMENT_CELL_BUDGET", 50_000)
     token_count = 300
     cues = [
@@ -271,15 +274,15 @@ def test_alignment_budget_exhaustion_rejects_a_bounded_run_that_misses_a_unique_
 
     result = align_cues_to_words(cues, words)
 
-    assert result.token_matches == []
-    assert len(result.divergence_spans) == 1
-    assert result.divergence_spans[0].srt_text.startswith("filler")
-    assert result.divergence_spans[0].asr_text.startswith("filler")
+    assert len(result.token_matches) == token_count - 2
+    assert {(span.srt_text, span.asr_text) for span in result.divergence_spans} == {
+        ("needle", "filler"),
+        ("filler", "needle"),
+    }
     assert result.diagnostics.unbanded_fallback is False
-    assert result.diagnostics.band_limited is True
-    assert result.diagnostics.unresolved is True
-    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
-    assert any(flag.kind == "alignment_unresolved" and flag.severity == "error" for flag in result.flags)
+    assert result.diagnostics.band_limited is False
+    assert result.diagnostics.unresolved is False
+    assert not any(flag.kind in {"alignment_band_limited", "alignment_unresolved"} for flag in result.flags)
 
 
 def test_alignment_budget_accepts_a_unique_pair_explained_by_an_adjacent_transposition(monkeypatch):
@@ -300,22 +303,6 @@ def test_alignment_budget_accepts_a_unique_pair_explained_by_an_adjacent_transpo
     assert run.band_limited is False
     assert sum(op.kind == "match" for op in run.ops) == len(tokens) - 1
     assert any(op.kind == "match" and op.srt_index == 21 and op.asr_index == 22 for op in run.ops)
-
-
-def test_local_transposition_check_uses_constant_radius_membership():
-    class MembershipOnlyPairs:
-        def __init__(self, pairs):
-            self.pairs = set(pairs)
-
-        def __contains__(self, pair):
-            return pair in self.pairs
-
-        def __iter__(self):
-            raise AssertionError("transposition proof must not scan every matched pair")
-
-    matched_pairs = MembershipOnlyPairs({(9, 9), (11, 10), (12, 12)})
-
-    assert aligner._is_locally_explained_transposition((10, 11), matched_pairs)
 
 
 def test_successful_timing_prior_replaces_failed_preliminary_unresolved_status(monkeypatch):
@@ -346,10 +333,39 @@ def test_successful_timing_prior_replaces_failed_preliminary_unresolved_status(m
 
     assert result.anchor_coverage == 1.0
     assert result.diagnostics.prior_used is True
-    assert result.diagnostics.band_limited is True
+    # Status describes the alignment that is kept, not the discarded attempt.
+    assert result.diagnostics.band_limited is False
     assert result.diagnostics.unresolved is False
-    assert any(flag.kind == "alignment_band_limited" for flag in result.flags)
+    assert not any(flag.kind == "alignment_band_limited" for flag in result.flags)
     assert not any(flag.kind == "alignment_unresolved" for flag in result.flags)
+
+
+def test_failed_timing_prior_run_never_replaces_a_resolved_text_alignment(monkeypatch):
+    cues = parse_srt_text(
+        "1\n00:00:00,000 --> 00:00:01,000\necho one\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\necho two\n\n"
+    )
+    words = [
+        Word(text="echo", start=0.1, end=0.2),
+        Word(text="one", start=0.3, end=0.4),
+        Word(text="echo", start=1.1, end=1.2),
+        Word(text="two", start=1.3, end=1.4),
+    ]
+    runs = iter(
+        [
+            aligner._AlignmentRun(ops=[aligner._Op("match", index, index, 1.0) for index in range(4)]),
+            aligner._AlignmentRun(ops=aligner._fully_divergent_ops(4, 4), band_limited=True, unresolved=True),
+        ]
+    )
+    monkeypatch.setattr(aligner, "_align_tokens_detailed", lambda *args, **kwargs: next(runs))
+
+    result = align_cues_to_words(cues, words)
+
+    assert result.anchor_coverage == 1.0
+    assert result.diagnostics.prior_used is False
+    assert result.diagnostics.unresolved is False
+    assert result.diagnostics.band_limited is False
+    assert not any(flag.kind.startswith("alignment_") for flag in result.flags)
 
 
 def test_alignment_retry_margins_progress_without_automatic_full_width():
