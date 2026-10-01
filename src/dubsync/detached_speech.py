@@ -116,9 +116,8 @@ def _separate(
     if (kept and (insertion or len(set(span.cue_ids)) != 1)) or (not kept and not decision.final_text.strip()):
         return None
     groups = _acoustic_groups(span, words, max_gap)
-    # Kept text can lose even a single far word; an approved wording is only
-    # divided where its words are seconds apart.
-    if groups is None or (len(groups) < 2 and not kept):
+    # Even a single word can be seconds away from the cue of its case.
+    if groups is None or (len(groups) < 2 and insertion):
         return None
     spoken = [words[index] for index in span.asr_word_indices]
     boundaries = [group.indices[0] - span.asr_word_indices[0] for group in groups[1:]]
@@ -223,12 +222,15 @@ def _separated_replacement(
         # window or holds. A partly retained cue has no approved word nearby.
         if whole_cues_only:
             return None
+        wordless = span.model_copy(update={
+            "asr_word_indices": [], "asr_text": "", "speaker_ids": [], "confidence": 0.0,
+        })
         if kept:
             # None of the words is spoken with the kept cue: they time nothing.
-            return _Separation([span.model_copy(update={
-                "asr_word_indices": [], "asr_text": "", "speaker_ids": [], "confidence": 0.0,
-            })], [decision], [])
-        return _held(span, decision)
+            return _Separation([wordless], [decision], [])
+        return _separated_without_home(
+            span, wordless, decision, groups, cuts, words, left_home, protected, speech_regions,
+        )
     first, last = home.index(True), len(home) - 1 - home[::-1].index(True)
     if first == 0 and last == len(groups) - 1:
         return None
@@ -282,22 +284,71 @@ def _separated_replacement(
         }
         outer_anchor = span.left_anchor_cue_id if leading else span.right_anchor_cue_id
         if outer_anchor in protected:
-            # Like every insertion next to a cue without audio evidence, it
-            # may be that cue's own line: it is reported, not generated.
-            flags.append(QCFlag(
-                kind=_HELD_KIND, cue_ids=list(span.cue_ids), severity="warning",
-                message=(
-                    "Approved words spoken seconds away from this cue stand next to a source cue without "
-                    "audio evidence; they were left out instead of being shown at the wrong time."
-                ),
-                confidence=decision.confidence, old_text=span.srt_text, new_text=text,
-                start=group.start, end=group.end,
-            ))
+            flags.append(_left_out_flag(span, decision, text, group))
             continue
         case_id = f"{DETACHED_SPEECH_PREFIX}{number}-{span.case_id}"
         spans.append(_group_span(span, group, words, case_id).model_copy(update=anchor_update))
         decisions.append(decision.model_copy(update={"case_id": case_id, "final_text": text}))
     return _Separation(spans, decisions, flags)
+
+
+def _separated_without_home(
+    span: DivergenceSpan, wordless: DivergenceSpan, decision: AdjudicationDecision, groups: list[_Group],
+    cuts: list[int] | None, words: list[Word], after_retained_words: bool, protected: set[int],
+    speech_regions: list[SpeechRegion] | None,
+) -> _Separation | None:
+    """Every approved word is spoken seconds away from the partly retained cue.
+
+    The audio has other words elsewhere instead of the cue's replaced tokens:
+    the tokens are removed like any approved deletion and each group becomes
+    an insertion with its own timing (next to a neighbouring cue it joins that
+    cue, as a far word directly before the next line always did). Only a
+    wording that follows the spoken words one by one can be placed that way.
+    """
+    spoken_tokens = sum(len(alphanumeric_signature(words[index].text)) for index in span.asr_word_indices)
+    if len(groups) > 1 and cuts is None or len(alphanumeric_signature(decision.final_text)) != spoken_tokens:
+        return _held(span, decision) if len(groups) > 1 else None
+    anchor_time = span.left_anchor_end if after_retained_words else span.right_anchor_start
+    if len(groups) == 1 and _is_mistimed_beside(
+        groups[0], _Group([], anchor_time, anchor_time), words, speech_regions,
+    ):
+        return None
+    pieces = _pieces(decision.final_text, cuts or [])
+    if any(not alphanumeric_signature(piece) for piece in pieces):
+        return _held(span, decision) if len(groups) > 1 else None
+    spans = [wordless]
+    decisions = [decision.model_copy(update={
+        "final_text": "",
+        "reason": f"{decision.reason} The approved words are spoken seconds away and were placed at their own time.",
+    })]
+    flags: list[QCFlag] = []
+    outer_anchors = {span.left_anchor_cue_id, span.right_anchor_cue_id} - set(span.cue_ids)
+    for number, (group, text) in enumerate(zip(groups, pieces)):
+        if outer_anchors & protected:
+            flags.append(_left_out_flag(span, decision, text, group))
+            continue
+        case_id = f"{DETACHED_SPEECH_PREFIX}{number}-{span.case_id}"
+        spans.append(_group_span(span, group, words, case_id))
+        decisions.append(decision.model_copy(update={"case_id": case_id, "final_text": text}))
+    if not after_retained_words:
+        # The words precede the cue's retained words: keep time order.
+        spans = [*spans[1:], spans[0]]
+        decisions = [*decisions[1:], decisions[0]]
+    return _Separation(spans, decisions, flags)
+
+
+def _left_out_flag(span: DivergenceSpan, decision: AdjudicationDecision, text: str, group: _Group) -> QCFlag:
+    # Like every insertion next to a cue without audio evidence, the words may
+    # be that cue's own line: they are reported, not generated.
+    return QCFlag(
+        kind=_HELD_KIND, cue_ids=list(span.cue_ids), severity="warning",
+        message=(
+            "Approved words spoken seconds away from this cue stand next to a source cue without "
+            "audio evidence; they were left out instead of being shown at the wrong time."
+        ),
+        confidence=decision.confidence, old_text=span.srt_text, new_text=text,
+        start=group.start, end=group.end,
+    )
 
 
 def _is_mistimed_beside(
