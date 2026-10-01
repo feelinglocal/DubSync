@@ -69,7 +69,7 @@ from .style_profile import FPSDetection, StyleProfile, derive_style_profile, det
 from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text
 from .timing_refinement import (
     BoundaryRefinementConfig, SpeechEvidence, boundary_refinement_config_from_config,
-    refine_cues_to_speech_activity, speech_evidence_for_words,
+    min_duration_policy_from_config, refine_cues_to_speech_activity, speech_evidence_for_words,
 )
 from .tokenize import alphanumeric_signature
 from .vad import (
@@ -624,6 +624,7 @@ def sync_episode(
         max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
         protected_cue_ids=confidence_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
+        min_duration_policy=min_duration_policy_from_config(provider_config),
     )
     flags.extend(recue_flags)
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
@@ -1766,7 +1767,12 @@ def _run_verify_stage(
     )
     flags.extend(final_order_flags)
     if speech_regions:
-        activity_flags = speech_activity_flags_for_cues(rebuilt, speech_regions, min_coverage)
+        # A cue held for the minimum display time is not an overrun and its
+        # short utterance still counts as speech activity.
+        readability_floor_ms = round(profile.min_cue_dur * 1000 + profile.frame_ms)
+        activity_flags = speech_activity_flags_for_cues(
+            rebuilt, speech_regions, min_coverage, min_cue_duration_ms=readability_floor_ms,
+        )
         rebuilt, flags, activity_flags = _remove_silent_generated_adlibs(
             rebuilt,
             flags,
@@ -1779,6 +1785,7 @@ def _run_verify_stage(
                 rebuilt,
                 speech_regions,
                 max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+                min_cue_duration_ms=readability_floor_ms,
             )
         )
     style_issues = lint_cues(rebuilt, profile)

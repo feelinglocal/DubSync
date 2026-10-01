@@ -69,6 +69,7 @@ def rebuild_cues(
     max_word_duration: float = 2.0,
     max_intra_cue_gap: float = 1.5,
     protected_cue_ids: set[int] | None = None,
+    min_duration_policy: str = "extend_into_silence",
 ) -> tuple[list[Cue], list[QCFlag]]:
     rebuilt: list[Cue] = []
     flags: list[QCFlag] = []
@@ -82,6 +83,9 @@ def rebuild_cues(
         max_word_duration=max_word_duration,
         max_intra_cue_gap=max_intra_cue_gap,
         protected_cue_ids=protected,
+        # The "acoustic" policy ends a short cue with its speech; refinement
+        # applies the same policy with the audio evidence rebuild lacks.
+        extend_short_cues=min_duration_policy != "acoustic",
     )
     flags.extend(timing_flags)
     held_cue_ids = protected | {
@@ -144,6 +148,7 @@ def _cue_timings(
     max_word_duration: float,
     max_intra_cue_gap: float,
     protected_cue_ids: set[int],
+    extend_short_cues: bool = True,
 ) -> tuple[dict[int, _CueTiming], list[QCFlag]]:
     timings: dict[int, _CueTiming] = {}
     flags: list[QCFlag] = []
@@ -187,7 +192,7 @@ def _cue_timings(
         start_ms = max(0, profile.snap_floor(min(word.start for word in matched_words) * 1000 - profile.lead_in_ms))
         spoken_end = max(word.end for word in matched_words) * 1000
         end_ms = profile.snap_ceil(spoken_end + profile.tail_ms)
-        min_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+        min_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000) if extend_short_cues else end_ms
         timings[cue.index] = _CueTiming(
             start_ms=start_ms,
             spoken_end_ms=profile.snap_ceil(spoken_end),

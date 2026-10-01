@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -21,6 +21,7 @@ from .vad import SpeechActivityAdapter
 
 # Another word may begin this close to a burst offset without sharing the burst.
 _SHARED_BURST_TOLERANCE_SECONDS = 0.01
+MIN_DURATION_POLICIES = ("extend_into_silence", "acoustic")
 
 
 @dataclass(frozen=True)
@@ -32,8 +33,22 @@ class BoundaryRefinementConfig:
     max_leading_silence_ms: int = 150
     max_trailing_silence_ms: int = 300
     max_word_duration_ms: int = 2000
-    # Shared with rebuild (timing.max_intra_cue_gap).
+    # Shared with rebuild (timing.max_intra_cue_gap, timing.min_duration_policy).
     max_intra_cue_gap_ms: int = 1500
+    min_duration_policy: str = "extend_into_silence"
+
+
+def min_duration_policy_from_config(provider_config: dict[str, object]) -> str:
+    """How a cue shorter than the minimum display duration is finished.
+
+    ``extend_into_silence`` keeps it on screen up to the minimum while nothing
+    else is heard and no other cue starts; ``acoustic`` ends it with its speech.
+    """
+    timing_config = provider_config.get("timing", {}) if isinstance(provider_config, dict) else {}
+    value = timing_config.get("min_duration_policy", MIN_DURATION_POLICIES[0]) if isinstance(timing_config, dict) else MIN_DURATION_POLICIES[0]
+    if value not in MIN_DURATION_POLICIES:
+        raise ValueError(f"timing.min_duration_policy must be one of: {', '.join(MIN_DURATION_POLICIES)}")
+    return str(value)
 
 
 def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
@@ -60,6 +75,7 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
         max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
         max_word_duration_ms=int(_timing_seconds(timing_config, "max_word_duration", 2.0) * 1000),
         max_intra_cue_gap_ms=int(_timing_seconds(timing_config, "max_intra_cue_gap", 1.5) * 1000),
+        min_duration_policy=min_duration_policy_from_config(provider_config),
     )
 
 
@@ -177,6 +193,7 @@ def refine_cues_to_speech_activity(
             flag for flag in word_repair_flags if (flag.start, flag.end) in retained_repairs
         ]
     region_index = SpeechRegionIndex(regions)
+    region_starts = [region.start for region in region_index.regions]
     word_starts = sorted(word.start for word in words) if words else []
 
     for index, cue in enumerate(dialogue_cues):
@@ -225,17 +242,23 @@ def refine_cues_to_speech_activity(
                 acoustic_floor_ms = profile.snap_ceil(acoustic_end * 1000)
             end_cap_ms = max(dialogue_cues[index + 1].start_ms, acoustic_floor_ms)
             end_ms = min(end_ms, end_cap_ms)
-        # Minimum display duration cannot add a silence tail beyond the
-        # acoustic endpoint. Preserve already accepted short tails, but do not
-        # manufacture more silence merely to reach the readability floor.
-        duration_extension_cap = max(
-            end_ms,
-            profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms),
-        )
-        end_ms = min(
-            max(end_ms, profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)),
-            duration_extension_cap,
-        )
+        speech_end_ms = profile.snap_ceil(acoustic_end * 1000 + options.end_pad_ms)
+        minimum_end_ms = profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)
+        if options.min_duration_policy == "acoustic":
+            # Minimum display duration cannot add a silence tail beyond the
+            # acoustic endpoint. Preserve already accepted short tails, but do
+            # not manufacture more silence merely to reach the readability floor.
+            end_ms = min(max(end_ms, minimum_end_ms), max(end_ms, speech_end_ms))
+        elif start_ms < speech_end_ms < minimum_end_ms:
+            # A cue shorter than the readability floor stays up while nothing
+            # else is heard: up to the floor, the next sound or the next cue.
+            quiet_until = _quiet_until_seconds(
+                acoustic_end, end_region, region_index.regions, region_starts, word_starts,
+            )
+            quiet_limit_ms = profile.snap_floor(quiet_until * 1000) if isfinite(quiet_until) else minimum_end_ms
+            end_ms = max(speech_end_ms, min(minimum_end_ms, quiet_limit_ms))
+            if end_cap_ms is not None:
+                end_ms = min(end_ms, end_cap_ms)
         if end_cap_ms is not None and end_ms > end_cap_ms:
             end_ms = max(start_ms, end_cap_ms)
 
@@ -438,6 +461,32 @@ def _acoustic_end_seconds(
     ):
         return last_region.end
     return last_word.end
+
+
+def _quiet_until_seconds(
+    acoustic_end: float,
+    end_region: SpeechRegion,
+    regions: tuple[SpeechRegion, ...],
+    region_starts: list[float],
+    word_starts: list[float],
+) -> float:
+    """When the silence after the cue's own voice ends (``inf`` when nothing follows).
+
+    Silence lasts until the next burst or the next ASR word, whichever begins
+    first. When the cue's burst keeps sounding, the next word spoken in it marks
+    the limit; a burst that continues without any word is another sound and
+    leaves no silence to extend into.
+    """
+    threshold = acoustic_end - _SHARED_BURST_TOLERANCE_SECONDS
+    following_word = bisect_left(word_starts, threshold)
+    next_word_start = word_starts[following_word] if following_word < len(word_starts) else float("inf")
+    if end_region.end - acoustic_end > _SHARED_BURST_TOLERANCE_SECONDS:
+        return next_word_start if next_word_start <= end_region.end else acoustic_end
+    next_region = bisect_left(region_starts, threshold)
+    while next_region < len(regions) and regions[next_region] is end_region:
+        next_region += 1
+    next_region_start = region_starts[next_region] if next_region < len(regions) else float("inf")
+    return min(next_region_start, next_word_start)
 
 
 def _word_refined_end_ms(

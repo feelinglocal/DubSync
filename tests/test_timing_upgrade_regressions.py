@@ -15,11 +15,18 @@ from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from dubsync.recue import rebuild_cues
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
-from dubsync.timing_refinement import boundary_refinement_config_from_config, refine_cues_to_speech_activity
+from dubsync.timing_refinement import (
+    BoundaryRefinementConfig,
+    boundary_refinement_config_from_config,
+    min_duration_policy_from_config,
+    refine_cues_to_speech_activity,
+)
 from dubsync.vad import (
     EnergySpeechActivityAdapter,
     cue_ids_with_audible_words,
     speech_activity_adapter_from_config,
+    speech_activity_flags_for_cues,
+    trailing_silence_flags_for_cues,
 )
 
 
@@ -512,3 +519,88 @@ def test_separate_breath_burst_after_the_last_word_does_not_extend_the_cue():
 
     assert refined == [cue]
     assert not any(flag.kind == "timing_refined" for flag in flags)
+
+
+# --- Task 6: one minimum-duration policy for rebuild and refinement -----------------------------
+
+
+def _interjection(policy: str | None = None, *, extra_regions=(), following=()):
+    # Episode 11 cue 941 "Hã?": rebuild padded it to 600 ms, verification cut it
+    # back to 200 ms and raised an error although the next cue was 12.5 s away.
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+    cue = Cue(index=941, start_ms=377_466, end_ms=378_066, lines=["Hã?"])
+    config = BoundaryRefinementConfig() if policy is None else BoundaryRefinementConfig(min_duration_policy=policy)
+    refined, flags = refine_cues_to_speech_activity(
+        [cue, *following], [SpeechRegion(start=377.47, end=377.62), *extra_regions], profile, config,
+        words=_words(("Hã?", 377.47, 377.62), *[(c.plain_text, c.start_ms / 1000, c.end_ms / 1000) for c in following]),
+        alignment=AlignmentResult(cue_word_indices={941: [0], **{c.index: [i + 1] for i, c in enumerate(following)}}),
+    )
+    return profile, refined[0], [flag.kind for flag in flags if 941 in flag.cue_ids]
+
+
+def test_isolated_interjection_keeps_the_minimum_display_time():
+    profile, cue, kinds = _interjection()
+
+    assert cue.end_ms == profile.snap_ceil(377_466 + 500)
+    assert "min_duration_unattainable" not in kinds
+
+
+def test_acoustic_minimum_duration_policy_ends_the_cue_with_its_speech():
+    profile, cue, kinds = _interjection("acoustic")
+
+    assert cue.end_ms == profile.snap_ceil(377_620 + 40)
+    assert "min_duration_unattainable" in kinds
+
+
+def test_minimum_display_time_stops_at_the_next_cue_and_reports_the_shortfall():
+    following = Cue(index=942, start_ms=377_800, end_ms=378_400, lines=["Oi."])
+    _, cue, kinds = _interjection(extra_regions=[SpeechRegion(start=377.8, end=378.4)], following=[following])
+
+    assert cue.end_ms == 377_800
+    assert "min_duration_unattainable" in kinds
+
+
+def test_minimum_display_time_never_covers_another_speakers_sound():
+    # A burst nobody owns begins 180 ms after the interjection ends.
+    profile, cue, kinds = _interjection(extra_regions=[SpeechRegion(start=377.8, end=379.0)])
+
+    assert cue.end_ms == profile.snap_floor(377_800)
+    assert "min_duration_unattainable" in kinds
+
+
+def test_rebuild_follows_the_acoustic_minimum_duration_policy():
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+    cue = Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hã?"])
+    words = _words(("Hã?", 1.0, 1.15))
+    alignment = AlignmentResult(cue_word_indices={1: [0]})
+
+    padded, _ = rebuild_cues([cue], words, alignment, profile)
+    acoustic, _ = rebuild_cues([cue], words, alignment, profile, min_duration_policy="acoustic")
+
+    assert padded[0].end_ms == 1500
+    assert acoustic[0].end_ms == profile.snap_ceil(1150 + 40)
+
+
+def test_minimum_duration_policy_config_is_validated():
+    assert min_duration_policy_from_config({}) == "extend_into_silence"
+    assert min_duration_policy_from_config({"timing": {"min_duration_policy": "acoustic"}}) == "acoustic"
+    assert boundary_refinement_config_from_config(
+        {"vad": {"boundary_refinement": True}, "timing": {"min_duration_policy": "acoustic"}}
+    ).min_duration_policy == "acoustic"
+    with pytest.raises(ValueError, match="timing.min_duration_policy"):
+        min_duration_policy_from_config({"timing": {"min_duration_policy": "pad"}})
+
+
+def test_readability_tail_of_a_short_cue_is_not_reported_as_silence_or_missing_speech():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=1500, lines=["Hã?"]),  # 100 ms of speech, held for readability
+        Cue(index=2, start_ms=3000, end_ms=3500, lines=["Ei,"]),  # nothing audible at all
+        Cue(index=3, start_ms=5000, end_ms=6500, lines=["Tail too long."]),
+    ]
+    regions = [SpeechRegion(start=1.0, end=1.1), SpeechRegion(start=5.0, end=5.4)]
+
+    trailing = trailing_silence_flags_for_cues(cues, regions, max_trailing_silence_ms=300, min_cue_duration_ms=533)
+    activity = speech_activity_flags_for_cues(cues, regions, min_coverage=0.5, min_cue_duration_ms=533)
+
+    assert [flag.cue_ids for flag in trailing] == [[3]]
+    assert [flag.cue_ids for flag in activity] == [[2], [3]]

@@ -66,6 +66,10 @@ vad:
 timing:
   max_word_duration: 2.0
   max_intra_cue_gap: 1.5
+  # extend_into_silence: a cue shorter than the minimum display time stays up
+  # while nothing else is heard and no other cue starts. acoustic: it ends
+  # with its speech.
+  min_duration_policy: extend_into_silence
   max_cps: 30
   min_cps: 2
 

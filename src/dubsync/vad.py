@@ -269,7 +269,15 @@ def speech_activity_flags_for_cues(
     cues: list[Cue],
     regions: list[SpeechRegion],
     min_coverage: float = 0.2,
+    *,
+    min_cue_duration_ms: int = 0,
 ) -> list[QCFlag]:
+    """Flag cues that show little speech activity.
+
+    A cue no longer than ``min_cue_duration_ms`` was only kept on screen for
+    readability: a short interjection inside it is real speech even when it
+    covers less than ``min_coverage`` of the padded display time.
+    """
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
     for cue in cues:
@@ -280,7 +288,10 @@ def speech_activity_flags_for_cues(
         duration = cue_end - cue_start
         if duration <= 0:
             continue
-        coverage = region_index.covered_seconds(cue_start, cue_end) / duration
+        covered = region_index.covered_seconds(cue_start, cue_end)
+        coverage = covered / duration
+        if cue.duration_ms <= min_cue_duration_ms and covered * 1000 >= DEFAULT_MIN_REGION_MS:
+            continue
         if coverage < min_coverage:
             flags.append(
                 QCFlag(
@@ -300,11 +311,18 @@ def trailing_silence_flags_for_cues(
     cues: list[Cue],
     regions: list[SpeechRegion],
     max_trailing_silence_ms: int = 300,
+    *,
+    min_cue_duration_ms: int = 0,
 ) -> list[QCFlag]:
+    """Flag cues that stay visible long after their speech.
+
+    A cue no longer than ``min_cue_duration_ms`` is exempt: its tail is the
+    minimum display time of a short utterance, not an overrun.
+    """
     flags: list[QCFlag] = []
     region_index = SpeechRegionIndex(regions)
     for cue in cues:
-        if not cue_has_spoken_text(cue):
+        if not cue_has_spoken_text(cue) or cue.duration_ms <= min_cue_duration_ms:
             continue
         cue_start = cue.start_ms / 1000.0
         cue_end = cue.end_ms / 1000.0
