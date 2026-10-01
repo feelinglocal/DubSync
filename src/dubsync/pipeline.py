@@ -535,6 +535,7 @@ def sync_episode(
         alignment.unmatched_cue_ids,
     )
     flags.extend(adlib_reconciliation_flags)
+    alignment, flags = _release_reconciled_cues(alignment, flags)
     adlib_cue_ids_by_case, inline_speaker_flags = _validate_inline_adlib_ownership(
         cues, words, alignment, decisions, adlib_cue_ids_by_case, profile,
         protected_cue_ids=confidence_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids),
@@ -633,7 +634,9 @@ def sync_episode(
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
     flags.extend(source_order_inversion_flags(
         rebuilt,
-        source_cue_ids=source_cue_ids,
+        # A reconciled cue was spoken at another place than written; like a
+        # generated insertion it has acoustic order, not a source position.
+        source_cue_ids=source_cue_ids - _reconciled_cue_ids(flags),
         protected_cue_ids=source_timing_held_cue_ids | timing_held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids) | shared_word_cue_ids(alignment),
     ))
     # Accepted insertions can precede their source-list anchor acoustically.
@@ -1788,6 +1791,7 @@ def _run_verify_stage(
     shared_source_cue_ids = shared_cue_ids & {cue.index for cue in source_cues}
     rebuilt = preserve_source_timings(rebuilt, source_cues, shared_source_cue_ids)
     flags = _without_stale_verify_flags(flags)
+    alignment, flags = _release_reconciled_cues(alignment, flags)
     forced_alignments: list[ForcedAlignmentCue] = []
     effective_words = words
     speech_regions = []
@@ -2847,6 +2851,45 @@ def _adlib_cue_ids_by_case(
         cue_ids[span.case_id] = next_index
         next_index += 1
     return cue_ids, flags
+
+
+def _reconciled_cue_ids(flags: list[QCFlag]) -> set[int]:
+    return {cue_id for flag in flags if flag.kind == "adlib_reconciled" for cue_id in flag.cue_ids}
+
+
+def _release_reconciled_cues(
+    alignment: AlignmentResult, flags: list[QCFlag],
+) -> tuple[AlignmentResult, list[QCFlag]]:
+    """A source cue that received its own spoken words is no missing-audio hold.
+
+    Lines spoken in another order than written leave one cue unmatched at its
+    source position while its words appear elsewhere as an insertion. Once the
+    accepted insertion reused that cue, the cue has acoustic evidence: it
+    leaves the protected and unmatched sets, is timed from its words and is
+    ordered by time. Verify repeats this from the persisted reconciliation
+    flags, so a resumed run cannot restore the stale source timing.
+    """
+    released = _reconciled_cue_ids(flags) & (
+        set(alignment.diagnostics.missing_audio_cue_ids) | set(alignment.unmatched_cue_ids)
+    )
+    if not released:
+        return alignment, flags
+    kept: list[QCFlag] = []
+    for flag in flags:
+        if flag.kind in {"missing_audio_timing_held", "missing_audio_source_cue_held"} and released.intersection(flag.cue_ids):
+            remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in released]
+            if not remaining:
+                continue
+            flag = flag.model_copy(update={"cue_ids": remaining})
+        kept.append(flag)
+    return alignment.model_copy(update={
+        "unmatched_cue_ids": [cue_id for cue_id in alignment.unmatched_cue_ids if cue_id not in released],
+        "diagnostics": alignment.diagnostics.model_copy(update={
+            "missing_audio_cue_ids": [
+                cue_id for cue_id in alignment.diagnostics.missing_audio_cue_ids if cue_id not in released
+            ],
+        }),
+    }), kept
 
 
 def _validate_inline_adlib_ownership(
