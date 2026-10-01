@@ -962,8 +962,8 @@ def _compound_run_ops(
                 or len({token.cue_id for token in group_tokens}) != 1
                 or splits_provider_word(group_words[0], group_words[-1])
                 or not _is_eligible_compound_group(
-                    [token.text for token in group_tokens],
-                    [words[index].text for index in group_words],
+                    [token.normalized for token in group_tokens],
+                    [words_norm[index] for index in group_words],
                 )
             ):
                 continue
@@ -1052,9 +1052,11 @@ def _compound_group_member_ops(
     return ops
 
 
-def _is_eligible_compound_group(token_texts_: list[str], word_texts: list[str]) -> bool:
-    # A hyphen marks the joined spelling of the same words (``Ano-Novo``).
-    return any("-" in text or "\u2011" in text for text in (*token_texts_, *word_texts))
+def _is_eligible_compound_group(token_keys: list[str], word_keys: list[str]) -> bool:
+    # The same letters spelled open, hyphenated or closed are the same speech
+    # (Ano-Novo / Ano Novo, Ehefrau / Ehe Frau, zu Hause / Zuhause, Se n\u00e3o /
+    # Sen\u00e3o). Numbers pair by value in their own groups, never by digit strings.
+    return not "".join(token_keys).isdigit()
 
 
 def _align_cues_to_units(
