@@ -50,9 +50,10 @@ llm:
 
 vad:
   provider: energy
-  threshold_dbfs: -45.0
-  window_ms: 100
-  min_region_ms: 100
+  # Energy VAD: 10 ms hop, thresholds adapt to each file's speech level and
+  # noise floor. Optional overrides: threshold_dbfs (absolute on-threshold),
+  # window_ms (non-overlapping analysis windows), min_region_ms, merge_gap_ms,
+  # hysteresis_db, edge_rise_db.
   min_coverage: 0.2
   boundary_refinement:
     enabled: true

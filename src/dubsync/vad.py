@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import wave
+from array import array
+from collections.abc import Iterator
+from dataclasses import dataclass
+from operator import mul
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +19,25 @@ from .subtitle_annotations import cue_has_spoken_text
 WORD_ENERGY_THRESHOLD_DBFS = -45.0
 WORD_ENERGY_MIN_ACTIVE_MS = 30
 WORD_ENERGY_PAD_SECONDS = 0.05
+
+# Energy VAD defaults (measured on clean dub stems; see EnergySpeechActivityAdapter).
+DEFAULT_HOP_MS = 10
+DEFAULT_MIN_REGION_MS = 30
+DEFAULT_MERGE_GAP_MS = 80
+DEFAULT_HYSTERESIS_DB = 6.0
+DEFAULT_EDGE_RISE_DB = 9.0
+ADAPTIVE_FLOOR_BLOCK_MS = 3000
+ADAPTIVE_LEVEL_PERCENTILE = 95.0
+ADAPTIVE_FLOOR_MARGIN_DB = 12.0
+ADAPTIVE_LEVEL_MARGIN_DB = 32.0
+ADAPTIVE_ON_MIN_DBFS = -62.0
+ADAPTIVE_ON_MAX_DBFS = -40.0
+# Frames at or below this level are digital silence and say nothing about the
+# recording's noise floor or speech level.
+DIGITAL_SILENCE_DBFS = -110.0
+_HISTOGRAM_BIN_DB = 0.25
+_STREAM_CHUNK_HOPS = 100
+_FULL_SCALE_DB = 20.0 * math.log10(32767)
 
 
 class SpeechActivityAdapter(Protocol):
@@ -32,13 +56,61 @@ class FixtureSpeechActivityAdapter:
         return [SpeechRegion.model_validate(row) for row in rows]
 
 
+@dataclass(frozen=True)
+class EnergyThresholds:
+    """Levels used for one file: detect above ``on``, bridge above ``off``, place edges at ``edge``."""
+
+    on_dbfs: float
+    off_dbfs: float
+    edge_dbfs: float
+    adaptive: bool
+    floor_dbfs: float | None = None
+    level_dbfs: float | None = None
+
+
 class EnergySpeechActivityAdapter:
-    def __init__(self, threshold_dbfs: float = -45.0, window_ms: int = 100, min_region_ms: int = 100):
+    """Streaming energy VAD that reports speech bursts at 10 ms resolution.
+
+    By default the thresholds follow the file: the on-threshold sits 32 dB under
+    the loud speech level (95th percentile of the sounding frames) and at least
+    12 dB over the noise floor (typical quietest frame per 3 s), a burst continues while the level stays within
+    ``hysteresis_db`` below it, silences shorter than ``merge_gap_ms`` are
+    bridged and activity shorter than ``min_region_ms`` is dropped. A region
+    starts at the first frame above the on-threshold, so soft consonant onsets
+    stay inside it, and ends at the last frame ``edge_rise_db`` above that
+    threshold, so it ends with the voice rather than with its decay or a breath.
+
+    ``threshold_dbfs`` forces an absolute on-threshold (both edges use it) and
+    ``window_ms`` restores non-overlapping analysis windows of that size, which
+    keeps configurations written for the first VAD working unchanged.
+    """
+
+    def __init__(
+        self,
+        threshold_dbfs: float | None = None,
+        window_ms: int | None = None,
+        min_region_ms: int | None = None,
+        *,
+        hysteresis_db: float = DEFAULT_HYSTERESIS_DB,
+        merge_gap_ms: int = DEFAULT_MERGE_GAP_MS,
+        edge_rise_db: float = DEFAULT_EDGE_RISE_DB,
+    ):
+        if window_ms is not None and window_ms <= 0:
+            raise ValueError("vad.window_ms must be positive")
+        if min_region_ms is not None and min_region_ms < 0:
+            raise ValueError("vad.min_region_ms must be non-negative")
+        if hysteresis_db < 0 or merge_gap_ms < 0 or edge_rise_db < 0:
+            raise ValueError("vad hysteresis, merge gap and edge rise must be non-negative")
         self.threshold_dbfs = threshold_dbfs
         self.window_ms = window_ms
-        self.min_region_ms = min_region_ms
+        self.min_region_ms = DEFAULT_MIN_REGION_MS if min_region_ms is None else min_region_ms
+        self.hysteresis_db = hysteresis_db
+        self.merge_gap_ms = merge_gap_ms
+        self.edge_rise_db = edge_rise_db
+        self.last_thresholds: EnergyThresholds | None = None
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
+        self.last_thresholds = None
         with wave.open(str(audio_path), "rb") as wav:
             channels = wav.getnchannels()
             sample_width = wav.getsampwidth()
@@ -47,50 +119,73 @@ class EnergySpeechActivityAdapter:
             _validate_pcm16(sample_width)
             if total_frames <= 0 or frame_rate <= 0:
                 return []
-            window_frames = max(1, int(frame_rate * self.window_ms / 1000.0))
-            regions: list[SpeechRegion] = []
-            # Region bounds stay in sample frames: float seconds made a single
-            # 100 ms window measure 0.0999999 s and silently dropped it.
-            active_start: int | None = None
-            active_end: int | None = None
-            start_frame = 0
+            legacy_windows = self.window_ms is not None
+            hop_frames = max(1, int(frame_rate * (self.window_ms if legacy_windows else DEFAULT_HOP_MS) / 1000.0))
+            levels = _hop_levels(wav, channels, hop_frames, overlap=not legacy_windows)
 
-            while start_frame < total_frames:
-                pcm = _mono_pcm16(wav.readframes(window_frames), channels)
-                if not pcm:
-                    break
-                end_frame = min(total_frames, start_frame + len(pcm))
-                is_active = _dbfs(pcm, 32767) > self.threshold_dbfs
-                if is_active:
-                    if active_start is None:
-                        active_start = start_frame
-                    active_end = end_frame
-                elif active_start is not None and active_end is not None:
-                    _append_region(regions, active_start, active_end, frame_rate, self.min_region_ms)
-                    active_start = None
-                    active_end = None
-                start_frame = end_frame
-
-        if active_start is not None and active_end is not None:
-            _append_region(regions, active_start, active_end, frame_rate, self.min_region_ms)
+        hop_ms = self.window_ms if legacy_windows else DEFAULT_HOP_MS
+        thresholds = self._thresholds(levels, max(1, round(ADAPTIVE_FLOOR_BLOCK_MS / hop_ms)))
+        self.last_thresholds = thresholds
+        if thresholds is None:
+            return []
+        # Frame i of the overlapping analysis describes the 10 ms slice centred
+        # in its 20 ms window; legacy windows describe themselves.
+        offset_frames = 0 if legacy_windows else hop_frames // 2
+        regions: list[SpeechRegion] = []
+        pending: tuple[int, int] | None = None
+        for first, last in _active_runs(levels, thresholds):
+            start_frame = 0 if first == 0 else first * hop_frames + offset_frames
+            end_frame = total_frames if last == len(levels) - 1 else (last + 1) * hop_frames + offset_frames
+            end_frame = min(total_frames, end_frame)
+            if pending is not None and (start_frame - pending[1]) * 1000 < self.merge_gap_ms * frame_rate:
+                pending = (pending[0], end_frame)
+                continue
+            if pending is not None:
+                _append_region(regions, pending[0], pending[1], frame_rate, self.min_region_ms)
+            pending = (start_frame, end_frame)
+        if pending is not None:
+            _append_region(regions, pending[0], pending[1], frame_rate, self.min_region_ms)
         return regions
+
+    def _thresholds(self, levels: array, floor_block_hops: int) -> EnergyThresholds | None:
+        if self.threshold_dbfs is not None:
+            on = float(self.threshold_dbfs)
+            return EnergyThresholds(on_dbfs=on, off_dbfs=on - self.hysteresis_db, edge_dbfs=on, adaptive=False)
+        level = _signal_level_percentile(levels, ADAPTIVE_LEVEL_PERCENTILE)
+        if level is None:
+            return None
+        floor = _noise_floor(levels, floor_block_hops)
+        on = min(
+            ADAPTIVE_ON_MAX_DBFS,
+            max(ADAPTIVE_ON_MIN_DBFS, floor + ADAPTIVE_FLOOR_MARGIN_DB, level - ADAPTIVE_LEVEL_MARGIN_DB),
+        )
+        return EnergyThresholds(
+            on_dbfs=on,
+            off_dbfs=on - self.hysteresis_db,
+            edge_dbfs=on + self.edge_rise_db,
+            adaptive=True,
+            floor_dbfs=floor,
+            level_dbfs=level,
+        )
 
 
 class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model path
     def __init__(
         self,
-        threshold_dbfs: float = -45.0,
-        window_ms: int = 100,
-        min_region_ms: int = 100,
+        threshold_dbfs: float | None = None,
+        window_ms: int | None = None,
+        min_region_ms: int | None = None,
         sampling_rate: int = 16000,
+        **energy_options: float,
     ):
         self.fallback = EnergySpeechActivityAdapter(
             threshold_dbfs=threshold_dbfs,
             window_ms=window_ms,
             min_region_ms=min_region_ms,
+            **energy_options,
         )
         self.sampling_rate = sampling_rate
-        self.min_region_ms = min_region_ms
+        self.min_region_ms = 100 if min_region_ms is None else min_region_ms
         self.fallback_used = False
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
@@ -140,19 +235,34 @@ def speech_activity_adapter_from_config(config: dict[str, object]) -> SpeechActi
         return FixtureSpeechActivityAdapter(Path(str(fixture_path)))
     provider = str(vad_config.get("provider", "energy")).lower()
     if provider == "energy":
-        return EnergySpeechActivityAdapter(
-            threshold_dbfs=float(vad_config.get("threshold_dbfs", -45.0)),
-            window_ms=int(vad_config.get("window_ms", 100)),
-            min_region_ms=int(vad_config.get("min_region_ms", 100)),
-        )
+        return EnergySpeechActivityAdapter(**_energy_options(vad_config))
     if provider == "silero":
         return SileroSpeechActivityAdapter(
-            threshold_dbfs=float(vad_config.get("threshold_dbfs", -45.0)),
-            window_ms=int(vad_config.get("window_ms", 100)),
-            min_region_ms=int(vad_config.get("min_region_ms", 100)),
             sampling_rate=int(vad_config.get("sampling_rate", 16000)),
+            **_energy_options(vad_config),
         )
     raise ValueError(f"Unsupported VAD provider: {provider}")
+
+
+def _energy_options(vad_config: dict[str, object]) -> dict[str, object]:
+    """Read energy VAD keys; an absent key selects the adaptive 10 ms default."""
+    options: dict[str, object] = {}
+    for key, convert in (
+        ("threshold_dbfs", float),
+        ("window_ms", int),
+        ("min_region_ms", int),
+        ("hysteresis_db", float),
+        ("merge_gap_ms", int),
+        ("edge_rise_db", float),
+    ):
+        value = vad_config.get(key)
+        if value is None:
+            continue
+        try:
+            options[key] = convert(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"vad.{key} must be numeric") from exc
+    return options
 
 
 def speech_activity_flags_for_cues(
@@ -319,6 +429,104 @@ def cue_ids_with_audible_words(
     except (wave.Error, EOFError, OSError):
         return set()
     return audible
+
+
+def _hop_levels(wav: wave.Wave_read, channels: int, hop_frames: int, *, overlap: bool) -> array:
+    """Stream the file once and return one dBFS level per hop.
+
+    With ``overlap`` each level is the RMS of two consecutive hops (a 20 ms
+    window at the default 10 ms hop). Only the compact level track is kept, so
+    memory stays bounded for multi-hour recordings.
+    """
+    levels = array("f")
+    previous: tuple[int, int] | None = None
+    while True:
+        pcm = _mono_pcm16(wav.readframes(hop_frames * _STREAM_CHUNK_HOPS), channels)
+        if not pcm:
+            break
+        for offset in range(0, len(pcm), hop_frames):
+            block = pcm[offset:offset + hop_frames]
+            current = (sum(map(mul, block, block)), len(block))
+            if not overlap:
+                levels.append(_energy_dbfs(*current))
+            elif previous is not None:
+                levels.append(_energy_dbfs(previous[0] + current[0], previous[1] + current[1]))
+            previous = current
+    if overlap and previous is not None:
+        levels.append(_energy_dbfs(*previous))
+    return levels
+
+
+def _energy_dbfs(square_sum: int, sample_count: int) -> float:
+    if square_sum <= 0 or sample_count <= 0:
+        return -math.inf
+    return 10.0 * math.log10(square_sum / sample_count) - _FULL_SCALE_DB
+
+
+def _signal_level_percentile(levels: array, percentile: float) -> float | None:
+    """Percentile of the frames that carry any signal, from a fixed-size histogram."""
+    bin_count = int(-DIGITAL_SILENCE_DBFS / _HISTOGRAM_BIN_DB)
+    histogram = [0] * bin_count
+    total = 0
+    for level in levels:
+        if level <= DIGITAL_SILENCE_DBFS:
+            continue
+        histogram[min(bin_count - 1, int((level - DIGITAL_SILENCE_DBFS) / _HISTOGRAM_BIN_DB))] += 1
+        total += 1
+    if total == 0:
+        return None
+    needed = max(1, math.ceil(total * percentile / 100.0))
+    seen = 0
+    for index, count in enumerate(histogram):
+        seen += count
+        if seen >= needed:
+            return DIGITAL_SILENCE_DBFS + (index + 0.5) * _HISTOGRAM_BIN_DB
+    return 0.0
+
+
+def _noise_floor(levels: array, block_hops: int) -> float:
+    """Typical level the recording falls to between sounds.
+
+    The quietest frame of each ~3 s block follows a changing bed, and the
+    median of those minima is unaffected by how much of the file is speech.
+    Digital silence counts as the lowest measurable floor.
+    """
+    minima = sorted(
+        max(DIGITAL_SILENCE_DBFS, min(levels[offset:offset + block_hops]))
+        for offset in range(0, len(levels), block_hops)
+    )
+    if not minima:
+        return DIGITAL_SILENCE_DBFS
+    return minima[len(minima) // 2]
+
+
+def _active_runs(levels: array, thresholds: EnergyThresholds) -> Iterator[tuple[int, int]]:
+    """Yield inclusive (first, last) frame indices of each speech burst.
+
+    A burst is a run of frames above the off-threshold that reaches the
+    on-threshold at least once. It starts at its first on-frame and ends at its
+    last edge-frame (its last on-frame when it never gets that loud).
+    """
+    on, off, edge = thresholds.on_dbfs, thresholds.off_dbfs, thresholds.edge_dbfs
+    in_run = False
+    first_on = last_on = last_edge = -1
+    for index, level in enumerate(levels):
+        if level > off:
+            if not in_run:
+                in_run = True
+                first_on = last_on = last_edge = -1
+            if level > on:
+                if first_on < 0:
+                    first_on = index
+                last_on = index
+                if level > edge:
+                    last_edge = index
+        elif in_run:
+            in_run = False
+            if first_on >= 0:
+                yield first_on, last_edge if last_edge >= 0 else last_on
+    if in_run and first_on >= 0:
+        yield first_on, last_edge if last_edge >= 0 else last_on
 
 
 def _append_region(
