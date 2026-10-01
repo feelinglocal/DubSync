@@ -2080,6 +2080,7 @@ def _run_verify_stage(
         rebuilt, source_cues, protected_source_cue_ids, reason="protected_region",
     )
     flags.extend(protected_source_restore_flags)
+    rebuilt, flags = _remove_leftover_duplicate_cues(rebuilt, source_cues, effective_words, alignment, flags)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
@@ -2187,6 +2188,96 @@ def _run_verify_stage(
 def _known_audio_duration_ms(audio_path: Path) -> int | None:
     duration = audio_seconds(audio_path)
     return int(round(duration * 1000)) if isfinite(duration) and duration > 0 else None
+
+
+_LEFTOVER_DUPLICATE_MAX_TOKENS = 4
+# Findings about a cue alone that are moot once the cue is gone.
+_LEFTOVER_CUE_FLAG_KINDS = frozenset({
+    "missing_audio_timing_held", "missing_audio_source_cue_held", "missing_audio_source_cue_restored",
+    "unmatched_cue", "dropped_line_candidate", "divergence_unresolved", "low_confidence_adjudication",
+    "cue_without_speech_activity", "overlap_stacked", "overlap_flag_only",
+})
+
+
+def _remove_leftover_duplicate_cues(
+    cues: list[Cue],
+    source_cues: list[Cue],
+    words: list[Word],
+    alignment: AlignmentResult,
+    flags: list[QCFlag],
+) -> tuple[list[Cue], list[QCFlag]]:
+    """Remove an unspoken source cue that repeats words of the cue shown at its time.
+
+    The script says "Claro," and then "É claro que a empresa ..."; the actor
+    says the phrase once. The first cue has no audio and stayed at its source
+    time inside the second, which shows the same word: a doubled line and an
+    overlap. A short source cue without any owned word whose complete wording
+    is spoken inside an overlapping, acoustically timed cue is a duplicate.
+    """
+    source_by_id = {cue.index: cue for cue in source_cues}
+
+    def spoken_signature(cue: Cue) -> list[str]:
+        owned = sorted(
+            (words[index] for index in alignment.cue_word_indices.get(cue.index, []) if 0 <= index < len(words)),
+            key=lambda word: (word.start, word.end),
+        )
+        return alphanumeric_signature(" ".join(word.text for word in owned))
+
+    def contains(whole: list[str], part: list[str]) -> bool:
+        # The aligner's spelling tolerance: "Vamos" is spoken as "vamo".
+        return any(
+            all(
+                token == candidate or fuzz.ratio(token, candidate, score_cutoff=85) >= 85
+                for token, candidate in zip(part, whole[start:start + len(part)])
+            )
+            for start in range(len(whole) - len(part) + 1)
+        )
+
+    removed: dict[int, Cue] = {}
+    merge_flags: list[QCFlag] = []
+    for cue in cues:
+        source = source_by_id.get(cue.index)
+        signature = alphanumeric_signature(speech_text_for_alignment(cue))
+        if (
+            source is None or alignment.cue_word_indices.get(cue.index)
+            or (cue.start_ms, cue.end_ms, cue.text) != (source.start_ms, source.end_ms, source.text)
+            or not 1 <= len(signature) <= _LEFTOVER_DUPLICATE_MAX_TOKENS
+            or cue_has_bracketed_screen_text(cue) or is_song_caption_cue(cue)
+        ):
+            continue
+        for other in cues:
+            overlap_ms = min(cue.end_ms, other.end_ms) - max(cue.start_ms, other.start_ms)
+            if (
+                other.index == cue.index or other.index in removed
+                or overlap_ms * 2 < cue.duration_ms
+                or cue_has_bracketed_screen_text(other) or is_song_caption_cue(other)
+                or speakers_known_different(cue.speaker_id, other.speaker_id)
+                or not contains(alphanumeric_signature(speech_text_for_alignment(other)), signature)
+                or not contains(spoken_signature(other), signature)
+            ):
+                continue
+            removed[cue.index] = cue
+            merge_flags.append(QCFlag(
+                kind="duplicate_cue_merged", cue_ids=[other.index, cue.index],
+                message=(
+                    "A source cue without audio repeats words spoken in the cue shown at the same time; "
+                    "the unspoken duplicate was removed."
+                ),
+                old_text=f"{other.text}\n\n{cue.text}", new_text=other.text,
+                start=other.start_ms / 1000.0, end=other.end_ms / 1000.0,
+            ))
+            break
+    if not removed:
+        return cues, flags
+    kept_flags: list[QCFlag] = []
+    for flag in flags:
+        if flag.kind in _LEFTOVER_CUE_FLAG_KINDS and removed.keys() & set(flag.cue_ids):
+            remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in removed]
+            if not remaining or flag.kind in {"overlap_stacked", "overlap_flag_only"}:
+                continue
+            flag = flag.model_copy(update={"cue_ids": remaining})
+        kept_flags.append(flag)
+    return [cue for cue in cues if cue.index not in removed], [*kept_flags, *merge_flags]
 
 
 def _remove_silent_generated_adlibs(

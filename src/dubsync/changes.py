@@ -349,7 +349,7 @@ def apply_adjudication_decisions(
                 )
             continue
 
-        guard_flag = _editorial_guard_rejection(span, decision, cue_ids)
+        guard_flag = _editorial_guard_rejection(span, decision, cue_ids, cues_by_id, cue_token_offsets)
         if guard_flag is not None:
             flags.append(guard_flag)
             continue
@@ -1477,16 +1477,54 @@ def single_token_prefix_replacement_targets(
     return targets
 
 
+def _span_source_context(
+    span: DivergenceSpan, cue_ids: list[int], cues_by_id: dict[int, Cue], cue_token_offsets: dict[int, int],
+) -> str:
+    """Authored text of the span's tokens with the punctuation directly around them."""
+    context: list[str] = []
+    for cue_id in cue_ids:
+        cue = cues_by_id[cue_id]
+        bounds = _span_token_bounds_for_cue(cue, span, cue_token_offsets[cue_id]) if span.srt_token_indices else None
+        token_spans = (
+            list(alignment_token_character_spans(cue) or []) if cue_has_bracketed_screen_text(cue)
+            else _token_character_spans(cue.plain_text)
+        )
+        text = cue.text if cue_has_bracketed_screen_text(cue) else cue.plain_text
+        if bounds is None or not token_spans or bounds[1] > len(token_spans):
+            context.append(text)
+            continue
+        start, end = bounds
+        context.append(text[
+            token_spans[start - 1][1] if start else 0:
+            token_spans[end][0] if end < len(token_spans) else len(text)
+        ])
+    return "\n".join(context)
+
+
 def _editorial_guard_rejection(
     span: DivergenceSpan,
     decision: AdjudicationDecision,
     cue_ids: list[int],
+    cues_by_id: dict[int, Cue] | None = None,
+    cue_token_offsets: dict[int, int] | None = None,
 ) -> QCFlag | None:
+    source_context = applied_text = None
+    if cues_by_id is not None and cue_token_offsets is not None:
+        source_context = _span_source_context(span, cue_ids, cues_by_id, cue_token_offsets)
+        if len(cue_ids) == 1 and span.srt_token_indices:
+            # A wording that repeats the cue's unchanged words is applied
+            # without them; only the applied part can add a mark.
+            cue = cues_by_id[cue_ids[0]]
+            bounds = _span_token_bounds_for_cue(cue, span, cue_token_offsets[cue.index])
+            if bounds is not None:
+                applied_text = _localized_indexed_replacement(cue, span, bounds, decision.final_text)
     try:
         validate_adjudication_editorial_contract(
             span,
             decision,
             allow_word_change=decision.verdict in {"use_audio", "hybrid"},
+            source_context=source_context,
+            applied_text=applied_text,
         )
     except EditorialGuardError as exc:
         return QCFlag(
@@ -1537,7 +1575,7 @@ def _restore_cues_rejected_by_editorial_guard(
         if source is None or cue.index not in changed_cue_ids:
             continue
         try:
-            validate_editorial_text(source.text, cue.text, allow_word_change=True)
+            validate_editorial_text(source.text, cue.text, allow_word_change=True, allow_removed_quotations=True)
         except EditorialGuardError as exc:
             rejected[cue.index] = QCFlag(
                 kind="editorial_guard_rejected",
@@ -1902,15 +1940,39 @@ def _apply_token_edits_with_spans(
             if terminal is not None and not _TERMINAL_PUNCTUATION_RE.search(stripped_replacement):
                 start_character = terminal.start(1)
                 end_character = start_character
+        ends_with_title = bounded_end > bounded_start and _is_title_abbreviation(source_text, *token_spans[bounded_end - 1])
+        if ends_with_title and bounded_end == bounded_start + 1 and _is_spoken_title(
+            source_text[start_character:end_character], stripped_replacement,
+        ):
+            # "Sr." is how the script writes the spoken "senhor": the same word.
+            continue
+        # Only a contraction suffix ("gibt's" -> "gibt es") gives up its
+        # apostrophe. An elision ("l'homme") or an opening quote ('oi') keeps it.
         replaces_contraction_suffix = (
             bounded_end > bounded_start
-            and start_character > cursor
+            and start_character > max(cursor, 1)
             and source_text[start_character - 1] in {"'", "\u2019"}
+            and source_text[start_character - 2].isalnum()
+            and source_text[slice(*token_spans[bounded_start])].casefold() in _CONTRACTION_SUFFIXES
         )
         if replaces_contraction_suffix:
             start_character -= 1
             if stripped_replacement:
                 stripped_replacement = f" {stripped_replacement}"
+        restored_before = restored_after = ""
+        if bounded_end > bounded_start and not any(mark in stripped_replacement for mark in _DOUBLE_QUOTATION_MARKS):
+            start_character, end_character, restored_before, restored_after = _balanced_quote_removal(
+                source_text, start_character, end_character,
+            )
+        if (
+            ends_with_title
+            and not stripped_replacement.endswith(".")
+            and end_character < len(source_text)
+            and source_text[end_character] == "."
+            and alphanumeric_signature(source_text[end_character + 1:])
+        ):
+            # The abbreviation's own period goes with it; the sentence continues.
+            end_character += 1
         if (
             bounded_end > bounded_start
             and stripped_replacement
@@ -1928,7 +1990,9 @@ def _apply_token_edits_with_spans(
             end_character += 1
         if start_character < cursor or bounded_start < previous_token_end:
             continue
-        pieces.append(source_text[cursor:start_character])
+        retained = source_text[cursor:start_character]
+        # A quotation that keeps words on one side of the edit keeps its mark there.
+        pieces.append(f"{retained.rstrip()}{restored_before} " if restored_before else retained)
         if bounded_start == bounded_end and stripped_replacement:
             left = source_text[start_character - 1:start_character] if start_character else ""
             right = source_text[end_character:end_character + 1]
@@ -1937,6 +2001,10 @@ def _apply_token_edits_with_spans(
             pieces.append(f"{prefix}{stripped_replacement}{suffix}")
         else:
             pieces.append(stripped_replacement)
+        if restored_after:
+            pieces.append(f" {restored_after}")
+            while end_character < len(source_text) and source_text[end_character] in " \t":
+                end_character += 1
         cursor = end_character
         previous_token_end = bounded_end
 
@@ -1954,9 +2022,64 @@ def _apply_token_edits_with_spans(
         normalized = re.sub(r" *(\r?\n) *", r"\1", normalized)
     punctuation_spacing = r"[^\S\r\n]+" if preserve_line_breaks else r"\s+"
     normalized = re.sub(rf"{punctuation_spacing}([,.;:!?\u2026])", r"\1", normalized)
+    if not _DANGLING_SEPARATOR_RE.search(source_text):
+        # A removed clause leaves its separator before the next mark
+        # ("a pol\u00edcia,." / "a oferecer,,"); authored clusters stay untouched.
+        normalized = _DANGLING_SEPARATOR_RE.sub("", normalized)
     for marker, fragment in protected:
         normalized = normalized.replace(marker, fragment)
     return _restore_terminal_punctuation(normalized, source_text)
+
+
+_DANGLING_SEPARATOR_RE = re.compile(r"[,;:]+(?=[.!?\u2026,;:])")
+_DOUBLE_QUOTATION_MARKS = '"\u201c\u201d\u201e\u201f\u00ab\u00bb'
+# English and German contraction suffixes; the word before them is complete.
+_CONTRACTION_SUFFIXES = frozenset({"s", "t", "m", "d", "re", "ve", "ll"})
+# Written title abbreviations and the words actors say for them (accent-folded).
+_TITLE_ABBREVIATIONS: dict[str, frozenset[str]] = {
+    "sr": frozenset({"senhor", "senor"}), "sra": frozenset({"senhora", "senora"}),
+    "srta": frozenset({"senhorita", "senorita"}), "srs": frozenset({"senhores", "senores"}),
+    "sras": frozenset({"senhoras", "senoras"}),
+    "dr": frozenset({"doutor", "doctor", "doktor", "docteur"}), "dra": frozenset({"doutora", "doctora"}),
+    "prof": frozenset({"professor", "profesor", "professeur"}), "profa": frozenset({"professora", "profesora"}),
+    "mr": frozenset({"mister"}), "mrs": frozenset({"missus", "missis"}), "ms": frozenset(),
+    "hr": frozenset({"herr"}), "fr": frozenset({"frau"}),
+    "mme": frozenset({"madame"}), "mlle": frozenset({"mademoiselle"}), "m": frozenset({"monsieur"}),
+    "d": frozenset({"dom", "dona", "don"}), "st": frozenset(), "jr": frozenset({"junior"}),
+}
+
+
+def _is_title_abbreviation(text: str, start: int, end: int) -> bool:
+    return text[start:end].casefold() in _TITLE_ABBREVIATIONS and text[end:end + 1] == "."
+
+
+def _is_spoken_title(abbreviation: str, replacement: str) -> bool:
+    spoken = alphanumeric_signature(replacement)
+    return len(spoken) == 1 and spoken[0] in _TITLE_ABBREVIATIONS.get(abbreviation.casefold(), frozenset())
+
+
+def _balanced_quote_removal(text: str, start: int, end: int) -> tuple[int, int, str, str]:
+    """Never leave half of a quotation behind when an edit removes one of its marks.
+
+    The partner directly beside the removed range goes with it (the whole
+    quotation is gone). A partner farther away still encloses retained words:
+    the removed mark is named so the caller puts it back beside them. Returns
+    the adjusted range, a mark to restore before it and one to restore after.
+    """
+    positions = [index for index, character in enumerate(text) if character in _DOUBLE_QUOTATION_MARKS]
+    restored_before = restored_after = ""
+    for opening, closing in zip(positions[0::2], positions[1::2]):
+        if start <= opening < end <= closing:
+            if closing == end:
+                end += 1
+            else:
+                restored_after = text[opening]
+        elif opening < start <= closing < end:
+            if opening == start - 1:
+                start -= 1
+            else:
+                restored_before = text[closing]
+    return start, end, restored_before, restored_after
 
 
 def _protect_text_fragments(

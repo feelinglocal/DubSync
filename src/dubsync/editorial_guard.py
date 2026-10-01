@@ -23,12 +23,28 @@ def validate_adjudication_editorial_contract(
     decision: AdjudicationDecision,
     *,
     allow_word_change: bool,
+    source_context: str | None = None,
+    applied_text: str | None = None,
 ) -> None:
+    """Check an approved wording against the source span it replaces.
+
+    The span text is built from alignment tokens and never contains
+    punctuation. ``source_context`` is the authored cue text of those tokens
+    with the punctuation directly around them: a quotation mark found there
+    is one the source already has, so the wording may repeat it.
+    ``applied_text`` is the part of the wording that replaces the tokens once
+    repeated cue context is removed. The edited cue is checked as a whole
+    afterwards; here only marks without a source counterpart are refused.
+    """
+    if source_context is None:
+        validate_editorial_text(span.srt_text, decision.final_text, allow_word_change=allow_word_change)
+        return
     validate_editorial_text(
-        span.srt_text,
-        decision.final_text,
-        allow_word_change=allow_word_change,
+        span.srt_text, decision.final_text, allow_word_change=allow_word_change, check_quotation_marks=False,
     )
+    applied = decision.final_text if applied_text is None else applied_text
+    if _signature_additions(_quotation_mark_signature(source_context), _quotation_mark_signature(applied)):
+        raise EditorialGuardError("quotation mark signature changed during adjudication")
 
 
 def validate_editorial_text(
@@ -36,11 +52,23 @@ def validate_editorial_text(
     after: str,
     *,
     allow_word_change: bool,
+    check_quotation_marks: bool = True,
+    allow_removed_quotations: bool = False,
 ) -> None:
+    """Refuse editorial changes that word adjudication has no authority for.
+
+    ``allow_removed_quotations`` accepts a result that lost complete
+    quotations (an approved deletion of the quoted words); a single missing
+    or any added mark is still a changed signature.
+    """
     if not allow_word_change and alphanumeric_signature(before) != alphanumeric_signature(after):
         raise EditorialGuardError("alphanumeric content changed without word-change authority")
-    if _quotation_mark_signature(before) != _quotation_mark_signature(after):
-        raise EditorialGuardError("quotation mark signature changed during adjudication")
+    if check_quotation_marks:
+        source_marks, edited_marks = _quotation_mark_signature(before), _quotation_mark_signature(after)
+        if source_marks != edited_marks and not (
+            allow_removed_quotations and _only_whole_quotations_removed(source_marks, edited_marks)
+        ):
+            raise EditorialGuardError("quotation mark signature changed during adjudication")
     if _html_tag_signature(before) != _html_tag_signature(after):
         raise EditorialGuardError("markup signature changed during adjudication")
     if _masked_word_signature(before) != _masked_word_signature(after):
@@ -84,6 +112,15 @@ def episode_editorial_addition_flags(
 
 def _signature_additions(before: tuple[str, ...], after: tuple[str, ...]) -> tuple[str, ...]:
     return tuple((Counter(after) - Counter(before)).elements())
+
+
+def _only_whole_quotations_removed(before: tuple[str, ...], after: tuple[str, ...]) -> bool:
+    """The edited marks are the source marks minus complete opening/closing pairs."""
+    if len(before) % 2 or len(after) % 2:
+        return False
+    pairs = list(zip(before[0::2], before[1::2]))
+    remaining = iter(pairs)
+    return all(pair in remaining for pair in zip(after[0::2], after[1::2]))
 
 
 def _quotation_mark_signature(text: str) -> tuple[str, ...]:
