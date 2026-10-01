@@ -90,11 +90,30 @@ def test_unreliable_flanking_words_do_not_reclassify_missing_audio(defect):
     "really Hoje eu preciso ir embora",
     "Hoje eu preciso ir embora really",
 ])
-def test_missing_source_prefix_or_tail_keeps_full_cue_protection(text):
+def test_missing_source_prefix_or_tail_of_a_well_matched_cue_is_reviewed_in_its_speech(text):
+    # Five of six source words were heard as compact, trustworthy speech. The
+    # unspoken edge word becomes a reviewable omission inside that speech
+    # instead of locking the whole cue to its source timing.
     cue = Cue(index=1, start_ms=1000, end_ms=3000, lines=[text])
     _, words = _supported_omission()
 
     alignment = aligner.align_cues_to_words([cue], words[:5])
+
+    assert alignment.diagnostics.missing_audio_cue_ids == []
+    omission, = alignment.divergence_spans
+    assert (omission.srt_text, omission.asr_text) == ("really", "")
+    assert (omission.start, omission.end) == (words[0].start, words[4].end)
+
+
+@pytest.mark.parametrize("text", [
+    "really truly Hoje eu preciso",
+    "Hoje eu preciso really truly",
+])
+def test_missing_source_prefix_or_tail_of_a_sparse_cue_keeps_full_cue_protection(text):
+    cue = Cue(index=1, start_ms=1000, end_ms=3000, lines=[text])
+    _, words = _supported_omission()
+
+    alignment = aligner.align_cues_to_words([cue], words[:3])
 
     assert alignment.diagnostics.missing_audio_cue_ids == [1]
 

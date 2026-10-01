@@ -75,6 +75,8 @@ NUMBER_GROUP_MAX_WORDS = 6
 # Below 1.0 so literal-only repairs never mistake a compound for an exact word.
 COMPOUND_MATCH_SCORE = 0.99
 UNTIMED_PUNCTUATION_SECONDS = 0.020
+# Provider words of one phrase may overlap by a few tens of milliseconds.
+OMISSION_WORD_OVERLAP_SECONDS = 0.05
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 # ``compound`` pairs a token of a concatenation-equal group with the provider
 # word it starts in; ``absorb`` hands a further word of that group to the cue.
@@ -1145,8 +1147,11 @@ def _align_cues_to_units(
     for cue_id, word_index in _absorbed_cue_words(ops, tokens):
         cue_word_indices.setdefault(cue_id, []).append(word_index)
 
-    divergence_spans = _source_omissions_with_local_context(
-        _build_divergences(ops, tokens, words), matches, cues, tokens, words,
+    divergence_spans = _mostly_matched_omission_windows(
+        _source_omissions_with_local_context(
+            _build_divergences(ops, tokens, words), matches, cues, tokens, words,
+        ),
+        matches, cues, tokens, words,
     )
     anchor_regions = _build_anchor_regions(ops, tokens, words)
     unmatched_cue_ids = [
@@ -1516,6 +1521,72 @@ def _source_omissions_with_local_context(
             continue
         contextualized[-1] = span.model_copy(update={"start": flanks[0].start, "end": flanks[-1].end})
     return contextualized
+
+
+def _mostly_matched_omission_windows(
+    spans: list[DivergenceSpan],
+    matches: list[TokenMatch],
+    cues: list[Cue],
+    tokens: list[SRTToken],
+    words: list[Word],
+) -> list[DivergenceSpan]:
+    """Window an unspoken word of a well-matched cue with that cue's own speech.
+
+    At a file edge, or between touching or slightly overlapping words, a
+    source-only span has no positive window and used to lock the whole cue
+    as missing audio, discarding the timing of its other words. When at
+    least two thirds of the cue matched compact, trustworthy words of one
+    speaker, the omission is reviewed inside the cue's speech instead.
+    Sparse, annotated, song and unreliable cues stay locked.
+    """
+    cues_by_id = {cue.index: cue for cue in cues}
+    matched_counts = Counter(match.cue_id for match in matches)
+    token_counts = Counter(token.cue_id for token in tokens)
+    words_by_cue: dict[int, set[int]] = {}
+    for match in matches:
+        words_by_cue.setdefault(match.cue_id, set()).add(match.asr_word_index)
+    windowed: list[DivergenceSpan] = []
+    for span in spans:
+        windowed.append(span)
+        if (
+            len(span.cue_ids) != 1 or not span.srt_token_indices
+            or span.asr_word_indices or span.asr_text.strip()
+            or _has_positive_window(span)
+        ):
+            continue
+        cue_id = span.cue_ids[0]
+        cue = cues_by_id.get(cue_id)
+        if (
+            cue is None or cue_has_bracketed_screen_text(cue) or _is_song_lyric_cue(cue)
+            or matched_counts[cue_id] * 3 < token_counts[cue_id] * 2
+        ):
+            continue
+        cue_words = [words[index] for index in sorted(words_by_cue.get(cue_id, ()))]
+        if not cue_words or any(
+            not math.isfinite(word.start) or not math.isfinite(word.end) or word.start < 0
+            or not 0.020 + 1e-9 < word.end - word.start <= IMPLAUSIBLE_MATCHED_WORD_SECONDS
+            or word.confidence is not None and word.confidence < 0.8
+            for word in cue_words
+        ):
+            continue
+        if (
+            any(not -OMISSION_WORD_OVERLAP_SECONDS - 1e-9 <= right.start - left.end <= 0.5
+                for left, right in zip(cue_words, cue_words[1:]))
+            or len({word.speaker_id for word in cue_words if word.speaker_id}) > 1
+        ):
+            continue
+        windowed[-1] = span.model_copy(update={"start": cue_words[0].start, "end": cue_words[-1].end})
+    return windowed
+
+
+def _has_positive_window(span: DivergenceSpan) -> bool:
+    return (
+        span.start is not None
+        and span.end is not None
+        and math.isfinite(span.start)
+        and math.isfinite(span.end)
+        and span.end > span.start
+    )
 
 
 def _source_only_zero_window_cue_ids(spans: list[DivergenceSpan]) -> set[int]:
