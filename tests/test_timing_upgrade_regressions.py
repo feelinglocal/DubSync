@@ -6,10 +6,12 @@ import wave
 from array import array
 
 import pytest
+import yaml
 
 from dubsync import pipeline
+from dubsync.asr_timing import PhraseEdgeSnap, phrase_edge_snap_from_config, repair_asr_word_edges
 from dubsync.cost import CostMeter
-from dubsync.models import AlignmentResult, Cue, QCFlag, Word
+from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
 from dubsync.vad import (
@@ -221,3 +223,167 @@ def test_default_energy_vad_streams_long_audio_with_bounded_memory(tmp_path):
 
     assert regions == []
     assert peak_bytes <= 8 * 1024 * 1024
+
+
+# --- Task 3: ASR word edges repaired from the speech bursts before rebuild ---------------------
+
+
+def test_start_stretched_word_keeps_its_real_end_and_moves_to_the_burst_onset():
+    # timing.md B2: Scribe stretched "Obrigada," back over an 11.7 s pause.
+    words = [
+        Word(text="aqui.", start=2115.50, end=2115.83),
+        Word(text="Obrigada,", start=2115.892, end=2127.592),
+        Word(text="Luke.", start=2127.652, end=2127.912),
+    ]
+    regions = [SpeechRegion(start=2115.20, end=2115.90), SpeechRegion(start=2127.08, end=2127.93)]
+
+    repaired, flags = repair_asr_word_edges(words, regions)
+
+    assert (repaired[1].start, repaired[1].end) == (2127.08, 2127.592)
+    assert repaired[2].start == 2127.652
+    assert [flag.kind for flag in flags] == ["asr_word_clamped"]
+    assert flags[0].old_text == "Obrigada, 2115.892 --> 2127.592"
+    assert flags[0].new_text == "Obrigada, 2127.080 --> 2127.592"
+
+
+def test_end_stretched_word_is_cut_at_the_end_of_its_own_burst():
+    words = [Word(text="o", start=1341.90, end=1342.10), Word(text="público.", start=1342.118, end=1346.978)]
+    regions = [SpeechRegion(start=1341.0, end=1342.60), SpeechRegion(start=1346.99, end=1348.0)]
+
+    repaired, flags = repair_asr_word_edges(words, regions)
+
+    assert (repaired[1].start, repaired[1].end) == (1342.118, 1342.60)
+    assert [flag.kind for flag in flags] == ["asr_word_clamped"]
+
+
+def test_stretch_that_reaches_the_next_phrase_keeps_the_side_that_can_hold_the_word():
+    regions = [SpeechRegion(start=48.2, end=48.9), SpeechRegion(start=67.0, end=69.0)]
+    end_stretched = [Word(text="Los", start=48.299, end=48.5), Word(text="geht's.", start=48.599, end=67.379)]
+    start_stretched = [Word(text="aqui.", start=48.3, end=48.8), Word(text="Obrigada,", start=48.84, end=67.5)]
+
+    repaired_end, _ = repair_asr_word_edges(end_stretched, regions)
+    repaired_start, _ = repair_asr_word_edges(start_stretched, regions)
+
+    # 0.3 s of speech after "Los" is the whole word "geht's."
+    assert (repaired_end[1].start, repaired_end[1].end) == (48.599, 48.9)
+    # 60 ms after "aqui." cannot be "Obrigada,": it was spoken where it ends.
+    assert (repaired_start[1].start, repaired_start[1].end) == (67.0, 67.5)
+
+
+def test_phrase_edges_snap_to_the_burst_without_per_word_flags():
+    # MAI: phrase starts on a 40 ms grid and ends after the voice has stopped.
+    words = [
+        Word(text="Se", start=9.975, end=10.10, confidence=None),  # starts 25 ms before the onset
+        Word(text="arruma,", start=10.16, end=10.66, confidence=None),  # ends 60 ms after the offset
+        Word(text="Vamos", start=12.045, end=12.30, confidence=None),  # starts 45 ms after the onset
+        Word(text="logo", start=12.36, end=12.55, confidence=None),
+        Word(text="embora.", start=12.60, end=12.95, confidence=None),  # ends 50 ms before the offset
+    ]
+    regions = [SpeechRegion(start=10.0, end=10.6), SpeechRegion(start=12.0, end=13.0)]
+
+    repaired, flags = repair_asr_word_edges(words, regions)
+
+    assert [(word.start, word.end) for word in repaired] == [
+        (10.0, 10.10), (10.16, 10.6), (12.0, 12.30), (12.36, 12.55), (12.60, 13.0),
+    ]
+    assert flags == []
+
+
+def test_burst_edges_owned_by_another_word_or_too_far_away_are_not_borrowed():
+    words = [
+        Word(text="Uau,", start=1.05, end=1.30),
+        Word(text="lindo!", start=1.55, end=1.80),
+        Word(text="Outra", start=2.0, end=2.2, speaker_id="speaker_2"),
+        Word(text="Hã?", start=5.40, end=5.56),
+    ]
+    regions = [SpeechRegion(start=1.0, end=3.0), SpeechRegion(start=5.0, end=6.0)]
+
+    repaired, _ = repair_asr_word_edges(words, regions)
+
+    assert repaired[1] == words[1]  # mid-burst word between two other words
+    assert repaired[2].end == 2.2  # the burst continues for 0.8 s: another sound, not this word
+    assert repaired[3] == words[3]  # 0.4 s after the onset and 0.44 s before the offset
+
+
+def test_word_without_acoustic_evidence_only_gets_the_duration_limit():
+    words = [Word(text="soft", start=1.0, end=1.4), Word(text="stretched", start=5.0, end=23.0)]
+
+    untouched, no_flags = repair_asr_word_edges(words[:1], [SpeechRegion(start=3.0, end=4.0)])
+    limited, flags = repair_asr_word_edges(words[1:], [])
+
+    assert untouched == words[:1] and no_flags == []
+    assert (limited[0].start, limited[0].end) == (5.0, 7.0)
+    assert [flag.kind for flag in flags] == ["asr_word_clamped"]
+
+
+def test_word_edge_repair_is_idempotent_and_keeps_word_count_and_order():
+    words = [
+        Word(text="aqui.", start=2115.50, end=2115.83),
+        Word(text="Obrigada,", start=2115.892, end=2127.592),
+        Word(text="Luke.", start=2127.652, end=2127.912),
+        Word(text="público.", start=2130.118, end=2134.978),
+    ]
+    regions = [
+        SpeechRegion(start=2115.20, end=2115.90), SpeechRegion(start=2127.08, end=2127.93),
+        SpeechRegion(start=2130.0, end=2130.6),
+    ]
+
+    once, _ = repair_asr_word_edges(words, regions)
+    twice, flags = repair_asr_word_edges(once, regions)
+
+    assert [word.text for word in once] == [word.text for word in words]
+    assert twice == once
+    assert flags == []
+
+
+def test_phrase_edge_snap_config_supports_per_model_overrides():
+    config = {"timing": {"phrase_edge_snap": {
+        "start_advance_ms": 120,
+        "models": {"scribe_v2": {"end_extension_ms": 80}},
+    }}}
+
+    assert phrase_edge_snap_from_config({}) == PhraseEdgeSnap()
+    assert phrase_edge_snap_from_config(config, "microsoft/mai-transcribe-2") == PhraseEdgeSnap(start_advance=0.12)
+    assert phrase_edge_snap_from_config(config, "scribe_v2") == PhraseEdgeSnap(start_advance=0.12, end_extension=0.08)
+    assert phrase_edge_snap_from_config({"timing": {"phrase_edge_snap": False}}) == PhraseEdgeSnap(0.0, 0.0)
+    with pytest.raises(ValueError, match="start_advance_ms"):
+        phrase_edge_snap_from_config({"timing": {"phrase_edge_snap": {"start_advance_ms": -1}}})
+
+
+def test_sync_starts_a_cue_at_the_real_onset_of_its_stretched_first_word(tmp_path):
+    source = tmp_path / "source.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:01,700\nBom dia.\n\n"
+        "2\n00:00:12,000 --> 00:00:13,000\nObrigada, Luke.\n",
+        encoding="utf-8",
+    )
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    fixture = tmp_path / "words.json"
+    fixture.write_text(json.dumps({"words": [
+        {"text": "Bom", "start": 1.0, "end": 1.2, "speaker_id": "A"},
+        {"text": "dia.", "start": 1.25, "end": 1.6, "speaker_id": "A"},
+        {"text": "Obrigada,", "start": 1.66, "end": 12.592, "speaker_id": "B"},
+        {"text": "Luke.", "start": 12.652, "end": 12.912, "speaker_id": "B"},
+    ]}), encoding="utf-8")
+    vad = tmp_path / "vad.json"
+    vad.write_text(
+        json.dumps({"regions": [{"start": 1.0, "end": 1.62}, {"start": 12.08, "end": 12.93}]}), encoding="utf-8"
+    )
+    config = tmp_path / "provider.yaml"
+    config.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(fixture)},
+        "vad": {"fixture_path": str(vad), "boundary_refinement": True},
+    }), encoding="utf-8")
+    output = tmp_path / "output.srt"
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+
+    result = pipeline.sync_episode(source, audio, output, tmp_path / "work", providers_path=config,
+                                   no_llm=True, style_profile=profile)
+
+    cues = parse_srt_text(output.read_text(encoding="utf-8"))
+    assert [cue.plain_text for cue in cues] == ["Bom dia.", "Obrigada, Luke."]
+    assert cues[1].start_ms == profile.snap_floor(12080)
+    kinds = [flag["kind"] for flag in result.report["flags"]]
+    assert "timing_outlier_trimmed" not in kinds
+    assert kinds.count("asr_word_clamped") == 1

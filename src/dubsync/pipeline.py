@@ -17,7 +17,6 @@ from .adjudication_regions import (
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, align_cues_to_words
-from .asr_timing import clamp_asr_word_durations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import extract_audio_snippets
 from .cache import CacheKey, JsonDiskCache, _sha256_file, write_json_atomic, write_text_atomic
@@ -69,8 +68,8 @@ from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mappin
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
 from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text
 from .timing_refinement import (
-    BoundaryRefinementConfig, boundary_refinement_config_from_config,
-    refine_cues_to_speech_activity,
+    BoundaryRefinementConfig, SpeechEvidence, boundary_refinement_config_from_config,
+    refine_cues_to_speech_activity, speech_evidence_for_words,
 )
 from .tokenize import alphanumeric_signature
 from .vad import (
@@ -610,9 +609,16 @@ def sync_episode(
             ),
         )
         flags.extend(sync_line_flags)
+    # ASR word edges are repaired against the audio once, before any cue is
+    # timed; rebuild and verification share the same repaired words.
+    speech_evidence = speech_evidence_for_words(
+        speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+        max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+        asr_artifact_path=episode_workdir / "asr.json",
+    )
     rebuilt, recue_flags = rebuild_cues(
         adjudicated_cues,
-        words,
+        speech_evidence.words,
         alignment,
         profile,
         max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
@@ -725,6 +731,7 @@ def sync_episode(
         include_dropped_line_flags=True,
         decisions=decisions,
         fps_summary_metadata=fps_summary_metadata,
+        speech_evidence=speech_evidence,
     )
 
 
@@ -1628,6 +1635,7 @@ def _run_verify_stage(
     include_dropped_line_flags: bool,
     decisions: list[AdjudicationDecision] | None = None,
     fps_summary_metadata: dict[str, object] | None = None,
+    speech_evidence: SpeechEvidence | None = None,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     # A shared phrase timestamp cannot establish its internal cue boundary.
@@ -1688,10 +1696,15 @@ def _run_verify_stage(
         overlap_regions = overlap_detection_adapter.detect(audio_for_asr)
         _write_json(episode_workdir / "overlap.json", {"regions": [region.model_dump() for region in overlap_regions]})
         flags.extend(overlap_flags_for_regions(rebuilt, overlap_regions))
-    speech_activity_adapter = speech_activity_adapter_from_config(provider_config)
-    if speech_activity_adapter is not None:
-        speech_regions = speech_activity_adapter.detect(audio_for_asr)
-        if getattr(speech_activity_adapter, "fallback_used", False):
+    if speech_evidence is None:
+        speech_evidence = speech_evidence_for_words(
+            speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            asr_artifact_path=episode_workdir / "asr.json",
+        )
+    if speech_evidence.detected:
+        speech_regions = speech_evidence.regions
+        if speech_evidence.fallback_used:
             flags.append(
                 QCFlag(
                     kind="vad_provider_fallback",
@@ -1701,13 +1714,8 @@ def _run_verify_stage(
                 )
             )
         _write_json(episode_workdir / "vad.json", {"regions": [region.model_dump() for region in speech_regions]})
-        effective_words, word_clamp_flags = clamp_asr_word_durations(
-            words,
-            speech_regions,
-            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
-            max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
-        )
-        flags.extend(word_clamp_flags)
+        effective_words = speech_evidence.words
+        flags.extend(speech_evidence.word_flags)
         rebuilt, timing_flags = refine_cues_to_speech_activity(
             rebuilt,
             speech_regions,

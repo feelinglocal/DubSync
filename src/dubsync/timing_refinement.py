@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
+from pathlib import Path
 
-from .asr_timing import clamp_asr_word_durations
+from .asr_timing import (
+    asr_model_from_artifact,
+    clamp_asr_word_durations,
+    phrase_edge_snap_from_config,
+    repair_asr_word_edges,
+)
 from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
+from .vad import SpeechActivityAdapter
 
 
 MAX_INTRA_CUE_WORD_GAP_SECONDS = 1.5
@@ -54,6 +61,50 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
         max_leading_silence_ms=_boundary_milliseconds(options, "max_leading_silence_ms", 150),
         max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
         max_word_duration_ms=int(max_word_duration * 1000),
+    )
+
+
+@dataclass(frozen=True)
+class SpeechEvidence:
+    """Speech bursts of one recording and the ASR words repaired against them.
+
+    Detected once after transcription so alignment, rebuild and verification
+    all time cues from the same word edges.
+    """
+
+    words: list[Word]
+    regions: list[SpeechRegion] = field(default_factory=list)
+    word_flags: list[QCFlag] = field(default_factory=list)
+    detected: bool = False
+    fallback_used: bool = False
+
+
+def speech_evidence_for_words(
+    adapter: SpeechActivityAdapter | None,
+    words: list[Word],
+    audio_path: Path,
+    provider_config: dict[str, object],
+    *,
+    max_word_duration: float = 2.0,
+    asr_artifact_path: Path | None = None,
+) -> SpeechEvidence:
+    """Run the configured VAD once and repair ASR word edges against its bursts."""
+    if adapter is None:
+        return SpeechEvidence(words=words)
+    regions = adapter.detect(audio_path)
+    repaired, word_flags = repair_asr_word_edges(
+        words,
+        regions,
+        max_word_duration=max_word_duration,
+        max_region_overrun=boundary_refinement_config_from_config(provider_config).max_trailing_silence_ms / 1000.0,
+        snap=phrase_edge_snap_from_config(provider_config, asr_model_from_artifact(asr_artifact_path)),
+    )
+    return SpeechEvidence(
+        words=repaired,
+        regions=regions,
+        word_flags=word_flags,
+        detected=True,
+        fallback_used=bool(getattr(adapter, "fallback_used", False)),
     )
 
 
