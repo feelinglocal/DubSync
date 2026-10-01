@@ -591,6 +591,23 @@ def test_minimum_display_time_never_covers_another_speakers_sound():
     assert "min_duration_unattainable" in kinds
 
 
+def test_cue_within_one_frame_of_the_minimum_is_not_reported_as_unattainable():
+    # A web job: "Komm her!" could be shown for 459 of 500 ms because another
+    # sound began one millisecond inside the last frame; that is not an error.
+    profile = StyleProfile(fps=23.976, min_cue_dur=0.5)
+    cue = Cue(index=10, start_ms=profile.snap_floor(21_385), end_ms=profile.snap_ceil(21_795), lines=["Komm her!"])
+
+    refined, flags = refine_cues_to_speech_activity(
+        [cue], [SpeechRegion(start=21.385, end=21.755), SpeechRegion(start=21.855, end=22.435)], profile,
+        words=_words(("Komm", 21.385, 21.539), ("her.", 21.6, 21.755)),
+        alignment=AlignmentResult(cue_word_indices={10: [0, 1]}),
+    )
+
+    assert refined[0].end_ms <= 21_855
+    assert 500 - refined[0].duration_ms < 1000 / 23.976
+    assert flags == []
+
+
 def test_rebuild_follows_the_acoustic_minimum_duration_policy():
     profile = StyleProfile(fps=30, min_cue_dur=0.5)
     cue = Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hã?"])

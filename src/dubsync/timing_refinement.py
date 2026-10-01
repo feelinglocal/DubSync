@@ -297,7 +297,9 @@ def refine_cues_to_speech_activity(
             )
             continue
 
-        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000
+        # On the frame grid a cue within one frame of the minimum is at the
+        # minimum; only a real shortfall is reported.
+        minimum_unattainable = end_ms - start_ms < profile.min_cue_dur * 1000 - profile.frame_ms
 
         if start_ms == cue.start_ms and end_ms == cue.end_ms:
             refined.append(cue)
