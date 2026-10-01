@@ -74,6 +74,7 @@ from .timing_refinement import (
 )
 from .tokenize import alphanumeric_signature
 from .vad import (
+    cue_ids_with_audible_words,
     dropped_line_flags_for_unmatched_cues,
     min_coverage_from_config,
     speech_activity_adapter_from_config,
@@ -1762,6 +1763,7 @@ def _run_verify_stage(
             rebuilt,
             flags,
             activity_flags,
+            audible_cue_ids=cue_ids_with_audible_words(audio_for_asr, activity_flags, effective_words, alignment),
         )
         flags.extend(activity_flags)
         flags.extend(
@@ -1846,6 +1848,7 @@ def _remove_silent_generated_adlibs(
     cues: list[Cue],
     flags: list[QCFlag],
     activity_flags: list[QCFlag],
+    audible_cue_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag], list[QCFlag]]:
     generated_cue_ids = {
         cue_id
@@ -1866,7 +1869,7 @@ def _remove_silent_generated_adlibs(
         )
         for cue_id in flag.cue_ids
         if cue_id in generated_cue_ids
-    }
+    } - (audible_cue_ids or set())
     if not silent_cue_ids:
         return cues, flags, activity_flags
 

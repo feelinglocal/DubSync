@@ -7,8 +7,13 @@ from typing import Protocol
 
 from .region_index import SpeechRegionIndex
 from .silence import _dbfs, _mono_pcm16, _validate_pcm16
-from .models import Cue, QCFlag, SpeechRegion
+from .models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
 from .subtitle_annotations import cue_has_spoken_text
+
+# Direct word-energy check used before a generated cue is deleted as silent.
+WORD_ENERGY_THRESHOLD_DBFS = -45.0
+WORD_ENERGY_MIN_ACTIVE_MS = 30
+WORD_ENERGY_PAD_SECONDS = 0.05
 
 
 class SpeechActivityAdapter(Protocol):
@@ -43,10 +48,11 @@ class EnergySpeechActivityAdapter:
             if total_frames <= 0 or frame_rate <= 0:
                 return []
             window_frames = max(1, int(frame_rate * self.window_ms / 1000.0))
-            min_region_seconds = self.min_region_ms / 1000.0
             regions: list[SpeechRegion] = []
-            active_start: float | None = None
-            active_end: float | None = None
+            # Region bounds stay in sample frames: float seconds made a single
+            # 100 ms window measure 0.0999999 s and silently dropped it.
+            active_start: int | None = None
+            active_end: int | None = None
             start_frame = 0
 
             while start_frame < total_frames:
@@ -55,20 +61,18 @@ class EnergySpeechActivityAdapter:
                     break
                 end_frame = min(total_frames, start_frame + len(pcm))
                 is_active = _dbfs(pcm, 32767) > self.threshold_dbfs
-                start_seconds = start_frame / frame_rate
-                end_seconds = end_frame / frame_rate
                 if is_active:
                     if active_start is None:
-                        active_start = start_seconds
-                    active_end = end_seconds
+                        active_start = start_frame
+                    active_end = end_frame
                 elif active_start is not None and active_end is not None:
-                    _append_region(regions, active_start, active_end, min_region_seconds)
+                    _append_region(regions, active_start, active_end, frame_rate, self.min_region_ms)
                     active_start = None
                     active_end = None
                 start_frame = end_frame
 
         if active_start is not None and active_end is not None:
-            _append_region(regions, active_start, active_end, min_region_seconds)
+            _append_region(regions, active_start, active_end, frame_rate, self.min_region_ms)
         return regions
 
 
@@ -259,9 +263,71 @@ def min_coverage_from_config(config: dict[str, object]) -> float:
     return float(vad_config.get("min_coverage", 0.2))
 
 
-def _append_region(regions: list[SpeechRegion], start: float, end: float, min_region_seconds: float) -> None:
-    if end - start >= min_region_seconds:
-        regions.append(SpeechRegion(start=round(start, 3), end=round(end, 3), confidence=None))
+def cue_ids_with_audible_words(
+    audio_path: Path,
+    activity_flags: list[QCFlag],
+    words: list[Word],
+    alignment: AlignmentResult,
+    *,
+    threshold_dbfs: float = WORD_ENERGY_THRESHOLD_DBFS,
+    min_active_ms: int = WORD_ENERGY_MIN_ACTIVE_MS,
+) -> set[int]:
+    """Find zero-coverage cues whose own ASR words still sit on audible energy.
+
+    Speech regions can miss a short interjection. Before a generated cue is
+    deleted as silent, its word intervals are measured directly at 10 ms
+    resolution. Undecodable audio yields no evidence, never an exception.
+    """
+    candidates = {
+        cue_id
+        for flag in activity_flags
+        if flag.kind == "cue_without_speech_activity" and flag.confidence is not None and flag.confidence <= 0.0
+        for cue_id in flag.cue_ids
+        if alignment.cue_word_indices.get(cue_id)
+    }
+    if not candidates:
+        return set()
+    audible: set[int] = set()
+    try:
+        with wave.open(str(audio_path), "rb") as wav:
+            channels = wav.getnchannels()
+            frame_rate = wav.getframerate()
+            total_frames = wav.getnframes()
+            if wav.getsampwidth() != 2 or frame_rate <= 0:
+                return set()
+            hop_frames = max(1, frame_rate // 100)
+            needed_hops = max(1, -(-min_active_ms * frame_rate // (1000 * hop_frames)))
+            for cue_id in sorted(candidates):
+                for word_index in alignment.cue_word_indices[cue_id]:
+                    if not 0 <= word_index < len(words):
+                        continue
+                    word = words[word_index]
+                    first = max(0, int((word.start - WORD_ENERGY_PAD_SECONDS) * frame_rate))
+                    last = min(total_frames, int((word.end + WORD_ENERGY_PAD_SECONDS) * frame_rate) + 1)
+                    if last <= first:
+                        continue
+                    wav.setpos(first)
+                    pcm = _mono_pcm16(wav.readframes(last - first), channels)
+                    active_hops = sum(
+                        1
+                        for offset in range(0, len(pcm), hop_frames)
+                        if _dbfs(pcm[offset:offset + hop_frames], 32767) > threshold_dbfs
+                    )
+                    if active_hops >= needed_hops:
+                        audible.add(cue_id)
+                        break
+    except (wave.Error, EOFError, OSError):
+        return set()
+    return audible
+
+
+def _append_region(
+    regions: list[SpeechRegion], start_frame: int, end_frame: int, frame_rate: int, min_region_ms: int,
+) -> None:
+    if (end_frame - start_frame) * 1000 >= min_region_ms * frame_rate:
+        regions.append(
+            SpeechRegion(start=round(start_frame / frame_rate, 3), end=round(end_frame / frame_rate, 3), confidence=None)
+        )
 
 
 def _covered_seconds(start: float, end: float, regions: list[SpeechRegion]) -> float:
