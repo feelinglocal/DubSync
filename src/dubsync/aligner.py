@@ -34,7 +34,15 @@ from .models import (
 )
 from .subtitle_annotations import cue_has_bracketed_screen_text
 from .text_metrics import contains_character_level_script, join_word_texts, token_texts
-from .tokenize import SRTToken, normalize_token, normalized_words, tokenize_cues
+from .tokenize import (
+    NUMBER_ALIASES,
+    SRTToken,
+    normalize_token,
+    normalized_words,
+    percent_suffix_length,
+    spoken_number_values,
+    tokenize_cues,
+)
 
 MATCH_THRESHOLD = 0.85
 MIN_ANCHOR_TOKENS = 3
@@ -52,6 +60,8 @@ MISSING_AUDIO_GUARD_VERSION = 6
 COMPOUND_MAX_PARTS = 3
 COMPOUND_MIN_CHARACTERS = 4
 COMPOUND_MAX_RUN_CELLS = 20_000
+# A spoken number ("mil quinhentos e vinte") may take this many words.
+NUMBER_GROUP_MAX_WORDS = 6
 # Below 1.0 so literal-only repairs never mistake a compound for an exact word.
 COMPOUND_MATCH_SCORE = 0.99
 UNTIMED_PUNCTUATION_SECONDS = 0.020
@@ -81,6 +91,41 @@ class _TimingPriors:
     token_priors: list[tuple[float, float]]
     word_centers: list[float]
     transform: _TimeTransform | None = None
+
+
+@dataclass(frozen=True)
+class _DigitAliases:
+    """Article-like number words ("eine", "um") that match only a digit token."""
+
+    token_aliases: list[str | None]
+    token_digits: list[str | None]
+    word_aliases: list[str | None]
+    word_digits: list[str | None]
+
+    def equivalent(self, token_index: int, word_index: int) -> bool:
+        alias = self.token_aliases[token_index]
+        if alias is not None and alias == self.word_digits[word_index]:
+            return True
+        alias = self.word_aliases[word_index]
+        return alias is not None and alias == self.token_digits[token_index]
+
+
+def _digit_aliases(tokens: list[SRTToken], words: list[Word], words_norm: list[str]) -> _DigitAliases | None:
+    def written_digits(text: str, key: str) -> str | None:
+        return key if key.isdigit() and any(character.isdigit() for character in text) else None
+
+    aliases = _DigitAliases(
+        token_aliases=[NUMBER_ALIASES.get(token.normalized) for token in tokens],
+        token_digits=[written_digits(token.text, token.normalized) for token in tokens],
+        word_aliases=[NUMBER_ALIASES.get(key) for key in words_norm],
+        word_digits=[written_digits(word.text, key) for word, key in zip(words, words_norm)],
+    )
+    if (
+        any(aliases.token_aliases) and any(aliases.word_digits)
+        or any(aliases.word_aliases) and any(aliases.token_digits)
+    ):
+        return aliases
+    return None
 
 
 @dataclass(frozen=True)
@@ -314,6 +359,7 @@ def _align_tokens_detailed(
     *,
     token_time_priors: list[tuple[float, float]] | None = None,
     word_time_centers: list[float] | None = None,
+    digit_aliases: _DigitAliases | None = None,
 ) -> _AlignmentRun:
     n = len(tokens)
     m = len(words_norm)
@@ -346,6 +392,7 @@ def _align_tokens_detailed(
             reachability,
             token_time_priors=token_time_priors,
             word_time_centers=word_time_centers,
+            digit_aliases=digit_aliases,
         )
         if ops is None:
             band_limited = band_limited or margin >= ALIGNMENT_RETRY_MARGINS[-1]
@@ -376,6 +423,7 @@ def _align_tokens_once(
     *,
     token_time_priors: list[tuple[float, float]] | None = None,
     word_time_centers: list[float] | None = None,
+    digit_aliases: _DigitAliases | None = None,
 ) -> list[_Op] | None:
     n = len(tokens)
     m = len(words_norm)
@@ -405,6 +453,8 @@ def _align_tokens_once(
         current_intervals = _band_windows(i, n, m, band_margin, reachability.get(i, ()), diagonal=False)
         current_scores = [NEG_INF] * _interval_cell_count(current_intervals)
         current_back = bytearray(len(current_scores))
+        row_alias = digit_aliases.token_aliases[i - 1] if digit_aliases is not None else None
+        row_digits = digit_aliases.token_digits[i - 1] if digit_aliases is not None else None
         for offset, j in _iter_interval_cells(current_intervals):
             best_score = NEG_INF
             best_op = _BACK_NONE
@@ -421,7 +471,12 @@ def _align_tokens_once(
                 best_op = _BACK_INSERT
             previous_diagonal_offset = _row_offset(previous_intervals, j - 1) if j > 0 else None
             if previous_diagonal_offset is not None:
-                similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
+                if (row_alias is not None and digit_aliases.word_digits[j - 1] == row_alias) or (
+                    row_digits is not None and digit_aliases.word_aliases[j - 1] == row_digits
+                ):
+                    similarity = 1.0
+                else:
+                    similarity = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
                 match_score = 2.0 * similarity if similarity >= MATCH_THRESHOLD else -0.6
                 candidate = previous_scores[previous_diagonal_offset] + match_score
                 if similarity >= MATCH_THRESHOLD:
@@ -452,6 +507,11 @@ def _align_tokens_once(
         offset = _row_offset(intervals, j)
         op = _BACK_NONE if offset is None else row_back[offset]
         if op == _BACK_MATCH:
+            if digit_aliases is not None and digit_aliases.equivalent(i - 1, j - 1):
+                ops.append(_Op("match", i - 1, j - 1, 1.0))
+                i -= 1
+                j -= 1
+                continue
             score = _similarity(tokens[i - 1].normalized, words_norm[j - 1])
             kind = "match" if tokens[i - 1].normalized == words_norm[j - 1] else "replace"
             ops.append(_Op(kind, i - 1, j - 1, score))
@@ -815,7 +875,58 @@ def _compound_run_ops(
             for inner, outer in ((first, first - 1), (last, last + 1))
         )
 
-    def group_at(source_position: int, audio_position: int) -> tuple[int, int] | None:
+    def number_group_at(source_position: int, audio_position: int) -> tuple[int, int, bool] | None:
+        # A number written in digits on one side and spoken as words on the other
+        # ("26" / "vinte e seis", "30%" / "trinta por cento", "190" / "um nove zero").
+        source_window = source[source_position : source_position + NUMBER_GROUP_MAX_WORDS]
+        audio_window = audio[audio_position : audio_position + NUMBER_GROUP_MAX_WORDS]
+        sides = (
+            ([tokens[index].normalized for index in source_window], [tokens[index].text for index in source_window],
+             [words_norm[index] for index in audio_window], False),
+            ([words_norm[index] for index in audio_window], [words[index].text for index in audio_window],
+             [tokens[index].normalized for index in source_window], True),
+        )
+        for digit_keys, digit_texts, spoken_keys, swapped in sides:
+            if digit_keys[:1] == ["prozent"] and percent_suffix_length(spoken_keys[:2]) == 2:
+                # "%" after an already matched number, spoken "por cento".
+                token_count, word_count = (2, 1) if swapped else (1, 2)
+                group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+                group_words = audio[audio_position : audio_position + word_count]
+                if (
+                    len(group_tokens) == token_count and len(group_words) == word_count
+                    and len({token.cue_id for token in group_tokens}) == 1
+                    and not splits_provider_word(group_words[0], group_words[-1])
+                ):
+                    return token_count, word_count, True
+                continue
+            if not digit_keys or not digit_keys[0].isdigit() or not any(ch.isdigit() for ch in digit_texts[0]):
+                continue
+            digit_count = 2 if len(digit_keys) > 1 and digit_keys[1] == "prozent" else 1
+            for spoken_count in range(1, min(NUMBER_GROUP_MAX_WORDS, len(spoken_keys)) + 1):
+                keys = spoken_keys[:spoken_count]
+                percent = percent_suffix_length(keys)
+                if (digit_count == 2) != bool(percent) or len(keys) - percent < 1:
+                    continue
+                if digit_count + spoken_count <= 2 and not percent:
+                    continue
+                if int(digit_keys[0]) not in spoken_number_values(keys[: len(keys) - percent]):
+                    continue
+                token_count, word_count = (
+                    (spoken_count, digit_count) if swapped else (digit_count, spoken_count)
+                )
+                group_tokens = [tokens[index] for index in source[source_position : source_position + token_count]]
+                group_words = audio[audio_position : audio_position + word_count]
+                if (
+                    len({token.cue_id for token in group_tokens}) == 1
+                    and not splits_provider_word(group_words[0], group_words[-1])
+                ):
+                    return token_count, word_count, True
+        return None
+
+    def group_at(source_position: int, audio_position: int) -> tuple[int, int, bool] | None:
+        number_group = number_group_at(source_position, audio_position)
+        if number_group is not None:
+            return number_group
         if tokens[source[source_position]].normalized[:1] != words_norm[audio[audio_position]][:1]:
             return None
         sizes = sorted(
@@ -844,7 +955,7 @@ def _compound_run_ops(
                 )
             ):
                 continue
-            return token_count, word_count
+            return token_count, word_count, False
         return None
 
     rebuilt: list[_Op] = []
@@ -863,7 +974,7 @@ def _compound_run_ops(
         )
         if found is None:
             break
-        source_position, audio_position, (token_count, word_count) = found
+        source_position, audio_position, (token_count, word_count, spoken_number) = found
         grouped = True
         rebuilt.extend(_Op("delete", index, None, 0.0) for index in source[source_cursor:source_position])
         rebuilt.extend(_Op("insert", None, index, 0.0) for index in audio[audio_cursor:audio_position])
@@ -872,6 +983,7 @@ def _compound_run_ops(
             audio[audio_position : audio_position + word_count],
             tokens,
             words_norm,
+            proportional=spoken_number,
         ))
         source_cursor = source_position + token_count
         audio_cursor = audio_position + word_count
@@ -887,22 +999,32 @@ def _compound_group_member_ops(
     group_words: list[int],
     tokens: list[SRTToken],
     words_norm: list[str],
+    *,
+    proportional: bool = False,
 ) -> list[_Op]:
-    """Give each token the word its spelling starts in; other words are absorbed."""
+    """Give each token the word its spelling starts in; other words are absorbed.
+
+    A spoken number has no shared spelling with its digits, so its tokens and
+    words are paired by position instead.
+    """
 
     def owner(boundaries: list[int], offset: int) -> int:
         return max(position for position, start in enumerate(boundaries) if start <= offset)
 
-    token_starts: list[int] = []
-    offset = 0
-    for index in group_tokens:
-        token_starts.append(offset)
-        offset += len(tokens[index].normalized)
-    word_starts: list[int] = []
-    offset = 0
-    for index in group_words:
-        word_starts.append(offset)
-        offset += len(words_norm[index])
+    if proportional:
+        token_starts = [position * len(group_words) for position in range(len(group_tokens))]
+        word_starts = [position * len(group_tokens) for position in range(len(group_words))]
+    else:
+        token_starts = []
+        offset = 0
+        for index in group_tokens:
+            token_starts.append(offset)
+            offset += len(tokens[index].normalized)
+        word_starts = []
+        offset = 0
+        for index in group_words:
+            word_starts.append(offset)
+            offset += len(words_norm[index])
     token_words = {
         token_position: owner(word_starts, start) for token_position, start in enumerate(token_starts)
     }
@@ -920,7 +1042,7 @@ def _compound_group_member_ops(
 
 def _is_eligible_compound_group(token_texts_: list[str], word_texts: list[str]) -> bool:
     # A hyphen marks the joined spelling of the same words (``Ano-Novo``).
-    return any("-" in text or "‑" in text for text in (*token_texts_, *word_texts))
+    return any("-" in text or "\u2011" in text for text in (*token_texts_, *word_texts))
 
 
 def _align_cues_to_units(
@@ -943,8 +1065,9 @@ def _align_cues_to_units(
             )
         )
     tokenized_cue_ids = {token.cue_id for token in tokens}
+    digit_aliases = _digit_aliases(tokens, words, words_norm)
 
-    preliminary_run = _align_tokens_detailed(tokens, words_norm)
+    preliminary_run = _align_tokens_detailed(tokens, words_norm, digit_aliases=digit_aliases)
     ops = preliminary_run.ops
     unbanded_fallback = preliminary_run.unbanded_fallback
     band_limited = preliminary_run.band_limited
@@ -966,6 +1089,7 @@ def _align_cues_to_units(
                 words_norm,
                 token_time_priors=timing_priors.token_priors,
                 word_time_centers=timing_priors.word_centers,
+                digit_aliases=digit_aliases,
             )
             # The timed run only refines a resolved text alignment; it never
             # replaces one with an unresolved artifact. Status describes the
