@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import ceil
+
 from .models import Cue, QCFlag
 from .srt_io import validate_cue_timings_for_export
 from .style_profile import StyleProfile
@@ -19,14 +21,21 @@ def finalize_cues_for_output(
     preserve_timing: bool = False,
     media_duration_ms: int | None = None,
     merge_duplicates: bool = True,
+    spoken_spans: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     """Finalize display order without replacing acoustic evidence with reading-time guesses.
 
     With ``preserve_timing``, physical speech overlaps remain visible review errors;
     reading speed and speaker gaps never shift the spoken boundaries. Source holds
-    and screen annotations are always kept verbatim, including outside the media.
+    and screen annotations are kept verbatim, including outside the media.
     Audio generation disables ``merge_duplicates`` because each word occurrence
     has known ownership even when repeated utterances snap to the same onset.
+
+    ``spoken_spans`` (first-word onset, last-word offset in ms per cue) lets
+    ``no_overlaps`` separate cues that only collide through display padding,
+    frame snapping or an unsynchronized source hold; a hold may then be clipped
+    at its acoustic neighbour (``_resolve_overlaps_with_speech_evidence``).
+    Without it nothing is moved.
     """
     if media_duration_ms is not None and media_duration_ms < 0:
         raise ValueError("media_duration_ms must be non-negative")
@@ -79,27 +88,124 @@ def finalize_cues_for_output(
         [*finalized, *untouched_cues],
         key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
     )
-    if no_overlaps and protected:
-        # Source holds are excluded from retiming, but overlaps with them still
-        # need a visible advisory even when other dialogue is adjusted.
-        for flag in _unresolved_acoustic_overlap_flags(
-            [cue for cue in combined if not is_bracketed_screen_text_cue(cue)]
-        ):
-            if protected.intersection(flag.cue_ids):
-                flags.append(flag.model_copy(update={
-                    "kind": "output_overlap_preserved",
-                    "severity": "warning",
-                    "message": "Uncertain source timing was preserved; this overlap needs review.",
-                }))
-    if no_overlaps and preserve_timing:
-        flags.extend(
-            _unresolved_acoustic_overlap_flags(
-                [cue for cue in combined if not is_bracketed_screen_text_cue(cue)]
+    if no_overlaps and preserve_timing and spoken_spans is not None:
+        combined = _resolve_overlaps_with_speech_evidence(combined, profile, protected, spoken_spans)
+    remaining_overlaps = (
+        _unresolved_acoustic_overlap_flags([cue for cue in combined if not is_bracketed_screen_text_cue(cue)])
+        if no_overlaps
+        else []
+    )
+    for flag in remaining_overlaps:
+        if preserve_timing:
+            # One finding per remaining pair. A pair that involves a source
+            # hold says so instead of claiming both cues are acoustically timed.
+            flags.append(
+                flag.model_copy(update={"message": _HELD_OVERLAP_MESSAGE})
+                if protected.intersection(flag.cue_ids)
+                else flag
             )
-        )
+        elif protected.intersection(flag.cue_ids):
+            # Source holds are excluded from retiming, but overlaps with them
+            # still need a visible advisory even when other dialogue is adjusted.
+            flags.append(flag.model_copy(update={
+                "kind": "output_overlap_preserved",
+                "severity": "warning",
+                "message": "Uncertain source timing was preserved; this overlap needs review.",
+            }))
     _assert_monotonic_starts(combined)
     validate_cue_timings_for_export(combined)
     return combined, flags
+
+
+_HELD_OVERLAP_MESSAGE = (
+    "A cue kept at its source timing overlaps its neighbour and could not be separated "
+    "without hiding speech; review the held cue's timing."
+)
+# A cue without word timing is only clipped while at least this many frames,
+# and half of its duration, remain; anything less is left for review.
+_MIN_CLIPPED_HOLD_FRAMES = 3
+_MAX_OVERLAP_PASSES = 8
+
+
+def _resolve_overlaps_with_speech_evidence(
+    cues: list[Cue],
+    profile: StyleProfile,
+    protected: set[int],
+    spoken_spans: dict[int, tuple[int, int]],
+) -> list[Cue]:
+    """Separate overlapping cues without delaying or hiding anyone's speech.
+
+    ``spoken_spans`` holds the first-word onset and last-word offset of every
+    cue that owns timed words. An overlapping pair gets one shared boundary:
+
+    * a cue timed from its words never starts later, so the boundary is its
+      start and the earlier cue's end is trimmed to it, provided that removes
+      only display padding or a frame-snap margin and not the earlier cue's
+      last word;
+    * a later cue kept at source timing (a hold or an unmatched cue) instead
+      starts where the earlier cue ends, as long as its own first word, when
+      known, is not cut;
+    * a cue without any word timing is clipped only while most of it remains;
+    * otherwise the words really overlap: simultaneous speech stays as it is.
+
+    Screen-text annotations are not dialogue and are left alone.
+    """
+    snap_slack_ms = ceil(profile.frame_ms)
+    min_hold_ms = ceil(profile.frame_ms * _MIN_CLIPPED_HOLD_FRAMES)
+
+    def acoustic(cue: Cue) -> bool:
+        return cue.index not in protected and cue.index in spoken_spans
+
+    def kept_ms(cue: Cue) -> float:
+        return max(min_hold_ms, cue.duration_ms / 2)
+
+    def boundary_ms(earlier: Cue, later: Cue) -> int | None:
+        earlier_span = spoken_spans.get(earlier.index)
+        later_span = spoken_spans.get(later.index)
+        if earlier_span is None and later_span is None:
+            return None
+        earliest = earlier_span[1] - snap_slack_ms if earlier_span is not None else earlier.start_ms + kept_ms(earlier)
+        if acoustic(later):
+            boundary = later.start_ms
+        else:
+            latest = later_span[0] + snap_slack_ms if later_span is not None else later.end_ms - kept_ms(later)
+            boundary = earlier.end_ms if earlier.end_ms <= latest else profile.snap_floor(latest)
+            boundary = max(boundary, later.start_ms)
+        if boundary < earliest or not earlier.start_ms < boundary < later.end_ms:
+            return None
+        return boundary
+
+    ordered = list(cues)
+    # Delaying a held cue can make it meet the following cue, so the pass is
+    # repeated; every change shortens a cue, and a few passes settle real data.
+    for _ in range(_MAX_OVERLAP_PASSES):
+        changed = False
+        resolved: list[Cue] = []
+        on_screen: list[int] = []
+        for cue in ordered:
+            if is_bracketed_screen_text_cue(cue):
+                resolved.append(cue)
+                continue
+            listed_start_ms = cue.start_ms
+            still_on_screen: list[int] = []
+            for position in on_screen:
+                earlier = resolved[position]
+                if earlier.end_ms > cue.start_ms:
+                    boundary = boundary_ms(earlier, cue)
+                    if boundary is not None:
+                        resolved[position] = earlier.with_timing(earlier.start_ms, min(earlier.end_ms, boundary))
+                        cue = cue.with_timing(max(cue.start_ms, boundary), cue.end_ms)
+                        changed = True
+                # Later cues are listed by start, so an earlier cue matters to
+                # them only while it outlasts this cue's listed start.
+                if resolved[position].end_ms > listed_start_ms:
+                    still_on_screen.append(position)
+            on_screen = [*still_on_screen, len(resolved)]
+            resolved.append(cue)
+        ordered = sorted(resolved, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
+        if not changed:
+            break
+    return ordered
 
 
 def _unresolved_acoustic_overlap_flags(cues: list[Cue]) -> list[QCFlag]:

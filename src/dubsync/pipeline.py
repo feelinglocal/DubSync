@@ -46,7 +46,7 @@ from .llm_providers import (
 from .models import AdjudicationDecision, AlignmentResult, AudioSnippet, Cue, CueContext, DivergenceSpan, ForcedAlignmentCue, QCFlag, Word
 from .observability import name_spelling_inconsistency_flags, span_coverage_flags
 from .output_order import finalize_cues_for_output, source_order_inversion_flags
-from .overlap import apply_overlap_policy
+from .overlap import apply_overlap_policy, reconcile_overlap_flags
 from .overlap_detection import overlap_detection_adapter_from_config, overlap_flags_for_regions
 from .providers import (
     CachedASRAdapter,
@@ -58,7 +58,7 @@ from .providers import (
 )
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
-from .recue import preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
+from .recue import cue_spoken_spans, preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
 from .reports import write_changes_diff, write_qc_report
 from .srt_io import parse_srt_text, write_srt
 from .silence import silence_flags_for_cues
@@ -1764,8 +1764,13 @@ def _run_verify_stage(
         protected_cue_ids=protected_cue_ids,
         preserve_timing=bool(effective_words or forced_alignments or speech_regions),
         media_duration_ms=_known_audio_duration_ms(audio_for_asr),
+        spoken_spans=cue_spoken_spans(
+            rebuilt, effective_words, alignment,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        ),
     )
-    flags.extend(final_order_flags)
+    flags = [*reconcile_overlap_flags(flags, rebuilt, final_order_flags), *final_order_flags]
     if speech_regions:
         # A cue held for the minimum display time is not an overrun and its
         # short utterance still counts as speech activity.

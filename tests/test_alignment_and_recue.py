@@ -687,7 +687,11 @@ def test_style_lint_allows_stacked_overlap_for_different_known_speakers():
     assert not any(issue.kind == "overlap" for issue in issues)
 
 
-def test_recue_chains_same_speaker_overlap():
+def test_recue_keeps_overlapping_word_evidence_on_its_own_speech():
+    # Formerly "chains same speaker overlap": the second cue was started at the
+    # first cue's end (1.7 s), after "beta" had been spoken and inside "two".
+    # A cue is no longer moved off its own words; the conflicting timestamps
+    # stay visible as an overlap for review.
     cues = parse_srt_text(
         "1\n00:00:00,000 --> 00:00:01,000\nalpha one\n\n"
         "2\n00:00:01,000 --> 00:00:02,000\nbeta two\n\n"
@@ -703,4 +707,5 @@ def test_recue_chains_same_speaker_overlap():
 
     rebuilt, _ = rebuild_cues(cues, words, alignment, profile)
 
-    assert rebuilt[1].start_ms == rebuilt[0].end_ms
+    assert rebuilt[1].start_ms == 1300
+    assert rebuilt[0].end_ms == 1700

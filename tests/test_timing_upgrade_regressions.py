@@ -12,6 +12,8 @@ from dubsync import pipeline
 from dubsync.asr_timing import PhraseEdgeSnap, phrase_edge_snap_from_config, repair_asr_word_edges
 from dubsync.cost import CostMeter
 from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, Word
+from dubsync.output_order import finalize_cues_for_output
+from dubsync.overlap import apply_overlap_policy, reconcile_overlap_flags
 from dubsync.recue import rebuild_cues
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
@@ -604,3 +606,126 @@ def test_readability_tail_of_a_short_cue_is_not_reported_as_silence_or_missing_s
 
     assert [flag.cue_ids for flag in trailing] == [[3]]
     assert [flag.cue_ids for flag in activity] == [[2], [3]]
+
+
+# --- Task 7: no overlapping cues except simultaneous speech --------------------------------------
+
+
+@pytest.mark.parametrize("speakers", [("A", "B"), (None, None), ("A", "A")])
+def test_words_less_than_a_frame_apart_do_not_create_an_overlap(speakers):
+    # rebuild.md BUG-5: the start is floored and the end is ceiled, so two words
+    # 5 ms apart produced A 0.100-1.000 and B 0.966-1.966.
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=900, lines=["Primeiro."]),
+        Cue(index=2, start_ms=900, end_ms=2000, lines=["Segundo."]),
+    ]
+    words = [
+        Word(text="Primeiro.", start=0.1, end=0.985, speaker_id=speakers[0]),
+        Word(text="Segundo.", start=0.99, end=1.9, speaker_id=speakers[1]),
+    ]
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+
+    rebuilt, _ = rebuild_cues(cues, words, AlignmentResult(cue_word_indices={1: [0], 2: [1]}), profile)
+    _, flags = apply_overlap_policy(rebuilt, policy="stack")
+
+    assert rebuilt[1].start_ms == profile.snap_floor(990)
+    assert rebuilt[0].end_ms == rebuilt[1].start_ms
+    assert flags == []
+
+
+@pytest.mark.parametrize("speakers", [(None, None), ("A", "A")])
+def test_rebuild_never_moves_a_cue_past_its_own_speech(speakers):
+    # rebuild.md BUG-1: B's words are 10.5-11.0 s; it was moved to 12.0-12.5 s.
+    cues = [
+        Cue(index=1, start_ms=10_000, end_ms=12_000, lines=["Long line."]),
+        Cue(index=2, start_ms=10_500, end_ms=11_000, lines=["Reply."]),
+    ]
+    words = [
+        Word(text="Long line.", start=10.0, end=12.0, speaker_id=speakers[0]),
+        Word(text="Reply.", start=10.5, end=11.0, speaker_id=speakers[1]),
+    ]
+
+    profile = StyleProfile(fps=30, min_cue_dur=0.5)
+
+    rebuilt, _ = rebuild_cues(cues, words, AlignmentResult(cue_word_indices={1: [0], 2: [1]}), profile)
+    _, flags = apply_overlap_policy(sorted(rebuilt, key=lambda cue: cue.start_ms), policy="stack")
+
+    assert (rebuilt[1].start_ms, rebuilt[1].end_ms) == (10_500, profile.snap_ceil(11_040))
+    assert [flag.kind for flag in flags] == ["overlap_stacked"]
+
+
+def test_overlap_flags_ignore_screen_text_and_see_past_the_list_neighbour():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=5000, lines=["Long line."]),
+        Cue(index=2, start_ms=1500, end_ms=2000, lines=["[Sign]"]),
+        Cue(index=3, start_ms=2100, end_ms=2600, lines=["Short."]),
+        Cue(index=4, start_ms=3000, end_ms=3500, lines=["Reply."]),
+    ]
+
+    _, flags = apply_overlap_policy(cues, policy="stack")
+
+    assert [flag.cue_ids for flag in flags] == [[1, 3], [1, 4]]
+
+
+def _finalize(cues, *, protected=(), spans):
+    return finalize_cues_for_output(
+        cues, StyleProfile(fps=30, min_cue_dur=0.5), no_overlaps=True, preserve_timing=True,
+        protected_cue_ids=set(protected), spoken_spans=spans,
+    )
+
+
+def test_final_order_trims_padding_and_snap_margin_to_the_next_start():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=2100, lines=["First."]),  # words end at 2.01 s
+        Cue(index=2, start_ms=2000, end_ms=3000, lines=["Second."]),
+    ]
+
+    finalized, flags = _finalize(cues, spans={1: (1005, 2010), 2: (2015, 2950)})
+
+    assert [(cue.start_ms, cue.end_ms) for cue in finalized] == [(1000, 2000), (2000, 3000)]
+    assert flags == []
+
+
+def test_final_order_clips_a_source_hold_at_its_acoustic_neighbours():
+    # Held cues keep unsynchronized source timing; the retimed neighbours do
+    # not move and keep every word.
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=2033, lines=["Cheiro de pêssego?"]),  # words end at 1.975 s
+        Cue(index=2, start_ms=1710, end_ms=3470, lines=["Held line."]),
+        Cue(index=3, start_ms=3300, end_ms=4000, lines=["Next."]),
+    ]
+
+    finalized, flags = _finalize(cues, protected={2}, spans={1: (1002, 1975), 3: (3310, 3950)})
+
+    assert [(cue.index, cue.start_ms, cue.end_ms) for cue in finalized] == [
+        (1, 1000, 2033), (2, 2033, 3300), (3, 3300, 4000),
+    ]
+    assert flags == []
+
+
+def test_final_order_keeps_simultaneous_speech_and_reports_it_once():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=2000, lines=["First speaker."], speaker_id="A"),
+        Cue(index=2, start_ms=1500, end_ms=2500, lines=["Second speaker."], speaker_id="B"),
+    ]
+    stacked = QCFlag(kind="overlap_stacked", cue_ids=[1, 2], message="Overlapping speaker cues require QC review.")
+    stale = QCFlag(kind="overlap_stacked", cue_ids=[2, 3], message="Overlapping speaker cues require QC review.")
+
+    finalized, final_flags = _finalize(cues, spans={1: (1005, 1960), 2: (1510, 2460)})
+    flags = [*reconcile_overlap_flags([stacked, stale], finalized, final_flags), *final_flags]
+
+    assert finalized == cues
+    assert [(flag.kind, flag.severity, flag.cue_ids) for flag in flags] == [("output_overlap_unresolved", "error", [1, 2])]
+
+
+def test_final_order_does_not_shrink_a_source_hold_to_nothing():
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=1500, lines=["Held fragment."]),
+        Cue(index=2, start_ms=1050, end_ms=2000, lines=["Spoken line."]),
+    ]
+
+    finalized, flags = _finalize(cues, protected={1}, spans={2: (1055, 1950)})
+
+    assert finalized == cues
+    assert [flag.kind for flag in flags] == ["output_overlap_unresolved"]
+    assert "source timing" in flags[0].message
