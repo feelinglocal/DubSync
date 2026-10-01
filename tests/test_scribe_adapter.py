@@ -137,6 +137,34 @@ def test_scribe_client_errors_are_not_retried(monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+def test_scribe_logprob_and_audio_events_are_kept_as_evidence_without_changing_word_confidence(monkeypatch, tmp_path):
+    response = SimpleNamespace(
+        language_code="deu", language_probability=0.98,
+        words=[
+            {"type": "audio_event", "text": "(lacht)", "start": 0.0, "end": 0.3, "speaker_id": "speaker_1", "logprob": 0.0},
+            {"type": "word", "text": "Hallo", "start": 0.4, "end": 0.7, "speaker_id": "speaker_0", "logprob": -0.05},
+            {"type": "spacing", "text": " ", "start": 0.7, "end": 0.8, "speaker_id": "speaker_0", "logprob": 0.0},
+            {"type": "word", "text": "Welt.", "start": 0.8, "end": 1.2, "speaker_id": "speaker_0", "logprob": -1.25},
+        ],
+    )
+    _fake_sdk(monkeypatch, [response])
+    adapter = ElevenLabsScribeAdapter(api_key="test-key")
+
+    words = adapter.transcribe(_audio(tmp_path))
+
+    assert [(word.text, word.confidence) for word in words] == [("Hallo", 1.0), ("Welt.", 1.0)]
+    assert adapter.last_evidence == {
+        "provider": "elevenlabs",
+        "language_code": "deu",
+        "language_probability": 0.98,
+        "word_logprobs": [
+            {"text": "Hallo", "start": 0.4, "end": 0.7, "logprob": -0.05},
+            {"text": "Welt.", "start": 0.8, "end": 1.2, "logprob": -1.25},
+        ],
+        "audio_events": [{"text": "(lacht)", "start": 0.0, "end": 0.3, "speaker_id": "speaker_1"}],
+    }
+
+
 def test_missing_scribe_key_is_a_configuration_error(monkeypatch, tmp_path):
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     with pytest.raises(ProviderError) as caught:

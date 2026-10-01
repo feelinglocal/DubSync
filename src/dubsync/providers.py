@@ -68,11 +68,13 @@ class CachedASRAdapter:
         self.last_repair_flags: list[QCFlag] = []
         self.last_cache_key: CacheKey | None = None
         self.last_usage: dict[str, object] = {}
+        self.last_evidence: dict[str, object] | None = None
         self.last_cache_hit = False
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         self.last_repair_flags = []
         self.last_usage = {}
+        self.last_evidence = None
         self.last_cache_hit = False
         params = self.params
         adapter_version = getattr(self.inner, "cache_version", None)
@@ -87,6 +89,9 @@ class CachedASRAdapter:
             self.last_cache_hit = True
             if isinstance(cached, dict):
                 self.last_usage = _safe_asr_usage(cached.get("usage"))
+                metadata = cached.get("metadata")
+                if isinstance(metadata, dict):
+                    self.last_evidence = _safe_provider_evidence(metadata.get("provider_evidence"))
             cached_words = cached.get("words", cached) if isinstance(cached, dict) else cached
             words, cache_repair_flags = repair_word_stream(cached_words, source="ASR cache")
             persisted_flags = _cached_repair_flags(cached)
@@ -103,27 +108,31 @@ class CachedASRAdapter:
             self.last_usage = _safe_asr_usage(getattr(self.inner, "last_usage", None))
             self._record_cost(audio_path, succeeded=succeeded)
         provider_flags = list(getattr(self.inner, "last_repair_flags", []))
+        self.last_evidence = _safe_provider_evidence(getattr(self.inner, "last_evidence", None))
         cacheable_words = _cacheable_word_items(provider_words)
         if cacheable_words is None:
             words, repair_flags = repair_word_stream(provider_words, source="ASR provider")
             self.last_repair_flags = [*provider_flags, *repair_flags]
             self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
             return words
-        self.cache.write(
-            key,
-            {
-                "words": cacheable_words,
-                "metadata": {"raw_provider_response": True, "repair_flags": [flag.model_dump() for flag in provider_flags]},
-                "usage": self.last_usage,
-            },
-        )
+        raw_metadata: dict[str, object] = {
+            "raw_provider_response": True, "repair_flags": [flag.model_dump() for flag in provider_flags],
+        }
+        if self.last_evidence is not None:
+            raw_metadata["provider_evidence"] = self.last_evidence
+        self.cache.write(key, {"words": cacheable_words, "metadata": raw_metadata, "usage": self.last_usage})
         words, repair_flags = repair_word_stream(cacheable_words, source="ASR provider")
         self.last_repair_flags = [*provider_flags, *repair_flags]
         self.cache.write(key, self._cache_payload(words, self.last_repair_flags))
         return words
 
     def _cache_payload(self, words: list[Word], flags: list[QCFlag]) -> dict[str, object]:
-        return {**_validated_word_cache_payload(words, flags), "usage": self.last_usage}
+        payload = {**_validated_word_cache_payload(words, flags), "usage": self.last_usage}
+        if self.last_evidence is not None:
+            # Provider evidence that is not part of Word (Scribe logprob and
+            # audio events, MAI chunk languages) stays with the saved result.
+            payload["metadata"]["provider_evidence"] = self.last_evidence
+        return payload
 
     def _record_cost(self, audio_path: Path, *, succeeded: bool) -> None:
         if self.cost_meter is None:
@@ -156,6 +165,22 @@ class CachedASRAdapter:
             # A retried request may have been billed twice; meter it as an
             # explicit estimate rather than failing the job or hiding it.
             self.cost_meter.add_audio_uncertain(self.cost_provider, uncertain_seconds, self.dollars_per_hour)
+
+
+_MAX_PROVIDER_EVIDENCE_BYTES = 16 * 1024 * 1024
+
+
+def _safe_provider_evidence(value: object) -> dict[str, object] | None:
+    """Keep provider evidence only when it is a bounded, strict-JSON mapping."""
+    if not isinstance(value, dict) or not value:
+        return None
+    try:
+        encoded = json.dumps(value, allow_nan=False, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded.encode("utf-8")) > _MAX_PROVIDER_EVIDENCE_BYTES:
+        return None
+    return json.loads(encoded)
 
 
 def _safe_asr_usage(value: object) -> dict[str, object]:
@@ -197,9 +222,11 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
         self.keyterms = list(keyterms or [])
         self.language_code = normalize_language_code(language_code)
         self.last_usage: dict[str, object] = {}
+        self.last_evidence: dict[str, object] = {}
 
     def transcribe(self, audio_path: Path) -> list[Word]:
         self.last_usage = {"request_count": 0}
+        self.last_evidence = {}
         if not self.api_key:
             raise ProviderError("ELEVENLABS_API_KEY is required for ElevenLabs Scribe.", code="configuration")
         try:
@@ -220,20 +247,41 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
         response = self._convert_with_retries(client, audio_path, convert_kwargs)
         raw_words = _field(response, "words", [])
         normalized = []
+        # Scribe's only per-word certainty is logprob, and audio events mark
+        # non-speech. Neither is a Word field, so both are kept as evidence;
+        # Word.confidence is populated exactly as before.
+        word_logprobs: list[dict[str, object]] = []
+        audio_events: list[dict[str, object]] = []
         for item in raw_words:
             item_type = _field(item, "type", "word")
             text = _field(item, "text", _field(item, "word", ""))
+            if item_type == "audio_event" and text:
+                audio_events.append({
+                    "text": str(text), "start": _finite_or_none(_field(item, "start")),
+                    "end": _finite_or_none(_field(item, "end")), "speaker_id": _field(item, "speaker_id", None),
+                })
             if item_type != "word" or not text:
                 continue
-            normalized.append(
-                Word(
-                    text=str(text),
-                    start=float(_field(item, "start", 0.0)),
-                    end=float(_field(item, "end", 0.0)),
-                    confidence=float(_field(item, "confidence", 1.0)),
-                    speaker_id=_field(item, "speaker_id", None),
-                )
+            word = Word(
+                text=str(text),
+                start=float(_field(item, "start", 0.0)),
+                end=float(_field(item, "end", 0.0)),
+                confidence=float(_field(item, "confidence", 1.0)),
+                speaker_id=_field(item, "speaker_id", None),
             )
+            normalized.append(word)
+            word_logprobs.append({
+                "text": word.text, "start": word.start, "end": word.end,
+                "logprob": _finite_or_none(_field(item, "logprob")),
+            })
+        language_code = _field(response, "language_code")
+        self.last_evidence = {
+            "provider": "elevenlabs",
+            "language_code": language_code if isinstance(language_code, str) else None,
+            "language_probability": _finite_or_none(_field(response, "language_probability")),
+            "word_logprobs": word_logprobs,
+            "audio_events": audio_events,
+        }
         return normalized
 
     def _convert_with_retries(self, client, audio_path: Path, convert_kwargs: dict[str, object]):
@@ -267,6 +315,12 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
             if not retryable or failures >= _SCRIBE_MAX_ATTEMPTS:
                 raise ProviderError(message, code=code) from None
             time.sleep(_SCRIBE_RETRY_BACKOFF_SECONDS[min(failures, len(_SCRIBE_RETRY_BACKOFF_SECONDS)) - 1])
+
+
+def _finite_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 _SCRIBE_MAX_ATTEMPTS = 3

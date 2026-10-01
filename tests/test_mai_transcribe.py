@@ -295,6 +295,38 @@ def test_rounding_flag_has_absolute_range_and_resets_next_transcription(monkeypa
     assert adapter.last_repair_flags == []
 
 
+def test_optional_per_word_confidence_is_parsed_when_present(monkeypatch, tmp_path):
+    _transport(monkeypatch, [{"words": [
+        {"word": "sure", "start": 0.2, "end": 0.5, "confidence": 0.87},
+        {"word": "maybe", "start": 0.6, "end": 0.9, "confidence": 1.5},
+        {"word": "odd", "start": 1.0, "end": 1.2, "confidence": "high"},
+        {"word": "plain", "start": 1.3, "end": 1.6},
+    ]}])
+    words = MAITranscribeAdapter(api_key="test-key").transcribe(_audio(tmp_path))
+
+    assert [(word.text, word.confidence) for word in words] == [
+        ("sure", 0.87), ("maybe", None), ("odd", None), ("plain", None),
+    ]
+
+
+def test_chunk_language_and_diarization_are_kept_as_provider_evidence(monkeypatch, tmp_path):
+    _transport(monkeypatch, [
+        {"words": [{"word": "Bom", "start": 3.5, "end": 3.8, "speaker": 0}], "language": "pt"},
+        {"words": [{"word": "Bom", "start": 0.5, "end": 0.8, "speaker": 1}], "language": "ca"},
+    ])
+    adapter = MAITranscribeAdapter(api_key="test-key", chunk_seconds=4)
+    adapter.transcribe(_audio(tmp_path, seconds=8))
+
+    assert adapter.last_evidence == {
+        "provider": "openrouter",
+        "chunks": [
+            {"index": 1, "offset": 0.0, "duration": 5.0, "language": "pt", "diarized": True},
+            {"index": 2, "offset": 3.0, "duration": 5.0, "language": "ca", "diarized": True},
+        ],
+        "speaker_links": [{"boundary": 4.0, "links": {"chunk_2:1": "chunk_1:0"}}],
+    }
+
+
 def test_diarization_can_be_disabled(monkeypatch, tmp_path):
     calls = _transport(monkeypatch, [{"words": [{"word": "hello", "start": 0, "end": 1, "speaker": 2}]}])
     words = MAITranscribeAdapter(api_key="test-key", diarize=False).transcribe(_audio(tmp_path))

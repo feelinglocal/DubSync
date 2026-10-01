@@ -164,6 +164,8 @@ def generate_srt_from_audio(
         "cache_hit": adapter.last_cache_hit,
         "repair_flags": [flag.model_dump() for flag in adapter.last_repair_flags],
     }
+    if adapter.last_evidence is not None:
+        asr_metadata["provider_evidence"] = adapter.last_evidence
     _write_json(
         episode_workdir / "asr.json",
         {

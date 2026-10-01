@@ -129,6 +129,73 @@ def test_provider_timing_correction_remains_reviewable_on_cache_hit(tmp_path):
     assert cached.last_cache_hit
 
 
+def test_provider_evidence_is_saved_with_the_cached_transcription_and_restored_on_hit(tmp_path):
+    evidence = {"provider": "elevenlabs", "word_logprobs": [{"text": "hi", "start": 0.0, "end": 0.2, "logprob": -0.1}]}
+
+    class EvidenceAdapter:
+        last_evidence = evidence
+        calls = 0
+
+        def transcribe(self, path):
+            self.calls += 1
+            return [Word(text="hi", start=0.0, end=0.2)]
+
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"example")
+    inner = EvidenceAdapter()
+    adapter = CachedASRAdapter(inner, JsonDiskCache(tmp_path / "cache"), "scribe_v2", {})
+
+    adapter.transcribe(audio)
+    assert adapter.last_evidence == evidence
+    [entry] = (tmp_path / "cache").glob("*.json")
+    assert '"provider_evidence"' in entry.read_text(encoding="utf-8")
+
+    restarted = CachedASRAdapter(EvidenceAdapter(), JsonDiskCache(tmp_path / "cache"), "scribe_v2", {})
+    restarted.inner.last_evidence = None
+    restarted.transcribe(audio)
+    assert restarted.last_cache_hit is True
+    assert restarted.last_evidence == evidence
+
+
+def test_unserializable_provider_evidence_is_ignored(tmp_path):
+    class OddAdapter:
+        last_evidence = {"value": float("nan")}
+
+        def transcribe(self, path):
+            return [Word(text="hi", start=0.0, end=0.2)]
+
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"example")
+    adapter = CachedASRAdapter(OddAdapter(), JsonDiskCache(tmp_path / "cache"), "fixture", {})
+    adapter.transcribe(audio)
+    assert adapter.last_evidence is None
+
+
+def test_generate_mode_asr_artifact_keeps_provider_evidence(tmp_path, monkeypatch):
+    import json
+    import dubsync.transcription as transcription
+
+    audio = tmp_path / "episode.wav"
+    with wave.open(str(audio), "wb") as out:
+        out.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        out.writeframes(b"\0\0" * 16000)
+
+    class EvidenceAdapter:
+        last_evidence = {"provider": "elevenlabs", "audio_events": [{"text": "(lacht)", "start": 0.0, "end": 0.2, "speaker_id": None}]}
+
+        def transcribe(self, path):
+            return [Word(text="Hallo.", start=0.3, end=0.7)]
+
+    monkeypatch.setattr(transcription, "adapter_from_config", lambda *args, **kwargs: EvidenceAdapter())
+    monkeypatch.setattr(transcription, "normalize_audio", lambda path, *args, **kwargs: path)
+    transcription.generate_srt_from_audio(
+        audio_path=audio, output_path=tmp_path / "output.srt", workdir=tmp_path / "work", no_llm=True,
+        transcription_provider="scribe_v2",
+    )
+    asr = json.loads((tmp_path / "work/episode/asr.json").read_text(encoding="utf-8"))
+    assert asr["metadata"]["provider_evidence"] == EvidenceAdapter.last_evidence
+
+
 def test_cached_words_from_an_older_adapter_version_are_not_reused(tmp_path):
     from dubsync.cache import CacheKey
     from dubsync.mai_transcribe import MAITranscribeAdapter

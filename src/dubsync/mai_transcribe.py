@@ -127,6 +127,8 @@ class MAITranscribeAdapter:
         self._dropped_runs: list[list[Word]] = []
         self._collapsed_pairs: list[tuple[Word, Word]] = []
         self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
+        # Per-chunk detected language, diarization state and speaker links, for the ASR artifact.
+        self.last_evidence: dict[str, object] = {}
 
     @staticmethod
     def _empty_usage() -> dict[str, object]:
@@ -143,15 +145,23 @@ class MAITranscribeAdapter:
         self._dropped_runs = []
         self._collapsed_pairs = []
         self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
+        self.last_evidence = {"provider": "openrouter", "chunks": [], "speaker_links": []}
         if not self.api_key:
             raise ProviderError("OPENROUTER_API_KEY is required for MAI-Transcribe 2.", code="configuration")
         words: list[Word] = []
         for index, chunk in enumerate(self._chunks(audio_path)):
             payload, diarized = self._request_chunk(chunk, index)
             chunk_words = self._words(payload, chunk, index, diarized=diarized)
+            language = payload.get("language")
+            self.last_evidence["chunks"].append({
+                "index": index + 1, "offset": chunk.offset, "duration": chunk.duration,
+                "language": language[:16] if isinstance(language, str) else None, "diarized": diarized,
+            })
             if index:
                 pairs = _overlap_pairs(words, chunk_words, chunk.owner_start)
-                chunk_words = _stitch_speakers(words, chunk_words, pairs)
+                chunk_words, links = _stitch_speakers(words, chunk_words, pairs)
+                if links:
+                    self.last_evidence["speaker_links"].append({"boundary": chunk.owner_start, "links": links})
                 words = _join_paired_words(words, chunk_words, pairs, chunk.owner_start)
             else:
                 words = chunk_words
@@ -407,7 +417,11 @@ class MAITranscribeAdapter:
             speaker_id = None
             if diarized and speaker is not None and str(speaker).strip():
                 speaker_id = f"chunk_{index + 1}:{speaker}"
-            words.append(Word(text=text, start=start, end=end, confidence=None, speaker_id=speaker_id))
+            # OpenRouter documents per-word confidence as optional; MAI has
+            # not been observed to send it, so absent stays unknown (None).
+            confidence = item.get("confidence")
+            confidence = float(confidence) if _nonnegative_number(confidence) and confidence <= 1.0 else None
+            words.append(Word(text=text, start=start, end=end, confidence=confidence, speaker_id=speaker_id))
         # One malformed record should not discard an otherwise valid paid
         # chunk; anything more is a provider failure and stays fail-closed.
         if len(invalid) > _MAX_INVALID_WORDS_PER_CHUNK or (invalid and not words):
@@ -615,7 +629,7 @@ def _overlap_pairs(left: list[Word], right: list[Word], boundary: float) -> dict
     return pairs
 
 
-def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int]) -> list[Word]:
+def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int]) -> tuple[list[Word], dict[str, str]]:
     """Carry speaker identity across a chunk cut using words both chunks heard.
 
     Labels are local to each API call. A right-chunk label is renamed to the
@@ -637,11 +651,11 @@ def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int])
             if reverse[left_speaker] == {right_speaker}:
                 mapping[right_speaker] = left_speaker
     if not mapping:
-        return right
+        return right, mapping
     return [
         word.model_copy(update={"speaker_id": mapping[word.speaker_id]}) if word.speaker_id in mapping else word
         for word in right
-    ]
+    ], mapping
 
 
 def _same_spoken_word(left: Word, right: Word, left_token: str, right_token: str, overlap: float) -> bool:
