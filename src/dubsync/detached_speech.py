@@ -6,7 +6,10 @@ actor's line or a late interjection into a cue shown at a different time
 ("no ano novo. Alô?" with "Alô?" spoken 14 s later). After adjudication each
 such case is divided at its large acoustic gaps: the group spoken at the cue's
 own time edits the cue, every other approved group becomes a pure insertion
-with its own timing. A wording that cannot be divided is held as a whole.
+with its own timing. When no group is spoken at the cue's time, the replaced
+tokens are removed and every group is inserted where it is spoken. A wording
+that cannot be divided is held as a whole, and kept source text is timed only
+by the words at its own time.
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from math import isfinite
 from .adjudication_regions import (
     JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SONG_CAPTION_PREFIX, SPEECH_REPEAT_PREFIX,
 )
+from .aligner import SONG_SOURCE_PREFIX
 from .changes import indexed_span_bounds, replacement_text_cuts
 from .edit_consistency import held_decisions
 from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, SpeechRegion, Word
@@ -26,7 +30,7 @@ from .tokenize import alphanumeric_signature
 DETACHED_SPEECH_PREFIX = "detached-"
 _DERIVED_PREFIXES = (
     JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_CAPTION_PREFIX,
-    DETACHED_SPEECH_PREFIX,
+    SONG_SOURCE_PREFIX, DETACHED_SPEECH_PREFIX,
 )
 _HELD_KIND = "adjudication_replacement_ownership_held"
 # A cue without retained words is expected near its source time, moved by the
