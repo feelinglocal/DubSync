@@ -7,6 +7,7 @@ from math import isfinite
 
 from .models import AlignmentResult, Cue, QCFlag, Word
 from .recue import timing_evidence_issue
+from .speaker_evidence import has_known_different_speakers, speakers_known_different
 from .style_profile import StyleProfile
 from .subtitle_annotations import (
     cue_has_bracketed_screen_text,
@@ -48,7 +49,8 @@ def split_speaker_turn_cues(
             output.append(cue)
             continue
         candidate_indices = _ordered_valid_word_indices(words, cue_word_indices.get(cue.index, []))
-        if len({words[index].speaker_id for index in candidate_indices if words[index].speaker_id}) < 2:
+        # Labels of unrelated scopes (two MAI chunks) are no speaker change.
+        if not has_known_different_speakers(words[index].speaker_id for index in candidate_indices):
             output.append(cue)
             continue
         retained, mapping_status = _retained_word_window(cue.plain_text, words, candidate_indices)
@@ -162,24 +164,6 @@ def split_speaker_turn_cues(
         ))
 
     return output, alignment.model_copy(update={"cue_word_indices": cue_word_indices}), flags, expansions
-
-
-_CHUNK_SCOPED_SPEAKER = re.compile(r"^(chunk_\d+):")
-
-
-def speakers_known_different(left: str | None, right: str | None) -> bool:
-    """Whether two speaker labels provably name different actors.
-
-    A missing label proves nothing. MAI labels are scoped to one transcription
-    chunk ("chunk_3:1"): the same actor gets unrelated labels in the next
-    chunk, so labels from different chunk scopes have an unknown relation and
-    are never evidence of a speaker change.
-    """
-    if not left or not right or left == right:
-        return False
-    left_scope = _CHUNK_SCOPED_SPEAKER.match(left)
-    right_scope = _CHUNK_SCOPED_SPEAKER.match(right)
-    return (left_scope.group(1) if left_scope else None) == (right_scope.group(1) if right_scope else None)
 
 
 def settle_collapsed_generated_adlibs(
@@ -303,7 +287,7 @@ def settle_collapsed_generated_adlibs(
 def _speaker_word_runs(words: list[Word], word_indices: list[int]) -> list[list[int]]:
     groups: list[list[int]] = []
     for index in word_indices:
-        if not groups or words[groups[-1][-1]].speaker_id != words[index].speaker_id:
+        if not groups or speakers_known_different(words[groups[-1][-1]].speaker_id, words[index].speaker_id):
             groups.append([])
         groups[-1].append(index)
     return groups
@@ -402,7 +386,7 @@ def _word_index_units(words: list[Word], ordered: list[int], *, max_gap_seconds:
                 (words[index].speaker_id for index in reversed(units[-1]) if words[index].speaker_id),
                 None,
             )
-            same_speaker = not (previous_speaker and word.speaker_id and previous_speaker != word.speaker_id)
+            same_speaker = not speakers_known_different(previous_speaker, word.speaker_id)
             close_in_time = word.start - previous.end <= max_gap_seconds
             if same_speaker and close_in_time and (
                 pending_openers or _only_punctuation(word.text, _SENTENCE_CLOSERS + ".?!…。、,;:")
@@ -790,7 +774,7 @@ def _starts_new_source_line_cue(
         (words[index].speaker_id for index in next_words if words[index].speaker_id),
         None,
     )
-    if previous_speaker and next_speaker and previous_speaker != next_speaker:
+    if speakers_known_different(previous_speaker, next_speaker):
         return True
     if _ends_sentence(_text_without_subtitle_markup(current_lines[-1])):
         return True
@@ -1017,7 +1001,7 @@ def _starts_new_cue(
         None,
     )
     next_speaker = next((words[index].speaker_id for index in unit if words[index].speaker_id), None)
-    if previous_speaker and next_speaker and previous_speaker != next_speaker:
+    if speakers_known_different(previous_speaker, next_speaker):
         return True
     last_word = max((words[index] for index in unit), key=lambda item: item.end)
     if _snapped_duration_ms(words[current[0]], last_word, profile) > max_cue_duration_seconds * 1000:

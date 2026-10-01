@@ -11,6 +11,7 @@ from .editorial_guard import (
     validate_editorial_text,
 )
 from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag, TokenMatch, Word
+from .speaker_evidence import has_known_different_speakers
 from .style_profile import StyleProfile
 from .subtitle_annotations import (
     alignment_token_character_spans,
@@ -1089,12 +1090,26 @@ def _continuation_prefix_replacement_target(
     final_text: str,
 ) -> int | None:
     """Keep an unfinished single-speaker phrase with its retained continuation."""
-    if (
-        len(set(span.speaker_ids)) != 1
-        or not span.speaker_ids[0]
-        or re.search(r"[.!?\u2026\u3002\uff01\uff1f]", final_text)
-    ):
+    if re.search(r"[.!?\u2026\u3002\uff01\uff1f]", final_text):
         return None
+    speakers = [speaker for speaker in dict.fromkeys(span.speaker_ids) if speaker]
+    if has_known_different_speakers(speakers):
+        return None
+    if len(speakers) != 1:
+        # Without one diarized actor (MAI without diarization, or labels of
+        # two unrelated chunk scopes) the phrase must be acoustically joined
+        # to the retained continuation: complete adjacent words that run
+        # into the right anchor. Otherwise this rule proves nothing, and the
+        # proportional fallback would leave one-word orphan cues.
+        indices = span.asr_word_indices
+        if (
+            not indices or indices != list(range(indices[0], indices[-1] + 1))
+            or span.right_anchor_cue_id != list(bounds_by_cue)[-1]
+            or span.end is None or span.right_anchor_start is None
+            or not isfinite(span.end) or not isfinite(span.right_anchor_start)
+            or not -0.05 <= span.right_anchor_start - span.end <= 0.2
+        ):
+            return None
     cue_ids = list(bounds_by_cue)
     for cue_id in cue_ids[:-1]:
         signature = alphanumeric_signature(cues_by_id[cue_id].plain_text)

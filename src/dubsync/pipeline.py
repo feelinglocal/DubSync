@@ -69,6 +69,7 @@ from .srt_io import parse_srt_text, write_srt
 from .silence import silence_flags_for_cues
 from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
+from .speaker_evidence import has_known_different_speakers, speakers_known_different
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
 from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text, speech_text_for_alignment
@@ -3041,9 +3042,7 @@ def _validate_inline_adlib_ownership(
         and not span.cue_ids
         and span.left_anchor_cue_id == span.right_anchor_cue_id == result[span.case_id]
         and result[span.case_id] in cues_by_id
-        and span.left_anchor_speaker_id is not None
-        and span.right_anchor_speaker_id is not None
-        and span.left_anchor_speaker_id != span.right_anchor_speaker_id
+        and speakers_known_different(span.left_anchor_speaker_id, span.right_anchor_speaker_id)
     ]
     if not candidates:
         return result, []
@@ -3146,7 +3145,8 @@ def _anchored_adlib_cue_id(
         right_id = None
     # One existing cue cannot own an insertion spoken by multiple actors.
     # Keep it generated so the word-aware segmentation stage can split turns.
-    if len(set(span.speaker_ids)) > 1:
+    # Labels of unrelated scopes (two MAI chunks) do not prove several actors.
+    if has_known_different_speakers(span.speaker_ids):
         return None
     left_speaker = span.left_anchor_speaker_id
     right_speaker = span.right_anchor_speaker_id
@@ -3160,11 +3160,7 @@ def _anchored_adlib_cue_id(
         and left_id in cues_by_id
         and span.insertion_token_offset is not None
     ):
-        if (
-            span.left_anchor_speaker_id is not None
-            and span.right_anchor_speaker_id is not None
-            and span.left_anchor_speaker_id != span.right_anchor_speaker_id
-        ):
+        if speakers_known_different(span.left_anchor_speaker_id, span.right_anchor_speaker_id):
             # A source cue may already contain two actors. A word-anchored
             # insertion can complete one actor's clause at that transition;
             # the mandatory speaker splitter then separates the two turns.
@@ -3250,7 +3246,12 @@ def _anchored_adlib_cue_id(
 
 
 def _anchor_speaker_is_compatible(speaker_ids: list[str], anchor_speaker_id: str | None) -> bool:
-    return not speaker_ids or anchor_speaker_id is None or anchor_speaker_id in speaker_ids
+    # Only a provably different actor is incompatible; a label from another
+    # chunk scope has an unknown relation to the anchor.
+    return (
+        not speaker_ids or anchor_speaker_id is None or anchor_speaker_id in speaker_ids
+        or not any(speakers_known_different(speaker_id, anchor_speaker_id) for speaker_id in speaker_ids)
+    )
 
 
 def _anchor_speaker_is_confirmed(speaker_ids: list[str], anchor_speaker_id: str | None) -> bool:
