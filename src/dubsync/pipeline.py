@@ -67,7 +67,7 @@ from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
-from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text
+from .subtitle_annotations import cue_has_bracketed_screen_text, cue_has_spoken_text, speech_text_for_alignment
 from .timing_refinement import (
     BoundaryRefinementConfig, boundary_refinement_config_from_config,
     refine_cues_to_speech_activity,
@@ -489,6 +489,9 @@ def sync_episode(
         adjudication_flags = [*incomplete_source_flags, *provider_flags]
         if llm_disabled_for_episode:
             for span in provider_spans:
+                if _is_punctuation_only_span(span):
+                    # Identical words in another tokenisation are not a divergence.
+                    continue
                 adjudication_flags.append(
                     QCFlag(
                         kind="divergence_unresolved",
@@ -563,6 +566,7 @@ def sync_episode(
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
         token_matches=alignment.token_matches,
     )
+    flags = _without_duplicate_ownership_holds(flags, change_flags)
     adjudicated_cues, alignment, segmentation_flags, cue_id_expansions = segment_generated_adlib_cues(
         adjudicated_cues,
         words,
@@ -735,6 +739,11 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     write_json_atomic(path, payload)
 
 
+def _is_punctuation_only_span(span: DivergenceSpan) -> bool:
+    source_signature = alphanumeric_signature(span.srt_text)
+    return bool(source_signature) and source_signature == alphanumeric_signature(span.asr_text)
+
+
 def _validate_rebuild_policy(path: Path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("policy_version") != _REBUILD_POLICY_VERSION:
@@ -773,13 +782,20 @@ _SOURCE_TIMING_HOLD_FLAG_KINDS = frozenset({
     "unresolved_alignment_adjudication_held",
     "oversized_adjudication_span_held",
 })
+# A model was asked and its answer could not be used. Each kind is the only
+# finding of its hold; none is repeated as "low confidence".
+_HELD_WORDING_FLAG_KINDS = frozenset({
+    "low_confidence_adjudication",
+    "adjudication_audio_unavailable",
+    "llm_provider_unavailable",
+    "invalid_llm_response",
+})
 
 
 def _confidence_held_source_cue_ids(flags: list[QCFlag]) -> set[int]:
     """Cues whose source WORDING is held: no split, merge or ownership transfer."""
     return {cue_id for flag in flags
-            if flag.kind in {"low_confidence_adjudication", "adjudication_audio_unavailable"}
-            or flag.kind in _SOURCE_TIMING_HOLD_FLAG_KINDS
+            if flag.kind in _HELD_WORDING_FLAG_KINDS or flag.kind in _SOURCE_TIMING_HOLD_FLAG_KINDS
             for cue_id in flag.cue_ids}
 
 
@@ -793,13 +809,7 @@ def _source_timing_held_cue_ids(flags: list[QCFlag]) -> set[int]:
             for cue_id in flag.cue_ids}
 
 
-_UNCONFIRMED_WORDING_FLAG_KINDS = frozenset({
-    "low_confidence_adjudication",
-    "adjudication_audio_unavailable",
-    "llm_provider_unavailable",
-    "invalid_llm_response",
-    "divergence_unresolved",
-})
+_UNCONFIRMED_WORDING_FLAG_KINDS = _HELD_WORDING_FLAG_KINDS | {"divergence_unresolved"}
 
 
 def _fold_unconfirmed_evidence_holds(
@@ -824,9 +834,35 @@ def _fold_unconfirmed_evidence_holds(
     return retained, held
 
 
+def _without_duplicate_ownership_holds(flags: list[QCFlag], change_flags: list[QCFlag]) -> list[QCFlag]:
+    """Report one ownership failure once.
+
+    The text planner and the word-ownership planner reject the same replacement
+    for the same reason. The text hold is the actionable finding (the approved
+    wording is not shown); it keeps the cues timing-held on its own.
+    """
+    text_holds = {
+        (flag.start, flag.end, cue_id)
+        for flag in change_flags if flag.kind == "adjudication_replacement_ownership_held"
+        for cue_id in flag.cue_ids
+    }
+    if not text_holds:
+        return flags
+    return [
+        flag for flag in flags
+        if not (
+            flag.kind == "adjudication_word_mapping_held" and flag.cue_ids
+            and all((flag.start, flag.end, cue_id) in text_holds for cue_id in flag.cue_ids)
+        )
+    ]
+
+
 def _timing_evidence_held_cue_ids(flags: list[QCFlag]) -> set[int]:
     return {cue_id for flag in flags
-            if flag.kind in {"timing_evidence_held", "adjudication_word_mapping_held", "protected_source_region_held"}
+            if flag.kind in {
+                "timing_evidence_held", "adjudication_word_mapping_held",
+                "adjudication_replacement_ownership_held", "protected_source_region_held",
+            }
             for cue_id in flag.cue_ids}
 
 
@@ -1042,21 +1078,48 @@ def _alignment_health_flags(
     alignment: AlignmentResult,
     *,
     source_cue_count: int,
+    source_cues: list[Cue] | None = None,
 ) -> list[QCFlag]:
-    if source_cue_count <= 0 or alignment.anchor_coverage >= 0.8:
+    coverage = _spoken_anchor_coverage(alignment, source_cues)
+    if source_cue_count <= 0 or coverage >= 0.8:
         return []
-    severity = "error" if alignment.anchor_coverage < 0.5 else "warning"
+    severity = "error" if coverage < 0.5 else "warning"
     return [
         QCFlag(
             kind="alignment_anchor_coverage_low",
             cue_ids=[],
             message=(
-                f"Only {alignment.anchor_coverage:.1%} of source tokens anchored to "
+                f"Only {coverage:.1%} of source tokens anchored to "
                 "acoustic words; review divergence spans and unmatched cues before delivery."
             ),
             severity=severity,
         )
     ]
+
+
+def _spoken_anchor_coverage(alignment: AlignmentResult, source_cues: list[Cue] | None) -> float:
+    """Anchor coverage over the source tokens a voice track can contain.
+
+    A dubbed voice stem has no music. Song captions without a single matched
+    word are not missed dialogue, so they do not count against alignment
+    health. Any other unmatched text still does.
+    """
+    if not source_cues:
+        return alignment.anchor_coverage
+    matched_cue_ids = {match.cue_id for match in alignment.token_matches}
+    unsung_cue_ids = {
+        cue.index for cue in source_cues
+        if cue.index not in matched_cue_ids and any(mark in cue.text for mark in "♪♫")
+    }
+    if not unsung_cue_ids:
+        return alignment.anchor_coverage
+    spoken_tokens = sum(
+        len(alphanumeric_signature(speech_text_for_alignment(cue)))
+        for cue in source_cues if cue.index not in unsung_cue_ids
+    )
+    if spoken_tokens <= 0:
+        return alignment.anchor_coverage
+    return min(1.0, len(alignment.token_matches) / spoken_tokens)
 
 
 def _load_style_profile_for_resume(path: Path, resume_stage: str | None) -> StyleProfile | None:
@@ -1846,11 +1909,12 @@ def _run_verify_stage(
     rebuilt, profanity_flags = apply_german_profanity_censorship(rebuilt, source_cues)
     flags.extend(profanity_flags)
     flags.extend(span_coverage_flags(source_cues, rebuilt, alignment.divergence_spans, decisions))
-    flags.extend(name_spelling_inconsistency_flags(source_cues, rebuilt))
+    flags.extend(name_spelling_inconsistency_flags(source_cues, rebuilt, asr_words=words))
     flags.extend(
         _alignment_health_flags(
             alignment,
             source_cue_count=_spoken_source_cue_count(source_cues),
+            source_cues=source_cues,
         )
     )
     flags = censor_german_profanity_flags(flags, source_cues)
@@ -2324,11 +2388,16 @@ def _restore_missing_audio_source_cues(
             })
         )
         restored.append(exact_source)
-        if (
-            cue.start_ms != source.start_ms
-            or cue.end_ms != source.end_ms
-            or cue.lines != source.lines
-        ):
+        # Report only what this pass really undid. A timing hold retains its
+        # approved wording on purpose, and its timing is normally still the
+        # source timing. A locked cue whose punctuation or line breaks alone
+        # were touched downstream is put back without a review error.
+        timing_restored = cue.start_ms != source.start_ms or cue.end_ms != source.end_ms
+        wording_restored = (
+            reason not in {"low_confidence", "timing_evidence"}
+            and alphanumeric_signature(cue.text) != alphanumeric_signature(source.text)
+        )
+        if timing_restored or wording_restored:
             restored_ids.add(cue.index)
 
     present_ids = {cue.index for cue in restored}

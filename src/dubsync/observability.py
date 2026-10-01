@@ -5,9 +5,14 @@ from collections import Counter, defaultdict
 
 from rapidfuzz import fuzz
 
-from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag
+from .models import AdjudicationDecision, Cue, DivergenceSpan, QCFlag, Word
+from .subtitle_annotations import speech_text_for_alignment
+from .tokenize import alphanumeric_signature
 
 _SENTENCE_BOUNDARY_BEFORE_WORD = re.compile(r"[.!?][\"'»“”„’\)\]]*\s*$")
+# A held cue can sit this far from its speech; an improvised word is still
+# evidence for that cue, while the same word elsewhere in the episode is not.
+_ASR_PRESENCE_PAD_SECONDS = 2.0
 
 
 def span_coverage_flags(
@@ -31,6 +36,11 @@ def span_coverage_flags(
         rebuilt_duration = 0 if rebuilt_window is None else max(0, rebuilt_window[1] - rebuilt_window[0])
         ratio = rebuilt_duration / source_duration
         if ratio >= min_ratio:
+            continue
+        # Compression means the retained words lost display time. An approved
+        # deletion removes words and their time together: fewer words in
+        # proportionally less time is shortened dialogue, not compression.
+        if ratio >= _retained_token_share(source_cues, rebuilt_cues, span.cue_ids):
             continue
         flags.append(
             QCFlag(
@@ -56,21 +66,33 @@ def name_spelling_inconsistency_flags(
     min_source_count: int = 2,
     min_source_consistency: float = 0.8,
     similarity_threshold: float = 0.7,
+    asr_words: list[Word] | None = None,
+    min_name_capitalization: float = 0.8,
 ) -> list[QCFlag]:
     source_occurrences = _case_preserving_source_occurrences(source_cues)
     source_tokens = [occurrence[0] for occurrence in source_occurrences]
     source_counts = Counter(token.casefold() for token in source_tokens)
     source_forms: dict[str, Counter[str]] = defaultdict(Counter)
-    source_name_like: dict[str, bool] = defaultdict(bool)
+    inner_counts: Counter[str] = Counter()
+    inner_capitalized: Counter[str] = Counter()
     for token, sentence_initial in source_occurrences:
         source_forms[token.casefold()][token] += 1
-        if _is_capitalized_token(token) and not sentence_initial:
-            source_name_like[token.casefold()] = True
+        if not sentence_initial:
+            inner_counts[token.casefold()] += 1
+            inner_capitalized[token.casefold()] += int(_is_capitalized_token(token))
+    # A name is written with a capital wherever it stands. A common word that
+    # was capitalized once inside a sentence ("ela" 29x, "Ela" once) is not.
+    source_name_like = {
+        key: inner_capitalized[key] >= min_name_capitalization * count
+        for key, count in inner_counts.items()
+    }
 
     output_occurrences: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    output_cues_by_id = {cue.index: cue for cue in output_cues}
     for cue in output_cues:
         for token in _case_preserving_tokens(cue.plain_text):
             output_occurrences[token.casefold()].append((token, cue.index))
+    asr_times = _asr_token_times(asr_words)
 
     flags: list[QCFlag] = []
     for output_key, occurrences in sorted(output_occurrences.items()):
@@ -95,13 +117,24 @@ def name_spelling_inconsistency_flags(
         if source_counts[source_key] / similar_source_count < min_source_consistency:
             continue
         source_spelling = source_forms[source_key].most_common(1)[0][0]
-        is_name_like = source_name_like[source_key]
+        is_name_like = source_name_like.get(source_key, False)
         kind = "name_spelling_inconsistency" if is_name_like else "unsourced_word_substitution"
         label = "a possible name drift" if is_name_like else "an unsourced word substitution"
+        cue_ids = {cue_id for _, cue_id in occurrences}
+        if not is_name_like and asr_times is not None:
+            # A different ordinary word that the ASR heard at this cue is what
+            # the actor said. Only wording without acoustic support is unsourced.
+            # A respelled source name stays reported: there the ASR is the suspect.
+            cue_ids = {
+                cue_id for cue_id in cue_ids
+                if not _heard_near_cue(asr_times.get(output_key, ()), output_cues_by_id[cue_id])
+            }
+            if not cue_ids:
+                continue
         flags.append(
             QCFlag(
                 kind=kind,
-                cue_ids=sorted({cue_id for _, cue_id in occurrences}),
+                cue_ids=sorted(cue_ids),
                 message=(
                     f"Output spelling '{output_spelling}' is absent from the source, while near spelling "
                     f"'{source_spelling}' appears {source_counts[source_key]} times; review as {label}."
@@ -112,6 +145,37 @@ def name_spelling_inconsistency_flags(
             )
         )
     return flags
+
+
+def _asr_token_times(asr_words: list[Word] | None) -> dict[str, list[tuple[float, float]]] | None:
+    if asr_words is None:
+        return None
+    times: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for word in asr_words:
+        for token in _case_preserving_tokens(word.text):
+            times[token.casefold()].append((word.start, word.end))
+    return times
+
+
+def _heard_near_cue(intervals, cue: Cue) -> bool:
+    start = cue.start_ms / 1000.0 - _ASR_PRESENCE_PAD_SECONDS
+    end = cue.end_ms / 1000.0 + _ASR_PRESENCE_PAD_SECONDS
+    return any(word_end >= start and word_start <= end for word_start, word_end in intervals)
+
+
+def _retained_token_share(source_cues: list[Cue], rebuilt_cues: list[Cue], cue_ids: list[int]) -> float:
+    selected = set(cue_ids)
+    source_tokens = sum(
+        len(alphanumeric_signature(speech_text_for_alignment(cue)))
+        for cue in source_cues if cue.index in selected
+    )
+    if source_tokens <= 0:
+        return 1.0
+    rebuilt_tokens = sum(
+        len(alphanumeric_signature(speech_text_for_alignment(cue)))
+        for cue in rebuilt_cues if cue.index in selected
+    )
+    return rebuilt_tokens / source_tokens
 
 
 def _cue_window(cues: list[Cue], cue_ids: list[int]) -> tuple[int, int] | None:

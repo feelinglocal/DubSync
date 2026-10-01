@@ -162,7 +162,12 @@ class AdjudicationEngine:
 
         for span in spans:
             decision = decisions_by_case.get(span.case_id)
+            # A hold created here already carries its own specific finding.
+            # It is not a model opinion, so it is never reported a second
+            # time as a low-confidence answer.
+            held_by_engine = False
             if span.case_id in audio_unavailable_case_ids:
+                held_by_engine = True
                 decision = AdjudicationDecision.model_validate(_unavailable_audio_decision(span))
                 flags.append(QCFlag(
                     kind="adjudication_audio_unavailable", cue_ids=span.cue_ids,
@@ -171,6 +176,7 @@ class AdjudicationEngine:
                     new_text=span.asr_text, start=span.start, end=span.end,
                 ))
             if decision is None:
+                held_by_engine = True
                 provider_failed = span.case_id in provider_failed_case_ids
                 decision = AdjudicationDecision(
                     case_id=span.case_id,
@@ -206,11 +212,12 @@ class AdjudicationEngine:
                     )
                 )
 
-            decision, confidence_flag = confidence_gated_decision(
-                span, decision, self.confidence_gate
-            )
-            if confidence_flag is not None:
-                flags.append(confidence_flag)
+            if not held_by_engine:
+                decision, confidence_flag = confidence_gated_decision(
+                    span, decision, self.confidence_gate
+                )
+                if confidence_flag is not None:
+                    flags.append(confidence_flag)
             decisions.append(decision)
 
         return decisions, flags
