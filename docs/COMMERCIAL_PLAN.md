@@ -66,8 +66,8 @@ flowchart LR
     A --> D["Persistent disk"]
     J --> W["Single background executor"]
     W --> F["FFmpeg normalize"]
-    F --> E["ElevenLabs Scribe v2 (default)"]
-    F --> M["MAI-Transcribe 2 via OpenRouter (selectable)"]
+    F --> M["MAI-Transcribe 2 via OpenRouter (default)"]
+    F --> E["ElevenLabs Scribe v2 (selectable)"]
     W --> G["Gemini 3.5 Flash-Lite adjudication (high thinking)"]
     G --> R["Flagged cases: Gemini 3.8 Flash review (medium thinking, selected clips)"]
     W --> P["Gemini 3.7 Flash punctuation (medium thinking)"]
@@ -110,7 +110,7 @@ The repository includes a Docker multi-stage build and `render.yaml` Blueprint:
 - Persistent disk: 10 GB.
 - Health check: `/api/health`.
 - Shutdown timing: Render-managed because custom shutdown delay is unsupported for services with a disk.
-- Secrets: `ELEVENLABS_API_KEY` for default transcription, optional `OPENROUTER_API_KEY` for MAI, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
+- Secrets: `OPENROUTER_API_KEY` for default MAI transcription, `ELEVENLABS_API_KEY` for selectable Scribe transcription, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `DUBSYNC_JOB_ACCESS_CODE`, entered in Render only.
 - Runtime data: `/var/data`.
 
 Current baseline infrastructure cost:
@@ -139,7 +139,7 @@ For a single-file or multi-file order, quote `max(total source-audio minutes × 
 
 Current provider price anchors:
 
-- Microsoft MAI-Transcribe 2 via OpenRouter: $0.10/hour launch catalog rate verified September 5, 2026. OpenRouter `usage.cost` takes precedence in metering; the hourly rate remains configurable. Scribe v2 is the default transcription option; MAI remains selectable.
+- Microsoft MAI-Transcribe 2 via OpenRouter: $0.10/hour launch catalog rate verified September 5, 2026. OpenRouter `usage.cost` takes precedence in metering; the hourly rate remains configurable. MAI-Transcribe 2 is the default transcription option for new jobs; Scribe v2 remains selectable.
 - ElevenLabs Scribe v1/v2: $0.22/hour, or $0.27/hour when keyterm prompting adds $0.05/hour.
 - Gemini 3.7 Flash punctuation retains medium thinking. Its recorded Standard paid-tier price is $0.75 per million input tokens and $3.75 per million output tokens through December 31, 2026, including thinking tokens, then $1.50/$7.50 starting January 1, 2027. These are the recorded 3.7 price anchors, not a quote for 3.8 adjudication.
 - Gemini 3.5 Flash-Lite adjudication uses high thinking. Standard paid-tier prices verified September 14, 2026 are $0.30 per million input tokens, $2.50 per million output tokens including thinking, $0.03 per million cached-input tokens, and $1.00 per million cached tokens per hour of storage. Meter generation, cache creation, and cache storage separately; Files API reuse alone does not remove input-token charges.
@@ -197,7 +197,7 @@ Before accepting paid customer media:
 
 - Keep the GitHub repository connected to the Render service.
 - Validate the Blueprint against Render's published schema.
-- Set paid ElevenLabs, OpenAI, and Gemini credentials in Render; set OpenRouter credentials when enabling selectable MAI transcription.
+- Set paid OpenRouter (default MAI transcription), OpenAI, and Gemini credentials in Render; set ElevenLabs credentials when enabling selectable Scribe transcription.
 - Set and periodically rotate `DUBSYNC_JOB_ACCESS_CODE`; never send it in a URL.
 - Run one short live generate job through the web route for each provider or model change.
 - Keep fixture-backed sync and generate browser tests green on every release.

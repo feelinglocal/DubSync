@@ -1,6 +1,9 @@
 asr:
-  provider: elevenlabs
-  model_id: scribe_v2
+  # Default: Microsoft MAI-Transcribe 2 via OpenRouter (OPENROUTER_API_KEY).
+  # Alternative: provider: elevenlabs, model_id: scribe_v2 (ELEVENLABS_API_KEY).
+  # The web model picker can select either model per job.
+  provider: openrouter
+  model: microsoft/mai-transcribe-2
   diarize: true
   # Optional: improve ASR spelling for names/terms in the episode.
   # keyterms:

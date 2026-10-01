@@ -890,7 +890,7 @@ def new_job_record(
     source_name: str | None = None,
     batch_id: str | None = None,
     batch_position: int | None = None,
-    transcription_provider: str = SCRIBE_TRANSCRIBE_MODEL,
+    transcription_provider: str = MAI_TRANSCRIBE_MODEL,
 ) -> JobRecord:
     now = datetime.now(UTC)
     return JobRecord(

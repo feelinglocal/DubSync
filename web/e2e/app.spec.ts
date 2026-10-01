@@ -35,7 +35,7 @@ for (const width of [320, 390, 1440]) {
       }
       await page.route('**/api/config', (route) => route.fulfill({ json: {
         ...defaultConfig, jobs_available: true,
-        transcription_models: [{ id: 'scribe_v2', label: 'ElevenLabs Scribe v2', available: true }],
+        transcription_models: [{ id: 'microsoft/mai-transcribe-2', label: 'MAI-Transcribe 2', available: true }],
       } }))
       await page.route('**/api/jobs', async (route) => {
         const request = route.request()
@@ -156,7 +156,7 @@ test('two browser contexts share one access code without sharing job state', asy
 
 test('audio-only job uploads, processes, and downloads an SRT', async ({ page }) => {
   await page.goto('/')
-  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
+  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('microsoft/mai-transcribe-2')
   await page.getByRole('button', { name: 'Generate from audio' }).click()
   await page.getByLabel('Dialogue audio').setInputFiles({
     name: 'dialogue.wav',
@@ -214,8 +214,8 @@ test('audio generation derives cue shape from an uploaded SRT style example', as
 
 test('explicit MAI sync survives refresh and protects job artifacts', async ({ page, request }) => {
   await page.goto('/')
-  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('scribe_v2')
-  await expect(page.getByRole('option', { name: 'MAI-Transcribe 2', exact: true })).toBeEnabled()
+  await expect(page.getByRole('combobox', { name: 'Transcription model' })).toHaveValue('microsoft/mai-transcribe-2')
+  await expect(page.getByRole('option', { name: 'MAI-Transcribe 2 (default)', exact: true })).toBeEnabled()
   await page.getByRole('combobox', { name: 'Transcription model' }).selectOption('microsoft/mai-transcribe-2')
   await page.getByLabel('Dialogue audio').setInputFiles({
     name: 'original.wav',

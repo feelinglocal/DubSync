@@ -7,7 +7,7 @@ export const transcriptionModelLabels: Record<TranscriptionProvider, string> = {
   'microsoft/mai-transcribe-2': 'MAI-Transcribe 2',
 }
 
-export const defaultTranscriptionProvider: TranscriptionProvider = 'scribe_v2'
+export const defaultTranscriptionProvider: TranscriptionProvider = 'microsoft/mai-transcribe-2'
 
 export const unavailableTranscriptionModels = Object.entries(transcriptionModelLabels).map(([id, label]) => ({
   id: id as TranscriptionProvider, label, available: false,

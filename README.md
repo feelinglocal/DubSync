@@ -30,7 +30,7 @@ dubsync sync episode.srt episode.wav -o episode.synced.srt --providers provider.
 dubsync generate episode.wav -o episode.generated.srt --providers provider.yaml --language ja
 ```
 
-Language hints reach ElevenLabs, OpenAI Whisper, AssemblyAI, and WhisperX. AssemblyAI's default model selection includes its documented multilingual fallback for Japanese or auto-detection. An explicit Japanese selection also sets an already configured MMS aligner to `jpn`; it does not enable or install that optional model. Automated tests use provider fixtures and mocked SDK calls; real Japanese audio transcription and optional model quality still need listening-based evaluation.
+Language hints reach MAI-Transcribe 2, ElevenLabs, OpenAI Whisper, AssemblyAI, and WhisperX as ISO-639-1 codes: `deu`, `pt-BR`, and `ja-JP` are sent as `de`, `pt`, and `ja`, and codes without an ISO-639-1 form pass through unchanged. AssemblyAI's default model selection includes its documented multilingual fallback for Japanese or auto-detection. An explicit Japanese selection also sets an already configured MMS aligner to `jpn`; it does not enable or install that optional model. Automated tests use provider fixtures and mocked SDK calls; real Japanese audio transcription and optional model quality still need listening-based evaluation.
 
 The first commercial release intentionally has no customer accounts, subscriptions, or Supabase dependency. Manual quotes issue a rotating job access code before paid processing, and every accepted child job receives a separate secret browser-held result token. Uploads and results expire 24 hours after each child finishes, and the API limits job creation per source IP. Production job intake fails closed when the access code is not configured. See `docs/COMMERCIAL_PLAN.md` for the product scope, provisional pricing, deployment limits, roadmap, and paid-launch gates.
 
@@ -59,7 +59,7 @@ To deploy:
 
 1. Put this workspace in a real private Git repository and connect that repository to Render.
 2. Create a Blueprint from `render.yaml`.
-3. Enter `ELEVENLABS_API_KEY` for default Scribe v2 transcription, `OPENROUTER_API_KEY` for optional MAI transcription, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. Never commit `.env`.
+3. Enter `OPENROUTER_API_KEY` for default MAI-Transcribe 2 transcription, `ELEVENLABS_API_KEY` for optional Scribe v2 transcription, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and a strong `DUBSYNC_JOB_ACCESS_CODE` as Render secrets. Never commit `.env`.
 4. Confirm `/api/health`, `/api/config` reports `jobs_available: true`, and the deployed commit matches the release SHA.
 5. Run one short paid-provider generate job through the web UI. The fixture-backed E2E suite covers sync behavior without provider spend.
 
@@ -100,7 +100,7 @@ Live provider smoke tests are opt-in because they can spend API credits:
 python -m pytest --live tests/test_live_smoke.py
 ```
 
-Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. ElevenLabs Scribe v2 is the default cloud ASR for sync and audio-to-SRT work; MAI-Transcribe 2 via OpenRouter remains selectable. `GEMINI_API_KEY` powers Gemini 3.5 Flash-Lite adjudication with high thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
+Gemini 3.5 Transcribe ASR is disabled. The CLI, web API, UI, and queued-job processor reject that transcription provider, including stale saved selections. Microsoft MAI-Transcribe 2 via OpenRouter is the default cloud ASR for new sync and audio-to-SRT jobs; ElevenLabs Scribe v2 remains selectable. `GEMINI_API_KEY` powers Gemini 3.5 Flash-Lite adjudication with high thinking and the unchanged Gemini 3.7 Flash punctuation pass with medium thinking.
 
 Create `.env` as needed:
 
@@ -141,13 +141,13 @@ python -m dubsync report workdir\episode --synced episode.synced.srt --golden ep
 
 New ASR checkpoints record source and normalized-audio hashes. A timing-stage resume rejects changed/missing audio before overwriting existing artifacts; use `--resume asr` to regenerate acoustic evidence. Legacy checkpoints remain readable with an explicit unverified-provenance QC warning. Rebuild checkpoints predating the current text/timing safeguards must resume from `rebuild`; `verify` also rejects decisions that no longer satisfy the configured confidence gate. These policies reuse the saved source snapshot intentionally. Normalized audio, caches, and result artifacts replace existing files only after a complete new file has been written.
 
-`--local` disables LLM calls and selects the WhisperX local-test ASR path. Normal cloud processing defaults to ElevenLabs Scribe v2. The web workspace has a transcription model picker for both Sync and Generate, including batches; Microsoft MAI-Transcribe 2 through OpenRouter remains available. Each job stores its selection, so changing the default does not change previously submitted jobs.
+`--local` disables LLM calls and selects the WhisperX local-test ASR path. Normal cloud processing defaults to Microsoft MAI-Transcribe 2 through OpenRouter (`provider.yaml`). The web workspace has a transcription model picker for both Sync and Generate, including batches, and preselects MAI-Transcribe 2; ElevenLabs Scribe v2 remains available. Each job stores its selection, so changing the default does not change previously submitted jobs; queued jobs saved with the older `default` value still use Scribe v2. If the default model's key is missing, the picker shows it as unavailable and the job is not switched to the other model.
 
-Set `OPENROUTER_API_KEY` in the server environment for MAI and `ELEVENLABS_API_KEY` for Scribe. Keys stay on the server; `/api/config` exposes only model names and availability. MAI requests word timestamps, diarization and verbatim text. Long normalized audio is sent in bounded chunks with overlapping context; speaker IDs are scoped to each chunk because independent requests cannot establish speaker identity across chunks. MAI cannot silently fall back to Scribe or fabricate timing if the provider omits word timestamps.
+Set `OPENROUTER_API_KEY` in the server environment for MAI and `ELEVENLABS_API_KEY` for Scribe. Keys stay on the server; `/api/config` exposes only model names and availability. MAI requests word timestamps, diarization and verbatim text. Long normalized audio is sent in bounded chunks with overlapping context. Speaker IDs are linked across a chunk cut when the words both chunks heard in the overlap map one label to one label; otherwise they stay scoped to their chunk. Each chunk gets at most three requests for timeouts, HTTP 408/5xx and connection errors; a chunk that keeps timing out with diarization is retried once without it and its words carry no speaker labels. Re-decoded duplicate word runs and doubled countdown numbers are removed before timing is used, with informational QC flags. MAI cannot silently fall back to Scribe or fabricate timing if the provider omits word timestamps. Scribe requests get the same bounded retries.
 
 `cost.json` records OpenRouter's reported `usage.cost` as `audio_billed`; when billing metadata is unavailable, the configured hourly rate is an estimate. Scribe costs use its configured hourly estimate. Cached transcription makes no new charge. MAI's September 5, 2026 catalog estimate is $0.10/audio-hour; set `asr.dollars_per_hour` if the rate changes.
 
-See the [September 5, 2026 MAI/Scribe comparison](docs/testing/mai-transcribe-2-comparison-2026-09-05.md) for historical latency, reference-text agreement, costs, and validation limits. Failed requests retain sanitized billing evidence in `asr_failure.json`; known charges with an uncertain total are marked `audio_billed_partial`.
+See the [September 5, 2026 MAI/Scribe comparison](docs/testing/mai-transcribe-2-comparison-2026-09-05.md) for historical latency, reference-text agreement, costs, and validation limits. Failed requests retain sanitized billing evidence in `asr_failure.json`; known charges with an uncertain total are marked `audio_billed_partial`, and a failed or retried request that may still have been billed is estimated as `audio_uncertain_estimate`.
 
 ### Gemini Audio Context
 
@@ -171,8 +171,8 @@ On September 10, 2026, local preparation of the supplied long audio reduced the 
 
 | Role | Provider | Status | Config |
 |---|---|---|---|
-| ASR default | ElevenLabs Scribe v2 | Word timestamps and diarization | `asr.provider: elevenlabs`, `model_id: scribe_v2`, `diarize: true`, optional `keyterms` / `character_names` |
-| ASR alternative | Microsoft MAI-Transcribe 2 via OpenRouter | Word timestamps, diarization, actual billing metadata | `asr.provider: openrouter`, `model: microsoft/mai-transcribe-2`, `diarize: true`, optional `keyterms` / `character_names` |
+| ASR default | Microsoft MAI-Transcribe 2 via OpenRouter | Word timestamps, diarization, actual billing metadata | `asr.provider: openrouter`, `model: microsoft/mai-transcribe-2`, `diarize: true`, optional `keyterms` / `character_names` |
+| ASR alternative | ElevenLabs Scribe v2 | Word timestamps and diarization | `asr.provider: elevenlabs`, `model_id: scribe_v2`, `diarize: true`, optional `keyterms` / `character_names` |
 | ASR fallback | OpenAI Whisper | Implemented optional adapter, no diarization | `asr.provider: openai`, `model: whisper-1` |
 | ASR fallback | AssemblyAI | Implemented optional adapter | `asr.provider: assemblyai`, `model: universal-3-pro` or `universal-2`, `speaker_labels: true` |
 | ASR retired | Gemini 3.5 Transcribe | Disabled; provider selectors reject it in CLI, web, and queued jobs | No supported configuration |
@@ -212,8 +212,8 @@ drop_policy: keep_flagged
 
 ```yaml
 asr:
-  provider: elevenlabs
-  model_id: scribe_v2
+  provider: openrouter
+  model: microsoft/mai-transcribe-2
   diarize: true
   keyterms:
     - Drachen-Evolutionssystem
@@ -311,6 +311,7 @@ The CLI writes `cost.json` and prints a cost meter. Fixture, local, resumed, and
 
 | Item | Planned cost basis |
 |---|---|
+| MAI-Transcribe 2 ASR (default) | OpenRouter's reported `usage.cost` per request; `$0.10/hr` estimate when billing metadata is missing |
 | Scribe v2 ASR | audio seconds x provider hourly price (`$0.22/hr`, or `$0.27/hr` when `keyterms` or `character_names` enable keyterm prompting) |
 | AssemblyAI ASR | audio seconds x provider/model hourly price (`$0.21/hr` for `universal-3-pro`, `$0.15/hr` for `universal-2`, plus `$0.02/hr` when `speaker_labels` is enabled; enabled by default) |
 | LLM adjudication/punctuation | input/output tokens x model price |

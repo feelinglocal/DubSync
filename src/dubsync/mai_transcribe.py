@@ -10,6 +10,8 @@ import os
 import time
 import wave
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -23,6 +25,22 @@ _MAX_CHUNK_SECONDS = 300.0
 _CONTEXT_SECONDS = 1.0
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_END_ROUNDING_SECONDS = 0.020
+# MAI word timestamps sit on a 20 ms grid; a rewind is a start well before the
+# previous end, never grid rounding.
+_REWIND_EPSILON_SECONDS = 0.005
+_MAX_REDECODED_RUN_WORDS = 12
+# Adjacent identical tokens closer than this are candidate decoder doubling.
+_MAX_DOUBLED_GAP_SECONDS = 0.15
+_MAX_DOUBLED_RUN_LINK_SECONDS = 1.0
+_MIN_DOUBLED_RUN_PAIRS = 3
+_MAX_FLAG_EXAMPLES = 20
+_MAX_INVALID_WORDS_PER_CHUNK = 1
+# Bounded per-chunk retries: one chunk costs about $0.008, far less than
+# failing a long job after earlier chunks were already paid.
+_MAX_CHUNK_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = (2.0, 5.0)
+_MAX_RATE_LIMIT_DELAY_SECONDS = 5.0
+_DIARIZED_TIMEOUTS_BEFORE_FALLBACK = 2
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -33,6 +51,32 @@ class _NoRedirects(HTTPRedirectHandler):
 
 def urlopen(request: Request, *, timeout: float):
     return build_opener(_NoRedirects()).open(request, timeout=timeout)
+
+
+class _AttemptFailure(Exception):
+    """One failed request; the chunk retry policy decides whether to repeat it."""
+
+    def __init__(
+        self, message: str, *, code: str | None = None, retryable: bool = False,
+        timeout: bool = False, retry_after: float = 1.0,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.timeout = timeout
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(value: object) -> float:
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(_MAX_RATE_LIMIT_DELAY_SECONDS, max(0.0, delay)) if math.isfinite(delay) else 1.0
+
+
+def _is_timeout(error: BaseException) -> bool:
+    return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
 
 
 @dataclass(frozen=True)
@@ -50,9 +94,13 @@ class MAITranscribeAdapter:
     Five-minute chunks include one second of context on both sides. Matching
     words in that overlap are joined once using original provider timestamps;
     otherwise a word's midpoint selects its owning chunk. Diarization labels
-    are local to each API call, so namespacing prevents unrelated speakers from
-    being merged between independent chunks.
+    are local to each API call: they are namespaced per chunk and only linked
+    across a cut when the overlap words map one label to one label, so
+    unrelated speakers are never merged between independent chunks.
     """
+
+    # Bump when word post-processing changes so stale ASR cache entries are not reused.
+    cache_version = "mai-words-2"
 
     def __init__(
         self,
@@ -77,6 +125,11 @@ class MAITranscribeAdapter:
         self.chunk_seconds = float(chunk_seconds)
         self.last_usage: dict[str, object] = self._empty_usage()
         self.last_repair_flags: list[QCFlag] = []
+        self._dropped_runs: list[list[Word]] = []
+        self._collapsed_pairs: list[tuple[Word, Word]] = []
+        self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
+        # Per-chunk detected language, diarization state and speaker links, for the ASR artifact.
+        self.last_evidence: dict[str, object] = {}
 
     @staticmethod
     def _empty_usage() -> dict[str, object]:
@@ -90,14 +143,60 @@ class MAITranscribeAdapter:
 
         self.last_usage = self._empty_usage()
         self.last_repair_flags = []
+        self._dropped_runs = []
+        self._collapsed_pairs = []
+        self._diarization_timeouts_before_fallback = _DIARIZED_TIMEOUTS_BEFORE_FALLBACK
+        self.last_evidence = {"provider": "openrouter", "chunks": [], "speaker_links": []}
         if not self.api_key:
             raise ProviderError("OPENROUTER_API_KEY is required for MAI-Transcribe 2.", code="configuration")
         words: list[Word] = []
         for index, chunk in enumerate(self._chunks(audio_path)):
-            payload = self._request(chunk.data)
-            chunk_words = self._words(payload, chunk, index)
-            words = _join_words(words, chunk_words, chunk.owner_start) if index else chunk_words
+            payload, diarized = self._request_chunk(chunk, index)
+            chunk_words = self._words(payload, chunk, index, diarized=diarized)
+            language = payload.get("language")
+            self.last_evidence["chunks"].append({
+                "index": index + 1, "offset": chunk.offset, "duration": chunk.duration,
+                "language": language[:16] if isinstance(language, str) else None, "diarized": diarized,
+            })
+            if index:
+                pairs = _overlap_pairs(words, chunk_words, chunk.owner_start)
+                chunk_words, links = _stitch_speakers(words, chunk_words, pairs)
+                if links:
+                    self.last_evidence["speaker_links"].append({"boundary": chunk.owner_start, "links": links})
+                words = _join_paired_words(words, chunk_words, pairs, chunk.owner_start)
+            else:
+                words = chunk_words
+        self.last_repair_flags.extend(self._word_run_summary_flags())
         return sorted(words, key=lambda word: (word.start, word.end))
+
+    def _word_run_summary_flags(self) -> list[QCFlag]:
+        # One aggregated flag per repair kind keeps a long episode reviewable
+        # without attaching provider housekeeping to individual cues.
+        flags = []
+        if self._dropped_runs:
+            examples = "; ".join(
+                f"{run[0].start:.2f}s {' '.join(word.text for word in run)!r}"
+                for run in self._dropped_runs[:_MAX_FLAG_EXAMPLES]
+            )
+            flags.append(QCFlag(
+                kind="asr_duplicate_words_dropped", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 re-emitted {len(self._dropped_runs)} word run(s) over already transcribed "
+                    f"audio; the earlier overlapping copy was dropped and the later copy kept: {examples}."
+                ),
+            ))
+        if self._collapsed_pairs:
+            examples = "; ".join(
+                f"{dropped.start:.2f}s {dropped.text!r}" for dropped, _kept in self._collapsed_pairs[:_MAX_FLAG_EXAMPLES]
+            )
+            flags.append(QCFlag(
+                kind="asr_doubled_words_collapsed", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 doubled {len(self._collapsed_pairs)} adjacent number token(s) in a counted "
+                    f"sequence; the shorter copy of each pair was dropped: {examples}."
+                ),
+            ))
+        return flags
 
     def _chunks(self, audio_path: Path):
         from .providers import ProviderError
@@ -134,16 +233,60 @@ class MAITranscribeAdapter:
         except (OSError, wave.Error, EOFError):
             raise ProviderError("MAI-Transcribe 2 could not read normalized WAV audio.") from None
 
-    def _request(self, audio: bytes) -> dict:
+    def _request_chunk(self, chunk: _Chunk, index: int) -> tuple[dict, bool]:
+        """Request one chunk with bounded retries; return the payload and whether it was diarized.
+
+        Timeouts, connection failures, HTTP 408 and 5xx are retried with a
+        short backoff, at most three requests per chunk. A failed attempt may
+        still have been billed, so it is counted as uncertain usage rather than
+        failing a long job. Diarization is the slow path that times out on long
+        chunks: a chunk that keeps timing out is retried once without it.
+        """
         from .providers import ProviderError
 
+        diarize = self.diarize
+        failures = 0
+        diarized_timeouts = 0
+        rate_limit_retried = False
+        while True:
+            try:
+                payload = self._request(chunk.data, diarize=diarize, seconds=chunk.duration)
+            except _AttemptFailure as failure:
+                if failure.code == "rate_limit" and not rate_limit_retried:
+                    rate_limit_retried = True
+                    time.sleep(failure.retry_after)
+                    continue
+                failures += 1
+                if not failure.retryable or failures >= _MAX_CHUNK_ATTEMPTS:
+                    raise ProviderError(str(failure), code=failure.code) from None
+                if failure.timeout and diarize:
+                    diarized_timeouts += 1
+                    if diarized_timeouts >= self._diarization_timeouts_before_fallback:
+                        diarize = False
+                        # Later chunks of this job fall back after one diarized timeout.
+                        self._diarization_timeouts_before_fallback = 1
+                time.sleep(_RETRY_BACKOFF_SECONDS[min(failures, len(_RETRY_BACKOFF_SECONDS)) - 1])
+                continue
+            if self.diarize and not diarize:
+                self.last_repair_flags.append(QCFlag(
+                    kind="asr_diarization_unavailable", severity="info",
+                    message=(
+                        f"MAI-Transcribe 2 chunk {index + 1} kept timing out with diarization, so it was "
+                        "transcribed without speaker labels; speaker turns in this range are unknown."
+                    ),
+                    start=chunk.owner_start, end=chunk.owner_end,
+                ))
+            return payload, diarize
+
+    def _request(self, audio: bytes, *, diarize: bool, seconds: float) -> dict:
+        """Send one request. Failures raise ``_AttemptFailure`` for the retry policy."""
         body = {
             "model": self.model,
             "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "wav"},
             "response_format": "verbose_json",
             "timestamp_granularities": ["segment", "word"],
             "provider": {"options": {"azure": {
-                "diarization": {"enabled": self.diarize},
+                "diarization": {"enabled": diarize},
                 "enhancedMode": {"modelOptions": {"transcribeStyle": "verbatim"}},
             }}},
         }
@@ -155,58 +298,69 @@ class MAITranscribeAdapter:
             _ENDPOINT, data=json.dumps(body).encode("utf-8"), method="POST",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
-        for attempt in range(2):
-            self.last_usage["request_count"] += 1
-            try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
-                    generation_id = response.headers.get("X-Generation-Id")
-                    if generation_id:
-                        self.last_usage["generation_ids"].append(str(generation_id))
-                    raw = response.read(_MAX_RESPONSE_BYTES + 1)
-            except HTTPError as exc:
-                status = exc.code
-                retry_after = exc.headers.get("Retry-After", "1") if exc.headers else "1"
-                exc.close()
-                if status == 429 and attempt == 0:
-                    try:
-                        delay = float(retry_after)
-                    except (TypeError, ValueError):
-                        delay = 1.0
-                    time.sleep(min(5.0, max(0.0, delay)) if math.isfinite(delay) else 1.0)
-                    continue
-                if status == 402:
-                    message = "OpenRouter credits are insufficient for MAI-Transcribe 2. Add credits to the OpenRouter account."
-                    code = "credits"
-                elif status in (401, 403):
-                    message = "OpenRouter rejected MAI-Transcribe 2 authentication. Check OPENROUTER_API_KEY and model access."
-                    code = "authentication"
-                elif status == 429:
-                    message = "OpenRouter rate limited MAI-Transcribe 2. Try again later."
-                    code = "rate_limit"
-                else:
-                    self._record_usage({})
-                    message = f"MAI-Transcribe 2 request failed with HTTP {status}."
-                    code = None
-                raise ProviderError(message, code=code) from None
-            except (URLError, OSError, ValueError):
-                # Do not automatically repeat a request whose billing is unknown.
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.") from None
-            if len(raw) > _MAX_RESPONSE_BYTES:
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned an oversized response.")
-            try:
-                payload = json.loads(raw)
-            except (ValueError, UnicodeError):
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned invalid JSON.") from None
-            if not isinstance(payload, dict):
-                self._record_usage({})
-                raise ProviderError("MAI-Transcribe 2 returned an invalid transcription response.")
-            # Record a paid response even if word validation subsequently rejects it.
-            self._record_usage(payload)
-            return payload
-        raise AssertionError("Unreachable retry state")  # pragma: no cover
+        self.last_usage["request_count"] += 1
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                generation_id = response.headers.get("X-Generation-Id")
+                if generation_id:
+                    self.last_usage["generation_ids"].append(str(generation_id))
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except HTTPError as exc:
+            status = exc.code
+            retry_after = exc.headers.get("Retry-After", "1") if exc.headers else "1"
+            exc.close()
+            if status == 429:
+                raise _AttemptFailure(
+                    "OpenRouter rate limited MAI-Transcribe 2. Try again later.",
+                    code="rate_limit", retry_after=_retry_after_seconds(retry_after),
+                ) from None
+            if status == 402:
+                raise _AttemptFailure(
+                    "OpenRouter credits are insufficient for MAI-Transcribe 2. Add credits to the OpenRouter account.",
+                    code="credits",
+                ) from None
+            if status in (401, 403):
+                raise _AttemptFailure(
+                    "OpenRouter rejected MAI-Transcribe 2 authentication. Check OPENROUTER_API_KEY and model access.",
+                    code="authentication",
+                ) from None
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                f"MAI-Transcribe 2 request failed with HTTP {status}.",
+                retryable=status == 408 or 500 <= status <= 599, timeout=status == 408,
+            ) from None
+        except (URLError, OSError, HTTPException) as exc:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                "MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.",
+                retryable=True, timeout=_is_timeout(exc),
+            ) from None
+        except ValueError:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure(
+                "MAI-Transcribe 2 could not complete the OpenRouter request within the connection timeout.",
+            ) from None
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned an oversized response.")
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned invalid JSON.") from None
+        if not isinstance(payload, dict):
+            self._record_unknown_billing(seconds)
+            raise _AttemptFailure("MAI-Transcribe 2 returned an invalid transcription response.")
+        # Record a paid response even if word validation subsequently rejects it.
+        self._record_usage(payload)
+        return payload
+
+    def _record_unknown_billing(self, seconds: float) -> None:
+        # The request may or may not have been charged: the total becomes
+        # unknown and the attempt is kept as an uncertain, estimable charge.
+        self._record_usage({})
+        self.last_usage["uncertain_request_count"] = int(self.last_usage.get("uncertain_request_count", 0)) + 1
+        self.last_usage["uncertain_seconds"] = float(self.last_usage.get("uncertain_seconds", 0.0)) + float(seconds)
 
     def _record_usage(self, payload: dict) -> None:
         usage = payload.get("usage")
@@ -219,9 +373,10 @@ class MAITranscribeAdapter:
                 if self.last_usage[field] is not None:
                     self.last_usage[field] += float(value)
 
-    def _words(self, payload: dict, chunk: _Chunk, index: int) -> list[Word]:
+    def _words(self, payload: dict, chunk: _Chunk, index: int, *, diarized: bool | None = None) -> list[Word]:
         from .providers import ProviderError
 
+        diarized = self.diarize if diarized is None else diarized
         raw_words = payload.get("words")
         if "words" not in payload and _explicit_empty_transcription(payload, chunk.duration):
             # MAI can omit words for a successful no-speech response. Accept
@@ -230,23 +385,24 @@ class MAITranscribeAdapter:
         if not isinstance(raw_words, list) or (not raw_words and str(payload.get("text", "")).strip()):
             raise ProviderError("MAI-Transcribe 2 did not return required word timestamps.")
         words = []
+        invalid: list[object] = []
+        rounding_flags: list[QCFlag] = []
         for item in raw_words:
-            if not isinstance(item, dict):
-                raise ProviderError("MAI-Transcribe 2 returned an invalid word timing record.")
-            text = item.get("word")
-            start, end = item.get("start"), item.get("end")
+            text = item.get("word") if isinstance(item, dict) else None
+            start, end = (item.get("start"), item.get("end")) if isinstance(item, dict) else (None, None)
             if (
                 not isinstance(text, str) or not text.strip()
                 or not _nonnegative_number(start) or not _nonnegative_number(end)
                 or end <= start or start >= chunk.duration
                 or end - chunk.duration > _MAX_END_ROUNDING_SECONDS + 1e-9
             ):
-                raise ProviderError("MAI-Transcribe 2 returned missing or invalid word timing.")
+                invalid.append(item)
+                continue
             if end > chunk.duration:
                 # Live MAI output can round the final endpoint 10 ms past the
                 # supplied WAV. Bound that repair to 20 ms and retain its source
                 # values for review; starts and larger errors remain untouched.
-                self.last_repair_flags.append(QCFlag(
+                rounding_flags.append(QCFlag(
                     kind="asr_timestamp_rounding_clamped", severity="info",
                     message=(
                         f"MAI-Transcribe 2 chunk {index + 1} endpoint rounding for {text!r}: "
@@ -260,9 +416,50 @@ class MAITranscribeAdapter:
             start, end = float(start) + chunk.offset, float(end) + chunk.offset
             speaker = item.get("speaker")
             speaker_id = None
-            if self.diarize and speaker is not None and str(speaker).strip():
+            if diarized and speaker is not None and str(speaker).strip():
                 speaker_id = f"chunk_{index + 1}:{speaker}"
-            words.append(Word(text=text, start=start, end=end, confidence=None, speaker_id=speaker_id))
+            # OpenRouter documents per-word confidence as optional; MAI has
+            # not been observed to send it, so absent stays unknown (None).
+            confidence = item.get("confidence")
+            confidence = float(confidence) if _nonnegative_number(confidence) and confidence <= 1.0 else None
+            words.append(Word(text=text, start=start, end=end, confidence=confidence, speaker_id=speaker_id))
+        # One malformed record should not discard an otherwise valid paid
+        # chunk; anything more is a provider failure and stays fail-closed.
+        if len(invalid) > _MAX_INVALID_WORDS_PER_CHUNK or (invalid and not words):
+            raise ProviderError("MAI-Transcribe 2 returned missing or invalid word timing.")
+        self.last_repair_flags.extend(rounding_flags)
+        for item in invalid:
+            record = item if isinstance(item, dict) else {}
+            text, start, end = record.get("word"), record.get("start"), record.get("end")
+            # Locate the flag only by whatever timing the record itself carries.
+            flag_start = float(start) + chunk.offset if _nonnegative_number(start) else None
+            flag_end = float(end) + chunk.offset if _nonnegative_number(end) else flag_start
+            if flag_start is not None and flag_end is not None and flag_end < flag_start:
+                flag_end = flag_start
+            self.last_repair_flags.append(QCFlag(
+                kind="asr_invalid_word_dropped", severity="warning",
+                message=(
+                    f"MAI-Transcribe 2 chunk {index + 1} returned a word record with missing or invalid timing "
+                    f"({text!r} start={start!r} end={end!r}); it was dropped and the rest of the chunk was kept."
+                )[:500],
+                start=flag_start, end=flag_end if flag_start is not None else None,
+            ))
+        # The provider's own word order is the only evidence of a re-decoded
+        # run, so both filters must run before sorting by time.
+        words, dropped_runs = _drop_redecoded_runs(words)
+        self._dropped_runs.extend(dropped_runs)
+        words, collapsed_pairs, kept_runs = _collapse_doubled_number_runs(words)
+        self._collapsed_pairs.extend(collapsed_pairs)
+        for run in kept_runs:
+            self.last_repair_flags.append(QCFlag(
+                kind="asr_doubled_word_run_kept", severity="info",
+                message=(
+                    f"MAI-Transcribe 2 wrote {len(run)} consecutive doubled words "
+                    f"({' '.join(word.text for word in run)!r}); this can be decoder doubling of sung or "
+                    "chanted lines, but the words were kept because a genuine repetition cannot be ruled out."
+                ),
+                start=run[0].start, end=run[-1].end,
+            ))
         return sorted(words, key=lambda word: (word.start, word.end))
 
 
@@ -285,13 +482,117 @@ def _explicit_empty_transcription(payload: dict, duration: float) -> bool:
     return True
 
 
+def _drop_redecoded_runs(words: list[Word]) -> tuple[list[Word], list[list[Word]]]:
+    """Drop the earlier copy when MAI rewinds and re-emits words it already wrote.
+
+    In raw provider order, a word that starts well before the previous word's
+    end begins a re-decoded run. The earlier run is the maximal suffix of kept
+    words that end after that start. Every observed case (ep11/ep17) re-emits
+    the same speech with a corrected continuation, so the later copy is kept.
+    The run is only dropped when the later words re-cover at least half of it,
+    it is short, and diarization does not attribute the two runs to different
+    speakers (overlapping dialogue is not a re-decode).
+    """
+    kept: list[int] = []
+    dropped: list[list[Word]] = []
+    for position, word in enumerate(words):
+        if kept and word.start < words[kept[-1]].end - _REWIND_EPSILON_SECONDS:
+            cut = len(kept)
+            while cut and words[kept[cut - 1]].end > word.start + _REWIND_EPSILON_SECONDS:
+                cut -= 1
+            earlier = [words[index] for index in kept[cut:]]
+            earlier_end = max(item.end for item in earlier)
+            later = []
+            for item in words[position:]:
+                if item.start >= earlier_end:
+                    break
+                later.append(item)
+            if _later_run_recovers(earlier, later):
+                dropped.append(earlier)
+                del kept[cut:]
+        kept.append(position)
+    return [words[index] for index in kept], dropped
+
+
+def _later_run_recovers(earlier: list[Word], later: list[Word]) -> bool:
+    if not earlier or not later or len(earlier) > _MAX_REDECODED_RUN_WORDS:
+        return False
+    earlier_start = min(word.start for word in earlier)
+    earlier_end = max(word.end for word in earlier)
+    later_start = min(word.start for word in later)
+    later_end = max(word.end for word in later)
+    covered = min(earlier_end, later_end) - max(earlier_start, later_start)
+    if covered < 0.5 * (earlier_end - earlier_start):
+        return False
+    earlier_speakers = {word.speaker_id for word in earlier}
+    later_speakers = {word.speaker_id for word in later}
+    if None not in earlier_speakers and None not in later_speakers and earlier_speakers.isdisjoint(later_speakers):
+        return False
+    return True
+
+
+def _collapse_doubled_number_runs(
+    words: list[Word],
+) -> tuple[list[Word], list[tuple[Word, Word]], list[list[Word]]]:
+    """Collapse MAI's AABBCC doubling only where it cannot be genuine speech.
+
+    A doubled pair is two adjacent identical tokens (not three) with a short
+    gap. Pairs linked by at most one other token form a run. A run of three or
+    more pairs made only of numbers is a counted sequence (``10, 10, 9, 9, ...``)
+    and keeps the longer copy of each pair. Any other run is left untouched and
+    reported, because doubled words can be real (``nein, nein``; a chorus).
+    """
+    tokens = [_normalized_word(word) for word in words]
+    pairs = []
+    for index in range(len(words) - 1):
+        if (
+            tokens[index] == tokens[index + 1]
+            and 0.0 <= words[index + 1].start - words[index].end + _REWIND_EPSILON_SECONDS
+            and words[index + 1].start - words[index].end <= _MAX_DOUBLED_GAP_SECONDS
+            and (index == 0 or tokens[index - 1] != tokens[index])
+            and (index + 2 >= len(words) or tokens[index + 2] != tokens[index])
+        ):
+            pairs.append(index)
+    runs: list[list[int]] = []
+    for index in pairs:
+        if runs:
+            previous = runs[-1][-1]
+            between = words[previous + 1:index + 1]
+            if index - (previous + 2) <= 1 and all(
+                right.start - left.end <= _MAX_DOUBLED_RUN_LINK_SECONDS for left, right in zip(between, between[1:])
+            ):
+                runs[-1].append(index)
+                continue
+        runs.append([index])
+    drop: set[int] = set()
+    collapsed: list[tuple[Word, Word]] = []
+    kept_runs: list[list[Word]] = []
+    for run in runs:
+        if len(run) < _MIN_DOUBLED_RUN_PAIRS:
+            continue
+        if all(tokens[index].isdigit() for index in run):
+            for index in run:
+                first, second = words[index], words[index + 1]
+                keep_first = first.end - first.start >= second.end - second.start
+                drop.add(index + 1 if keep_first else index)
+                collapsed.append((second, first) if keep_first else (first, second))
+        else:
+            kept_runs.append(words[run[0]:run[-1] + 2])
+    return [word for index, word in enumerate(words) if index not in drop], collapsed, kept_runs
+
+
 def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Word]:
+    return _join_paired_words(left, right, _overlap_pairs(left, right, boundary), boundary)
+
+
+def _overlap_pairs(left: list[Word], right: list[Word], boundary: float) -> dict[int, int]:
     """Match overlapping occurrences before ownership so timing jitter cannot split a pair.
 
     The monotonic one-to-one match keeps repeated words distinct. Requiring
     overlapping intervals avoids merging repetitions at clearly different times.
-    A matched pair always contributes one real provider record, even when its
-    two midpoints disagree about which chunk owns it.
+    The two chunks can spell one spoken word differently (``vamo``/``vamos``),
+    so a strongly overlapping, similar word also pairs; exact text pairs are
+    preferred over such spelling pairs.
     """
     from .providers import ProviderError
 
@@ -301,20 +602,23 @@ def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Wo
         raise ProviderError("MAI-Transcribe 2 returned too many overlapping word timestamps.")
     left_tokens = [_normalized_word(left[i]) for i in left_overlap]
     right_tokens = [_normalized_word(right[i]) for i in right_overlap]
-    scores = [[(0, 0.0) for _ in range(len(right_overlap) + 1)] for _ in range(len(left_overlap) + 1)]
+    # Score: (exact text pairs, all pairs, summed overlap similarity).
+    scores = [[(0, 0, 0.0) for _ in range(len(right_overlap) + 1)] for _ in range(len(left_overlap) + 1)]
     matches = {}
     for row, left_index in enumerate(left_overlap, start=1):
         for col, right_index in enumerate(right_overlap, start=1):
             lword, rword = left[left_index], right[right_index]
             overlap = min(lword.end, rword.end) - max(lword.start, rword.start)
             score = max(scores[row - 1][col], scores[row][col - 1])
-            if left_tokens[row - 1] == right_tokens[col - 1] and overlap > 0:
+            if overlap > 0:
                 similarity = overlap / min(lword.end - lword.start, rword.end - rword.start)
-                diagonal = scores[row - 1][col - 1]
-                candidate = (diagonal[0] + 1, diagonal[1] + similarity)
-                if candidate >= score:
-                    score = candidate
-                    matches[(row, col)] = True
+                exact = left_tokens[row - 1] == right_tokens[col - 1]
+                if exact or _same_spoken_word(lword, rword, left_tokens[row - 1], right_tokens[col - 1], overlap):
+                    diagonal = scores[row - 1][col - 1]
+                    candidate = (diagonal[0] + int(exact), diagonal[1] + 1, diagonal[2] + similarity)
+                    if candidate >= score:
+                        score = candidate
+                        matches[(row, col)] = True
             scores[row][col] = score
     pairs = {}
     row, col = len(left_overlap), len(right_overlap)
@@ -327,6 +631,50 @@ def _join_words(left: list[Word], right: list[Word], boundary: float) -> list[Wo
             row -= 1
         else:
             col -= 1
+    return pairs
+
+
+def _stitch_speakers(left: list[Word], right: list[Word], pairs: dict[int, int]) -> tuple[list[Word], dict[str, str]]:
+    """Carry speaker identity across a chunk cut using words both chunks heard.
+
+    Labels are local to each API call. A right-chunk label is renamed to the
+    left label only when every matched overlap word links the two labels one
+    to one; labels without such evidence stay scoped to their own chunk.
+    """
+    links: dict[str, set[str]] = {}
+    reverse: dict[str, set[str]] = {}
+    for left_index, right_index in pairs.items():
+        left_speaker, right_speaker = left[left_index].speaker_id, right[right_index].speaker_id
+        if left_speaker is None or right_speaker is None:
+            continue
+        links.setdefault(right_speaker, set()).add(left_speaker)
+        reverse.setdefault(left_speaker, set()).add(right_speaker)
+    mapping = {}
+    for right_speaker, left_speakers in links.items():
+        if len(left_speakers) == 1:
+            left_speaker = next(iter(left_speakers))
+            if reverse[left_speaker] == {right_speaker}:
+                mapping[right_speaker] = left_speaker
+    if not mapping:
+        return right, mapping
+    return [
+        word.model_copy(update={"speaker_id": mapping[word.speaker_id]}) if word.speaker_id in mapping else word
+        for word in right
+    ], mapping
+
+
+def _same_spoken_word(left: Word, right: Word, left_token: str, right_token: str, overlap: float) -> bool:
+    # MAI never lets two different words touch, so a substantial overlap
+    # between the two chunks' words means they transcribe the same speech.
+    if SequenceMatcher(None, left_token, right_token).ratio() >= 0.5:
+        return overlap >= 0.4 * min(left.end - left.start, right.end - right.start)
+    return overlap >= 0.6 * (max(left.end, right.end) - min(left.start, right.start))
+
+
+def _join_paired_words(left: list[Word], right: list[Word], pairs: dict[int, int], boundary: float) -> list[Word]:
+    """A matched pair always contributes one real provider record, even when
+    its two midpoints disagree about which chunk owns it; unmatched words are
+    owned by their own midpoint."""
     paired_right = set(pairs.values())
     joined = []
     for index, word in enumerate(left):

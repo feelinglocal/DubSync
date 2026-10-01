@@ -41,6 +41,13 @@ class CostMeter(BaseModel):
         usd = seconds / 3600.0 * dollars_per_hour
         self.items.append(CostItem(provider=provider, kind="audio", units={"seconds": seconds}, usd=round(usd, 6)))
 
+    def add_audio_uncertain(self, provider: str, seconds: float, dollars_per_hour: float) -> None:
+        """Estimate audio a provider may have billed for a failed or retried request."""
+        usd = seconds / 3600.0 * dollars_per_hour
+        self.items.append(CostItem(
+            provider=provider, kind="audio_uncertain_estimate", units={"seconds": seconds}, usd=round(usd, 6),
+        ))
+
     def add_tokens(
         self,
         provider: str,
