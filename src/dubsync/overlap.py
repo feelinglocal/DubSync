@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .models import Cue, QCFlag
+from .speaker_evidence import speakers_known_different
 from .subtitle_annotations import is_bracketed_screen_text_cue
 
 _POLICY_OVERLAP_FLAG_KINDS = frozenset({"overlap_stacked", "overlap_flag_only"})
@@ -110,12 +111,9 @@ def reconcile_overlap_flags(flags: list[QCFlag], final_cues: list[Cue], final_fl
 
 
 def _can_dash_merge(left: Cue, right: Cue) -> bool:
-    return (
-        left.end_ms > right.start_ms
-        and left.speaker_id is not None
-        and right.speaker_id is not None
-        and left.speaker_id != right.speaker_id
-    )
+    # Only provably different actors talk over each other; labels of unrelated
+    # scopes (two MAI chunks) may name the same one.
+    return left.end_ms > right.start_ms and speakers_known_different(left.speaker_id, right.speaker_id)
 
 
 def _overlap_start(left: Cue, right: Cue) -> float:

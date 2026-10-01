@@ -3,6 +3,7 @@ from __future__ import annotations
 from math import ceil
 
 from .models import Cue, QCFlag
+from .speaker_evidence import speakers_known_different
 from .srt_io import validate_cue_timings_for_export
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
@@ -567,7 +568,7 @@ def _separated_start_ms(previous: Cue, cue: Cue, profile: StyleProfile) -> int:
 
 
 def _known_different_speakers(left: Cue, right: Cue) -> bool:
-    if left.speaker_id and right.speaker_id and left.speaker_id != right.speaker_id:
+    if speakers_known_different(left.speaker_id, right.speaker_id):
         return True
     return bool(left.character and right.character and left.character != right.character)
 

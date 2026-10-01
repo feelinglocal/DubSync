@@ -61,6 +61,7 @@ from .providers import (
     CachedASRAdapter,
     adapter_from_config,
     apply_asr_language,
+    asr_language_code,
     apply_local_asr_config,
     apply_transcription_provider_config,
     repair_word_stream,
@@ -266,23 +267,29 @@ def sync_episode(
                 write_text_atomic(episode_workdir / "cost.json", cost_meter.to_json())
             raise
         asr_repair_flags = list(adapter.last_repair_flags)
+        asr_metadata: dict[str, object] = {
+            "provider": asr_provider,
+            "model": model_name,
+            "usage": adapter.last_usage,
+            "cache_hit": adapter.last_cache_hit,
+            "audio_provenance": {
+                "source_sha256": source_audio_sha256 or adapter.last_cache_key.audio_sha256,
+                "asr_input_sha256": adapter.last_cache_key.audio_sha256,
+                "normalized": audio_for_asr != audio_path,
+            },
+            "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
+        }
+        # Evidence that is not part of a word (Scribe logprob and audio events,
+        # MAI chunk languages and speaker links) stays with the transcript.
+        provider_evidence = getattr(adapter, "last_evidence", None)
+        if provider_evidence is not None:
+            asr_metadata["provider_evidence"] = provider_evidence
         _write_json(
             episode_workdir / "asr.json",
             {
                 "words": [word.model_dump() for word in words],
                 "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
-                "metadata": {
-                    "provider": asr_provider,
-                    "model": model_name,
-                    "usage": adapter.last_usage,
-                    "cache_hit": adapter.last_cache_hit,
-                    "audio_provenance": {
-                        "source_sha256": source_audio_sha256 or adapter.last_cache_key.audio_sha256,
-                        "asr_input_sha256": adapter.last_cache_key.audio_sha256,
-                        "normalized": audio_for_asr != audio_path,
-                    },
-                    "repair_flags": [flag.model_dump() for flag in asr_repair_flags],
-                },
+                "metadata": asr_metadata,
             },
         )
     long_audio_llm_flag = None if no_llm else _long_audio_llm_skip_flag(audio_for_asr, provider_config)
@@ -350,7 +357,12 @@ def sync_episode(
         alignment = _load_alignment_artifact(episode_workdir / "align.json")
         _validate_alignment_screen_text_provenance(alignment, cues)
     else:
-        alignment = align_cues_to_words(cues, words)
+        episode_language = _episode_language_code(provider_config, language)
+        # A known language decides which article-like words are numbers.
+        alignment = (
+            align_cues_to_words(cues, words, language=episode_language) if episode_language
+            else align_cues_to_words(cues, words)
+        )
         alignment = _alignment_with_adjudication_context(alignment, cues)
         alignment = _alignment_with_song_caption_guard(alignment, cues, words)
         _write_json(episode_workdir / "align.json", alignment.model_dump())
@@ -818,6 +830,19 @@ def sync_episode(
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     write_json_atomic(path, payload)
+
+
+def _episode_language_code(provider_config: dict[str, object], language: str | None) -> str | None:
+    """ISO-639-1 code of the episode language, when the job or the ASR config names one."""
+    asr_config = provider_config.get("asr", {}) if isinstance(provider_config, dict) else {}
+    configured: object = None
+    if isinstance(asr_config, dict):
+        codes = asr_config.get("language_codes")
+        configured = (
+            asr_config.get("language") or asr_config.get("language_code")
+            or (codes[0] if isinstance(codes, list) and len(codes) == 1 else None)
+        )
+    return asr_language_code(language) or asr_language_code(configured if isinstance(configured, str) else None)
 
 
 def _is_punctuation_only_span(span: DivergenceSpan) -> bool:

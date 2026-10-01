@@ -41,10 +41,10 @@ from .models import (
 from .subtitle_annotations import cue_has_bracketed_screen_text
 from .text_metrics import contains_character_level_script, join_word_texts, token_texts
 from .tokenize import (
-    NUMBER_ALIASES,
     SRTToken,
     normalize_token,
     normalized_words,
+    number_alias,
     percent_suffix_length,
     spoken_number_values,
     tokenize_cues,
@@ -124,14 +124,16 @@ class _DigitAliases:
         return alias is not None and alias == self.token_digits[token_index]
 
 
-def _digit_aliases(tokens: list[SRTToken], words: list[Word], words_norm: list[str]) -> _DigitAliases | None:
+def _digit_aliases(
+    tokens: list[SRTToken], words: list[Word], words_norm: list[str], language: str | None = None,
+) -> _DigitAliases | None:
     def written_digits(text: str, key: str) -> str | None:
         return key if key.isdigit() and any(character.isdigit() for character in text) else None
 
     aliases = _DigitAliases(
-        token_aliases=[NUMBER_ALIASES.get(token.normalized) for token in tokens],
+        token_aliases=[number_alias(token.normalized, language) for token in tokens],
         token_digits=[written_digits(token.text, token.normalized) for token in tokens],
-        word_aliases=[NUMBER_ALIASES.get(key) for key in words_norm],
+        word_aliases=[number_alias(key, language) for key in words_norm],
         word_digits=[written_digits(word.text, key) for word, key in zip(words, words_norm)],
     )
     if (
@@ -754,13 +756,19 @@ def _alignment_word_units(words: list[Word]) -> tuple[list[Word], list[int], fro
             word_indices.append(index)
     return units, word_indices, frozenset(atomic_word_indices)
 
-def align_cues_to_words(cues: list[Cue], words: list[Word]) -> AlignmentResult:
+def align_cues_to_words(cues: list[Cue], words: list[Word], *, language: str | None = None) -> AlignmentResult:
+    """Align source cue tokens to ASR words.
+
+    ``language`` (ISO-639-1, when the episode language is known) decides which
+    article-like words count as numbers: "um" is "1" in Portuguese, not in German.
+    """
     units, original_indices, atomic_word_indices = _alignment_word_units(words)
     result = _align_cues_to_units(
         cues,
         units,
         unit_word_indices=original_indices if atomic_word_indices else None,
         atomic_word_indices=atomic_word_indices,
+        language=language,
     )
 
     original_counts = Counter(original_indices)
@@ -834,6 +842,7 @@ def _compound_group_ops(
     *,
     unit_word_indices: list[int] | None = None,
     atomic_word_indices: frozenset[int] = frozenset(),
+    language: str | None = None,
 ) -> list[_Op]:
     """Pair concatenation-equal token and word groups inside divergence runs.
 
@@ -849,7 +858,7 @@ def _compound_group_ops(
     def flush() -> None:
         result.extend(_compound_run_ops(
             run, tokens, words, words_norm,
-            unit_word_indices=unit_word_indices, atomic_word_indices=atomic_word_indices,
+            unit_word_indices=unit_word_indices, atomic_word_indices=atomic_word_indices, language=language,
         ) if run else ())
         run.clear()
 
@@ -871,6 +880,7 @@ def _compound_run_ops(
     *,
     unit_word_indices: list[int] | None,
     atomic_word_indices: frozenset[int],
+    language: str | None = None,
 ) -> list[_Op]:
     source = [op.srt_index for op in run if op.srt_index is not None]
     audio = [op.asr_index for op in run if op.asr_index is not None]
@@ -924,7 +934,7 @@ def _compound_run_ops(
                     continue
                 if digit_count + spoken_count <= 2 and not percent:
                     continue
-                if int(digit_keys[0]) not in spoken_number_values(keys[: len(keys) - percent]):
+                if int(digit_keys[0]) not in spoken_number_values(keys[: len(keys) - percent], language):
                     continue
                 token_count, word_count = (
                     (spoken_count, digit_count) if swapped else (digit_count, spoken_count)
@@ -1119,6 +1129,7 @@ def _align_cues_to_units(
     *,
     unit_word_indices: list[int] | None = None,
     atomic_word_indices: frozenset[int] = frozenset(),
+    language: str | None = None,
 ) -> AlignmentResult:
     tokens = tokenize_cues(cues)
     words_norm = normalized_words(words)
@@ -1133,7 +1144,7 @@ def _align_cues_to_units(
             )
         )
     tokenized_cue_ids = {token.cue_id for token in tokens}
-    digit_aliases = _digit_aliases(tokens, words, words_norm)
+    digit_aliases = _digit_aliases(tokens, words, words_norm, language)
 
     preliminary_run = _align_tokens_detailed(tokens, words_norm, digit_aliases=digit_aliases)
     ops = preliminary_run.ops
@@ -1181,6 +1192,7 @@ def _align_cues_to_units(
             words_norm,
             unit_word_indices=unit_word_indices,
             atomic_word_indices=atomic_word_indices,
+            language=language,
         )
         ops = _absorb_touching_repeats(ops, words, words_norm)
     song_cue_ids = {cue.index for cue in cues if _is_song_lyric_cue(cue)}
