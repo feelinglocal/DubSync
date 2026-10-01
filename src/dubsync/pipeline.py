@@ -60,7 +60,7 @@ from .providers import (
 from .profanity import apply_german_profanity_censorship, censor_german_profanity_flags
 from .punctuation import apply_punctuation_pass
 from .recue import preserve_source_timings, rebuild_cues, shared_word_cue_ids, shared_word_timing_flags
-from .reports import write_changes_diff, write_qc_report
+from .reports import write_change_log, write_qc_report
 from .srt_io import parse_srt_text, write_srt
 from .silence import silence_flags_for_cues
 from .source_quality import detect_source_errors
@@ -1820,6 +1820,7 @@ def _run_verify_stage(
                 source_cue_count=_spoken_source_cue_count(source_cues),
             ),
         },
+        source_cues=source_cues,
     )
     _write_json(
         episode_workdir / "verify.json",
@@ -1831,7 +1832,7 @@ def _run_verify_stage(
             "style_issues": report["style_issues"],
         },
     )
-    write_changes_diff(episode_workdir / "changes.diff.srt", flags)
+    write_change_log(episode_workdir / "changes.diff.srt", report["changes"])
     _write_json(episode_workdir / "cost.json", cost_meter.as_dict())
 
     return PipelineResult(output_path, episode_workdir, cost_meter, report)

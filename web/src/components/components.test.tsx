@@ -251,10 +251,49 @@ describe('shared components', () => {
     expect(screen.getByText('No automated QC warnings or errors · 2 informational notes.')).toBeVisible()
   })
 
+  it('tiers the QC verdict from review items instead of raw flag counts', () => {
+    const rawCounts = { flags: 854, style_violations: 176, error_count: 117, warning_count: 911, info_count: 2 }
+    const completed = job({ status: 'complete', result: {
+      cue_count: 975, cost_usd: 0,
+      qc_summary: { ...rawCounts, verdict: 'clean', review_item_count: 0, review_error_count: 0,
+        review_warning_count: 0, review_cue_count: 0, change_count: 280, text_change_count: 275 },
+    }, downloads: ['srt', 'qc-html', 'changes'] })
+    const { container, rerender } = render(<JobPanel job={completed} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('975 cues ready')).toBeVisible()
+    expect(screen.getByText('Nothing needs review · 280 changes logged.')).toBeVisible()
+    expect(container.querySelector('.status-icon')).not.toHaveClass('is-error')
+    expect(screen.queryByText(/117 QC errors/)).toBeNull()
+
+    rerender(<JobPanel job={{ ...completed, result: { cue_count: 975, cost_usd: 0, qc_summary: {
+      ...rawCounts, verdict: 'check', review_item_count: 3, review_error_count: 0, review_warning_count: 3,
+      review_cue_count: 5, change_count: 280,
+    } } }} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('975 cues processed · 3 items to check')).toBeVisible()
+    expect(screen.getByText('3 items to check (5 cues) · 280 changes logged. See the QC report.')).toBeVisible()
+    expect(container.querySelector('.status-icon')).toHaveClass('is-warning')
+
+    rerender(<JobPanel job={{ ...completed, result: { cue_count: 975, cost_usd: 0, qc_summary: {
+      ...rawCounts, verdict: 'attention', review_item_count: 40, review_error_count: 5, review_warning_count: 35,
+      review_cue_count: 47, change_count: 280,
+    } } }} onDownload={vi.fn()} downloading={null} />)
+    expect(screen.getByText('975 cues processed · attention needed')).toBeVisible()
+    expect(screen.getByText('5 items need fixing · 35 to check · 280 changes logged. Review before delivery.')).toBeVisible()
+    expect(container.querySelector('.status-icon')).toHaveClass('is-error')
+  })
+
+  it('offers the change log download when the job has one', async () => {
+    const onDownload = vi.fn()
+    render(<JobPanel job={job({ status: 'complete', result: { cue_count: 2, cost_usd: 0 },
+      downloads: ['srt', 'qc-json', 'qc-html', 'changes'] })} onDownload={onDownload} downloading={null} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Changes' }))
+    expect(onDownload).toHaveBeenCalledWith('changes')
+  })
+
   it('shows unavailable or legacy QC summaries without claiming an automated clean result', () => {
     const completed = job({ status: 'complete', result: { cue_count: 1, cost_usd: 0 }, downloads: ['srt', 'qc-html'] })
-    const { rerender } = render(<JobPanel job={completed} onDownload={vi.fn()} downloading={null} />)
+    const { container, rerender } = render(<JobPanel job={completed} onDownload={vi.fn()} downloading={null} />)
     expect(screen.getByText('QC summary unavailable. Review the QC report.')).toBeVisible()
+    expect(container.querySelector('.status-icon')).toHaveClass('is-neutral')
     rerender(<JobPanel job={{ ...completed, result: {
       cue_count: 1, cost_usd: 0, qc_summary: { flags: 2, style_violations: 1 },
     } }} onDownload={vi.fn()} downloading={null} />)

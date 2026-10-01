@@ -41,6 +41,25 @@ def test_score_cues_marks_unknown_asr_confidence_as_unscored():
     assert scores[0].source == "unscored"
 
 
+def test_score_cues_treats_a_constant_asr_confidence_as_no_evidence():
+    # Scribe words arrive with the adapter default 1.0 everywhere; a value
+    # that never varies cannot rank one cue above another.
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=1500, lines=["hello there"]),
+        Cue(index=2, start_ms=2000, end_ms=2500, lines=["quiet"]),
+    ]
+    words = [
+        Word(text="hello", start=1.0, end=1.2, confidence=1.0),
+        Word(text="there", start=1.2, end=1.5, confidence=1.0),
+        Word(text="quiet", start=2.0, end=2.3, confidence=1.0),
+    ]
+    alignment = AlignmentResult(cue_word_indices={1: [0, 1], 2: [2]})
+
+    scores = score_cues(cues, words, alignment)
+
+    assert [score.source for score in scores] == ["unscored", "unscored"]
+
+
 def test_cps_sanity_flags_fire_for_fast_and_slow_cues():
     borderline = Cue(index=1, start_ms=0, end_ms=1000, lines=["x" * 30])
     impossible = Cue(index=2, start_ms=2000, end_ms=2500, lines=["x" * 40])

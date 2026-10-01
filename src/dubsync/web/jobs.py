@@ -843,7 +843,8 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
         output_srt=result.output_srt,
         qc_json=result.episode_workdir / "qc_report.json",
         qc_html=result.episode_workdir / "qc_report.html",
-        changes_srt=changes if changes.exists() else None,
+        # The change log is empty when the delivery keeps every scripted line.
+        changes_srt=changes if changes.exists() and changes.stat().st_size > 0 else None,
         cost_usd=result.cost_meter.total_usd,
         cue_count=cue_count,
     )

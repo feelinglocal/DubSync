@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from dubsync.models import Cue, QCFlag, StyleIssue
-from dubsync.reports import write_changes_diff, write_qc_report
-from dubsync.srt_io import parse_srt_text
+from dubsync.models import Cue, CueScore, QCFlag, StyleIssue
+from dubsync.reports import write_change_log, write_changes_diff, write_qc_report
+from dubsync.srt_io import parse_srt_text, write_srt
 
 
 def test_qc_report_groups_counts_and_sorts_by_severity(tmp_path):
@@ -64,6 +64,151 @@ def test_qc_report_sorts_same_severity_flags_by_start_then_cue_id(tmp_path):
         "early_warning",
         "late_warning",
     ]
+
+
+def test_qc_report_keeps_raw_findings_and_adds_customer_sections(tmp_path):
+    source = [
+        Cue(index=33, start_ms=10_000, end_ms=11_000, lines=["Primeiro."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo."]),
+    ]
+    delivered = [
+        source[0],
+        Cue(index=940, start_ms=11_200, end_ms=11_600, lines=["Ei."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo!"]),
+    ]
+    flags = [
+        QCFlag(kind="timing_evidence_held", cue_ids=[34], severity="error", message="Sparse timing.",
+               start=12.0, end=13.0),
+        QCFlag(kind="adlib_inserted", cue_ids=[940], message="Adjudication verdict use_audio: [hybrid:primary] Ei.",
+               new_text="Ei.", start=11.2, end=11.6),
+        QCFlag(kind="text_changed", cue_ids=[34], message="Adjudication verdict use_audio: [hybrid:fallback] Shout.",
+               old_text="Segundo.", new_text="Segundo!", start=12.0, end=12.5),
+        QCFlag(kind="asr_word_clamped", message="ASR word endpoint clamped."),
+    ]
+
+    payload = write_qc_report(
+        tmp_path / "qc.json", tmp_path / "qc.html", delivered, flags, [],
+        summary_metadata={"fps_detection_confident": False}, source_cues=source,
+    )
+
+    stored = json.loads((tmp_path / "qc.json").read_text(encoding="utf-8"))
+    assert stored == payload
+    assert len(payload["flags"]) == 4
+    assert [item["kind"] for item in payload["review"]] == ["timing_evidence_held"]
+    # Delivered numbering: internal cue 34 is SRT #3 because the ad-lib was inserted before it.
+    delivered_srt = parse_srt_text(write_srt(delivered, renumber=True))
+    review_item = payload["review"][0]
+    assert review_item["srt_numbers"] == [3]
+    assert review_item["cue_ids"] == [34]
+    assert delivered_srt[2].plain_text == review_item["text"] == "Segundo!"
+    assert [(change["srt_number"], change["change"]) for change in payload["changes"]] == [(2, "added"), (3, "edited")]
+    assert [item["kind"] for item in payload["diagnostics"]] == ["asr_word_clamped"]
+    summary = payload["summary"]
+    assert summary["verdict"] == "attention"
+    assert (summary["review_item_count"], summary["review_error_count"], summary["change_count"]) == (1, 1, 2)
+    assert summary["error_count"] == 1 and summary["flags"] == 4
+    covered = {index for section in ("review", "changes", "notes", "diagnostics")
+               for item in payload[section] for index in item["raw_flags"]}
+    assert covered == {0, 1, 2, 3}
+
+
+def _customer_report(tmp_path):
+    source = [
+        Cue(index=33, start_ms=10_000, end_ms=11_000, lines=["Primeiro."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo."]),
+        Cue(index=35, start_ms=20_000, end_ms=21_000, lines=["Terceiro."]),
+        Cue(index=36, start_ms=30_000, end_ms=31_000, lines=["Quarto."]),
+    ]
+    delivered = [
+        Cue(index=33, start_ms=10_000, end_ms=11_500, lines=["Primeiro."]),
+        Cue(index=940, start_ms=11_600, end_ms=11_900, lines=["Ei."]),
+        Cue(index=34, start_ms=12_000, end_ms=13_000, lines=["Segundo!"]),
+        Cue(index=36, start_ms=30_000, end_ms=31_000, lines=["Quarto."]),
+    ]
+    flags = [
+        QCFlag(kind="timing_evidence_held", cue_ids=[36], severity="error", message="Sparse timing.",
+               start=30.0, end=31.0),
+        QCFlag(kind="text_changed", cue_ids=[34], confidence=0.9,
+               message="Adjudication verdict use_audio: [hybrid:fallback] The actor shouts.",
+               old_text="Segundo.", new_text="Segundo!", start=12.0, end=12.5),
+        QCFlag(kind="adlib_inserted", cue_ids=[940],
+               message="Adjudication verdict use_audio: [hybrid:primary] The actor says Ei.",
+               new_text="Ei.", start=11.6, end=11.9),
+        QCFlag(kind="dropped_adjudicated_cue", cue_ids=[35], message="removed by drop_policy.",
+               old_text="Terceiro.", new_text="", start=20.0, end=21.0),
+        QCFlag(kind="timing_refined", cue_ids=[33], message="Cue boundary adjusted.",
+               old_text="10.000 --> 11.000", new_text="10.000 --> 11.500", start=10.0, end=11.5),
+        QCFlag(kind="fps_detection_low_confidence", message="Defaulting to 30 fps."),
+        QCFlag(kind="asr_word_clamped", message="ASR word endpoint clamped."),
+    ]
+    payload = write_qc_report(
+        tmp_path / "qc.json", tmp_path / "qc.html", delivered, flags, [],
+        summary_metadata={"fps_detection_confident": False}, source_cues=source,
+    )
+    return payload, (tmp_path / "qc.html").read_text(encoding="utf-8")
+
+
+def test_qc_html_lists_review_then_changes_then_notes_with_diagnostics_collapsed(tmp_path):
+    _, page = _customer_report(tmp_path)
+
+    review_at = page.index("Needs review")
+    changes_at = page.index("Changes")
+    notes_at = page.index("Notes")
+    diagnostics_at = page.index("Diagnostics")
+    assert review_at < changes_at < notes_at < diagnostics_at
+    assert page.rindex("<details", 0, diagnostics_at) > notes_at
+    assert "#4" in page[review_at:changes_at] and "00:00:30,000" in page[review_at:changes_at]
+    assert "Segundo." in page[changes_at:notes_at] and "Segundo!" in page[changes_at:notes_at]
+    assert "The actor shouts." in page
+    assert "[hybrid:" not in page
+    assert "<pre>" not in page
+    assert 'name="viewport"' in page
+
+
+def test_change_log_lists_only_text_changes_in_playback_order_with_delivered_numbers(tmp_path):
+    payload, _ = _customer_report(tmp_path)
+    destination = tmp_path / "changes.diff.srt"
+
+    write_change_log(destination, payload["changes"])
+
+    blocks = parse_srt_text(destination.read_text(encoding="utf-8"))
+    assert [block.start_ms for block in blocks] == sorted(block.start_ms for block in blocks)
+    assert [block.lines[0] for block in blocks] == [
+        "# SRT #2 added (cue 940)",
+        "# SRT #3 edited (cue 34)",
+        "# removed after SRT #3 (cue 35)",
+    ]
+    added, edited, removed = blocks
+    assert (added.start_ms, added.end_ms) == (11_600, 11_900)
+    assert "+ Ei." in added.lines
+    assert edited.lines[1:] == ["# The actor shouts.", "- Segundo.", "+ Segundo!"]
+    assert (removed.start_ms, removed.end_ms) == (20_000, 21_000)
+    assert "- Terceiro." in removed.lines
+    assert all("timing" not in block.text.lower() for block in blocks)
+    assert "[hybrid:" not in destination.read_text(encoding="utf-8")
+
+
+def test_qc_report_shows_cue_scores_only_with_real_evidence(tmp_path):
+    cues = [
+        Cue(index=1, start_ms=0, end_ms=1_000, lines=["Olá."]),
+        Cue(index=2, start_ms=2_000, end_ms=3_000, lines=["Tchau."]),
+    ]
+    unscored = [CueScore(cue_id=cue.index, start=cue.start_ms / 1000, end=cue.end_ms / 1000, cps=4.0,
+                         score=0.0, source="unscored") for cue in cues]
+
+    payload = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", cues, [], [], unscored)
+
+    assert [score["score"] for score in payload["cue_scores"]] == [None, None]
+    page = (tmp_path / "qc.html").read_text(encoding="utf-8")
+    assert "<th>Score</th>" not in page
+    assert "0.0" not in page
+
+    scored = [unscored[0].model_copy(update={"score": 0.82, "source": "forced_alignment"}), unscored[1]]
+    payload = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", cues, [], [], scored)
+
+    assert [score["score"] for score in payload["cue_scores"]] == [0.82, None]
+    page = (tmp_path / "qc.html").read_text(encoding="utf-8")
+    assert "<th>Score</th>" in page and "0.82" in page
 
 
 @pytest.mark.parametrize("start,end", [(None, None), (2.0, 2.0), (1491.8, 1490.666)])

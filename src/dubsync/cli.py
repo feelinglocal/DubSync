@@ -173,6 +173,7 @@ def report(
         flags = [QCFlag.model_validate(flag) for flag in raw_flags] if isinstance(raw_flags, list) else []
         style_violations = int(payload.get("summary", {}).get("style_violations", 0)) if isinstance(payload.get("summary"), dict) else 0
         source_cues = _load_report_source_cues(report_path.parent / "ingest.json")
+        review_items, change_items = payload.get("review"), payload.get("changes")
         payload["evaluation"] = evaluate_against_golden(
             predicted_cues,
             golden_cues,
@@ -180,6 +181,9 @@ def report(
             flags=flags,
             style_violations=style_violations,
             source=source_cues,
+            # Delivered SRT numbering; older reports fall back to the raw flags.
+            review_items=review_items if isinstance(review_items, list) else None,
+            change_items=change_items if isinstance(change_items, list) else None,
         )
     console.print(json.dumps(payload, indent=2, ensure_ascii=False))
 

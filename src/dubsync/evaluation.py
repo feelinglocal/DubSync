@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
 
 from .models import Cue, QCFlag
+from .qc_review import build_review, review_cue_ids
 from .tokenize import alphanumeric_signature
 
 
@@ -28,7 +30,17 @@ def evaluate_against_golden(
     flags: list[QCFlag] | None = None,
     style_violations: int = 0,
     source: list[Cue] | None = None,
+    *,
+    review_items: Sequence[Mapping[str, object]] | None = None,
+    change_items: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
+    """Compare predicted cues with a golden SRT.
+
+    ``review_items``/``change_items`` are the ``review``/``changes`` lists of a
+    QC report; they carry delivered SRT numbers, which match the cue numbers of
+    a parsed delivered SRT. Without them the review list is rebuilt from
+    ``flags``, whose cue ids must then use the numbering of ``predicted``.
+    """
     predicted_signatures = [_text_signature(cue) for cue in predicted]
     golden_signatures = [_text_signature(cue) for cue in golden]
     cue_alignment = _match_cues_by_content(
@@ -54,7 +66,7 @@ def evaluate_against_golden(
     end_mae_ms = round(sum(end_deltas) / matched_count, 3) if matched_count else None
     ends_within_1 = _ratio(sum(1 for delta in end_deltas if delta <= frame_ms), matched_count)
     ends_within_3 = _ratio(sum(1 for delta in end_deltas if delta <= frame_ms * 3), matched_count)
-    review_burden = _review_burden_ratio(predicted, flags or [])
+    review_burden = _review_burden_ratio(predicted, flags or [], review_items=review_items)
     improv_metrics = _improv_detection_metrics(
         predicted,
         golden,
@@ -62,6 +74,7 @@ def evaluate_against_golden(
         cue_alignment,
         golden_signatures,
         source=source,
+        change_items=change_items,
     )
 
     return {
@@ -406,12 +419,36 @@ def _signature_similarity(predicted_signature: tuple[str, ...], golden_signature
     return fuzz.ratio(" ".join(predicted_signature), " ".join(golden_signature)) / 100.0
 
 
-def _review_burden_ratio(cues: list[Cue], flags: list[QCFlag]) -> float:
+def _review_burden_ratio(
+    cues: list[Cue],
+    flags: list[QCFlag],
+    *,
+    review_items: Sequence[Mapping[str, object]] | None = None,
+) -> float:
+    """Share of cues a human must look at: review items, not every raw flag.
+
+    Logged changes, notes (song captions kept), diagnostics and duplicate
+    reports of one root cause do not add review burden.
+    """
+
     if not cues:
         return 0.0
     existing_cue_ids = {cue.index for cue in cues}
-    flagged_cues = {cue_id for flag in flags for cue_id in flag.cue_ids if cue_id in existing_cue_ids}
-    return len(flagged_cues) / len(cues)
+    if review_items is not None:
+        review_cues = {
+            number
+            for item in review_items
+            for number in _int_list(item.get("srt_numbers"))
+        }
+    else:
+        review_cues = review_cue_ids(build_review(flags, [], cues))
+    return len(review_cues & existing_cue_ids) / len(cues)
+
+
+def _int_list(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int) and not isinstance(item, bool)]
 
 
 def _improv_detection_metrics(
@@ -421,16 +458,27 @@ def _improv_detection_metrics(
     cue_alignment: list[_CueMatch],
     golden_signatures: list[tuple[str, ...]],
     source: list[Cue] | None = None,
+    change_items: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     by_predicted = {cue.index: cue for cue in predicted}
     aligned_by_predicted_id = {match.predicted.index: match for match in cue_alignment}
-    flagged_change_ids = {
-        cue_id
-        for flag in flags
-        if flag.kind in TEXT_CHANGE_FLAG_KINDS
-        for cue_id in flag.cue_ids
-        if cue_id in by_predicted
-    }
+    if change_items is not None:
+        # Report change entries name the delivered SRT number of each changed cue.
+        flagged_change_ids = {
+            number
+            for item in change_items
+            if item.get("change") in ("edited", "added")
+            and isinstance(number := item.get("srt_number"), int)
+            and number in by_predicted
+        }
+    else:
+        flagged_change_ids = {
+            cue_id
+            for flag in flags
+            if flag.kind in TEXT_CHANGE_FLAG_KINDS
+            for cue_id in flag.cue_ids
+            if cue_id in by_predicted
+        }
     if source:
         source_signatures = [_text_signature(cue) for cue in source]
         source_alignment = _match_cues_by_content(

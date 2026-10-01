@@ -221,7 +221,9 @@ def test_evaluation_cannot_pass_timing_with_missing_dialogue():
 
 def test_evaluation_review_burden_counts_only_current_cue_ids():
     cues = [Cue(index=1, start_ms=0, end_ms=500, lines=["Hello."])]
-    flags = [QCFlag(kind="text_changed", cue_ids=[1, 2, 3], message="Old merged cue IDs.")]
+    # A review item (not a logged change) that still names merged-away cue ids.
+    flags = [QCFlag(kind="adjudication_span_edit_held", cue_ids=[1, 2, 3], message="Old merged cue IDs.",
+                    severity="error")]
 
     metrics = evaluate_against_golden(cues, cues, fps=30, flags=flags)
 
