@@ -335,6 +335,25 @@ _TIMING_RECOVERY_KINDS = frozenset({"missing_dialogue_audio_reconciled", "collap
 # these flags name delivered display cues only.
 _DISPLAY_CHANGE_KINDS = frozenset({"annotation_line_limit_pagination", "annotation_line_limit_reflow"})
 _LAYOUT_CHANGE_KINDS = frozenset({"output_line_limit_reflow", *_DISPLAY_CHANGE_KINDS})
+
+
+def is_layout_only_change(item: Mapping[str, object]) -> bool:
+    """Whether a report ``changes`` entry re-breaks or pages a cue and keeps its wording.
+
+    Screen-caption pages and reflows are display composition. A speech reflow
+    entry is layout only while its old and new text differ in white space alone.
+    """
+
+    kind = item.get("kind")
+    if kind in _DISPLAY_CHANGE_KINDS:
+        return True
+    old_text, new_text = item.get("old_text"), item.get("new_text")
+    return (
+        kind in _LAYOUT_CHANGE_KINDS and isinstance(old_text, str) and isinstance(new_text, str)
+        and "".join(old_text.split()) == "".join(new_text.split())
+    )
+
+
 _MOVE_THRESHOLD_KINDS = frozenset({"timing_refined", "forced_alignment_refined"})
 # Diagnostic buckets that do not correspond to one raw kind.
 _DIAGNOSTIC_TITLES = {

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from rapidfuzz import fuzz
 
 from .models import Cue, QCFlag
-from .qc_review import build_review, review_cue_ids
+from .qc_review import build_review, is_layout_only_change, review_cue_ids
 from .tokenize import alphanumeric_signature
 
 
@@ -464,10 +464,12 @@ def _improv_detection_metrics(
     aligned_by_predicted_id = {match.predicted.index: match for match in cue_alignment}
     if change_items is not None:
         # Report change entries name the delivered SRT number of each changed cue.
+        # A reflow or caption page keeps the wording; it is not a flagged improvisation.
         flagged_change_ids = {
             number
             for item in change_items
             if item.get("change") in ("edited", "added")
+            and not is_layout_only_change(item)
             and isinstance(number := item.get("srt_number"), int)
             and number in by_predicted
         }
