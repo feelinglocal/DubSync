@@ -184,7 +184,8 @@ def test_clear_native_wording_cannot_create_or_borrow_acoustic_ownership(fault):
 @pytest.mark.parametrize("source,heard", [("Wait here Tao", "Wait here Tao"), ("Tao closer", "Tao closer"),
                                            ("Tao", "Please Tao")])
 def test_neighbor_echo_check_preserves_source_backed_repetition_and_unrelated_improvisation(source, heard):
-    case = _case(target=source)
+    # Long enough to voice three words (a 0.3 s burst is too short for 11 letters).
+    case = _case(target=source, bursts=((1.45, 1.95),))
     questions = _questions(case)
     result = _reconcile(case, questions, [_decision(questions[0], heard)])
     assert result.resolved_cue_ids == {2}
@@ -286,6 +287,106 @@ def test_neighbor_chain_ownership_does_not_count_silence_between_its_bursts():
     result = _reconcile(case, questions, [_decision(questions[0])])
     assert result.resolved_cue_ids == set()
     assert result.cues == case[0]
+
+
+def _wide_gap_case(*, left_end, bursts, right_start=3.2):
+    """A wider anchored gap: the right anchor word starts at 3.2 s."""
+    cues, words, alignment, regions = _case(bursts=bursts)
+    words[2] = words[2].model_copy(update={"start": 3.2, "end": 3.5})
+    regions[0] = SpeechRegion(start=1, end=left_end)
+    regions[-1] = SpeechRegion(start=right_start, end=3.5)
+    return cues, words, alignment, regions
+
+
+@pytest.mark.parametrize("left_end,bursts,right_start", [
+    (2.5, ((2.8, 2.83),), 3.2),  # neighbour activity runs 1.2 s past its word, then a separate blip
+    (1.35, ((1.5, 1.9), (2.3, 2.5)), 3.2),  # a 50 ms crossing joins a whole gap burst to the neighbour
+    (1.3, ((1.6, 1.9),), 2.6),  # 0.6 s right pre-roll
+    (1.3, ((1.6, 1.9), (3.0, 3.05)), 3.15),  # within the allowance, but a whole gap burst joins the right chain
+])
+def test_anchor_chain_beyond_the_neighbor_boundary_allowance_keeps_the_cue_held(left_end, bursts, right_start):
+    case = _wide_gap_case(left_end=left_end, bursts=bursts, right_start=right_start)
+    questions = _questions(case)
+    assert questions
+    result = _reconcile(case, questions, [_decision(questions[0], "Tao,", verdict="keep_srt")])
+    assert result.outcomes[0]["outcome"] == "speech_burst_crosses_anchor"
+    assert result.cues == case[0] and result.resolved_cue_ids == set()
+    assert result.alignment == case[2]
+
+
+def test_anchor_chain_within_the_neighbor_boundary_allowance_still_bounds_a_separate_utterance():
+    case = _wide_gap_case(left_end=1.6, bursts=((1.9, 2.4),))
+    questions = _questions(case)
+    result = _reconcile(case, questions, [_decision(questions[0], "Tao,", verdict="keep_srt")])
+    assert result.outcomes[0]["outcome"] == "audio_confirmed_utterance"
+    assert result.spoken_spans == {2: (1900, 2400)}
+
+
+def _captured_laugh_tail_case(final_pulse):
+    """Captured 1B cue-11 geometry: the left region runs 0.345 s past its ASR anchor."""
+    cues, words, alignment, _ = _case(bursts=(), target="ははは")
+    cues = [cues[0].with_timing(40000, 41800), cues[1].with_timing(42800, 43130),
+            cues[2].with_timing(43500, 44200)]
+    words = [word.model_copy(update={"start": start, "end": end}) for word, (start, end) in zip(
+        words, ((41.36, 41.6), (41.61, 41.84), (42.905, 43.7)),
+    )]
+    parent = alignment.divergence_spans[0].model_copy(update={
+        "start": 41.84, "end": 42.905, "left_anchor_end": 41.84, "right_anchor_start": 42.905,
+    })
+    alignment = alignment.model_copy(update={"divergence_spans": [parent]})
+    regions = [SpeechRegion(start=39.565, end=42.185), SpeechRegion(start=final_pulse[0], end=final_pulse[1]),
+               SpeechRegion(start=42.905, end=43.7)]
+    return cues, words, alignment, regions
+
+
+@pytest.mark.parametrize("final_pulse", [(42.265, 42.465), (42.385, 42.585), (42.4, 42.6)])
+def test_laugh_is_not_timed_on_its_last_pulse_after_an_overrunning_neighbor_region(final_pulse):
+    case = _captured_laugh_tail_case(final_pulse)
+    questions = _questions(case, audio_duration_seconds=45)
+    result = _reconcile(case, questions, [_decision(questions[0], "ははは", verdict="keep_srt")])
+    assert result.outcomes[0]["outcome"] == "speech_burst_crosses_anchor"
+    assert result.cues == case[0] and result.resolved_cue_ids == set()
+
+
+@pytest.mark.parametrize("burst,side,crossing", [
+    ((1.45, 1.74), "right", (1.96, 2.4)),  # 150 ms after the left region; 140 ms right pre-roll
+    ((1.45, 1.74), "right", (2.09, 2.4)),  # 10 ms right pre-roll
+    ((1.7, 1.95), "left", (1, 1.4)),  # 150 ms before the right region; 100 ms left post-roll
+])
+def test_burst_beside_one_anchor_does_not_depend_on_the_other_anchor_crossing(burst, side, crossing):
+    results = []
+    for crossed in (False, True):
+        case = _case(bursts=(burst,))
+        if crossed:
+            case[3][0 if side == "left" else -1] = SpeechRegion(start=crossing[0], end=crossing[1])
+        questions = _questions(case)
+        result = _reconcile(case, questions, [_decision(questions[0], "Tao,", verdict="keep_srt")])
+        results.append((result.outcomes[0]["outcome"], result.spoken_spans,
+                        next(cue for cue in result.cues if cue.index == 2)))
+    assert results[0] == results[1]
+    assert results[0][0] == "audio_confirmed_utterance"
+    assert results[0][1] == {2: (round(burst[0] * 1000), round(burst[1] * 1000))}
+
+
+@pytest.mark.parametrize("burst", [(1.8, 1.83), (1.8, 1.84), (1.8, 1.88), (1.7, 1.85)])
+@pytest.mark.parametrize("verdict", ["keep_srt", "use_audio"])
+def test_short_burst_cannot_carry_a_multi_word_line(burst, verdict):
+    line = "Tao, please hurry along right now today."
+    case = _case(bursts=(burst,), target=line if verdict == "keep_srt" else "Tao,")
+    questions = _questions(case)
+    result = _reconcile(case, questions, [_decision(questions[0], line, verdict=verdict)])
+    assert result.outcomes[0]["outcome"] == "speech_burst_too_short"
+    assert result.cues == case[0] and result.resolved_cue_ids == set()
+    assert result.alignment == case[2]
+
+
+def test_multi_word_line_on_a_plausible_burst_is_still_recovered():
+    case = _case(bursts=((1.45, 1.9),))
+    questions = _questions(case)
+    result = _reconcile(case, questions, [_decision(questions[0], "Tao, hurry up")])
+    assert result.outcomes[0]["outcome"] == "audio_confirmed_utterance"
+    assert next(cue for cue in result.cues if cue.index == 2).plain_text == "Tao, hurry up"
+    assert result.spoken_spans == {2: (1450, 1900)}
 
 
 @pytest.mark.parametrize("fault", ["missing_region_coverage", "no_anchor", "shared_anchor", "ambiguous_anchor",
@@ -577,6 +678,31 @@ def test_pipeline_uncertain_missing_dialogue_retains_source_and_review(tmp_path,
     assert target["lines"] == case[0][1].lines
     assert payload["alignment"]["diagnostics"]["missing_audio_cue_ids"] == [2]
     assert not any(flag["kind"] == "missing_dialogue_audio_reconciled" for flag in result.report["flags"])
+
+
+@pytest.mark.parametrize("mode", ["fresh", "rebuild"])
+def test_pipeline_does_not_time_a_heard_cue_on_a_breath_beyond_overrunning_neighbor_activity(
+    tmp_path, monkeypatch, mode,
+):
+    # The cue is spoken straight after "here", so the neighbour's region runs
+    # 0.35 s past its word; a separate breath is the only other gap activity.
+    case = _case(bursts=((1.87, 1.89),))
+    case[3][0] = SpeechRegion(start=1, end=1.65)
+    _, adapter, run = _pipeline_case(tmp_path, monkeypatch, case_override=case, heard="Tao,")
+    result = run()
+    if mode != "fresh":
+        adapter.seen.clear()
+        result = run(resume=mode)
+        assert adapter.seen == []
+    payload = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    target = next(cue for cue in payload["cues"] if cue["index"] == 2)
+    assert (target["start_ms"], target["end_ms"], target["lines"]) == (2000, 2300, ["Tao,"])
+    assert payload["alignment"]["diagnostics"]["missing_audio_cue_ids"] == [2]
+    proof = json.loads((result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
+    assert proof["outcomes"][0]["outcome"] == "speech_burst_crosses_anchor"
+    assert not any(flag["kind"] == "missing_dialogue_audio_reconciled" for flag in result.report["flags"])
+    assert any(flag["kind"] == "missing_audio_source_cue_held" and 2 in flag["cue_ids"]
+               for flag in result.report["flags"])
 
 
 @pytest.mark.parametrize("mode", ["fresh", "rebuild", "verify"])

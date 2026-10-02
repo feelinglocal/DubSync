@@ -14,7 +14,8 @@ from math import ceil, floor, isfinite
 
 from .adjudication_regions import is_song_caption_cue
 from .adjudication_case_cache import flag_applies_to_case
-from .asr_timing import MIN_OWNED_OVERLAP_SECONDS, has_sufficient_speech_overlap
+from .asr_timing import (MIN_OWNED_OVERLAP_SECONDS, MIN_SECONDS_PER_LETTER, MIN_WHOLE_WORD_SECONDS,
+                         has_sufficient_speech_overlap)
 from .models import AdjudicationDecision, AlignmentResult, Cue, CueContext, DivergenceSpan, QCFlag, SpeechRegion, Word
 from .recue import _BOUNDARY_SENTENCE_PUNCTUATION
 from .style_profile import StyleProfile
@@ -334,21 +335,30 @@ def _contains(sequence, part):
 
 
 def _independent_gap_activity(question, words, regions, bursts):
-    """Exclude whole anchor-owned chains when their edges cross a word anchor.
+    """Exclude a whole anchor-owned chain only when its spill past the word anchor is bounded.
 
     An ASR edge can sit inside its own speech burst. That neighbour activity
     must not prevent a separate, clearly heard utterance from using its own
     chain. Join activity before testing ownership, so no piece of a connected
-    utterance can be discarded or timed independently.
+    utterance can be discarded or timed independently. A chain reaching past
+    the neighbour-boundary allowance, or holding a region wholly inside the
+    gap, may carry the target itself; it stays as crossing activity.
     """
     start, end = question.span.left_anchor_end, question.span.right_anchor_start
-    if not any(region.start < start - _EPSILON or region.end > end + _EPSILON for region in bursts):
+    left_crosses = any(region.start < start - _EPSILON for region in bursts)
+    right_crosses = any(region.end > end + _EPSILON for region in bursts)
+    if not left_crosses and not right_crosses:
         return bursts
     if any(not isfinite(region.start) or not isfinite(region.end) or region.start >= region.end for region in regions):
         return bursts
     chains = []
     members = []
     for region in sorted(regions, key=lambda item: (item.start, item.end)):
+        # A neighbour whose activity stops at its word anchor is separate from
+        # the gap; the other anchor's crossing must not join gap activity to it.
+        if (not left_crosses and region.end <= start + _EPSILON
+                or not right_crosses and region.start >= end - _EPSILON):
+            continue
         if chains and region.start - chains[-1].end < _MAX_SPEECH_CHAIN_GAP_SECONDS - _EPSILON:
             chains[-1] = SpeechRegion(start=chains[-1].start, end=max(chains[-1].end, region.end))
             members[-1].append(region)
@@ -371,15 +381,20 @@ def _independent_gap_activity(question, words, regions, bursts):
                 result.append(index)
         return result
 
+    def bounded(index, intrusion):
+        # The same allowance bounds the omission and whole-utterance guards.
+        return intrusion <= question.neighbor_boundary_allowance_seconds + _EPSILON and not any(
+            start - _EPSILON <= member.start and member.end <= end + _EPSILON for member in members[index])
+
     left_owned, right_owned = owned(left), owned(right)
     excluded = set()
     if len(left_owned) == 1 and left_owned[0] not in right_owned:
         index = left_owned[0]
-        if chains[index].start < start < chains[index].end:
+        if chains[index].start < start < chains[index].end and bounded(index, chains[index].end - start):
             excluded.add(index)
     if len(right_owned) == 1 and right_owned[0] not in left_owned:
         index = right_owned[0]
-        if chains[index].start < end < chains[index].end:
+        if chains[index].start < end < chains[index].end and bounded(index, end - chains[index].start):
             excluded.add(index)
     return [chain for index, chain in enumerate(chains) if index not in excluded
             and chain.start < end - _EPSILON and chain.end > start + _EPSILON]
@@ -519,6 +534,12 @@ def _resolution_reason(question, decision, sources, alignment, words, regions, f
         if burst.start - chain_end >= _MAX_SPEECH_CHAIN_GAP_SECONDS - _EPSILON:
             return "no_unique_speech_burst", None
         chain_end = max(chain_end, burst.end)
+    # A chain shorter than the plausible duration of the whole line cannot
+    # alone carry several words, as for a word's own speech burst.
+    letters = sum(character.isalnum() for character in decision.final_text)
+    plausible = max(MIN_WHOLE_WORD_SECONDS, MIN_SECONDS_PER_LETTER * letters)
+    if len(heard) > 1 and chain_end - chain_start < plausible - _EPSILON:
+        return "speech_burst_too_short", None
     return "audio_confirmed_utterance", SpeechRegion(start=chain_start, end=chain_end)
 
 
@@ -616,7 +637,8 @@ def reconcile_missing_dialogue(
                 if flag.kind == "missing_audio_source_cue_held" and target_outcomes:
                     message = (
                         "Audio confirmed the target wording, but no unique independent speech chain established its timing; retained the source cue for review."
-                        if target_outcomes <= {"no_unique_speech_burst", "speech_burst_crosses_anchor", "no_safe_frame_boundary"}
+                        if target_outcomes <= {"no_unique_speech_burst", "speech_burst_crosses_anchor",
+                                               "speech_burst_too_short", "no_safe_frame_boundary"}
                         else "The bounded audio question did not establish both the whole cue's wording and independent acoustic ownership; retained the source cue for review."
                     )
                     cleaned.append(flag.model_copy(update={"message": message}))
