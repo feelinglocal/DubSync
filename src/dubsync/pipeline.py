@@ -4862,7 +4862,8 @@ def _alignment_with_decision_words(
     prefix_replacement_targets = single_token_prefix_replacement_targets(
         source_cues or [], spans, decisions
     )
-    external_target_protection = set(protected_cue_ids or ()) | set(alignment.diagnostics.missing_audio_cue_ids)
+    held_cue_ids = set(protected_cue_ids or ())
+    external_target_protection = held_cue_ids | set(alignment.diagnostics.missing_audio_cue_ids)
     # Confidence holds apply to their own spans. Retain existing evidence for
     # independent accepted edits while protecting new neighboring destinations.
     protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
@@ -5031,6 +5032,10 @@ def _alignment_with_decision_words(
                     cue_word_indices[cue_id] = [
                         index for index in cue_word_indices.get(cue_id, []) if index not in span_word_indices
                     ]
+        # No answer confirmed that a held keep's divergent words say its text.
+        # They stay in the held case's evidence; only words continuing the
+        # cue's own speech may time it, never an edge across a longer pause.
+        held_keep = decision.verdict == "keep_srt" and set(span.cue_ids) <= held_cue_ids
         for cue_id, spoken_indices in word_indices_by_cue.items():
             if cue_id in protected_cue_ids:
                 continue
@@ -5038,6 +5043,10 @@ def _alignment_with_decision_words(
                 existing = cue_word_indices.get(cue_id, [])
                 if not existing:
                     continue
+                if held_keep and words is not None:
+                    spoken_indices = _held_keep_continuous_words(
+                        spoken_indices, existing, words, max_intra_cue_gap,
+                    )
             combined = sorted(set(cue_word_indices.get(cue_id, []) + spoken_indices))
             if combined:
                 cue_word_indices[cue_id] = combined
@@ -5175,6 +5184,41 @@ def _kept_words_join_own_anchors(
         if group.intersection(added) and not group.intersection(anchors):
             return False
     return True
+
+
+# The longest pause across which an approved short ad-lib may still continue
+# a cue (_anchored_adlib_cue_id). An unconfirmed word gets no further reach.
+# A shorter bound would cut real first words: a vocative is often followed by
+# a pause of about 0.6 s ("Damien, aber ich kann ...").
+_HELD_KEEP_MAX_CONTINUATION_GAP_SECONDS = 1.0
+
+
+def _held_keep_continuous_words(
+    added: list[int], anchors: list[int], words: list[Word], max_gap: float,
+) -> list[int]:
+    """Drop unconfirmed words that a pause separates from the cue's own words.
+
+    Words between the cue's first and last own word stay, so the cue keeps
+    its inner pauses bridged. Before and after them, a word joins only when
+    no longer pause than the continuation gap lies between it and those words.
+    """
+    gap = min(_HELD_KEEP_MAX_CONTINUATION_GAP_SECONDS, max_gap)
+    own = {index for index in anchors if 0 <= index < len(words)}
+    if not own or any(index < 0 or index >= len(words) for index in added):
+        return added
+    ordered = sorted(own | set(added), key=lambda index: (words[index].start, index))
+    if any(not isfinite(words[index].start) or not isfinite(words[index].end) for index in ordered):
+        return added
+    groups: list[list[int]] = []
+    end = float("-inf")
+    for index in ordered:
+        if words[index].start - end > gap + _GAP_EPSILON_SECONDS:
+            groups.append([])
+        groups[-1].append(index)
+        end = max(end, words[index].end)
+    anchored = [position for position, group in enumerate(groups) if own.intersection(group)]
+    continuous = {index for group in groups[anchored[0] : anchored[-1] + 1] for index in group}
+    return [index for index in added if index in continuous]
 
 
 def _indexed_replacement_word_indices(
