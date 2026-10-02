@@ -256,7 +256,7 @@ def test_german_attachment_guard_preserves_punctuation_and_unrelated_boundaries(
     (7, "テーブルをひっくり返したのは", ["テーブルを", "ひっくり返したのは"],
      6067, 7700, 34, "speaker_0"),
 ])
-def test_frozen_japanese_orphans_reflow_at_phrases_with_exact_envelopes_and_owners(
+def test_frozen_japanese_single_lines_stay_whole_and_reflow_at_phrases_only_under_an_enforced_width(
         cue_id, text, expected, start, end, first_owner, speaker):
     # Geometry and provider indices come from the six policy-33 delivered cues.
     source = Cue(index=cue_id, start_ms=start, end_ms=end, lines=[text], speaker_id=speaker)
@@ -266,6 +266,13 @@ def test_frozen_japanese_orphans_reflow_at_phrases_with_exact_envelopes_and_owne
                       end=start / 1000 + (position + .8) * step)
                  for position, char in enumerate(text))
     ownership = {cue_id: list(range(first_owner, first_owner + len(text)))}
+    # These were the customer's own single lines, delivered under the width
+    # inferred from that customer's file: they stay on one line.
+    kept = split_crowded_output_cues([source], words, ownership, StyleProfile(max_chars_per_line=26),
+                                     enforce_width=False)
+    assert kept.cues[0] is source and not kept.flags and not kept.expansions
+    assert kept.cue_word_indices == ownership
+    # Only an enforced width (an explicit style, or generation) re-breaks them.
     result = split_crowded_output_cues([source], words, ownership, StyleProfile(max_chars_per_line=26))
     assert result.cues == [source.with_lines(expected)]
     assert result.cue_word_indices == ownership and not result.expansions

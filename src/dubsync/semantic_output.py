@@ -446,8 +446,15 @@ def _timed_parts(cue: Cue, words: list[Word], indices: list[int], profile: Style
 def split_crowded_output_cues(cues: list[Cue], words: list[Word],
                              cue_word_indices: Mapping[int, list[int]], profile: StyleProfile,
                              *, max_lines: int | None = None, min_parts: int = 1,
-                             protected_cue_ids: set[int] | None = None) -> OutputSegmentation:
-    """Apply the final two-line ceiling without estimating speech timestamps."""
+                             protected_cue_ids: set[int] | None = None,
+                             enforce_width: bool = True) -> OutputSegmentation:
+    """Apply the final two-line ceiling without estimating speech timestamps.
+
+    With ``enforce_width`` false the width is the customer's own (derived from
+    the source file): a cue within the line limit keeps its lines whatever
+    their width, which ordinary line-length QC reports. Only a cue over the
+    line limit is reflowed or split.
+    """
     limit = min(2, profile.max_lines_per_cue, max_lines if max_lines is not None else 2)
     if limit < 1 or min_parts < 1:
         raise ValueError("display line and part limits must be positive")
@@ -457,7 +464,8 @@ def split_crowded_output_cues(cues: list[Cue], words: list[Word],
     next_id = max([0, *ownership, *(cue.index for cue in cues)]) + 1
     output, flags, expansions, visual_pages = [], [], {}, {}
     for cue in cues:
-        if len(cue.text.splitlines()) <= limit and all(display_width(line) <= profile.max_chars_per_line for line in cue.lines) and min_parts == 1:
+        fits_width = not enforce_width or all(display_width(line) <= profile.max_chars_per_line for line in cue.lines)
+        if len(cue.text.splitlines()) <= limit and fits_width and min_parts == 1:
             output.append(cue)
             continue
         compact = wrap_semantic_lines(cue.plain_text, profile.max_chars_per_line)
@@ -514,6 +522,9 @@ def split_crowded_output_cues(cues: list[Cue], words: list[Word],
                                 start=cue.start_ms / 1000, end=cue.end_ms / 1000))
         else:
             reflowed = cue.with_lines(compact_lines(cue.text, limit, profile.max_chars_per_line))
+            if not enforce_width and reflowed.lines == cue.lines:
+                output.append(cue)  # Nothing was reflowed: the customer's lines stay without a layout flag.
+                continue
             output.append(reflowed)
             flags.append(QCFlag(kind="output_line_limit_reflow", cue_ids=[cue.index], severity="info",
                                 message="A safe spoken split was unavailable. Text was reflowed within its existing interval; width overflow remains visible to style QC.",

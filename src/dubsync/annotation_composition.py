@@ -32,7 +32,7 @@ def _overlaps(left: Cue, right: Cue) -> bool:
 def compose_bracketed_annotations(
     cues: list[Cue], cue_word_indices: Mapping[int, list[int]] | None = None,
     *, words: list[Word] | None = None, profile: StyleProfile | None = None,
-    protected_cue_ids: set[int] | None = None,
+    protected_cue_ids: set[int] | None = None, enforce_width: bool = True,
 ) -> AnnotationComposition:
     """Compose screen captions around exact incoming speech intervals.
 
@@ -41,10 +41,12 @@ def compose_bracketed_annotations(
     captions become ordered pages and reliably owned speech may acquire
     children at exact word boundaries. Caption wording is retained, spoken
     words never repeat, and actual page intervals are recorded. Legacy calls
-    retain continuous full-caption composition.
+    retain continuous full-caption composition. With ``enforce_width`` false
+    (a source-derived width) only the line count crowds a display.
     """
     if profile is not None:
-        return _compose_bounded_annotations(cues, cue_word_indices or {}, words or [], profile, protected_cue_ids)
+        return _compose_bounded_annotations(cues, cue_word_indices or {}, words or [], profile, protected_cue_ids,
+                                            enforce_width)
     return _compose_unbounded_annotations(cues, cue_word_indices)
 
 
@@ -149,8 +151,15 @@ def _coverage_gaps(start: int, end: int, intervals: list[list[int]]) -> list[lis
     return gaps
 
 
+def _caption_pages(track: Cue, profile: StyleProfile, limit: int, enforce_width: bool) -> list[list[str]]:
+    if not enforce_width and len(track.text.splitlines()) <= limit:
+        return [list(track.lines)]  # The customer's caption lines already fit the available lines.
+    return paginate_annotation_lines(track.lines, profile.max_chars_per_line, limit)
+
+
 def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[int]], words: list[Word],
-                                 profile: StyleProfile, protected: set[int] | None) -> AnnotationComposition:
+                                 profile: StyleProfile, protected: set[int] | None,
+                                 enforce_width: bool = True) -> AnnotationComposition:
     """Paginate crowded visual tracks while keeping each spoken word once.
 
     A caption page can occupy a whole spoken child or a known visual gap.
@@ -159,7 +168,8 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
     """
     legacy = _compose_unbounded_annotations(cues, incoming)
     if not legacy.tracks:
-        segmented = split_crowded_output_cues(cues, words, incoming, profile, protected_cue_ids=protected)
+        segmented = split_crowded_output_cues(cues, words, incoming, profile, protected_cue_ids=protected,
+                                              enforce_width=enforce_width)
         return AnnotationComposition(segmented.cues, segmented.cue_word_indices, {}, {}, segmented.flags,
                                      segmented.expansions, 2)
     limit = min(2, profile.max_lines_per_cue)
@@ -180,10 +190,11 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
             budget = max(1, limit - 1)
             contained = [track for track in overlapping
                          if cue.start_ms <= track.start_ms and track.end_ms <= cue.end_ms]
-            requested = max(1, sum(len(paginate_annotation_lines(track.lines, profile.max_chars_per_line, budget))
+            requested = max(1, sum(len(_caption_pages(track, profile, budget, enforce_width))
                                    for track in contained))
             segmented = split_crowded_output_cues([cue], words, ownership, profile, max_lines=budget,
-                                                  min_parts=requested, protected_cue_ids=protected)
+                                                  min_parts=requested, protected_cue_ids=protected,
+                                                  enforce_width=enforce_width)
             speech.extend(segmented.cues)
             ownership = segmented.cue_word_indices
             flags.extend(segmented.flags)
@@ -217,7 +228,7 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
         eligible = [slot for slot in slots if slot["start"] < track.end_ms and slot["end"] > track.start_ms]
         available = [slot for slot in eligible if slot["capacity"] > 0]
         page_limit = min((slot["capacity"] for slot in available), default=1)
-        pages = paginate_annotation_lines(track.lines, profile.max_chars_per_line, page_limit)
+        pages = _caption_pages(track, profile, page_limit, enforce_width)
         if len(pages) > len(available) or not available:
             # A single word, held cue or simultaneous speech cannot always
             # supply enough child envelopes. Keep all visual wording and the

@@ -246,6 +246,13 @@ def sync_episode(
     )
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
+    # A source-derived style describes the customer's own layout: its line
+    # limits change an existing cue only when a style was explicitly chosen or
+    # is stricter than the source.
+    enforce_existing_line_limit = explicit_style_override or (
+        profile.max_lines_per_cue < source_profile.max_lines_per_cue
+        or profile.max_chars_per_line < source_profile.max_chars_per_line
+    )
     fps_summary_metadata = _fps_summary_metadata(
         profile,
         fps_detection,
@@ -487,6 +494,7 @@ def sync_episode(
             missing_dialogue=missing_dialogue,
             source_pair_hearing_mode="verify",
             secondary_words=secondary_words, secondary_context=secondary_context,
+            enforce_line_width=enforce_existing_line_limit,
         )
 
     if resume_stage in {"adjudicate", "rebuild"}:
@@ -945,10 +953,6 @@ def sync_episode(
     flags.extend(change_flags)
     flags.extend(segmentation_flags)
     timing_held_cue_ids = _timing_evidence_held_cue_ids(flags)
-    enforce_existing_line_limit = explicit_style_override or (
-        profile.max_lines_per_cue < source_profile.max_lines_per_cue
-        or profile.max_chars_per_line < source_profile.max_chars_per_line
-    )
     line_limit_cue_ids = (
         ({cue.index for cue in cues} - confidence_held_cue_ids)
         if enforce_existing_line_limit else set()
@@ -1127,6 +1131,7 @@ def sync_episode(
         missing_dialogue=missing_dialogue,
         source_pair_hearing_mode=("disabled" if llm_disabled_for_episode else "rebuild" if resume_stage == "rebuild" else "fresh"),
         secondary_words=secondary_words, secondary_context=secondary_context,
+        enforce_line_width=enforce_existing_line_limit,
     )
 
 
@@ -2841,6 +2846,7 @@ def _run_verify_stage(
     source_pair_hearing_mode: str = "disabled",
     secondary_words: list[Word] | None = None,
     secondary_context: dict[str, object] | None = None,
+    enforce_line_width: bool = False,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     if speech_evidence is None:
@@ -3199,9 +3205,11 @@ def _run_verify_stage(
     # Keep the acoustic result intact for verify-resume. Display-only splits
     # must not become new source cues or be refined a second time on resume.
     pre_output_cues, pre_output_alignment, pre_output_flags = rebuilt, alignment, flags
+    # The two-line ceiling always applies. A cue within it keeps its layout
+    # unless the style's width is enforced; its width stays a style finding.
     segmented = split_crowded_output_cues(
         rebuilt, effective_words, alignment.cue_word_indices, profile,
-        protected_cue_ids=protected_cue_ids,
+        protected_cue_ids=protected_cue_ids, enforce_width=enforce_line_width,
     )
     rebuilt = segmented.cues
     alignment = alignment.model_copy(update={"cue_word_indices": segmented.cue_word_indices})
@@ -3211,7 +3219,7 @@ def _run_verify_stage(
     composition = (
         compose_bracketed_annotations(
             rebuilt, pre_annotation_ownership, words=effective_words, profile=profile,
-            protected_cue_ids=protected_cue_ids,
+            protected_cue_ids=protected_cue_ids, enforce_width=enforce_line_width,
         )
         if _output_no_overlaps(provider_config)
         else AnnotationComposition(list(rebuilt), dict(pre_annotation_ownership), {}, {})
