@@ -4429,11 +4429,15 @@ def _absorb_redecoded_insertions(
                     ),
                 })
             elif approved:
-                # Spoken right after its twin, approved without hearing it: the
-                # evidence that would tell a repetition from a re-decode is missing.
+                # Spoken right after its twin, approved without recorded audio
+                # evidence (a text-only route, or an answer from before the
+                # evidence field): the evidence that would tell a repetition
+                # from a re-decode is missing. The text names no internal cue
+                # id: review items name the delivered numbers (qc_review).
                 hold_reason = (
-                    "Approved repetition has no audio evidence: the words repeat the adjacent words of "
-                    f"cue {owner} right after them and the decision was made without hearing the audio"
+                    "Approved repetition has no audio evidence on record: the words repeat the adjacent "
+                    "words right after them, and only a clear hearing can tell a spoken repetition from "
+                    "the provider decoding the same words twice"
                 )
                 dropped[span.case_id] = decision.model_copy(update={
                     "verdict": "keep_srt", "final_text": span.srt_text,

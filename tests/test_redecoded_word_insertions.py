@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 import yaml
@@ -185,6 +186,24 @@ def test_approved_copy_is_only_taken_back_when_it_shares_the_time_of_its_twin():
     assert [(item.verdict, item.final_text) for item in decisions] == [("keep_srt", "")]
     assert "decoded one utterance twice" in decisions[0].reason and flags == []
     assert alignment.cue_word_indices[2] == [1, 2, 3]
+
+
+def test_hold_of_an_approval_without_audio_evidence_names_no_internal_cue_id():
+    # The hold text reaches the customer as the review item's detail. Review items name the
+    # delivered cue numbers (the output is renumbered in time order), so the text must not carry
+    # the internal id of the twin's cue; and evidence=None also covers answers from before the
+    # evidence field, so it must not claim that nobody listened.
+    span = DivergenceSpan(case_id="case-1", cue_ids=[], srt_text="", asr_text="Vem", asr_word_indices=[1],
+                          start=10.00, end=10.10, left_anchor_cue_id=1, right_anchor_cue_id=2)
+    approved = AdjudicationDecision(case_id="case-1", verdict="use_audio", final_text="Vem", confidence=0.95, reason="heard")
+
+    _, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [approved], _come_words((10.00, 10.10)))
+
+    assert decisions[0].verdict == "keep_srt" and [flag.kind for flag in flags] == ["low_confidence_adjudication"]
+    for text in (flags[0].message, decisions[0].reason):
+        assert "no audio evidence" in text
+        assert re.search(r"\bcue \d+", text) is None
+        assert "without hearing" not in text
 
 
 def test_touching_copy_the_adjudicator_did_not_approve_still_times_the_cue_of_its_twin():
