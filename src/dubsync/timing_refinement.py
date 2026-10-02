@@ -108,8 +108,8 @@ class SpeechEvidence:
     fallback_used: bool = False
     # How far (seconds) a phrase-initial word start was moved back onto its burst onset.
     start_snap: float = PhraseEdgeSnap().start_advance
-    # The same limit for a recording whose phrase starts lag, and the level track that decided it.
-    lagging_start_snap: float = PhraseEdgeSnap().lagging_start_advance
+    # The level track that decided the wider move of a lagging recording; the
+    # late-start review check reads it too.
     levels: SpeechLevels | None = None
 
 
@@ -151,7 +151,6 @@ def speech_evidence_for_words(
         detected=True,
         fallback_used=bool(getattr(adapter, "fallback_used", False)),
         start_snap=snap.start_advance,
-        lagging_start_snap=snap.lagging_start_advance,
         levels=levels,
     )
 

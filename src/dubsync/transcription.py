@@ -410,9 +410,6 @@ def generate_srt_from_audio(
         flags.extend(late_start_flags_for_cues(
             cues, speech_regions, words, alignment.cue_word_indices, generated_spoken_spans(words, alignment),
             max_onset_lead_ms=max(phrase_edge_snap.start_advance, PhraseEdgeSnap().start_advance) * 1000,
-            max_review_lead_ms=max(
-                phrase_edge_snap.lagging_start_advance, PhraseEdgeSnap().lagging_start_advance,
-            ) * 1000,
             levels=speech_levels,
             frame_ms=profile.frame_ms,
             end_pad_ms=max(profile.tail_ms, boundary_refinement.end_pad_ms),

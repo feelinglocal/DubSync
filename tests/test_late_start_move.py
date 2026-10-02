@@ -27,8 +27,10 @@ PROFILE = StyleProfile(fps=30.0)
 # The shape of 2B-scribe cue 51: the burst starts at 70.835 s, Scribe packs the phrase into its end.
 BURST = SpeechRegion(start=70.835, end=72.285)
 PHRASE = "山下森彦に伝えろ"
-# Scribe Japanese: most phrase starts lag their onset, one in five by more than the 200 ms snap window.
+# Scribe Japanese: most phrase starts lag their onset, one in five by more than the 200 ms snap window
+# (exactly the share the rule asks for); the second sample lags well inside the rule (two in five).
 LAGGING = (0.15, 0.15, 0.25, 0.15, 0.12) * 5
+CLEARLY_LAGGING = (0.15, 0.25, 0.25, 0.15, 0.12) * 5
 # MAI, German, Portuguese: phrase starts sit on their onset and a late one is an exception.
 ON_TIME = (0.03, 0.05, 0.0, 0.08, 0.04) * 5
 SPEECH_DB, BREATH_DB = -25.0, -45.0
@@ -42,8 +44,13 @@ def _characters(text: str, start: float, end: float) -> list[Word]:
     ]
 
 
-def _recording(lags, first_word_start: float = 71.5, *, lead_db: float = SPEECH_DB, intruder: Word | None = None):
-    """One-phrase bursts with the given first-word lags, then the phrase under test in ``BURST``."""
+def _recording(lags, first_word_start: float = 71.5, *, lead_db: float = SPEECH_DB, intruder: Word | None = None,
+               lead_levels: list[float] | None = None):
+    """One-phrase bursts with the given first-word lags, then the phrase under test in ``BURST``.
+
+    The lead before the phrase is ``lead_db`` throughout, or ends with the 10 ms
+    ``lead_levels`` (a measured shape) right before the first word.
+    """
     words: list[Word] = []
     regions: list[SpeechRegion] = []
     for index, lag in enumerate(lags):
@@ -59,8 +66,11 @@ def _recording(lags, first_word_start: float = 71.5, *, lead_db: float = SPEECH_
     for region in regions:
         for hop in range(round((region.start - 0.005) * 100), round((region.end - 0.005) * 100)):
             hops[hop] = SPEECH_DB
-    for hop in range(round((BURST.start - 0.005) * 100), round((first_word_start - 0.005) * 100)):
+    last_lead_hop = round((first_word_start - 0.005) * 100)
+    for hop in range(round((BURST.start - 0.005) * 100), last_lead_hop):
         hops[hop] = lead_db
+    for position, level in enumerate(reversed(lead_levels or [])):
+        hops[last_lead_hop - 1 - position] = level
     return words, regions, vad.SpeechLevels(levels=hops, hop_seconds=0.01, offset_seconds=0.005), first
 
 
@@ -77,14 +87,15 @@ def _timed(raw_words, regions, levels, first, *, snap: PhraseEdgeSnap | None = N
     )
     flags = vad.late_start_flags_for_cues(
         refined, regions, words, alignment.cue_word_indices, cue_spoken_spans(refined, words, alignment),
-        max_onset_lead_ms=200, max_review_lead_ms=700, frame_ms=PROFILE.frame_ms, end_pad_ms=40, levels=levels,
+        max_onset_lead_ms=200, frame_ms=PROFILE.frame_ms, end_pad_ms=40, levels=levels,
     )
     return words, refined[0], flags
 
 
+@pytest.mark.parametrize("lags", [LAGGING, CLEARLY_LAGGING], ids=["share-on-threshold", "clearly-lagging"])
 @pytest.mark.parametrize("first_word_start", [71.036, 71.5])
-def test_late_first_word_of_a_lagging_recording_moves_onto_its_speech_onset(first_word_start):
-    raw, regions, levels, first = _recording(LAGGING, first_word_start)
+def test_late_first_word_of_a_lagging_recording_moves_onto_its_speech_onset(first_word_start, lags):
+    raw, regions, levels, first = _recording(lags, first_word_start)
     provider_words = [word.model_copy() for word in raw]
 
     words, cue, flags = _timed(raw, regions, levels, first)
@@ -153,14 +164,65 @@ def test_quiet_lead_is_neither_moved_onto_nor_reported():
     assert flags == []
 
 
-def test_lead_beyond_the_plausible_lag_is_neither_moved_onto_nor_reported():
+# Measured 10 ms levels (dBFS) of the lead before two delivered EP11 cue starts the human editor moved
+# 100-134 ms earlier. Both leads are quiet as a whole and end in the voice.
+# EP11 MAI "Cinco.": a fricative onset 12-18 dB below the vowel, then 80 ms of vowel before the cue start.
+CINCO_LEAD = [-52, -49, -46, -41, -39, -40, -40, -36, -33, -33, -35, -35, -34, -29, -24, -22, -24, -25, -23, -22, -22]
+# EP11 Scribe "Um.": the detector opened the burst 110 ms before the voice, then 130 ms of loud voice.
+UM_LEAD = [-54, -52, -53, -53, -53, -56, -57, -59, -63, -63, -56, -44, -35, -25, -19, -18, -17, -17, -17, -18, -20,
+           -19, -19, -19]
+
+
+@pytest.mark.parametrize("lead_levels", [CINCO_LEAD, UM_LEAD], ids=["cinco", "um"])
+def test_a_start_inside_a_rising_onset_is_reported_but_not_moved_onto_the_onset(lead_levels):
+    raw, regions, levels, first = _recording(LAGGING, lead_db=BREATH_DB, lead_levels=lead_levels)
+
+    words, cue, flags = _timed(raw, regions, levels, first)
+
+    # The lead as a whole is not the phrase: nothing moves onto the burst onset.
+    assert words[first] == raw[first]
+    assert cue.start_ms == 71500
+    # But the voice is already sounding when the cue starts: the customer must hear it.
+    assert [(flag.kind, flag.cue_ids) for flag in flags] == [(KIND, [1])]
+
+
+def test_a_breath_right_up_to_the_cue_start_is_not_reported():
+    # Quiet lead ending in two quiet hops: the word starts on the cue start.
+    raw, regions, levels, first = _recording(LAGGING, lead_db=BREATH_DB, lead_levels=[-30, -31, -45, -44, -46])
+
+    words, cue, flags = _timed(raw, regions, levels, first)
+
+    assert words[first] == raw[first]
+    assert flags == []
+
+
+def test_lead_ends_in_speech_judges_the_last_hops_before_the_start():
+    hops = array("f", [-90.0]) * 300
+    hops[100:160] = array("f", [-22.0]) * 60
+    levels = vad.SpeechLevels(levels=hops, hop_seconds=0.01, offset_seconds=0.0)
+    for lead, ends_in_speech, whole in (
+        (CINCO_LEAD, True, False), (UM_LEAD, True, False), ([-45.0] * 21, False, False), ([-24.0] * 21, True, True),
+        ([-45.0] * 18 + [-24.0] * 3, False, False), ([-45.0] * 17 + [-24.0] * 4, True, False),
+    ):
+        hops[100 - len(lead):100] = array("f", [float(level) for level in lead])
+        assert levels.lead_ends_in_speech(1.0 - 0.01 * len(lead), 1.0, 1.6) is ends_in_speech
+        assert levels.lead_is_speech(1.0 - 0.01 * len(lead), 1.0, 1.6) is whole
+    # A lead shorter than the window needs all of its hops.
+    hops[97:100] = array("f", [-24.0, -24.0, -45.0])
+    assert levels.lead_ends_in_speech(0.97, 1.0, 1.6) is False
+    assert levels.lead_ends_in_speech(0.0, 0.0, 1.6) is False
+
+
+def test_lead_beyond_the_plausible_lag_is_not_moved_onto_but_still_reported():
+    # Word repair does not trust a 715 ms lag; a speech-level lead that nobody owns is still the customer's to hear.
     raw, regions, levels, first = _recording(LAGGING, 71.55)
 
     words, cue, flags = _timed(raw, regions, levels, first)
 
     assert words[first].start == 71.55
     assert cue.start_ms == PROFILE.snap_floor(71550)
-    assert flags == []
+    assert [(flag.kind, flag.cue_ids) for flag in flags] == [(KIND, [1])]
+    assert flags[0].start == pytest.approx(BURST.start)
 
 
 def test_without_a_level_track_the_late_start_is_reported_not_moved():
@@ -360,15 +422,19 @@ def test_sync_starts_the_cues_of_a_lagging_recording_on_their_speech_onsets(tmp_
     assert saved[-3]["start"] == pytest.approx(regions[-1].start + 0.665, abs=0.011)
 
 
-@pytest.mark.parametrize(("lead_amplitude", "reported"), [(6000, True), (1000, False)])
-def test_sync_keeps_a_late_start_when_the_recording_does_not_lag(tmp_path, lead_amplitude, reported):
-    source, audio, providers, regions = _episode(tmp_path, ON_TIME, last_lag=0.41, lead_amplitude=lead_amplitude)
+@pytest.mark.parametrize(("lead_amplitude", "last_lag", "reported"), [
+    (6000, 0.41, True), (1000, 0.41, False),
+    # No upper bound for the review item: 900 ms of speech-level sound that nobody owns is still reported.
+    (6000, 0.9, True),
+])
+def test_sync_keeps_a_late_start_when_the_recording_does_not_lag(tmp_path, lead_amplitude, last_lag, reported):
+    source, audio, providers, regions = _episode(tmp_path, ON_TIME, last_lag=last_lag, lead_amplitude=lead_amplitude)
 
     result = pipeline.sync_episode(source, audio, tmp_path / "output.srt", tmp_path / "work",
                                    providers_path=providers, no_llm=True, fps=30.0)
 
     delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
-    assert delivered[-1].start_ms == PROFILE.snap_floor(49410)
+    assert delivered[-1].start_ms == PROFILE.snap_floor(49000 + round(last_lag * 1000))
     # A speech-level lead is the customer's to check; a quiet one (a breath) is not.
     assert [flag["cue_ids"] for flag in _late_flags(result.report)] == ([[len(regions)]] if reported else [])
 

@@ -30,6 +30,12 @@ _LEAD_EDGE_TOLERANCE_SECONDS = 0.01
 # that follows. A breath before the phrase is 15-25 dB quieter than the phrase.
 LEAD_SPEECH_MARGIN_DB = 10.0
 MIN_LEAD_SPEECH_SHARE = 0.5
+# A lead that is quiet as a whole still ends in the voice when at least
+# MIN_TRAILING_SPEECH_HOPS of the last TRAILING_LEAD_HOPS hops before the phrase
+# start are within the margin: a fricative or breathy onset rising into its
+# vowel, or a burst the detector opened before the voice (EP11 "Cinco.", "Um.").
+TRAILING_LEAD_HOPS = 5
+MIN_TRAILING_SPEECH_HOPS = 4
 
 # Energy VAD defaults (measured on clean dub stems; see EnergySpeechActivityAdapter).
 DEFAULT_HOP_MS = 10
@@ -94,6 +100,22 @@ class SpeechLevels:
             return False
         floor = median(body) - LEAD_SPEECH_MARGIN_DB
         return sum(level >= floor for level in lead) >= MIN_LEAD_SPEECH_SHARE * len(lead)
+
+    def lead_ends_in_speech(self, onset: float, start: float, burst_end: float) -> bool:
+        """Whether the phrase's own voice is already sounding right before its start at ``start``.
+
+        Weaker than :meth:`lead_is_speech`, which asks the whole lead to sound
+        like the phrase: here only the hops immediately before the start count,
+        so a start inside a rising onset is recognised although the lead as a
+        whole is quiet. Right for a review flag, not for a move onto the onset.
+        """
+        lead = self.between(onset, start)
+        body = self.between(start, burst_end)
+        if not lead or not body:
+            return False
+        floor = median(body) - LEAD_SPEECH_MARGIN_DB
+        trailing = lead[-TRAILING_LEAD_HOPS:]
+        return sum(level >= floor for level in trailing) >= min(len(trailing), MIN_TRAILING_SPEECH_HOPS)
 
 
 @dataclass(frozen=True)
@@ -416,7 +438,6 @@ def late_start_flags_for_cues(
     end_pad_ms: float = 0.0,
     cue_ids: set[int] | None = None,
     excluded_cue_ids: set[int] | None = None,
-    max_review_lead_ms: float | None = None,
     levels: SpeechLevels | None = None,
 ) -> list[QCFlag]:
     """Flag cues that start after their own speech burst has begun.
@@ -430,10 +451,13 @@ def late_start_flags_for_cues(
     no other word reaches into it and no other spoken cue is on screen there
     for longer than its display padding (``end_pad_ms`` plus one frame). A
     punctuation-only ASR token is not a word here: its duration is no speech.
-    A word more than ``max_review_lead_ms`` after the onset is not reported: a
-    lead that long is another sound, not a late timestamp. Neither is a lead
-    that ``levels`` shows to be quieter than the phrase (a breath). ``cues`` is
-    the delivered list; ``cue_ids`` limits which of them are checked.
+    There is no upper bound on the lead: a long speech-level lead that nobody
+    owns is at least unrecognised sound the customer should hear. The only
+    lead not reported is one that ``levels`` shows to be quieter than the
+    phrase as a whole and still quiet right before the cue start (a breath,
+    then the word on the cue start); a lead that ends in the voice is the
+    cue's own onset however quiet it began. ``cues`` is the delivered list;
+    ``cue_ids`` limits which of them are checked.
     """
     region_index = SpeechRegionIndex(regions)
     if not region_index.regions:
@@ -459,9 +483,10 @@ def late_start_flags_for_cues(
         lead_ms = cue.start_ms - onset_ms
         if span[0] - onset_ms <= max_onset_lead_ms or lead_ms <= max_onset_lead_ms - frame_ms:
             continue
-        if max_review_lead_ms is not None and span[0] - onset_ms > max_review_lead_ms:
-            continue
-        if levels is not None and not levels.lead_is_speech(burst[1].start, span[0] / 1000.0, burst[1].end):
+        if levels is not None and not (
+            levels.lead_is_speech(burst[1].start, span[0] / 1000.0, burst[1].end)
+            or levels.lead_ends_in_speech(burst[1].start, span[0] / 1000.0, burst[1].end)
+        ):
             continue
         own = set(cue_word_indices.get(cue.index, ()))
         # A neighbouring word may touch the onset by this much without owning it, as in word repair.
