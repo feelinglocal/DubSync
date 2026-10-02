@@ -288,6 +288,7 @@ def generate_srt_from_audio(
     )
     # Only the energy detector measures levels; other detectors leave the fixed start window.
     speech_levels = getattr(speech_activity_adapter, "last_levels", None)
+    provider_words = words
     words, word_clamp_flags = repair_asr_word_edges(
         words,
         speech_regions,
@@ -331,6 +332,7 @@ def generate_srt_from_audio(
             alignment=alignment,
             protected_cue_ids=ambiguous_cue_ids,
             ambiguous_word_indices=uncertain_word_indices,
+            source_words=provider_words,
         )
         flags.extend(timing_flags)
 

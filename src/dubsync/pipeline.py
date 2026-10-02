@@ -2953,6 +2953,7 @@ def _run_verify_stage(
             protected_cue_ids=protected_cue_ids,
             fixed_cue_ids=shared_source_cue_ids - unresolved_shared_cue_ids,
             ambiguous_word_indices=uncertain_word_indices,
+            source_words=speech_evidence.source_words,
         )
         flags.extend(timing_flags)
         if include_dropped_line_flags:

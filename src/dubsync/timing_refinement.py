@@ -111,6 +111,9 @@ class SpeechEvidence:
     # The level track that decided the wider move of a lagging recording; the
     # late-start review check reads it too.
     levels: SpeechLevels | None = None
+    # The provider's words, index-aligned with ``words``. Boundary refinement
+    # judges burst ownership on them, as word repair did.
+    source_words: list[Word] | None = None
 
 
 def speech_evidence_for_words(
@@ -152,6 +155,7 @@ def speech_evidence_for_words(
         fallback_used=bool(getattr(adapter, "fallback_used", False)),
         start_snap=snap.start_advance,
         levels=levels,
+        source_words=words,
     )
 
 
@@ -176,7 +180,18 @@ def refine_cues_to_speech_activity(
     protected_cue_ids: set[int] | None = None,
     fixed_cue_ids: set[int] | None = None,
     ambiguous_word_indices: set[int] | None = None,
+    source_words: list[Word] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
+    """Fit cue edges to the speech bursts of their own words.
+
+    ``source_words`` are the provider's words that ``words`` were repaired
+    from, index for index. A burst moves a cue edge into its first or last word
+    only when it covers enough of the provider's word, the rule word repair
+    applied; a phrase snap that later put the word's start on the burst is no
+    evidence of ownership. Without them ``words`` are judged as given.
+    """
+    if source_words is not None and words is not None and len(source_words) != len(words):
+        raise ValueError("source_words must give the provider timing of every word, in the order of words")
     options = config or BoundaryRefinementConfig()
     ambiguous_indices = set(ambiguous_word_indices or ())
     if ambiguous_word_indices is None and words and alignment is not None and options.enabled and regions:
@@ -243,8 +258,14 @@ def refine_cues_to_speech_activity(
             max_word_duration_seconds=options.max_word_duration_ms / 1000.0,
             max_intra_cue_gap_seconds=options.max_intra_cue_gap_ms / 1000.0,
         )
+        # A word window exists only with words and an alignment.
+        provider_words = (
+            _provider_words_by_id(cue, words, alignment, source_words)
+            if word_window is not None and source_words is not None
+            else {}
+        )
         cue_regions = (
-            _regions_from_word_window(word_window, region_index, options)
+            _regions_from_word_window(word_window, region_index, options, provider_words.get(id(word_window[0])))
             if word_window is not None
             else _regions_overlapping_cue(cue, region_index)
         )
@@ -257,7 +278,9 @@ def refine_cues_to_speech_activity(
         last_word_is_outlier = word_window is not None and _is_word_duration_outlier(word_window[-1], options)
         # The cue's own voice ends with the burst that holds its last word.
         acoustic_end = (
-            _acoustic_end_seconds(word_window[-1], end_region, options, word_starts)
+            _acoustic_end_seconds(
+                word_window[-1], end_region, options, word_starts, provider_words.get(id(word_window[-1])),
+            )
             if word_window is not None
             else end_region.end
         )
@@ -415,16 +438,35 @@ def _word_window_for_cue(
     return selected
 
 
+def _provider_words_by_id(
+    cue: Cue, words: list[Word], alignment: AlignmentResult, source_words: list[Word],
+) -> dict[int, Word]:
+    """The provider's timing of each of the cue's own words, keyed by the repaired word's identity."""
+    return {
+        id(words[index]): source_words[index]
+        for index in alignment.cue_word_indices.get(cue.index, [])
+        if 0 <= index < len(words)
+    }
+
+
 def _regions_from_word_window(
     word_window: list[Word],
     region_index: SpeechRegionIndex,
     config: BoundaryRefinementConfig,
+    first_provider_word: Word | None = None,
 ) -> tuple[SpeechRegion, SpeechRegion] | None:
     first_word = word_window[0]
     last_word = word_window[-1]
     start_region = _region_containing_timestamp(first_word.start, region_index)
     if start_region is None:
         start_region = _region_overlapping_word(first_word, region_index)
+        # A word that starts in silence belongs to the burst after it only when
+        # that burst covers enough of the word, as in word repair; a burst it
+        # merely touches is no start, and the cue keeps its timing as it does
+        # when the word touches no burst at all.
+        owner = first_provider_word if first_provider_word is not None else first_word
+        if start_region is not None and not has_sufficient_speech_overlap(owner, start_region.start, start_region.end):
+            start_region = None
     end_probe = last_word.start if _is_word_duration_outlier(last_word, config) else last_word.end
     end_region = _region_containing_timestamp(end_probe, region_index)
     if end_region is None:
@@ -482,23 +524,27 @@ def _acoustic_end_seconds(
     last_region: SpeechRegion,
     config: BoundaryRefinementConfig,
     word_starts: list[float],
+    provider_word: Word | None = None,
 ) -> float:
     """Where the cue's own voice stops: the offset of the burst holding its last word.
 
     A word that runs past a burst ends there only when the burst owns enough
-    of the word to replace its edge, as in word repair. A burst that runs
-    past the word is the same voice only while it is short and no other word
-    begins inside it; a longer or shared burst is another sound, and a later
-    separate burst (a breath) is never considered.
+    of the word to replace its edge, as in word repair; with the provider's
+    timing of the word (``provider_word``) that is judged on it, so a start the
+    phrase snap moved onto the burst does not make the burst its owner. A burst
+    that runs past the word is the same voice only while it is short and no
+    other word begins inside it; a longer or shared burst is another sound, and
+    a later separate burst (a breath) is never considered.
     """
     if _is_word_duration_outlier(last_word, config):
         return last_region.end
     if last_region.end <= last_word.start:
         return last_word.end
     if last_word.end >= last_region.end:
+        owner = provider_word if provider_word is not None else last_word
         return (
             last_region.end
-            if has_sufficient_speech_overlap(last_word, last_region.start, last_region.end)
+            if has_sufficient_speech_overlap(owner, last_region.start, last_region.end)
             else last_word.end
         )
     following = bisect_right(word_starts, last_word.start)
