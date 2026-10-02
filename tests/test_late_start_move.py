@@ -215,6 +215,70 @@ def test_a_start_inside_the_snap_window_still_snaps_without_any_recording_eviden
     assert flags == []
 
 
+# The shape of 2A-scribe cues 50 and 51: Scribe gives 三 21 ms inside the burst 64.375-65.135 and puts the
+# 分 of the same cue 6 s late, as a 20 ms token in the lead of the next phrase.
+_COLLAPSED_BURSTS = [SpeechRegion(start=64.375, end=65.135), SpeechRegion(start=70.615, end=72.095)]
+_COLLAPSED_WORDS = [("三", 64.739, 64.760), ("分", 71.14, 71.16)]
+_NEXT_PHRASE_WORDS = [("山", 71.28, 71.32), ("下", 71.36, 71.361), ("森", 71.46, 71.48), ("彦", 71.48, 71.6),
+                      ("に", 71.6, 71.82), ("伝", 71.82, 71.9), ("え", 71.9, 72.02), ("ろ", 72.02, 72.08)]
+
+
+def _collapsed_phrase_recording():
+    """A lagging recording whose last two cues are shaped like 2A-scribe cues 50 and 51."""
+    words, regions = [], []
+    for index, lag in enumerate(LAGGING):
+        onset = 1.0 + 2.0 * index
+        regions.append(SpeechRegion(start=onset, end=onset + 1.0))
+        words.extend(_characters("そうだな", onset + lag, onset + 0.98))
+    regions.extend(_COLLAPSED_BURSTS)
+    first = len(words)
+    words.extend(Word(text=text, start=start, end=end) for text, start, end in (*_COLLAPSED_WORDS, *_NEXT_PHRASE_WORDS))
+    hops = array("f", [-90.0]) * 7400
+    for region in regions:
+        for hop in range(round((region.start - 0.005) * 100), round((region.end - 0.005) * 100)):
+            hops[hop] = SPEECH_DB
+    return words, regions, vad.SpeechLevels(levels=hops, hop_seconds=0.01, offset_seconds=0.005), first
+
+
+def test_a_collapsed_token_is_not_stretched_onto_the_onset_and_its_cue_stays_held():
+    raw, regions, levels, first = _collapsed_phrase_recording()
+    cues = [Cue(index=50, start_ms=64666, end_ms=65466, lines=["三分？"]),
+            Cue(index=51, start_ms=70700, end_ms=72133, lines=["山下森彦に伝えろ"])]
+    alignment = AlignmentResult(
+        cue_word_indices={50: [first, first + 1], 51: list(range(first + 2, first + 10))}, anchor_coverage=1.0,
+    )
+
+    words, _ = repair_asr_word_edges(raw, regions, max_region_overrun=0.3, levels=levels)
+    rebuilt, flags = rebuild_cues(cues, words, alignment, PROFILE)
+
+    # The recording lags (the first phrase of the sample moves), but a 21 ms token is no start evidence.
+    assert words[0].start == regions[0].start
+    assert words[first:first + 2] == raw[first:first + 2]
+    # 分 stays a 20 ms stray at 71.14: it does not cover the lead of the next phrase, whose starts are untouched.
+    assert (words[first + 1].start, words[first + 1].end) == (71.14, 71.16)
+    assert [word.start for word in words[first + 2:]] == [word.start for word in raw[first + 2:]]
+    # The cue keeps its source timing and its hold, which routes it to whole-utterance hearing.
+    assert (rebuilt[0].start_ms, rebuilt[0].end_ms) == (64666, 65466)
+    assert [(flag.kind, flag.cue_ids) for flag in flags if flag.kind == "timing_evidence_held"] == [
+        ("timing_evidence_held", [50]),
+    ]
+    assert rebuilt[1].start_ms == PROFILE.snap_floor(71280)
+
+
+@pytest.mark.parametrize("duration_ms", [1, 20, 21, 40])
+def test_a_token_without_a_duration_of_its_own_never_moves_in_a_lagging_recording(duration_ms):
+    raw, regions, levels, first = _recording(LAGGING, 71.5)
+    raw[first] = raw[first].model_copy(update={"end": round(71.5 + duration_ms / 1000, 3)})
+
+    words, _ = repair_asr_word_edges(raw, regions, max_region_overrun=0.3, levels=levels)
+
+    assert words[first] == raw[first]
+    # A sibling with a duration of its own still moves under the same evidence.
+    raw[first] = raw[first].model_copy(update={"end": 71.56})
+    moved, _ = repair_asr_word_edges(raw, regions, max_region_overrun=0.3, levels=levels)
+    assert (moved[first].start, moved[first].end) == (BURST.start, 71.56)
+
+
 # --- Real audio: the energy VAD's own level track decides, in synchronization and in generation ---------
 
 TOKENS = [first + second for first in ("ka", "mo", "ri", "su", "te", "no", "ha", "mi")

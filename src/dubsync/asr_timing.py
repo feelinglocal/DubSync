@@ -28,6 +28,13 @@ _EDGE_TOLERANCE_SECONDS = 0.01
 MIN_LAG_SAMPLE_WORDS = 20
 LAGGING_MEDIAN_SECONDS = 0.1
 LAGGING_SHARE = 0.2
+# A token no longer than this has no duration of its own: Scribe writes 1-40 ms
+# placeholders for characters it could not time, and MAI 20 ms for a short word
+# it only guessed at. Its start says nothing about where the phrase begins, so
+# the wide window leaves it alone and the collapsed-timing hold downstream still
+# sees it as collapsed. Phrase-initial characters that genuinely lag are
+# 60-220 ms long in the corpus.
+COLLAPSED_TOKEN_SECONDS = 0.04
 
 
 @dataclass(frozen=True)
@@ -43,8 +50,10 @@ class PhraseEdgeSnap:
 
     In a recording whose phrase starts lag as a rule, a phrase-initial start up
     to ``lagging_start_advance`` seconds after the onset moves back as well,
-    provided the burst sounds like the phrase from its onset on. It widens the
-    start snap, so it does nothing while ``start_advance`` is zero.
+    provided the burst sounds like the phrase from its onset on and the word
+    has a duration of its own (a collapsed placeholder token stays where the
+    provider put it). It widens the start snap, so it does nothing while
+    ``start_advance`` is zero.
     """
 
     start_advance: float = 0.2
@@ -274,6 +283,7 @@ def repair_asr_word_edges(
                 onset is not None
                 and levels is not None
                 and onset.start + snap.start_advance < start <= onset.start + lagging_advance
+                and end - start > COLLAPSED_TOKEN_SECONDS + 1e-9
                 and latest_end_before[index] <= onset.start + _EDGE_TOLERANCE_SECONDS
                 and earliest_start_after[index] >= start
                 and levels.lead_is_speech(onset.start, start, onset.end)
