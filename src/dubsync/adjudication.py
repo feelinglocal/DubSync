@@ -15,6 +15,7 @@ from .providers import ProviderError
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
 _MAX_UNPACKED_SCENE_BATCHES = 16
+REQUIRED_AUDIO_HEARING_POLICY_VERSION = 1
 
 
 class LLMAdapter(Protocol):
@@ -111,7 +112,10 @@ class AdjudicationEngine:
         llm_spans: list[DivergenceSpan] = []
         deterministic_case_ids: set[str] = set()
         for span in spans:
-            heuristic_decision = self.deterministic_policy.decide(span)
+            # Explicit hearing questions concern audibility/acoustic ownership,
+            # even when the two written strings happen to be identical.
+            heuristic_decision = (None if span.case_id in self.required_audio_case_ids
+                                  else self.deterministic_policy.decide(span))
             if heuristic_decision is None:
                 llm_spans.append(span)
             else:

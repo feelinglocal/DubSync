@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from math import ceil
 
+from .adjudication_regions import is_song_caption_cue
 from .models import Cue, QCFlag
 from .speaker_evidence import speakers_known_different
 from .srt_io import validate_cue_timings_for_export
@@ -24,6 +25,7 @@ def finalize_cues_for_output(
     media_duration_ms: int | None = None,
     merge_duplicates: bool = True,
     spoken_spans: dict[int, tuple[int, int]] | None = None,
+    untimed_song_caption_ids: set[int] | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     """Finalize display order without replacing acoustic evidence with reading-time guesses.
 
@@ -96,7 +98,9 @@ def finalize_cues_for_output(
         key=lambda cue: (cue.start_ms, cue.end_ms, cue.index),
     )
     if no_overlaps and preserve_timing and spoken_spans is not None:
-        combined = _resolve_overlaps_with_speech_evidence(combined, profile, protected, spoken_spans, fixed)
+        combined = _resolve_overlaps_with_speech_evidence(
+            combined, profile, protected, spoken_spans, fixed, untimed_song_caption_ids,
+        )
     remaining_overlaps = (
         _unresolved_acoustic_overlap_flags([cue for cue in combined if not is_bracketed_screen_text_cue(cue)])
         if no_overlaps
@@ -147,6 +151,7 @@ def _resolve_overlaps_with_speech_evidence(
     protected: set[int],
     spoken_spans: dict[int, tuple[int, int]],
     fixed_cue_ids: set[int] | None = None,
+    untimed_song_caption_ids: set[int] | None = None,
 ) -> list[Cue]:
     """Separate overlapping cues without delaying or hiding anyone's speech.
 
@@ -171,7 +176,13 @@ def _resolve_overlaps_with_speech_evidence(
     def acoustic(cue: Cue) -> bool:
         return cue.index not in protected and cue.index in spoken_spans
 
-    def kept_ms(cue: Cue) -> float:
+    def kept_ms(cue: Cue, *, yields_to_speech: bool = False) -> float:
+        if (yields_to_speech and cue.index in (untimed_song_caption_ids or set())
+                and cue.index not in spoken_spans and is_song_caption_cue(cue)):
+            # A caption already classified as absent from the voice track
+            # yields to real speech even near its start. Readability stays in
+            # final QC; ordinary held dialogue keeps its half-duration floor.
+            return min_hold_ms
         return max(min_hold_ms, cue.duration_ms / 2)
 
     def boundary_ms(earlier: Cue, later: Cue) -> int | None:
@@ -179,11 +190,11 @@ def _resolve_overlaps_with_speech_evidence(
         later_span = spoken_spans.get(later.index)
         if earlier_span is None and later_span is None:
             return None
-        earliest = earlier_span[1] - snap_slack_ms if earlier_span is not None else earlier.start_ms + kept_ms(earlier)
+        earliest = earlier_span[1] - snap_slack_ms if earlier_span is not None else earlier.start_ms + kept_ms(earlier, yields_to_speech=True)
         if not acoustic(earlier):
             # A hold can own words spoken outside the interval it is shown in;
             # with or without known words it is never clipped to a sliver.
-            earliest = max(earliest, earlier.start_ms + kept_ms(earlier))
+            earliest = max(earliest, earlier.start_ms + kept_ms(earlier, yields_to_speech=True))
         if acoustic(later):
             boundary = later.start_ms
         else:

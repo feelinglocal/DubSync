@@ -24,6 +24,7 @@ from .profanity import apply_german_profanity_censorship, censor_german_profanit
 from .punctuation import apply_punctuation_pass
 from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags
 from .reports import write_qc_report
+from .semantic_output import expand_output_flags, split_crowded_output_cues
 from .speaker_evidence import speakers_known_different
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
@@ -379,17 +380,25 @@ def generate_srt_from_audio(
         and all(final_by_id[cue_id].duration_ms >= profile.min_cue_dur * 1000 - profile.frame_ms
                 for cue_id in flag.cue_ids if cue_id in final_by_id)
     )]
-    if speech_activity_adapter is not None:
-        acoustic_cues = [cue.with_timing(cue.start_ms, min(cue.end_ms, extended_from[cue.index]))
-                         if cue.index in extended_from else cue for cue in cues]
-        flags.extend(speech_activity_flags_for_cues(acoustic_cues, speech_regions, min_coverage_from_config(provider_config)))
-        flags.extend(
-            trailing_silence_flags_for_cues(
-                acoustic_cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms
-            )
-        )
     cues, profanity_flags = apply_german_profanity_censorship(cues)
     flags.extend(profanity_flags)
+    segmented = split_crowded_output_cues(
+        cues, words, alignment.cue_word_indices, profile, protected_cue_ids=ambiguous_cue_ids,
+    )
+    cues = segmented.cues
+    alignment = alignment.model_copy(update={"cue_word_indices": segmented.cue_word_indices})
+    flags = [*expand_output_flags(flags, segmented.expansions), *segmented.flags]
+    if speech_activity_adapter is not None:
+        acoustic_ends = {
+            child: end for parent, end in extended_from.items()
+            for child in segmented.expansions.get(parent, [parent])
+        }
+        acoustic_cues = [cue.with_timing(cue.start_ms, min(cue.end_ms, acoustic_ends[cue.index]))
+                         if cue.index in acoustic_ends else cue for cue in cues]
+        flags.extend(speech_activity_flags_for_cues(acoustic_cues, speech_regions, min_coverage_from_config(provider_config)))
+        flags.extend(trailing_silence_flags_for_cues(
+            acoustic_cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+        ))
     flags.extend(cps_sanity_flags(cues, max_cps=constraints.max_cps, min_cps=constraints.min_cps))
     flags = censor_german_profanity_flags(flags)
 
@@ -406,6 +415,7 @@ def generate_srt_from_audio(
             "constraints": constraints.model_dump(),
             "asr": asr_metadata,
             "cue_word_indices": alignment.cue_word_indices,
+            "output_segmentation": {"expansions": segmented.expansions, "caption_pages": segmented.caption_pages},
         },
     )
     report = write_qc_report(

@@ -39,6 +39,7 @@ from .models import (
     TokenMatch,
     Word,
 )
+from .recue import timing_evidence_issue
 from .subtitle_annotations import cue_has_bracketed_screen_text
 from .text_metrics import contains_character_level_script, join_word_texts, token_texts
 from .tokenize import (
@@ -61,7 +62,7 @@ NEG_INF = -1_000_000_000.0
 TIME_PRIOR_MAX_BONUS = 0.2
 TIME_PRIOR_MIN_RADIUS_SECONDS = 2.0
 ALIGNMENT_OUTLIER_SECONDS = 12.0
-MISSING_AUDIO_GUARD_VERSION = 7
+MISSING_AUDIO_GUARD_VERSION = 8
 # The lyric part of a span that pooled unheard song lines with dialogue.
 SONG_SOURCE_PREFIX = "song-source-"
 _DERIVED_CASE_PREFIXES = (JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, SONG_SOURCE_PREFIX)
@@ -1612,8 +1613,10 @@ def _mostly_matched_omission_windows(
     matched_counts = Counter(match.cue_id for match in matches)
     token_counts = Counter(token.cue_id for token in tokens)
     words_by_cue: dict[int, set[int]] = {}
+    owners_by_word: dict[int, set[int]] = {}
     for match in matches:
         words_by_cue.setdefault(match.cue_id, set()).add(match.asr_word_index)
+        owners_by_word.setdefault(match.asr_word_index, set()).add(match.cue_id)
     windowed: list[DivergenceSpan] = []
     for span in spans:
         windowed.append(span)
@@ -1630,12 +1633,23 @@ def _mostly_matched_omission_windows(
             or matched_counts[cue_id] * 3 < token_counts[cue_id] * 2
         ):
             continue
-        cue_words = [words[index] for index in sorted(words_by_cue.get(cue_id, ()))]
+        word_indices = sorted(words_by_cue.get(cue_id, ()))
+        if any(owners_by_word[index] != {cue_id} for index in word_indices):
+            continue
+        cue_words = [words[index] for index in word_indices]
         if not cue_words or any(
             not math.isfinite(word.start) or not math.isfinite(word.end) or word.start < 0
-            or not 0.020 + 1e-9 < word.end - word.start <= IMPLAUSIBLE_MATCHED_WORD_SECONDS
+            or not 0 < word.end - word.start <= IMPLAUSIBLE_MATCHED_WORD_SECONDS
             or word.confidence is not None and word.confidence < 0.8
             for word in cue_words
+        ):
+            continue
+        # A short internal particle does not erase the phrase's reliable
+        # outer anchors. The full window must still be noncollapsed, and a
+        # placeholder at either edge cannot establish an audio question.
+        if (
+            any(word.end - word.start <= 0.020 + 1e-9 for word in (cue_words[0], cue_words[-1]))
+            or timing_evidence_issue(cue, cue_words) is not None
         ):
             continue
         if (

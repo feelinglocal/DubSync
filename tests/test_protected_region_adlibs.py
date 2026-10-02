@@ -399,7 +399,14 @@ def test_pipeline_preserves_source_branches_on_normal_rebuild_and_verify_runs(tm
 
     def assert_output():
         rebuilt = [Cue.model_validate(item) for item in json.loads((episode_dir / "rebuild.json").read_text(encoding="utf-8"))["cues"]]
-        assert [cue for cue in rebuilt if "♪" in cue.text] == song_cues
+        delivered_songs = [cue for cue in rebuilt if "♪" in cue.text]
+        assert len(delivered_songs) == len(song_cues)
+        for delivered, source in zip(delivered_songs, song_cues, strict=True):
+            # The global two-line display policy may reflow a long lyric;
+            # its full wording, timing and all non-layout fields stay exact.
+            assert " ".join(delivered.lines) == " ".join(source.lines)
+            assert delivered.with_lines(source.lines) == source
+            assert len(delivered.lines) <= 2
         spoken_greetings = sum(len(alphanumeric_signature(cue.text)) // 3 for cue in rebuilt
                               if alphanumeric_signature(cue.text) == ["feliz", "ano", "novo"])
         assert spoken_greetings == (3 if extra_clip_available else 2)

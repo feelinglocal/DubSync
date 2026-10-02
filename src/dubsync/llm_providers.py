@@ -17,7 +17,7 @@ from .gemini_audio_context import (
     GeminiSnippetUploads,
     validate_audio_context_config,
 )
-from .models import AdjudicationDecision, AudioEvidence, AudioSnippet, Cue, DivergenceSpan, Verdict, Word
+from .models import AdjudicationDecision, AudioEvidence, AudioSnippet, Cue, DivergenceSpan, SourcePairEvidence, Verdict, Word
 from .punctuation import PunctuationAdapter, StaticPunctuationAdapter
 from .providers import ProviderError
 from .subtitle_annotations import (
@@ -30,6 +30,10 @@ from .tokenize import tokenize_cues
 
 
 logger = logging.getLogger(__name__)
+
+_WHOLE_UTTERANCE_HEARING_PROMPT_VERSION = 1
+_SOURCE_PAIR_HEARING_PROMPT_VERSION = 2
+_COLLAPSED_SINGLETON_HEARING_PROMPT_VERSION = 2
 
 
 class AdjudicationBatch(BaseModel):
@@ -47,6 +51,7 @@ class AdjudicationResponseDecision(BaseModel):
     speaker: str | None = None
     character: str | None = None
     reason: str
+    source_pair_evidence: SourcePairEvidence | None = None
 
 
 class AdjudicationResponseBatch(BaseModel):
@@ -864,6 +869,61 @@ def _adjudication_prompt(
             for snippet in (audio_snippets or {}).values()
         ],
     }
+    for case in payload["spans"]:
+        if case["case_id"].startswith("collapsed-singleton-timing-"):
+            case["collapsed_singleton_hearing_policy"] = {
+                "version": _COLLAPSED_SINGLETON_HEARING_PROMPT_VERSION,
+                "keep_srt_final_text": case["srt_text"],
+                "instruction": (
+                    "Listen to the complete outer-anchor bracket, including activity between the neighboring spoken anchors. "
+                    "Use heard_clearly only when the complete target is heard exactly once, independently distinguishable "
+                    "from the neighboring anchors and all read-only context, including any supplied short interjections. "
+                    "All other unresolved activity in that bracket must be confidently nonlexical, such as breath or laughter. "
+                    "If another word, repeated target, overlapping voice or ambiguous vocalization cannot be ruled out, "
+                    "return heard_unclear. Distrust the collapsed primary timestamp and matching source/ASR hypotheses; "
+                    "they do not establish where or whether a word was heard. Do not return timestamps or borrow "
+                    "neighboring context. heard_text contains only the complete target actually heard, or the uncertainty. "
+                    "For keep_srt, copy keep_srt_final_text into final_text exactly, including its punctuation. "
+                    "The lexical hearing belongs in heard_text; do not remove source punctuation from final_text."
+                ),
+            }
+        if case["case_id"].startswith("source-pair-timing-v2-"):
+            speakers = case.get("speaker_ids", [])
+            candidate_id = case["case_id"] + "-candidate"
+            candidate = (audio_snippets or {}).get(candidate_id)
+            case["source_pair_hearing_policy"] = {
+                "version": _SOURCE_PAIR_HEARING_PROMPT_VERSION,
+                "anchor_speaker_id": speakers[0] if len(speakers) == 1 else None,
+                "candidate_audio_id": candidate_id,
+                "candidate_audio_available": candidate is not None,
+                "accepted_parts": case["srt_text"].splitlines(),
+                "instruction": (
+                    "Assess both complete parts using the wider case audio and the separate candidate excerpt of the SAME occurrence. "
+                    "Return source_pair_evidence with first_text and second_text as actually heard, sequence, voice_relation, "
+                    "intervening_speech, candidate_complete, candidate_start_clipped, candidate_end_clipped, "
+                    "laugh_outside_candidate and the exact candidate_audio_id. sequence is first_then_second only when "
+                    "the entire first part finishes before the second begins; overlapping, reversed or unclear speech does not qualify. "
+                    "voice_relation is same, different or unclear; return the anchor_speaker_id in speaker only for same, "
+                    "and null for different or unclear. For different voices do not identify or name the second speaker. "
+                    "Check that the candidate contains the complete first part and ALL of the target laugh, including its first "
+                    "chuckle and final exhalation, by comparing with the wider context. If either clip is unavailable, or any "
+                    "required finding is uncertain, use heard_unclear and null/unclear findings. Do not infer completeness "
+                    "or identity from source text, ASR agreement or timestamps. Do not return timestamps, add dialogue dashes, "
+                    "or include surrounding dialogue. heard_text and final_text contain the actually heard complete pair only."
+                ),
+            }
+    if language == "ja":
+        for case in payload["spans"]:
+            if case["case_id"].startswith("whole-utterance-timing-"):
+                case["hearing_orthography_policy"] = {
+                    "version": _WHOLE_UTTERANCE_HEARING_PROMPT_VERSION,
+                    "instruction": (
+                        "Write heard_text in normal Japanese orthography, preserving the actually audible words and inflections. "
+                        "When an audible word's reading and meaning unambiguously match a conventional kanji spelling shown "
+                        "in the source, that spelling may be used instead of phonetic kana. Do not copy source wording that "
+                        "was not heard; retain a different heard form or uncertainty when appropriate."
+                    ),
+                }
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -916,7 +976,9 @@ def _adjudication_review_prompt(
 ) -> str:
     """Build detailed local ownership evidence; never include whole-episode media."""
     selected_ids = {span.case_id for span in spans}
-    if set(audio_snippets) != selected_ids:
+    selected_audio_ids = selected_ids | {span.case_id + "-candidate" for span in spans
+                                         if span.case_id.startswith("source-pair-timing-v2-")}
+    if set(audio_snippets) != selected_audio_ids:
         raise ProviderError("Review audio must contain exactly the selected case clips")
     payload = json.loads(_adjudication_prompt(
         spans, confidence_gate=confidence_gate, audio_snippets=audio_snippets,

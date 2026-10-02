@@ -217,6 +217,10 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     # Normal successful operations.
     "text_changed": _change_kind("Wording changed to match the audio"),
     "missing_dialogue_audio_reconciled": _change_kind("Source-only dialogue checked against the audio"),
+    "accepted_anchor_omission_reconciled": _change_kind("Absent dialogue removed between confirmed neighboring lines"),
+    "source_pair_audio_reconciled": _change_kind("Spoken line and laugh joined after audio review"),
+    "source_exchange_audio_reconciled": _change_kind("Two speakers grouped after complete audio review"),
+    "collapsed_singleton_audio_reconciled": _change_kind("Word timing recovered from confirmed audio"),
     "adlib_inserted": _change_kind("Added line spoken in the audio"),
     "adlib_reconciled": _change_kind("Added line matched to a script cue"),
     "dropped_adjudicated_cue": _change_kind("Line removed"),
@@ -224,6 +228,10 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     "speaker_turn_split": _change_kind("Cue split at a speaker change"),
     "generated_adlib_segmented": _change_kind("Added speech split into cues"),
     "sync_cue_line_limit_split": _change_kind("Cue split to the line limit"),
+    "output_line_limit_split": _change_kind("Cue split to the line limit"),
+    "output_line_limit_reflow": _change_kind("Cue reflowed to the line limit"),
+    "annotation_line_limit_pagination": _change_kind("Screen text divided into pages"),
+    "annotation_line_limit_reflow": _change_kind("Screen text reflowed to the line limit"),
     "duplicate_cue_merged": _change_kind("Duplicate cue merged"),
     "overlap_dash_merge": _change_kind("Overlapping lines merged into a dash cue"),
     "german_profanity_censored": _change_kind("Profanity masked"),
@@ -309,7 +317,9 @@ _LYRIC_ABSENCE_KINDS = frozenset({
 _TEXT_CHANGE_KINDS = frozenset({
     "text_changed", "adlib_inserted", "adlib_reconciled", "dropped_adjudicated_cue", "dropped_unmatched_cue",
     "speaker_turn_split", "generated_adlib_segmented", "sync_cue_line_limit_split", "duplicate_cue_merged",
-    "overlap_dash_merge", "german_profanity_censored", "cps_cue_merged",
+    "output_line_limit_split", "output_line_limit_reflow",
+    "annotation_line_limit_pagination", "annotation_line_limit_reflow",
+    "overlap_dash_merge", "german_profanity_censored", "cps_cue_merged", "source_pair_audio_reconciled", "source_exchange_audio_reconciled",
 })
 _TIMING_CHANGE_KINDS = frozenset({
     "timing_refined", "forced_alignment_refined", "media_boundary_clamped", "cps_duration_extended",
@@ -319,6 +329,7 @@ _MOVE_THRESHOLD_KINDS = frozenset({"timing_refined", "forced_alignment_refined"}
 # Diagnostic buckets that do not correspond to one raw kind.
 _DIAGNOSTIC_TITLES = {
     "stale_overlap": "Overlap reported before a later stage separated the cues",
+    "resolved_omission_adjudication": "Earlier AI uncertainty resolved by confirmed dialogue omission",
     "style:frame_grid": "Timecode off the frame grid (your timing, or the frame rate was guessed)",
     "style:line_length": "Line longer than the style profile (your text)",
     "style:line_count": "More lines than the style profile (your text)",
@@ -520,6 +531,14 @@ class _FindingSorter:
         for position, cue in enumerate(self.cues):
             self.position.setdefault(cue.index, position)
         self.by_id = {cue.index: cue for cue in reversed(self.cues)}
+        self.confirmed_omissions = {
+            cue_id
+            for flag in self.flags
+            if flag.kind in {"missing_dialogue_audio_reconciled", "accepted_anchor_omission_reconciled"}
+            and flag.confidence == 1.0 and flag.new_text == ""
+            for cue_id in flag.cue_ids
+            if cue_id not in self.by_id
+        }
         self.has_source = source_cues is not None
         self.source = {cue.index: cue for cue in source_cues or []}
         self.fps_confident = summary_metadata.get("fps_detection_confident") is True
@@ -650,6 +669,13 @@ class _FindingSorter:
     def _sort_review_flag(self, index: int, flag: QCFlag, spec: KindSpec) -> None:
         kind = flag.kind
         cue_ids = flag.cue_ids
+        if kind == "low_confidence_adjudication" and cue_ids and all(
+            cue_id in self.confirmed_omissions for cue_id in cue_ids
+        ):
+            # Keep the earlier failed hearing in raw diagnostics. A later complete
+            # audio check removed every target; there is no delivered cue to fix.
+            self._diagnostic("resolved_omission_adjudication", index, flag)
+            return
         if kind == "alignment_anchor_coverage_low" and flag.severity != "error":
             # Coverage counts unspoken song captions; only a collapse is actionable.
             self._diagnostic(kind, index, flag)

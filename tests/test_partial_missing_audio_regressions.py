@@ -60,17 +60,13 @@ def test_positive_omission_window_retains_its_existing_word_boundaries():
 
 
 @pytest.mark.parametrize("defect", [
-    "low-confidence", "collapsed-word", "20-ms-word", "overlong-word", "overlap",
+    "low-confidence", "overlong-word", "overlap",
     "speaker-change", "remote-flank",
 ])
 def test_unreliable_flanking_words_do_not_reclassify_missing_audio(defect):
     cues, words = _supported_omission()
     if defect == "low-confidence":
         words[1] = words[1].model_copy(update={"confidence": .4})
-    elif defect == "collapsed-word":
-        words[1] = words[1].model_copy(update={"start": 1.499})
-    elif defect == "20-ms-word":
-        words[1] = words[1].model_copy(update={"start": 1.48})
     elif defect == "overlong-word":
         words[0] = words[0].model_copy(update={"start": -1.0})
     elif defect == "overlap":
@@ -84,6 +80,23 @@ def test_unreliable_flanking_words_do_not_reclassify_missing_audio(defect):
 
     assert alignment.diagnostics.missing_audio_cue_ids == [1]
     assert alignment.divergence_spans[0].end <= alignment.divergence_spans[0].start
+
+
+@pytest.mark.parametrize("internal_start", [1.499, 1.48], ids=["1-ms-internal-word", "20-ms-internal-word"])
+def test_short_internal_word_uses_reliable_outer_anchors_for_the_whole_clause_question(internal_start):
+    # The short word cannot establish a local omission window. Guard 8 may
+    # still ask about the whole mostly matched phrase using its reliable outer
+    # words; opening that hearing question does not repair any word timestamp.
+    cues, words = _supported_omission()
+    words[1] = words[1].model_copy(update={"start": internal_start})
+    before = [word.model_dump() for word in words]
+    alignment = aligner.align_cues_to_words(cues, words)
+    assert alignment.diagnostics.missing_audio_cue_ids == []
+    assert alignment.cue_word_indices == {1: [0, 1, 2, 3, 4], 2: [6, 7]}
+    omission = next(span for span in alignment.divergence_spans if span.srt_text == "realmente")
+    assert (omission.start, omission.end) == (1.05, 2.35)
+    assert omission.asr_word_indices == []
+    assert [word.model_dump() for word in words] == before
 
 
 @pytest.mark.parametrize("text", [

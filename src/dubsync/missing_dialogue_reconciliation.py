@@ -13,8 +13,10 @@ import json
 from math import ceil, floor, isfinite
 
 from .adjudication_regions import is_song_caption_cue
-from .asr_timing import MIN_OWNED_OVERLAP_SECONDS
+from .adjudication_case_cache import flag_applies_to_case
+from .asr_timing import MIN_OWNED_OVERLAP_SECONDS, has_sufficient_speech_overlap
 from .models import AdjudicationDecision, AlignmentResult, Cue, CueContext, DivergenceSpan, QCFlag, SpeechRegion, Word
+from .recue import _BOUNDARY_SENTENCE_PUNCTUATION
 from .style_profile import StyleProfile
 from .subtitle_annotations import cue_has_bracketed_screen_text, speech_text_for_alignment
 from .text_metrics import join_word_texts
@@ -22,6 +24,7 @@ from .tokenize import alphanumeric_signature, tokenize_cues
 
 
 MISSING_DIALOGUE_POLICY_VERSION = 1
+MISSING_DIALOGUE_RECEIPT_POLICY_VERSION = 3
 MISSING_DIALOGUE_RESIDUAL_PREFIX = "missing-dialogue-residual-v1-"
 _MAX_ANCHORED_WINDOW_SECONDS = 16.0
 _MAX_TARGET_TOKENS = 16
@@ -41,17 +44,40 @@ class MissingDialogueQuestion:
     left_word_indices: tuple[int, ...]
     right_word_indices: tuple[int, ...]
     read_only_source_tokens: tuple[str, ...]
+    purpose: str = "missing_dialogue"
+    target_word_indices: tuple[int, ...] = ()
+    evidence_word_indices: tuple[int, ...] = ()
+    discarded_word_indices: tuple[int, ...] = ()
+    word_evidence_sha256: str = ""
+    neighbor_boundary_allowance_seconds: float = .3
+    secondary_acoustic_proof: dict[str, object] | None = None
+    secondary_acoustic_proof_sha256: str = ""
 
     @property
     def cue_id(self) -> int:
         return self.span.cue_ids[0]
 
     def record(self) -> dict[str, object]:
-        return {
+        result = {
             "span": self.span.model_dump(mode="json"), "parent_case_id": self.parent_case_id,
             "left_word_indices": list(self.left_word_indices), "right_word_indices": list(self.right_word_indices),
             "read_only_source_tokens": list(self.read_only_source_tokens),
+            "neighbor_boundary_allowance_seconds": self.neighbor_boundary_allowance_seconds,
         }
+        # Keep ordinary omission-question receipts stable. Positive timing
+        # questions bind their extra, read-only word provenance explicitly.
+        if self.purpose != "missing_dialogue":
+            result.update({
+                "purpose": self.purpose, "target_word_indices": list(self.target_word_indices),
+                "evidence_word_indices": list(self.evidence_word_indices),
+                "discarded_word_indices": list(self.discarded_word_indices),
+                "word_evidence_sha256": self.word_evidence_sha256,
+                "neighbor_boundary_allowance_seconds": self.neighbor_boundary_allowance_seconds,
+            })
+        if self.secondary_acoustic_proof is not None:
+            result.update({"secondary_acoustic_proof": self.secondary_acoustic_proof,
+                           "secondary_acoustic_proof_sha256": self.secondary_acoustic_proof_sha256})
+        return result
 
 
 @dataclass(frozen=True)
@@ -84,6 +110,22 @@ def _owners(alignment: AlignmentResult) -> dict[int, set[int]]:
         for index in indices:
             result.setdefault(index, set()).add(cue_id)
     return result
+
+
+def _sentence_punctuation_indices(indices, words):
+    return bool(indices) and list(indices) == sorted(set(indices)) and all(
+        0 <= index < len(words) and bool(words[index].text.strip())
+        and set(words[index].text.strip()) <= _BOUNDARY_SENTENCE_PUNCTUATION
+        and isfinite(words[index].start) and isfinite(words[index].end)
+        and 0 <= words[index].start < words[index].end
+        for index in indices
+    )
+
+
+def _question_word_digest(question, words):
+    indices = sorted(set((*question.left_word_indices, *question.right_word_indices,
+                          *question.target_word_indices, *question.evidence_word_indices)))
+    return _digest([{"word_index": index, "word": words[index].model_dump(mode="json")} for index in indices])
 
 
 def _anchor_indices(cue_id, alignment, words, tokens, owners, uncertain):
@@ -123,6 +165,7 @@ def _lexical_words_in_gap(words: list[Word], start: float, end: float) -> bool:
 def build_missing_dialogue_questions(
     cues: list[Cue], alignment: AlignmentResult, words: list[Word], regions: list[SpeechRegion] | None, *,
     uncertain_word_indices: set[int] | None = None, audio_duration_seconds: float,
+    max_neighbor_boundary_overrun: float = .3,
 ) -> list[MissingDialogueQuestion]:
     """Return narrowly editable questions; original mixed spans remain held.
 
@@ -131,7 +174,7 @@ def build_missing_dialogue_questions(
     gap boundaries come from independently matched words, never source times.
     """
     if (regions is None or alignment.diagnostics.unresolved or not isfinite(audio_duration_seconds)
-            or audio_duration_seconds <= 0
+            or audio_duration_seconds <= 0 or not isfinite(max_neighbor_boundary_overrun) or max_neighbor_boundary_overrun < 0
             or any(not isfinite(r.start) or not isfinite(r.end) or not 0 <= r.start < r.end for r in regions)):
         return []
     tokens = tokenize_cues(cues)
@@ -140,9 +183,10 @@ def build_missing_dialogue_questions(
     uncertain = uncertain_word_indices or set()
     result: list[MissingDialogueQuestion] = []
     for position, cue in enumerate(cues):
-        if (cue.index not in missing or position == 0 or position + 1 >= len(cues)
+        owned = tuple(alignment.cue_word_indices.get(cue.index, ()))
+        if (position == 0 or position + 1 >= len(cues)
                 or is_song_caption_cue(cue) or cue_has_bracketed_screen_text(cue)
-                or alignment.cue_word_indices.get(cue.index)):
+                or owned and not _sentence_punctuation_indices(owned, words)):
             continue
         own = [token.token_index for token in tokens if token.cue_id == cue.index]
         parents = [span for span in alignment.divergence_spans
@@ -150,13 +194,21 @@ def build_missing_dialogue_questions(
         if len(parents) != 1 or not own or len(own) > _MAX_TARGET_TOKENS:
             continue
         parent = parents[0]
+        punctuation_only = (
+            _sentence_punctuation_indices(parent.asr_word_indices, words)
+            and not alphanumeric_signature(parent.asr_text)
+            and set(owned) <= set(parent.asr_word_indices)
+            and not any(owners.get(index, set()) - {cue.index} for index in parent.asr_word_indices)
+        )
+        if not punctuation_only and (cue.index not in missing or owned):
+            continue
         source_indices = parent.srt_token_indices
         if (not set(own) <= set(source_indices) or source_indices != sorted(set(source_indices))
                 or source_indices[0] < 0 or source_indices[-1] >= len(tokens)
                 or [tokens[index].normalized for index in source_indices] != alphanumeric_signature(parent.srt_text)
                 or any(tokens[index].cue_id not in parent.cue_ids for index in source_indices)
-                or set(parent.cue_ids) & missing != {cue.index}
-                or parent.asr_word_indices or alphanumeric_signature(parent.asr_text)):
+                or (set(parent.cue_ids) & missing) - {cue.index}
+                or not punctuation_only and (parent.asr_word_indices or alphanumeric_signature(parent.asr_text))):
             continue
         left, right = cues[position - 1], cues[position + 1]
         if (parent.left_anchor_cue_id != left.index or parent.right_anchor_cue_id != right.index
@@ -191,8 +243,14 @@ def build_missing_dialogue_questions(
             left_anchor_speaker_id=words[left_indices[-1]].speaker_id,
             right_anchor_speaker_id=words[right_indices[0]].speaker_id,
         )
-        result.append(MissingDialogueQuestion(question, parent.case_id, left_indices, right_indices,
-                      tuple(tokens[index].normalized for index in source_indices if index not in own)))
+        candidate = MissingDialogueQuestion(question, parent.case_id, left_indices, right_indices,
+                      tuple(tokens[index].normalized for index in source_indices if index not in own),
+                      purpose="nonlexical_missing_dialogue" if punctuation_only else "missing_dialogue",
+                      target_word_indices=owned, evidence_word_indices=tuple(parent.asr_word_indices) if punctuation_only else (),
+                      neighbor_boundary_allowance_seconds=max_neighbor_boundary_overrun)
+        if punctuation_only:
+            candidate = MissingDialogueQuestion(**{**candidate.__dict__, "word_evidence_sha256": _question_word_digest(candidate, words)})
+        result.append(candidate)
     return result
 
 
@@ -214,7 +272,9 @@ def with_missing_dialogue_residual_questions(
     parents = {span.case_id: span for span in alignment.divergence_spans}
     added: list[DivergenceSpan] = []
     for question in questions:
-        parent = parents[question.parent_case_id]
+        parent = parents.get(question.parent_case_id)
+        if parent is None:
+            continue
         for cue_id in dict.fromkeys(parent.cue_ids):
             if cue_id == question.cue_id:
                 continue
@@ -240,7 +300,7 @@ def with_missing_dialogue_residual_questions(
 
 def reconciliation_context(questions, cues, alignment, words, regions, *, audio_sha256):
     return {
-        "policy_version": MISSING_DIALOGUE_POLICY_VERSION,
+        "policy_version": MISSING_DIALOGUE_RECEIPT_POLICY_VERSION,
         "audio_required": True, "audio_sha256": audio_sha256,
         "questions_sha256": _digest([question.record() for question in questions]),
         "source_sha256": _digest([cue.model_dump(mode="json") for cue in cues]),
@@ -325,22 +385,94 @@ def _independent_gap_activity(question, words, regions, bursts):
             and chain.start < end - _EPSILON and chain.end > start + _EPSILON]
 
 
+def _unowned_omission_activity(question, sources, alignment, words, regions):
+    """An absence answer may exclude only fully accounted-for neighbour audio.
+
+    Each raw member of an excluded chain must overlap reliable words belonging
+    to one completely matched neighbour. A connected but untranscribed pulse
+    remains activity, even when it falls within the normal boundary allowance.
+    """
+    if any(not isfinite(r.start) or not isfinite(r.end) or not 0 <= r.start < r.end for r in regions):
+        return list(regions)
+    chains = []
+    for region in sorted(regions, key=lambda item: (item.start, item.end)):
+        if chains and region.start - max(item.end for item in chains[-1]) < _MAX_SPEECH_CHAIN_GAP_SECONDS - _EPSILON:
+            chains[-1].append(region)
+        else:
+            chains.append([region])
+    tokens = tokenize_cues(list(sources.values()))
+    owners = _owners(alignment)
+    neighbors = []
+    for cue_id, indices in ((question.span.left_anchor_cue_id, question.left_word_indices),
+                            (question.span.right_anchor_cue_id, question.right_word_indices)):
+        own_tokens = {token.token_index for token in tokens if token.cue_id == cue_id}
+        matched = {match.srt_token_index for match in alignment.token_matches
+                   if match.cue_id == cue_id and match.asr_word_index in indices and match.score >= .8
+                   and 0 <= match.srt_token_index < len(tokens)
+                   and tokens[match.srt_token_index].cue_id == cue_id
+                   and tokens[match.srt_token_index].normalized in alphanumeric_signature(words[match.asr_word_index].text)}
+        if (own_tokens and own_tokens <= matched
+                and alphanumeric_signature(speech_text_for_alignment(sources[cue_id])) ==
+                    [token for index in indices for token in alphanumeric_signature(words[index].text)]
+                and all(owners.get(index) == {cue_id} and isfinite(words[index].start) and isfinite(words[index].end)
+                        and 0 <= words[index].start < words[index].end
+                        and .020 + _EPSILON < words[index].end - words[index].start <= 2.0 for index in indices)):
+            neighbors.append((cue_id, indices))
+    remaining = []
+    gap_start, gap_end = question.span.left_anchor_end, question.span.right_anchor_start
+    for members in chains:
+        start, end = min(r.start for r in members), max(r.end for r in members)
+        if start >= gap_end - _EPSILON or end <= gap_start + _EPSILON:
+            continue
+        owned = False
+        for cue_id, indices in neighbors:
+            allowance = question.neighbor_boundary_allowance_seconds
+            if (start < question.span.start - _EPSILON or end > question.span.end + _EPSILON
+                    or start < words[indices[0]].start - allowance - _EPSILON
+                    or end > words[indices[-1]].end + allowance + _EPSILON
+                    or any(not any(has_sufficient_speech_overlap(words[index], r.start, r.end) for index in indices)
+                           for r in members)):
+                continue
+            if any(alphanumeric_signature(word.text) and
+                   (not isfinite(word.start) or not isfinite(word.end)
+                    or word.start < end - _EPSILON and word.end > start + _EPSILON
+                    and (index not in indices or owners.get(index) != {cue_id})) for index, word in enumerate(words)):
+                continue
+            owned = True
+            break
+        if not owned:
+            remaining.extend(members)
+    return remaining
+
+
 def _resolution_reason(question, decision, sources, alignment, words, regions, flags):
     if decision is None:
         return "pending_audio_question", None
     if decision.evidence != "heard_clearly" or decision.confidence != 1:
         return "unconfirmed_audio", None
-    if any(flag.cue_ids and question.cue_id in flag.cue_ids and flag.kind in {
+    if any(flag_applies_to_case(flag, question.span) and flag.kind in {
         "adjudication_audio_unavailable", "audio_snippet_unavailable", "llm_provider_unavailable",
         "invalid_llm_response", "low_confidence_adjudication", "adjudication_review_unavailable",
     } for flag in flags):
         return "unconfirmed_audio", None
+    if question.purpose == "whole_utterance_timing":
+        from .whole_utterance_timing import whole_utterance_resolution_reason
+        return whole_utterance_resolution_reason(question, decision, sources, alignment, words, regions)
     span = question.span
     source = sources[question.cue_id]
-    if (alignment.diagnostics.unresolved or alignment.cue_word_indices.get(question.cue_id)
+    target_indices = tuple(alignment.cue_word_indices.get(question.cue_id, ()))
+    nonlexical = question.purpose == "nonlexical_missing_dialogue"
+    if (alignment.diagnostics.unresolved or target_indices and not nonlexical
             or is_song_caption_cue(source) or cue_has_bracketed_screen_text(source)):
         return "source_or_ownership_changed", None
     owners = _owners(alignment)
+    if nonlexical and (
+        target_indices != question.target_word_indices
+        or not _sentence_punctuation_indices(question.evidence_word_indices, words)
+        or any(owners.get(index, set()) - {source.index} for index in question.evidence_word_indices)
+        or _question_word_digest(question, words) != question.word_evidence_sha256
+    ):
+        return "source_or_ownership_changed", None
     if any(index >= len(words) or owners.get(index) != {cue_id}
            for cue_id, indices in ((span.left_anchor_cue_id, question.left_word_indices),
                                   (span.right_anchor_cue_id, question.right_word_indices)) for index in indices):
@@ -357,7 +489,8 @@ def _resolution_reason(question, decision, sources, alignment, words, regions, f
     if not heard:
         if decision.final_text.strip() or (decision.heard_text or "").strip() or decision.verdict == "keep_srt":
             return "wording_does_not_match_hearing", None
-        return ("audio_confirmed_omission", None) if not bursts else ("untranscribed_activity_remains", None)
+        remaining = _unowned_omission_activity(question, sources, alignment, words, regions)
+        return ("audio_confirmed_omission", None) if not remaining else ("untranscribed_activity_remains", None)
     bursts = _independent_gap_activity(question, words, regions, bursts)
     read_only = list(question.read_only_source_tokens)
     target = alphanumeric_signature(span.srt_text)
@@ -400,9 +533,16 @@ def reconcile_missing_dialogue(
     spoken: dict[int, tuple[int, int]] = {}
     outcomes: list[dict[str, object]] = []
     change_flags: list[QCFlag] = []
+    current_by_id = {cue.index: cue for cue in rebuilt}
     for question in questions:
         decision = by_case.get(question.span.case_id)
-        outcome, burst = _resolution_reason(question, decision, sources, alignment, words, regions, flags)
+        current = current_by_id.get(question.cue_id)
+        if (question.purpose == "whole_utterance_timing" and
+                (current is None or alphanumeric_signature(current.plain_text) !=
+                 alphanumeric_signature(sources[question.cue_id].plain_text))):
+            outcome, burst = "source_or_wording_changed", None
+        else:
+            outcome, burst = _resolution_reason(question, decision, sources, alignment, words, regions, flags)
         outcomes.append({"case_id": question.span.case_id, "cue_id": question.cue_id, "outcome": outcome,
                          "native_evidence": decision.evidence if decision else None,
                          "heard_text": decision.heard_text if decision else None})
@@ -420,8 +560,9 @@ def reconcile_missing_dialogue(
             if end_ms < burst.end * 1000 or start_ms < question.span.left_anchor_end * 1000 or end_ms <= start_ms:
                 outcomes[-1]["outcome"] = "no_safe_frame_boundary"
                 continue
-            lines = source.lines if alphanumeric_signature(source.plain_text) == alphanumeric_signature(decision.final_text) else [decision.final_text.strip()]
-            replacement[source.index] = source.with_lines(lines).with_timing(start_ms, end_ms)
+            base = current if question.purpose == "whole_utterance_timing" else source
+            lines = base.lines if alphanumeric_signature(base.plain_text) == alphanumeric_signature(decision.final_text) else [decision.final_text.strip()]
+            replacement[source.index] = base.with_lines(lines).with_timing(start_ms, end_ms)
             spoken[source.index] = (floor(burst.start * 1000), ceil(burst.end * 1000))
         change_flags.append(QCFlag(
             kind="missing_dialogue_audio_reconciled", severity="info", cue_ids=[source.index],
@@ -432,6 +573,8 @@ def reconcile_missing_dialogue(
             end=burst.end if burst else question.span.right_anchor_start,
         ))
     resolved = set(replacement)
+    positively_resolved = {question.cue_id for question in questions
+                           if question.purpose == "whole_utterance_timing" and question.cue_id in resolved}
     # Resolving Tao does not approve the neighbouring "chega" from the
     # original mixed case. Retain one actionable wording finding for that
     # residual fragment without making it editable or changing its timing.
@@ -460,8 +603,9 @@ def reconcile_missing_dialogue(
     def clean(items):
         cleaned = []
         for flag in items:
-            if flag.kind in _RELEASED_HOLD_KINDS and set(flag.cue_ids) & resolved:
-                remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in resolved]
+            released = positively_resolved if flag.kind == "timing_evidence_held" else resolved if flag.kind in _RELEASED_HOLD_KINDS else set()
+            if set(flag.cue_ids) & released:
+                remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in released]
                 if remaining:
                     cleaned.append(flag.model_copy(update={"cue_ids": remaining}))
             else:

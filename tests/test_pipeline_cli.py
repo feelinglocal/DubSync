@@ -1420,7 +1420,12 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
     ):
         snippet_path = output_dir / f"{spans[0].case_id}.wav"
         snippet_path.parent.mkdir(parents=True, exist_ok=True)
-        snippet_path.write_bytes(b"RIFFsnippetWAVEfmt ")
+        # Clip provenance now verifies decoded PCM coverage, not just a header.
+        with wave.open(str(snippet_path), "wb") as snippet_wav:
+            snippet_wav.setnchannels(1)
+            snippet_wav.setsampwidth(2)
+            snippet_wav.setframerate(16000)
+            snippet_wav.writeframes(b"\x00\x00" * 48000)
         snippet_calls.append(
             {
                 "audio_path": audio_path_arg,

@@ -15,6 +15,24 @@ _TRANSIENT = frozenset({
     "audio_snippet_unavailable", "adjudication_audio_unavailable", "adjudication_review_unavailable",
     "invalid_llm_response", "llm_provider_unavailable",
 })
+ADJUDICATION_FLAG_SCOPE_POLICY_VERSION = 1
+
+
+def flag_applies_to_case(flag: QCFlag, span: DivergenceSpan) -> bool:
+    """Keep failures on the question they describe, including legacy caches.
+
+    Several independent questions can concern the same cue. Known text or
+    boundaries identify their scope; a failure with no usable scope remains
+    conservative. This does not remove the finding from the episode's QC.
+    """
+    if flag.cue_ids and span.cue_ids and not set(flag.cue_ids).intersection(span.cue_ids):
+        return False
+    if flag.old_text is not None and flag.old_text != span.srt_text:
+        return False
+    for value, expected in ((flag.start, span.start), (flag.end, span.end)):
+        if value is not None and expected is not None and abs(value - expected) > 1e-6:
+            return False
+    return True
 
 
 def case_cache_key(
@@ -59,6 +77,10 @@ def read_case(cache: JsonDiskCache, key: CacheKey, span: DivergenceSpan):
         flags = [QCFlag.model_validate(item) for item in payload["flags"]]
     except (KeyError, TypeError, ValueError, ValidationError):
         return None
+    # Older per-case caches copied every flag sharing a cue ID, including
+    # failures from other partial or whole-cue questions. Filter while the
+    # cache's owning span is still known, before the flags are aggregated.
+    flags = [flag for flag in flags if flag_applies_to_case(flag, span)]
     if any(flag.kind in _TRANSIENT for flag in flags):
         return None
     return decision.model_copy(update={"case_id": span.case_id}), flags
@@ -67,8 +89,13 @@ def read_case(cache: JsonDiskCache, key: CacheKey, span: DivergenceSpan):
 def write_case(
     cache: JsonDiskCache, key: CacheKey, span: DivergenceSpan,
     decision: AdjudicationDecision, flags: Sequence[QCFlag],
+    *, audio_provenance: dict | None = None,
 ) -> None:
+    flags = [flag for flag in flags if flag_applies_to_case(flag, span)]
     if decision.case_id != span.case_id or any(flag.kind in _TRANSIENT for flag in flags):
         return
-    cache.write(key, {"decision": decision.model_dump(mode="json"),
-                      "flags": [flag.model_dump(mode="json") for flag in flags]})
+    value = {"decision": decision.model_dump(mode="json"),
+             "flags": [flag.model_dump(mode="json") for flag in flags]}
+    if audio_provenance is not None:
+        value["audio_provenance"] = audio_provenance
+    cache.write(key, value)

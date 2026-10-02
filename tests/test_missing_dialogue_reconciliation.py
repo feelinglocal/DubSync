@@ -465,6 +465,58 @@ def _pipeline_case(tmp_path, monkeypatch, *, bursts=(), heard="", evidence="hear
     return case, adapter, run
 
 
+@pytest.mark.parametrize("mode", ["fresh", "cache", "rebuild", "verify", "legacy_case_cache", "legacy_batch_cache"])
+def test_whole_timing_recovery_requires_native_audio_even_when_wording_is_identical(tmp_path, monkeypatch, mode):
+    cues = [Cue(index=1, start_ms=900, end_ms=1300, lines=["Wait here."]),
+            Cue(index=2, start_ms=2000, end_ms=2300, lines=["Tao."]),
+            Cue(index=3, start_ms=2300, end_ms=2800, lines=["Come."])]
+    words = [Word(text=text, start=start, end=end) for text, start, end in [
+        ("Wait", 1.0, 1.15), ("here", 1.16, 1.3), ("Tao", 1.701, 1.702), ("Come", 2.1, 2.4),
+    ]]
+    tokens = tokenize_cues(cues)
+    ownership = {1: [0, 1], 2: [2], 3: [3]}
+    alignment = AlignmentResult(
+        cue_word_indices=ownership,
+        token_matches=[TokenMatch(cue_id=token.cue_id, srt_token_index=token.token_index,
+                                 asr_word_index=token.token_index, score=1) for token in tokens],
+        divergence_spans=[], unmatched_cue_ids=[],
+        diagnostics={"missing_audio_cue_ids": [], "missing_audio_guard_version": pipeline.MISSING_AUDIO_GUARD_VERSION},
+    )
+    regions = [SpeechRegion(start=1, end=1.3), SpeechRegion(start=1.6, end=1.9), SpeechRegion(start=2.1, end=2.4)]
+    _, adapter, run = _pipeline_case(tmp_path, monkeypatch, case_override=(cues, words, alignment, regions), heard="Tao.")
+    if mode.startswith("legacy_"):
+        # Reproduce the prior cache writer: a typographic shortcut with no
+        # hearing-specific key context. No native evidence is fabricated.
+        with monkeypatch.context() as legacy:
+            legacy.setattr(pipeline, "_required_hearing_cache_context", lambda _span: {})
+            legacy.setattr(AdjudicationEngine, "adjudicate", lambda engine, spans: (
+                [engine.deterministic_policy.decide(span) for span in spans], [],
+            ))
+            old_result = run()
+        assert adapter.seen == []
+        old_proof = json.loads((old_result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
+        assert old_proof["decisions"][0]["evidence"] is None
+        if mode == "legacy_case_cache":
+            monkeypatch.setattr(pipeline, "_load_cached_adjudication", lambda *_a, **_k: None)
+    result = run()
+    assert len(adapter.seen) == 1
+    assert adapter.seen[0].case_id.startswith("whole-utterance-timing-")
+    assert adapter.seen[0].asr_text == "Tao"
+    if mode in {"cache", "rebuild", "verify"}:
+        adapter.seen.clear()
+        result = run(**({} if mode == "cache" else {"resume": mode}))
+        assert adapter.seen == []
+    artifact = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    target = next(cue for cue in artifact["cues"] if cue["index"] == 2)
+    assert target["start_ms"] <= 1600 and target["end_ms"] >= 1900
+    assert target["end_ms"] <= 2100
+    assert artifact["alignment"]["cue_word_indices"] == {str(k): v for k, v in ownership.items()}
+    proof = json.loads((result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
+    assert proof["decisions"][0]["heard_text"] == "Tao."
+    assert proof["decisions"][0]["evidence"] == "heard_clearly"
+    assert any(outcome["outcome"] == "audio_confirmed_utterance" for outcome in proof["outcomes"])
+
+
 @pytest.mark.parametrize("mode", ["fresh", "cache", "rebuild", "verify"])
 def test_pipeline_reconciles_complete_native_omission_in_fresh_cached_and_resumed_runs(tmp_path, monkeypatch, mode):
     case, adapter, run = _pipeline_case(tmp_path, monkeypatch)

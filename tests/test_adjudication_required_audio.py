@@ -257,3 +257,129 @@ def test_pipeline_requires_focused_audio_only_when_full_audio_is_disabled(tmp_pa
     assert adapter.calls == [("audio", ["case-1"])]
     assert [cue.plain_text for cue in adapter.source_context] == ["old source words"]
     assert "different spoken wording" in result.output_srt.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("source,asr", [("三分？", "三分？"), ("三分？", "三 分"), ("Hello!", "hello")])
+def test_explicit_whole_hearing_reaches_native_adapter_despite_identical_words(tmp_path, monkeypatch, source, asr):
+    """Exercise the production native adapter; intercept only its transport."""
+    from types import SimpleNamespace
+    from dubsync import llm_providers
+    from dubsync.llm_providers import GeminiLLMAdapter
+    calls = []
+    span = _span("whole-utterance-timing-v2-cue-50").model_copy(update={"srt_text": source, "asr_text": asr})
+    before = span.model_dump()
+    snippet = _snippet(tmp_path, span)
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text=json.dumps({"decisions": [{
+            "case_id": span.case_id, "verdict": "keep_srt", "final_text": source,
+            "heard_text": source, "evidence": "heard_clearly", "speaker": None,
+            "character": "unknown", "reason": "Synthetic native-schema response for routing regression.",
+        }]}), usage_metadata={})
+
+    monkeypatch.setattr(llm_providers, "_gemini_generate_json", capture)
+    adapter = GeminiLLMAdapter(api_key="test", model="gemini-3.8-flash")
+    decisions, flags = AdjudicationEngine(adapter, audio_snippets={span.case_id: snippet},
+        required_audio_case_ids={span.case_id}, language="ja").adjudicate([span])
+    assert len(calls) == 1
+    assert calls[0]["audio_snippets"] == {span.case_id: snippet}
+    payload = json.loads(calls[0]["prompt"])
+    sent = next(case for case in payload["spans"] if case["case_id"] == span.case_id)
+    assert sent["srt_text"] == source and sent["asr_text"] == asr
+    assert decisions[0].evidence == "heard_clearly" and decisions[0].heard_text == source
+    assert decisions[0].confidence == 1 and flags == []
+    assert span.model_dump() == before
+
+
+@pytest.mark.parametrize("fault", ["missing", "truncated", "text_only"])
+def test_identical_required_words_cannot_bypass_the_audio_availability_hold(tmp_path, fault):
+    span = _span("whole-utterance-timing-v2-cue-50").model_copy(update={"srt_text": "三分？", "asr_text": "三分"})
+    adapter = _TextAdapter() if fault == "text_only" else _AudioAdapter()
+    snippets = {span.case_id: _snippet(tmp_path, span)}
+    if fault == "missing":
+        snippets = {}
+    elif fault == "truncated":
+        snippets[span.case_id] = snippets[span.case_id].model_copy(update={"start": .15})
+    decisions, flags = AdjudicationEngine(adapter, audio_snippets=snippets,
+        required_audio_case_ids={span.case_id}).adjudicate([span])
+    _assert_held(decisions[0], flags, span)
+    assert adapter.calls == []
+
+
+def test_an_ordinary_typographic_case_keeps_its_deterministic_route():
+    span = _span().model_copy(update={"srt_text": "Hello!", "asr_text": "hello"})
+    adapter = _AudioAdapter()
+    decisions, flags = AdjudicationEngine(adapter, required_audio_case_ids={"a-different-case"},
+        require_audio_snippets=True).adjudicate([span])
+    assert decisions[0].final_text == "Hello!" and decisions[0].evidence is None
+    assert flags == [] and adapter.calls == []
+
+
+@pytest.mark.parametrize("language,case_id,has_policy", [
+    ("ja", "whole-utterance-timing-v2-cue-17", True),
+    ("ja", "case-17", False),
+    ("en", "whole-utterance-timing-v2-cue-17", False),
+])
+def test_whole_japanese_hearing_reports_orthography_without_rewriting_the_evidence(language, case_id, has_policy):
+    from dubsync.llm_providers import _adjudication_prompt
+
+    span = _span(case_id).model_copy(update={"srt_text": "ここで跪いて", "asr_text": "ここでひざまずいて"})
+    payload = json.loads(_adjudication_prompt([span], language=language))
+    sent = payload["spans"][0]
+    assert sent["srt_text"] == span.srt_text and sent["asr_text"] == span.asr_text
+    assert ("hearing_orthography_policy" in sent) is has_policy
+    if has_policy:
+        instruction = sent["hearing_orthography_policy"]["instruction"]
+        assert "actually audible words and inflections" in instruction
+        assert "Do not copy source wording that was not heard" in instruction
+        assert "retain a different heard form or uncertainty" in instruction
+
+
+@pytest.mark.parametrize("case_id,has_policy", [
+    ("source-pair-timing-v2-cues-10-11", True), ("case-10", False),
+    ("whole-utterance-timing-v2-cue-10", False),
+])
+def test_source_pair_hearing_requires_complete_ordered_candidate_evidence(case_id, has_policy):
+    from dubsync.llm_providers import _adjudication_prompt
+
+    span = _span(case_id).model_copy(update={"srt_text": "いいでしょ？\nははは",
+                                            "speaker_ids": ["speaker_0"]})
+    before = span.model_dump()
+    sent = json.loads(_adjudication_prompt([span], language="ja"))["spans"][0]
+    assert ("source_pair_hearing_policy" in sent) is has_policy
+    if has_policy:
+        policy = sent["source_pair_hearing_policy"]
+        assert policy["anchor_speaker_id"] == "speaker_0"
+        assert "both complete parts" in policy["instruction"]
+        assert "voice_relation" in policy["instruction"]
+        assert "source_pair_evidence" in policy["instruction"]
+        assert "candidate_start_clipped" in policy["instruction"]
+        assert "laugh_outside_candidate" in policy["instruction"]
+        assert "Do not infer" in policy["instruction"]
+    assert span.model_dump() == before
+
+
+@pytest.mark.parametrize("case_id,has_policy", [
+    ("collapsed-singleton-timing-v1-cue-601", True), ("case-601", False),
+    ("whole-utterance-timing-v2-cue-601", False),
+])
+def test_collapsed_singleton_hearing_requires_unique_word_and_excludes_unassigned_speech(case_id, has_policy):
+    from dubsync.llm_providers import _adjudication_prompt
+
+    span = _span(case_id).model_copy(update={"srt_text": "É.", "asr_text": "É."})
+    before = span.model_dump()
+    sent = json.loads(_adjudication_prompt([span], language="pt"))["spans"][0]
+    assert ("collapsed_singleton_hearing_policy" in sent) is has_policy
+    if has_policy:
+        policy = sent["collapsed_singleton_hearing_policy"]
+        instruction = policy["instruction"]
+        assert policy["version"] == 2
+        assert policy["keep_srt_final_text"] == span.srt_text
+        assert "including its punctuation" in instruction
+        assert "heard_text" in instruction and "final_text" in instruction
+        assert "exactly once" in instruction and "complete outer-anchor bracket" in instruction
+        assert "read-only context" in instruction and "nonlexical" in instruction
+        assert "heard_unclear" in instruction and "Do not return timestamps" in instruction
+        assert "collapsed primary timestamp" in instruction
+    assert span.model_dump() == before

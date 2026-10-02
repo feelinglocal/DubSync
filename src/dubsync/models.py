@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 
 Verdict = Literal["keep_srt", "use_audio", "hybrid"]
@@ -153,6 +153,21 @@ class AlignmentResult(BaseModel):
     diagnostics: AlignmentDiagnostics = Field(default_factory=AlignmentDiagnostics)
 
 
+class SourcePairEvidence(BaseModel):
+    """Audio findings for a complete, separately excerpted two-part exchange."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    first_text: str
+    second_text: str
+    sequence: Literal["first_then_second", "second_then_first", "overlapping", "unclear"]
+    voice_relation: Literal["same", "different", "unclear"]
+    intervening_speech: bool | None
+    candidate_complete: bool | None
+    candidate_start_clipped: bool | None
+    candidate_end_clipped: bool | None
+    laugh_outside_candidate: bool | None
+    candidate_audio_id: str
+
+
 class AdjudicationDecision(BaseModel):
     case_id: str
     verdict: Verdict
@@ -165,6 +180,14 @@ class AdjudicationDecision(BaseModel):
     # New audio evidence has a deterministic gate value, never a model score.
     evidence: AudioEvidence | None = None
     heard_text: str | None = None
+    source_pair_evidence: SourcePairEvidence | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_pair_evidence(self, handler):
+        data = handler(self)
+        if self.source_pair_evidence is None:
+            data.pop("source_pair_evidence", None)
+        return data
 
     @model_validator(mode="before")
     @classmethod

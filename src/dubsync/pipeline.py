@@ -11,11 +11,18 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from .adjudication import AdjudicationEngine, KeepSRTAdapter, confidence_gated_decision
-from .adjudication_case_cache import case_cache_key, read_case, word_stream_digest, write_case
+from .accepted_anchor_omission import reconcile_accepted_anchor_omissions
+from .adjudication_audio_provenance import (
+    AudioProvenanceRecorder, bind_case_audio_provenance, cached_case_audio_snippet,
+)
+from .adjudication_case_cache import (
+    ADJUDICATION_FLAG_SCOPE_POLICY_VERSION, case_cache_key, flag_applies_to_case,
+    read_case, word_stream_digest, write_case,
+)
 from .adjudication_policy import DETERMINISTIC_ADJUDICATION_POLICY_VERSION, DeterministicAdjudicationPolicy
 from .adjudication_regions import (
     PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX, is_joint_region,
-    is_song_caption_cue, protect_song_captions,
+    is_song_caption_cue, protect_song_captions, extend_boundary_anchor_regions,
     validated_protected_source_regions,
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
@@ -55,6 +62,8 @@ from .llm_providers import (
     _ADJUDICATION_REVIEW_PROMPT_VERSION,
     _PUNCTUATION_PROMPT_VERSION,
     _SPEAKER_MAPPING_PROMPT_VERSION,
+    _WHOLE_UTTERANCE_HEARING_PROMPT_VERSION,
+    _SOURCE_PAIR_HEARING_PROMPT_VERSION,
     drain_usage_events,
     adjudication_fallback_config,
     llm_adapter_from_config,
@@ -88,11 +97,21 @@ from .recue import (
 )
 from .region_index import SpeechRegionIndex
 from .reports import write_change_log, write_qc_report
+from .semantic_output import expand_output_flags, split_crowded_output_cues
 from .srt_io import decode_srt_bytes, parse_srt_text, write_srt
 from .source_language import infer_source_language
 from .silence import silence_flags_for_cues
 from .source_quality import detect_source_errors
 from .source_order import sort_cues_chronologically
+from .source_pair_timing import (
+    SOURCE_PAIR_TIMING_POLICY_VERSION, SOURCE_PAIR_TIMING_PREFIX,
+    build_source_pair_timing_questions, reconcile_source_pair_timing,
+)
+from .source_pair_audio import SOURCE_PAIR_CANDIDATE_AUDIO_POLICY_VERSION, SourcePairAudioAdapter
+from .collapsed_singleton_timing import (
+    COLLAPSED_SINGLETON_TIMING_POLICY_VERSION, COLLAPSED_SINGLETON_TIMING_PREFIX,
+    build_collapsed_singleton_timing_questions, reconcile_collapsed_singleton_timing,
+)
 from .speaker_evidence import has_known_different_speakers, speakers_known_different
 from .speaker_mapping import speaker_mapping_adapter_from_config, speaker_mapping_flags
 from .style_profile import FPSDetection, StyleProfile, derive_style_profile, detect_fps_with_confidence
@@ -111,6 +130,7 @@ from .vad import (
     trailing_silence_flags_for_cues,
 )
 from .verify import cps_sanity_flags, lint_cues, score_cues
+from .whole_utterance_timing import WHOLE_UTTERANCE_TIMING_POLICY_VERSION, build_whole_utterance_timing_questions
 
 VERIFY_STAGE_FLAG_KINDS = frozenset(
     {
@@ -156,7 +176,7 @@ _TRANSIENT_ADJUDICATION_FLAG_KINDS = frozenset(
 
 _TRANSIENT_PUNCTUATION_FLAG_KINDS = frozenset({"punctuation_provider_unavailable"})
 
-_REBUILD_POLICY_VERSION = 26
+_REBUILD_POLICY_VERSION = 35
 _ADJUDICATION_POLICY_VERSION = 8
 _WORD_TIMING_POLICY_VERSION = 3
 _PUNCTUATION_POLICY_VERSION = 1
@@ -369,11 +389,24 @@ def sync_episode(
     uncertain_word_indices = ambiguous_word_indices(words, speech_evidence.word_flags)
     cross_check_agreement = compare_word_streams(words, secondary_words) if secondary_words is not None else None
     cross_check_policy = DeterministicAdjudicationPolicy(cues, episode_language, register_policy)
+    resume_alignment = None
+    resume_adjudication = None
     if resume_stage in {"adjudicate", "rebuild", "verify"}:
         _validate_word_timing_provenance(episode_workdir / "align.json", word_timing_provenance)
         if resume_stage == "verify":
             _validate_word_timing_provenance(
                 episode_workdir / "rebuild.json", word_timing_provenance, require_alignment=True,
+            )
+        resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
+        _validate_alignment_screen_text_provenance(resume_alignment, cues)
+        prepared = _alignment_with_boundary_anchor_regions(
+            resume_alignment, cues, words, allow_expansion=resume_stage == "adjudicate",
+        )
+        if prepared != resume_alignment:
+            resume_alignment = _alignment_with_adjudication_context(prepared, cues)
+        if resume_stage in {"rebuild", "verify"}:
+            resume_adjudication = _load_adjudication_artifact(
+                episode_workdir / "adjudicate.json", alignment=resume_alignment,
             )
         if write_ingest_artifacts:
             _write_json(episode_workdir / "ingest.json", {"cues": [cue.model_dump() for cue in cues], **ingest_metadata})
@@ -382,17 +415,15 @@ def sync_episode(
     llm_disabled_for_episode = no_llm or long_audio_llm_flag is not None
 
     if resume_stage == "verify":
-        resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
-        _validate_alignment_screen_text_provenance(resume_alignment, cues)
+        assert resume_alignment is not None and resume_adjudication is not None
         missing_dialogue = _missing_dialogue_evidence(
             cues, resume_alignment, words, speech_evidence, audio_for_asr, episode_workdir,
-            load_saved=True,
+            load_saved=True, provider_config=provider_config,
+            secondary_words=secondary_words, secondary_context=secondary_context,
         )
         _validate_missing_dialogue_rebuild_binding(episode_workdir, missing_dialogue)
         protected_source_regions = _protected_regions_for_alignment(resume_alignment, cues, words)
-        resume_decisions = _load_adjudication_artifact(
-            episode_workdir / "adjudicate.json"
-        )[0]
+        resume_decisions = resume_adjudication[0]
         if cross_check_agreement is not None:
             cross_check_selected, _ = cross_check_decision_gate(
                 resume_alignment.divergence_spans, resume_decisions,
@@ -438,7 +469,7 @@ def sync_episode(
             words=words,
             alignment=_load_rebuild_alignment(episode_workdir / "rebuild.json"),
             flags=[
-                *_load_report_flags(episode_workdir / "qc_report.json"),
+                *_load_verify_input_flags(episode_workdir),
                 *source_order_flags,
                 *fps_override_flags,
                 *fps_detection_flags,
@@ -447,27 +478,31 @@ def sync_episode(
             ],
             cost_meter=cost_meter,
             include_dropped_line_flags=False,
-            decisions=resume_decisions,
+            decisions=_load_late_decisions(episode_workdir, resume_decisions),
             fps_summary_metadata=fps_summary_metadata,
             speech_evidence=speech_evidence,
             word_timing_provenance=word_timing_provenance,
             missing_dialogue=missing_dialogue,
+            source_pair_hearing_mode="verify",
+            secondary_words=secondary_words, secondary_context=secondary_context,
         )
 
     if resume_stage in {"adjudicate", "rebuild"}:
-        alignment = _load_alignment_artifact(episode_workdir / "align.json")
-        _validate_alignment_screen_text_provenance(alignment, cues)
+        assert resume_alignment is not None
+        alignment = resume_alignment
     else:
         # A known language decides which article-like words are numbers.
         alignment = (
             align_cues_to_words(cues, words, language=episode_language) if episode_language
             else align_cues_to_words(cues, words)
         )
+        alignment = _alignment_with_boundary_anchor_regions(alignment, cues, words)
         alignment = _alignment_with_adjudication_context(alignment, cues)
         alignment = _alignment_with_song_caption_guard(alignment, cues, words)
     missing_dialogue = _missing_dialogue_evidence(
         cues, alignment, words, speech_evidence, audio_for_asr, episode_workdir,
-        load_saved=resume_stage == "rebuild",
+        load_saved=resume_stage == "rebuild", provider_config=provider_config,
+        secondary_words=secondary_words, secondary_context=secondary_context,
     )
     if resume_stage != "rebuild":
         if missing_dialogue is not None and not llm_disabled_for_episode:
@@ -502,7 +537,8 @@ def sync_episode(
         flags.append(long_audio_llm_flag)
     decisions: list[AdjudicationDecision] = []
     if resume_stage == "rebuild":
-        decisions, adjudication_flags = _load_adjudication_artifact(episode_workdir / "adjudicate.json")
+        assert resume_adjudication is not None
+        decisions, adjudication_flags = resume_adjudication
         decisions, adjudication_flags = _apply_incomplete_source_holds_to_decisions(
             alignment.divergence_spans,
             provider_config,
@@ -515,8 +551,8 @@ def sync_episode(
             song_caption_cue_ids=_song_caption_cue_ids(cues),
         )
         flags.extend(adjudication_flags)
-        _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
-    elif alignment.divergence_spans:
+        _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags, alignment=alignment)
+    elif alignment.divergence_spans or (missing_dialogue is not None and missing_dialogue.questions):
         provider_spans, held_decisions, incomplete_source_flags = (
             _hold_incomplete_source_insertions(
                 alignment.divergence_spans,
@@ -572,6 +608,7 @@ def sync_episode(
             )
             cached_case_decisions: list[AdjudicationDecision] = []
             cached_case_flags: list[QCFlag] = []
+            cached_audio_snippets: list[dict] = []
             pending_spans = provider_spans
             case_keys: dict[str, CacheKey] = {}
             case_cache = None
@@ -588,9 +625,19 @@ def sync_episode(
                     else:
                         cached_case_decisions.append(cached_case[0])
                         cached_case_flags.extend(cached_case[1])
+                        cached_value = case_cache.read(case_keys[span.case_id])
+                        cached_snippet = cached_case_audio_snippet(
+                            cached_value.get("audio_provenance") if isinstance(cached_value, dict) else None,
+                            case_keys[span.case_id], span,
+                            cached_case[0], audio_snippet_context,
+                        )
+                        if cached_snippet is not None:
+                            cached_audio_snippets.append(cached_snippet)
                 if not pending_spans:
                     cached_adjudication = cached_case_decisions, _unique_flags(cached_case_flags)
             if cached_adjudication is None:
+                audio_provenance_recorder = (AudioProvenanceRecorder(audio_snippet_source.load)
+                                             if audio_snippet_source is not None else None)
                 llm_adapter = (
                     KeepSRTAdapter()
                     if llm_disabled_for_episode
@@ -605,8 +652,8 @@ def sync_episode(
                     confidence_gate=_adjudication_confidence_gate(provider_config),
                     scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
                     audio_snippet_batches=(
-                        audio_snippet_source.load
-                        if audio_snippet_source is not None
+                        audio_provenance_recorder.load
+                        if audio_provenance_recorder is not None
                         else None
                     ),
                     require_audio_snippets=(
@@ -651,13 +698,22 @@ def sync_episode(
                     for span in pending_spans:
                         if span.case_id in by_case:
                             write_case(case_cache, case_keys[span.case_id], span, by_case[span.case_id],
-                                       _flags_for_adjudication_case(span, provider_flags, review_outages))
+                                       _flags_for_adjudication_case(span, provider_flags, review_outages),
+                                       audio_provenance=bind_case_audio_provenance(
+                                           case_keys[span.case_id], span, by_case[span.case_id],
+                                           audio_provenance_recorder.manifest() if audio_provenance_recorder is not None else {},
+                                           audio_snippet_context,
+                                       ))
                 provider_decisions = [*cached_case_decisions, *provider_decisions]
                 provider_flags = _unique_flags([*cached_case_flags, *provider_flags])
                 if audio_snippet_source is not None:
+                    snippet_manifest = audio_snippet_source.manifest()
+                    snippet_manifest["snippets"] = [
+                        *cached_audio_snippets, *audio_provenance_recorder.manifest()["snippets"],
+                    ]
                     _write_json(
                         episode_workdir / "audio_snippets.json",
-                        audio_snippet_source.manifest(),
+                        snippet_manifest,
                     )
                 if not llm_disabled_for_episode:
                     _write_cached_adjudication(
@@ -720,9 +776,9 @@ def sync_episode(
                     )
                 )
         flags.extend(adjudication_flags)
-        _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags)
+        _write_adjudication_artifact(episode_workdir / "adjudicate.json", decisions, adjudication_flags, alignment=alignment)
     else:
-        _write_adjudication_artifact(episode_workdir / "adjudicate.json", [], [])
+        _write_adjudication_artifact(episode_workdir / "adjudicate.json", [], [], alignment=alignment)
 
     if missing_dialogue is not None:
         _write_json(episode_workdir / "missing_dialogue_reconciliation.json", missing_dialogue.artifact())
@@ -736,6 +792,7 @@ def sync_episode(
             _write_adjudication_artifact(
                 episode_workdir / "adjudicate.json", decisions,
                 _unique_flags([*_load_adjudication_artifact(episode_workdir / "adjudicate.json")[1], *cross_check_flags]),
+                alignment=alignment,
             )
         _write_json(episode_workdir / "asr_cross_check_analysis.json", {
             "context": secondary_context, "summary": cross_check_agreement.summary,
@@ -752,6 +809,7 @@ def sync_episode(
         _write_adjudication_artifact(
             episode_workdir / "adjudicate.json", decisions,
             _unique_flags([*_load_adjudication_artifact(episode_workdir / "adjudicate.json")[1], *confidence_flags]),
+            alignment=alignment,
         )
     confidence_held_cue_ids = _confidence_held_source_cue_ids(flags)
     source_timing_held_cue_ids = _source_timing_held_cue_ids(flags) | ambiguous_source_cue_ids
@@ -768,6 +826,7 @@ def sync_episode(
         _write_adjudication_artifact(
             episode_workdir / "adjudicate.json", decisions,
             _load_adjudication_artifact(episode_workdir / "adjudicate.json")[1],
+            alignment=alignment,
         )
 
     alignment, decisions = _absorb_redecoded_insertions(
@@ -1064,6 +1123,8 @@ def sync_episode(
         speech_evidence=speech_evidence,
         word_timing_provenance=word_timing_provenance,
         missing_dialogue=missing_dialogue,
+        source_pair_hearing_mode=("disabled" if llm_disabled_for_episode else "rebuild" if resume_stage == "rebuild" else "fresh"),
+        secondary_words=secondary_words, secondary_context=secondary_context,
     )
 
 
@@ -1074,14 +1135,34 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 def _missing_dialogue_evidence(
     cues: list[Cue], alignment: AlignmentResult, words: list[Word], speech_evidence: SpeechEvidence,
     audio_path: Path, episode_workdir: Path, *, load_saved: bool,
+    provider_config: dict[str, object] | None = None,
+    secondary_words: list[Word] | None = None,
+    secondary_context: dict[str, object] | None = None,
 ) -> MissingDialogueEvidence | None:
-    if not alignment.diagnostics.missing_audio_cue_ids or not speech_evidence.detected:
+    if not speech_evidence.detected:
         return None
+    uncertain = ambiguous_word_indices(words, speech_evidence.word_flags)
+    duration = audio_seconds(audio_path)
+    neighbor_boundary_overrun = _boundary_refinement_config(provider_config or {}).max_trailing_silence_ms / 1000.0
     questions = build_missing_dialogue_questions(
         cues, alignment, words, speech_evidence.regions,
-        uncertain_word_indices=ambiguous_word_indices(words, speech_evidence.word_flags),
-        audio_duration_seconds=audio_seconds(audio_path),
+        uncertain_word_indices=uncertain, audio_duration_seconds=duration,
+        max_neighbor_boundary_overrun=neighbor_boundary_overrun,
     )
+    positive_questions = build_whole_utterance_timing_questions(
+        cues, alignment, words, speech_evidence.regions,
+        uncertain_word_indices=uncertain, audio_duration_seconds=duration,
+        max_word_duration=_timing_float_config(provider_config or {}, "max_word_duration", 2.0),
+        max_intra_cue_gap=_timing_float_config(provider_config or {}, "max_intra_cue_gap", 1.5),
+        max_neighbor_boundary_overrun=neighbor_boundary_overrun,
+        secondary_words=secondary_words, secondary_context=secondary_context,
+    )
+    positive_by_id = {question.cue_id: question for question in positive_questions}
+    questions = [positive_by_id.get(question.cue_id, question)
+                 if question.purpose == "nonlexical_missing_dialogue" else question
+                 for question in questions]
+    existing_ids = {question.cue_id for question in questions}
+    questions.extend(question for question in positive_questions if question.cue_id not in existing_ids)
     if not questions:
         return None
     context = reconciliation_context(
@@ -1091,10 +1172,32 @@ def _missing_dialogue_evidence(
     flags: list[QCFlag] = []
     artifact_path = episode_workdir / "missing_dialogue_reconciliation.json"
     if load_saved and artifact_path.exists():
+        saved = json.loads(artifact_path.read_text(encoding="utf-8"))
+        _validate_accepted_anchor_omission_binding(episode_workdir, saved.get("outcomes", []))
         decisions, flags = validate_reconciliation_artifact(
-            json.loads(artifact_path.read_text(encoding="utf-8")), context, questions,
+            saved, context, questions,
         )
     return MissingDialogueEvidence(questions, context, decisions, flags)
+
+
+def _accepted_anchor_omission_digest(outcomes) -> str | None:
+    proofs = [item for item in outcomes if "accepted_anchor_omission_proof" in item]
+    return (hashlib.sha256(json.dumps(proofs, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":")).encode("utf-8")).hexdigest()
+            if proofs else None)
+
+
+def _validate_accepted_anchor_omission_binding(episode_workdir: Path, outcomes) -> None:
+    path = episode_workdir / "rebuild.json"
+    if not path.exists():
+        return
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    expected = saved.get("accepted_anchor_omission_sha256")
+    ordinary = episode_workdir / "adjudicate.json"
+    if (expected != _accepted_anchor_omission_digest(outcomes)
+            or (expected is not None and saved.get("accepted_anchor_ordinary_sha256") !=
+                (_sha256_file(ordinary) if ordinary.exists() else None))):
+        raise ValueError("Accepted-anchor omission proof is stale or invalid; resume from adjudicate to validate the audio evidence.")
 
 
 def _validate_missing_dialogue_rebuild_binding(
@@ -1107,6 +1210,123 @@ def _validate_missing_dialogue_rebuild_binding(
             "Missing-dialogue decisions do not match the rebuilt cues; resume from adjudicate "
             "to validate the bounded audio evidence again."
         )
+
+
+def _late_timing_hearing(
+    questions, current_cues, source_cues, alignment, words, regions, *, audio_path,
+    audio_for_asr, episode_workdir, provider_config, cost_meter, mode, kind="source_pair_timing",
+) -> MissingDialogueEvidence | None:
+    """Hear a bounded timing question after ordinary text edits settle."""
+    artifact_path = episode_workdir / f"{kind}.json"
+    receipt_key = kind.removesuffix("_timing") + "_receipt_sha256"
+    audio_directory = episode_workdir / (kind.replace("_", "-") + "-audio")
+    if not questions:
+        evidence = None
+    else:
+        spans = [question.span for question in questions]
+        snippet_source = _adjudication_audio_snippet_source(
+            audio_for_asr, audio_directory, provider_config,
+        )
+        audio_context = _adjudication_audio_cache_context(
+            audio_path, audio_for_asr, provider_config,
+            snippet_source.cache_context() if snippet_source is not None else None,
+        )
+        pair_contexts = {
+            question.span.case_id: {"candidate_start": question.utterance_start_seconds,
+                                    "candidate_end": question.utterance_end_seconds,
+                                    "candidate_audio_id": question.span.case_id + "-candidate"}
+            for question in questions if question.span.case_id.startswith(SOURCE_PAIR_TIMING_PREFIX)
+        }
+        keys = _adjudication_case_keys(spans, provider_config, current_cues, words, audio_context,
+                                      case_contexts=pair_contexts)
+        context = reconciliation_context(
+            questions, source_cues, alignment, words, regions, audio_sha256=_sha256_file(audio_for_asr),
+        )
+        ordinary_artifact = episode_workdir / "adjudicate.json"
+        context["ordinary_adjudication_sha256"] = _sha256_file(ordinary_artifact) if ordinary_artifact.exists() else None
+        # Store digests, never provider credentials. The receipt must follow
+        # the same prompt, model, register and audio policy as the case cache.
+        context["hearing_case_keys"] = {case_id: key.digest for case_id, key in keys.items()}
+        evidence = None
+        if mode in {"verify", "rebuild"} and artifact_path.exists():
+            saved_decisions, saved_flags = validate_reconciliation_artifact(
+                json.loads(artifact_path.read_text(encoding="utf-8")), context, questions,
+            )
+            evidence = MissingDialogueEvidence(questions, context, saved_decisions, saved_flags)
+        if evidence is None and mode in {"verify", "rebuild"}:
+            raise ValueError("Bounded timing hearing is missing or stale; resume from adjudicate to check the complete audio.")
+        if evidence is None:
+            decisions, flags = [], []
+            if mode == "fresh":
+                cache = JsonDiskCache(episode_workdir / "llm-case-cache")
+                pending = []
+                for span in spans:
+                    cached = read_case(cache, keys[span.case_id], span)
+                    if cached is None:
+                        pending.append(span)
+                    else:
+                        decisions.append(cached[0])
+                        flags.extend(cached[1])
+                if pending:
+                    adapter = llm_adapter_from_config(provider_config, pass_name="adjudication")
+                    _set_adapter_episode_context(adapter, current_cues, words=words)
+                    language = _episode_language_code(provider_config, None)
+                    register = _adjudication_register_policy(provider_config)
+                    context_setter = getattr(adapter, "set_adjudication_context", None)
+                    if callable(context_setter):
+                        context_setter(language=language, register_policy=register)
+                    llm_config = llm_config_for_pass(provider_config, "adjudication")
+                    hearing_adapter = (SourcePairAudioAdapter(
+                        adapter, questions, audio_for_asr, audio_directory / "candidate-snippets",
+                        extractor=extract_audio_snippets,
+                    ) if kind == "source_pair_timing" else adapter)
+                    engine = AdjudicationEngine(
+                        hearing_adapter, confidence_gate=_adjudication_confidence_gate(provider_config),
+                        scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
+                        audio_snippet_batches=snippet_source.load if snippet_source is not None else None,
+                        require_audio_snippets=True, required_audio_case_ids={span.case_id for span in pending},
+                        max_batch_spans=llm_config.get("max_batch_spans", 25),
+                        max_concurrent_batches=llm_config.get("max_concurrent_batches", 1),
+                        retry_timed_out_batches=llm_config.get("retry_timed_out_batches", False),
+                        source_cues=current_cues, language=language, register_policy=register,
+                    )
+                    session_flags: list[QCFlag] = []
+                    with _adjudication_audio_session(
+                        adapter, audio_path, audio_for_asr, provider_config,
+                        audio_directory, cost_meter, session_flags,
+                    ):
+                        new_decisions, new_flags = engine.adjudicate(pending)
+                    if isinstance(hearing_adapter, SourcePairAudioAdapter):
+                        _write_json(episode_workdir / "source_pair_candidate_snippets.json", {
+                            "clips": hearing_adapter.manifest(),
+                        })
+                    new_flags.extend(session_flags)
+                    new_flags.extend(snippet_source.flags() if snippet_source is not None else [])
+                    route_report = getattr(adapter, "route_report", None)
+                    review_outages = None
+                    if callable(route_report):
+                        review_outages = {
+                            item["case_id"] for item in route_report().get("decisions", [])
+                            if isinstance(item, dict) and item.get("route") == "held" and "case_id" in item
+                            and any(str(reason).endswith("_provider_failure") for reason in item.get("reasons", []))
+                        }
+                    for span in pending:
+                        decision = next((item for item in new_decisions if item.case_id == span.case_id), None)
+                        if decision is not None:
+                            write_case(cache, keys[span.case_id], span, decision,
+                                       _flags_for_adjudication_case(span, new_flags, review_outages))
+                    decisions.extend(new_decisions)
+                    flags.extend(new_flags)
+                    flags.extend(_record_llm_usage_events(cost_meter, adapter, provider_config, pass_name="adjudication"))
+                if snippet_source is not None and pending:
+                    _write_json(episode_workdir / f"{kind}_audio_snippets.json", snippet_source.manifest())
+            evidence = MissingDialogueEvidence(questions, context, decisions, _unique_flags(flags))
+    if mode == "verify":
+        rebuilt = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+        expected = evidence.artifact()["receipt_sha256"] if evidence is not None else None
+        if rebuilt.get(receipt_key) != expected:
+            raise ValueError("Bounded timing hearing does not match the rebuilt cues; resume from rebuild.")
+    return evidence
 
 
 def _confirmed_source_wording_cue_ids(
@@ -1700,6 +1920,27 @@ def _spoken_source_cue_count(cues: list[Cue]) -> int:
     return sum(1 for cue in cues if cue_has_spoken_text(cue))
 
 
+def _alignment_with_boundary_anchor_regions(
+    alignment: AlignmentResult, cues: list[Cue], words: list[Word], *, allow_expansion: bool = True,
+) -> AlignmentResult:
+    """Include a disputed retained edge in its own complete audio question."""
+    if alignment.diagnostics.unresolved:
+        return alignment
+    spans = extend_boundary_anchor_regions(
+        alignment.divergence_spans, alignment.token_matches, cues, tokenize_cues(cues), words,
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+        cue_word_indices=alignment.cue_word_indices,
+    )
+    if spans == alignment.divergence_spans:
+        return alignment
+    if not allow_expansion:
+        raise ValueError(
+            "Cannot reuse a partial answer for a complete boundary-anchor question; "
+            "resume from adjudicate to hear the expanded scope."
+        )
+    return alignment.model_copy(update={"divergence_spans": spans})
+
+
 def _validate_alignment_screen_text_provenance(
     alignment: AlignmentResult,
     cues: list[Cue],
@@ -1823,34 +2064,99 @@ def _load_rebuild_artifact(path: Path) -> list[Cue]:
     if not path.exists():
         raise FileNotFoundError(f"Cannot resume verify without rebuild artifact: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return [Cue.model_validate(item) for item in payload.get("pre_annotation_cues", payload.get("cues", []))]
+    items = payload.get("pre_source_pair_cues", payload.get("pre_output_cues", payload.get("pre_annotation_cues", payload.get("cues", []))))
+    return [Cue.model_validate(item) for item in items]
 
 
 def _load_rebuild_alignment(path: Path) -> AlignmentResult:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if "pre_source_pair_alignment" in payload:
+        return AlignmentResult.model_validate(payload["pre_source_pair_alignment"])
+    if "pre_output_alignment" in payload:
+        return AlignmentResult.model_validate(payload["pre_output_alignment"])
     saved = payload["alignment"]
     if "pre_annotation_cue_word_indices" in payload:
         saved = {**saved, "cue_word_indices": payload["pre_annotation_cue_word_indices"]}
     return AlignmentResult.model_validate(saved)
 
 
-def _load_adjudication_artifact(path: Path) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
+def _load_verify_input_flags(episode_workdir: Path) -> list[QCFlag]:
+    """Resume from findings before display pagination created child IDs."""
+    payload = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    if "pre_source_pair_flags" in payload:
+        return [QCFlag.model_validate(item) for item in payload["pre_source_pair_flags"]]
+    if "pre_output_flags" in payload:
+        return [QCFlag.model_validate(item) for item in payload["pre_output_flags"]]
+    return _load_report_flags(episode_workdir / "qc_report.json")
+
+
+def _load_late_decisions(episode_workdir: Path, fallback: list[AdjudicationDecision]) -> list[AdjudicationDecision]:
+    """Replay the decisions after word-placement and ownership transforms."""
+    payload = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    saved = payload.get("pre_source_pair_decisions")
+    return [AdjudicationDecision.model_validate(item) for item in saved] if saved is not None else fallback
+
+
+def _boundary_anchor_bindings(
+    alignment: AlignmentResult, decisions: list[AdjudicationDecision],
+) -> dict[str, str]:
+    """Bind answers that explicitly reopen an otherwise retained token.
+
+    These regular regions contain their original exact match as editable
+    evidence. Joint regions already have their own complete-region contract.
+    No new span field is needed, so unrelated per-case caches stay reusable.
+    """
+    bindings = {}
+    for span in alignment.divergence_spans:
+        if is_joint_region(span):
+            continue
+        source, audio = set(span.srt_token_indices), set(span.asr_word_indices)
+        retained = [match for match in alignment.token_matches
+                    if match.srt_token_index in source and match.asr_word_index in audio]
+        if not retained:
+            continue
+        if span.case_id in bindings:
+            raise ValueError("Duplicate boundary-anchor question; resume from adjudicate.")
+        payload = {
+            "span": span.model_dump(mode="json"),
+            "retained_matches": [match.model_dump(mode="json") for match in retained],
+            "decisions": [decision.model_dump(mode="json") for decision in decisions
+                          if decision.case_id == span.case_id],
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        bindings[span.case_id] = hashlib.sha256(encoded).hexdigest()
+    return bindings
+
+
+def _load_adjudication_artifact(
+    path: Path, *, alignment: AlignmentResult | None = None,
+) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
     if not path.exists():
         raise FileNotFoundError(f"Cannot resume rebuild without adjudication artifact: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     raw_flags = payload.get("flags", [])
+    decisions = [AdjudicationDecision.model_validate(item) for item in payload.get("decisions", [])]
+    if alignment is not None and payload.get("boundary_anchor_bindings", {}) != _boundary_anchor_bindings(alignment, decisions):
+        raise ValueError(
+            "Saved wording does not match the complete boundary-anchor question; "
+            "resume from adjudicate to refresh its bound answer."
+        )
     return (
-        [AdjudicationDecision.model_validate(item) for item in payload.get("decisions", [])],
+        decisions,
         [QCFlag.model_validate(item) for item in raw_flags] if isinstance(raw_flags, list) else [],
     )
 
 
-def _write_adjudication_artifact(path: Path, decisions: list[AdjudicationDecision], flags: list[QCFlag]) -> None:
+def _write_adjudication_artifact(
+    path: Path, decisions: list[AdjudicationDecision], flags: list[QCFlag], *, alignment: AlignmentResult | None = None,
+) -> None:
+    bindings = _boundary_anchor_bindings(alignment, decisions) if alignment is not None else {}
     _write_json(
         path,
         {
             "decisions": [decision.model_dump() for decision in decisions],
             "flags": [flag.model_dump() for flag in flags],
+            **({"boundary_anchor_bindings": bindings} if bindings else {}),
         },
     )
 
@@ -1865,7 +2171,32 @@ def _adjudication_register_policy(provider_config: dict[str, object]) -> str:
     return policy
 
 
-def _adjudication_case_keys(spans, config, cues, words, audio_context):
+def _required_hearing_cache_context(span: DivergenceSpan) -> dict[str, int]:
+    from .adjudication import REQUIRED_AUDIO_HEARING_POLICY_VERSION
+
+    if not span.case_id.startswith((SPEECH_REPEAT_PREFIX, "missing-dialogue-v",
+                                   MISSING_DIALOGUE_RESIDUAL_PREFIX, "whole-utterance-timing-", SOURCE_PAIR_TIMING_PREFIX,
+                                   COLLAPSED_SINGLETON_TIMING_PREFIX)):
+        return {}
+    context = {"required_audio_hearing_policy_version": REQUIRED_AUDIO_HEARING_POLICY_VERSION}
+    if span.case_id.startswith("whole-utterance-timing-"):
+        context["adjudication_flag_scope_policy_version"] = ADJUDICATION_FLAG_SCOPE_POLICY_VERSION
+        context["whole_utterance_timing_policy_version"] = WHOLE_UTTERANCE_TIMING_POLICY_VERSION
+        context["whole_utterance_hearing_prompt_version"] = _WHOLE_UTTERANCE_HEARING_PROMPT_VERSION
+    if span.case_id.startswith(SOURCE_PAIR_TIMING_PREFIX):
+        context["source_pair_timing_policy_version"] = SOURCE_PAIR_TIMING_POLICY_VERSION
+        context["source_pair_hearing_prompt_version"] = _SOURCE_PAIR_HEARING_PROMPT_VERSION
+        context["source_pair_candidate_audio_policy_version"] = SOURCE_PAIR_CANDIDATE_AUDIO_POLICY_VERSION
+        context["adjudication_flag_scope_policy_version"] = ADJUDICATION_FLAG_SCOPE_POLICY_VERSION
+    if span.case_id.startswith(COLLAPSED_SINGLETON_TIMING_PREFIX):
+        from .llm_providers import _COLLAPSED_SINGLETON_HEARING_PROMPT_VERSION
+        context["collapsed_singleton_timing_policy_version"] = COLLAPSED_SINGLETON_TIMING_POLICY_VERSION
+        context["collapsed_singleton_hearing_prompt_version"] = _COLLAPSED_SINGLETON_HEARING_PROMPT_VERSION
+        context["adjudication_flag_scope_policy_version"] = ADJUDICATION_FLAG_SCOPE_POLICY_VERSION
+    return context
+
+
+def _adjudication_case_keys(spans, config, cues, words, audio_context, *, case_contexts=None):
     llm_config = llm_config_for_pass(config, "adjudication")
     provider = str(llm_config.get("provider", "gemini")).lower()
     model = str(llm_config.get("model") or _default_llm_model(provider))
@@ -1887,7 +2218,8 @@ def _adjudication_case_keys(spans, config, cues, words, audio_context):
         context["asr_cross_check"] = config["_asr_cross_check_context"]
     words_sha = word_stream_digest(words)
     return {span.case_id: case_cache_key(
-        span, model=model, params=_llm_cache_params(llm_config), policy_context=context,
+        span, model=model, params=_llm_cache_params(llm_config),
+        policy_context={**context, **_required_hearing_cache_context(span), **(case_contexts or {}).get(span.case_id, {})},
         source_cues=cues, source_words=words, word_evidence_sha256=words_sha,
     ) for span in spans}
 
@@ -1896,11 +2228,11 @@ def _flags_for_adjudication_case(
     span: DivergenceSpan, flags: list[QCFlag], review_outages: set[str] | None = None,
 ) -> list[QCFlag]:
     # An unscoped failure must prevent caching, even if it named no cue.
-    return [flag for flag in flags if not (
+    return [flag for flag in flags if flag_applies_to_case(flag, span) and not (
         flag.kind == "adjudication_review_unavailable" and review_outages is not None
         and span.case_id not in review_outages
     ) and (
-        (not flag.cue_ids and flag.kind in _TRANSIENT_ADJUDICATION_FLAG_KINDS)
+        (not flag.cue_ids and flag.kind in _TRANSIENT_ADJUDICATION_FLAG_KINDS | {"low_confidence_adjudication"})
         or bool(set(flag.cue_ids).intersection(span.cue_ids))
         or (not span.cue_ids and flag.start == span.start and flag.end == span.end)
     )]
@@ -2228,6 +2560,10 @@ def _adjudication_cache_key(
     }
     if provider_config.get("_asr_cross_check_context") is not None:
         payload["asr_cross_check"] = provider_config["_asr_cross_check_context"]
+    required_hearing = {span.case_id: _required_hearing_cache_context(span) for span in spans
+                        if _required_hearing_cache_context(span)}
+    if required_hearing:
+        payload["required_audio_hearing_policies"] = required_hearing
     return CacheKey.from_payload(payload, model=model, params=_llm_cache_params(llm_config))
 
 
@@ -2500,6 +2836,9 @@ def _run_verify_stage(
     speech_evidence: SpeechEvidence | None = None,
     word_timing_provenance: dict[str, object] | None = None,
     missing_dialogue: MissingDialogueEvidence | None = None,
+    source_pair_hearing_mode: str = "disabled",
+    secondary_words: list[Word] | None = None,
+    secondary_context: dict[str, object] | None = None,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     if speech_evidence is None:
@@ -2628,6 +2967,8 @@ def _run_verify_stage(
     )
     flags.extend(protected_source_restore_flags)
     missing_dialogue_spoken_spans: dict[int, tuple[int, int]] = {}
+    independently_resolved_cue_ids: set[int] = set()
+    missing_dialogue_outcomes = []
     if missing_dialogue is not None:
         reconciled = reconcile_missing_dialogue(
             rebuilt, source_cues, alignment, effective_words, speech_regions,
@@ -2637,6 +2978,7 @@ def _run_verify_stage(
         rebuilt, alignment, flags = reconciled.cues, reconciled.alignment, reconciled.flags
         protected_cue_ids -= reconciled.resolved_cue_ids
         missing_dialogue_spoken_spans = reconciled.spoken_spans
+        independently_resolved_cue_ids = reconciled.resolved_cue_ids
         if reconciled.resolved_cue_ids:
             # Reconciliation can move a source hold ahead of a cue that was
             # already sorted before it. Recheck source order using the source
@@ -2655,16 +2997,123 @@ def _run_verify_stage(
             flags.extend(flag for flag in source_order_flags
                          if reconciled.resolved_cue_ids.intersection(flag.cue_ids))
             rebuilt = sorted(rebuilt, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
+        missing_dialogue_outcomes = reconciled.outcomes
+    pre_source_pair_cues, pre_source_pair_alignment, pre_source_pair_flags = rebuilt, alignment, list(flags)
+    accepted_anchor_outcomes = []
+    accepted_anchor_guards = {
+        "uncertain_word_indices": sorted(uncertain_word_indices),
+        "protected_cue_ids": sorted(protected_source_cue_ids | shared_source_cue_ids |
+                                    source_timing_held_cue_ids | timing_held_cue_ids),
+        "resolved_cue_ids": sorted(independently_resolved_cue_ids),
+    }
+    if missing_dialogue is not None and secondary_words and speech_regions:
+        manifest_path = episode_workdir / "audio_snippets.json"
+        omission = reconcile_accepted_anchor_omissions(
+            rebuilt, source_cues, alignment, effective_words, speech_regions, missing_dialogue,
+            secondary_words=secondary_words, secondary_context=secondary_context, decisions=decisions,
+            verified_audio_sha256=_sha256_file(audio_for_asr),
+            audio_snippet_manifest=json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None,
+            audio_duration_seconds=audio_seconds(audio_for_asr), flags=flags,
+            **{key: set(values) for key, values in accepted_anchor_guards.items()},
+        )
+        rebuilt, alignment, flags = omission.cues, omission.alignment, omission.flags
+        protected_cue_ids -= omission.resolved_cue_ids
+        independently_resolved_cue_ids |= omission.resolved_cue_ids
+        accepted_anchor_outcomes = [item for item in omission.outcomes if "accepted_anchor_omission_proof" in item]
+        replacements = {item["case_id"]: item for item in accepted_anchor_outcomes}
+        missing_dialogue_outcomes = [replacements.get(item["case_id"], item) for item in missing_dialogue_outcomes]
+    if source_pair_hearing_mode in {"verify", "rebuild"}:
+        _validate_accepted_anchor_omission_binding(episode_workdir, accepted_anchor_outcomes)
+    if missing_dialogue is not None:
         _write_json(episode_workdir / "missing_dialogue_reconciliation.json", {
-            **missing_dialogue.artifact(), "outcomes": reconciled.outcomes,
+            **missing_dialogue.artifact(), "outcomes": missing_dialogue_outcomes,
+        })
+    pair_questions = build_source_pair_timing_questions(
+        rebuilt, source_cues, alignment, effective_words, speech_regions,
+        audio_duration_seconds=audio_seconds(audio_for_asr), uncertain_word_indices=uncertain_word_indices,
+        protected_cue_ids=protected_cue_ids, resolved_cue_ids=independently_resolved_cue_ids,
+    ) if speech_regions else []
+    source_pair = _late_timing_hearing(
+        pair_questions, rebuilt, source_cues, alignment, effective_words, speech_regions,
+        audio_path=audio_path, audio_for_asr=audio_for_asr, episode_workdir=episode_workdir,
+        provider_config=provider_config, cost_meter=cost_meter, mode=source_pair_hearing_mode,
+    )
+    if source_pair is not None:
+        paired = reconcile_source_pair_timing(
+            rebuilt, source_cues, alignment, effective_words, speech_regions,
+            source_pair.questions, source_pair.decisions, profile,
+            flags=_unique_flags([*flags, *source_pair.flags]),
+            uncertain_word_indices=uncertain_word_indices, protected_cue_ids=protected_cue_ids,
+            resolved_cue_ids=independently_resolved_cue_ids,
+        )
+        rebuilt, alignment, flags = paired.cues, paired.alignment, paired.flags
+        protected_cue_ids -= paired.resolved_cue_ids
+        missing_dialogue_spoken_spans.update(paired.spoken_spans)
+        _write_json(episode_workdir / "source_pair_timing.json", {**source_pair.artifact(), "outcomes": paired.outcomes})
+        independently_resolved_cue_ids |= paired.resolved_cue_ids
+    # A collapsed primary word may keep its timing hold while independently
+    # confirmed current anchor wording enables the opt-in secondary proof.
+    singleton_protected = (protected_source_cue_ids | shared_source_cue_ids |
+                           source_timing_held_cue_ids | missing_audio_cue_ids) - independently_resolved_cue_ids
+    singleton_kwargs = dict(
+        secondary_words=secondary_words, secondary_context=secondary_context, decisions=decisions,
+        audio_duration_seconds=audio_seconds(audio_for_asr) if speech_regions else 0,
+        uncertain_word_indices=uncertain_word_indices, protected_cue_ids=singleton_protected,
+        resolved_cue_ids=independently_resolved_cue_ids,
+    )
+    singleton_questions = build_collapsed_singleton_timing_questions(
+        rebuilt, source_cues, alignment, effective_words, speech_regions, **singleton_kwargs,
+    ) if speech_regions and secondary_words else []
+    collapsed_singleton = _late_timing_hearing(
+        singleton_questions, rebuilt, source_cues, alignment, effective_words, speech_regions,
+        audio_path=audio_path, audio_for_asr=audio_for_asr, episode_workdir=episode_workdir,
+        provider_config=provider_config, cost_meter=cost_meter, mode=source_pair_hearing_mode,
+        kind="collapsed_singleton_timing",
+    )
+    if collapsed_singleton is not None:
+        singleton = reconcile_collapsed_singleton_timing(
+            rebuilt, source_cues, alignment, effective_words, speech_regions,
+            collapsed_singleton.questions, collapsed_singleton.decisions, profile,
+            flags=_unique_flags([*flags, *collapsed_singleton.flags]), **singleton_kwargs,
+        )
+        rebuilt, alignment, flags = singleton.cues, singleton.alignment, singleton.flags
+        protected_cue_ids -= singleton.resolved_cue_ids
+        ambiguous_cue_ids -= singleton.resolved_cue_ids
+        missing_dialogue_spoken_spans.update(singleton.spoken_spans)
+        if singleton.resolved_cue_ids:
+            kept_flags = []
+            for flag in flags:
+                if flag.kind == "timing_evidence_held" and singleton.resolved_cue_ids.intersection(flag.cue_ids):
+                    remaining = [cue_id for cue_id in flag.cue_ids if cue_id not in singleton.resolved_cue_ids]
+                    if not remaining:
+                        continue
+                    flag = flag.model_copy(update={"cue_ids": remaining})
+                if flag.kind == "output_order_inversion" and singleton.resolved_cue_ids.intersection(flag.cue_ids):
+                    continue
+                kept_flags.append(flag)
+            flags = kept_flags
+            by_id = {cue.index: cue for cue in rebuilt}
+            flags.extend(flag for flag in source_order_inversion_flags(
+                [by_id[cue.index] for cue in source_cues if cue.index in by_id],
+                source_cue_ids={cue.index for cue in source_cues} - _reconciled_cue_ids(flags),
+                protected_cue_ids=protected_cue_ids,
+            ) if singleton.resolved_cue_ids.intersection(flag.cue_ids))
+            rebuilt = sorted(rebuilt, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
+        _write_json(episode_workdir / "collapsed_singleton_timing.json", {
+            **collapsed_singleton.artifact(), "outcomes": singleton.outcomes,
         })
     rebuilt, flags = _remove_leftover_duplicate_cues(rebuilt, source_cues, effective_words, alignment, flags)
+    untimed_song_caption_ids = {
+        cue_id for flag in flags if flag.kind == _SONG_CAPTION_NOTE_KIND for cue_id in flag.cue_ids
+        if cue_id in alignment.diagnostics.missing_audio_cue_ids and not alignment.cue_word_indices.get(cue_id)
+    }
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
         no_overlaps=_output_no_overlaps(provider_config),
         protected_cue_ids=protected_cue_ids,
         fixed_cue_ids=ambiguous_cue_ids,
+        untimed_song_caption_ids=untimed_song_caption_ids,
         preserve_timing=bool(effective_words or forced_alignments or speech_regions),
         media_duration_ms=_known_audio_duration_ms(audio_for_asr),
         spoken_spans={**cue_spoken_spans(
@@ -2726,16 +3175,72 @@ def _run_verify_stage(
     )
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(_without_song_caption_silence_duplicates(flags))
+    # Keep the acoustic result intact for verify-resume. Display-only splits
+    # must not become new source cues or be refined a second time on resume.
+    pre_output_cues, pre_output_alignment, pre_output_flags = rebuilt, alignment, flags
+    segmented = split_crowded_output_cues(
+        rebuilt, effective_words, alignment.cue_word_indices, profile,
+        protected_cue_ids=protected_cue_ids,
+    )
+    rebuilt = segmented.cues
+    alignment = alignment.model_copy(update={"cue_word_indices": segmented.cue_word_indices})
+    flags = [*expand_output_flags(flags, segmented.expansions), *segmented.flags]
     pre_annotation_cues = rebuilt
     pre_annotation_ownership = alignment.cue_word_indices
     composition = (
-        compose_bracketed_annotations(rebuilt, pre_annotation_ownership)
+        compose_bracketed_annotations(
+            rebuilt, pre_annotation_ownership, words=effective_words, profile=profile,
+            protected_cue_ids=protected_cue_ids,
+        )
         if _output_no_overlaps(provider_config)
         else AnnotationComposition(list(rebuilt), dict(pre_annotation_ownership), {}, {})
     )
     rebuilt = composition.cues
-    if composition.tracks:
-        alignment = alignment.model_copy(update={"cue_word_indices": composition.cue_word_indices})
+    alignment = alignment.model_copy(update={"cue_word_indices": composition.cue_word_indices})
+    flags = [*expand_output_flags(flags, composition.expansions), *composition.flags]
+    expanded_ids = {child for expansion in (segmented.expansions, composition.expansions)
+                    for children in expansion.values() for child in children}
+    if expanded_ids:
+        # Child display windows have their own readability and acoustic QC.
+        # Findings about the previous unsplit window are no longer current.
+        activity_kinds = {"cue_without_speech_activity", "cue_with_excessive_trailing_silence", "cue_on_silence"}
+        flags = [flag for flag in flags if not (
+            flag.kind in activity_kinds and expanded_ids.intersection(flag.cue_ids)
+        )]
+        children = [cue for cue in rebuilt if cue.index in expanded_ids]
+        if speech_regions:
+            flags.extend(speech_activity_flags_for_cues(
+                children, speech_regions, min_coverage,
+                min_cue_duration_ms=round(profile.min_cue_dur * 1000 + profile.frame_ms),
+            ))
+            flags.extend(trailing_silence_flags_for_cues(
+                children, speech_regions,
+                max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+                min_cue_duration_ms=round(profile.min_cue_dur * 1000 + profile.frame_ms),
+            ))
+        if audio_for_asr != audio_path:
+            flags.extend(silence_flags_for_cues(audio_for_asr, children))
+    flags = [flag for flag in flags if flag.kind not in {
+        "impossible_cps_fast", "impossible_cps_slow", "invalid_cue_duration",
+    }]
+    flags.extend(cps_sanity_flags(
+        rebuilt, max_cps=_timing_float_config(provider_config, "max_cps", 30.0),
+        min_cps=_timing_float_config(provider_config, "min_cps", 2.0),
+    ))
+    flags = _unique_flags(flags)
+    split_spoken_parents = {
+        parent for expansions, original_ownership in (
+            (segmented.expansions, pre_output_alignment.cue_word_indices),
+            (composition.expansions, pre_annotation_ownership),
+        ) for parent in expansions
+        if original_ownership.get(parent)
+        and alignment.cue_word_indices.get(parent) != original_ownership[parent]
+    }
+    # A full-utterance forced score cannot certify its retained first child.
+    final_forced_alignments = [item for item in forced_alignments if item.cue_id not in split_spoken_parents]
+    cue_scores = score_cues(
+        rebuilt, effective_words, alignment, final_forced_alignments, protected_cue_ids=protected_cue_ids,
+    )
     continuous_screen_text_ms: dict[int, int] = {}
     for cue in rebuilt:
         track_ids = composition.cue_annotations.get(cue.index, [])
@@ -2744,7 +3249,10 @@ def _run_verify_stage(
         # Every caption on this fragment must have continuous coverage. A
         # long-lived caption cannot conceal a second, genuinely short one.
         continuous_screen_text_ms[cue.index] = min(
-            max((end - start for start, end in composition.tracks[track_id]["display_intervals"]
+            max((end - start
+                 for page in composition.tracks[track_id].get("pages", [composition.tracks[track_id]])
+                 if cue.index in page["display_cue_ids"]
+                 for start, end in page["display_intervals"]
                  if start <= cue.start_ms and end >= cue.end_ms), default=cue.duration_ms)
             for track_id in track_ids
         )
@@ -2756,8 +3264,32 @@ def _run_verify_stage(
         "policy_version": _REBUILD_POLICY_VERSION,
         "word_timing": word_timing_provenance or _word_timing_provenance(words, speech_evidence),
         "missing_dialogue_receipt_sha256": missing_dialogue.artifact()["receipt_sha256"] if missing_dialogue is not None else None,
+        "source_pair_receipt_sha256": source_pair.artifact()["receipt_sha256"] if source_pair is not None else None,
+        "collapsed_singleton_receipt_sha256": collapsed_singleton.artifact()["receipt_sha256"] if collapsed_singleton is not None else None,
+        "accepted_anchor_omission_sha256": _accepted_anchor_omission_digest(accepted_anchor_outcomes),
+        "accepted_anchor_ordinary_sha256": (_sha256_file(episode_workdir / "adjudicate.json")
+                                           if _accepted_anchor_omission_digest(accepted_anchor_outcomes) else None),
+        **({"accepted_anchor_omission_guards": accepted_anchor_guards} if accepted_anchor_outcomes else {}),
+        **({
+            "pre_source_pair_cues": [cue.model_dump() for cue in pre_source_pair_cues],
+            "pre_source_pair_alignment": pre_source_pair_alignment.model_dump(),
+            "pre_source_pair_flags": [flag.model_dump() for flag in pre_source_pair_flags],
+            "pre_source_pair_decisions": [decision.model_dump() for decision in decisions],
+            "collapsed_singleton_guards": {
+                "uncertain_word_indices": sorted(uncertain_word_indices),
+                "protected_cue_ids": sorted(singleton_protected),
+                "resolved_cue_ids": sorted(independently_resolved_cue_ids),
+            },
+        } if source_pair is not None or collapsed_singleton is not None or accepted_anchor_outcomes else {}),
         "alignment": alignment.model_dump(),
         "cues": [cue.model_dump() for cue in rebuilt],
+        "pre_output_cues": [cue.model_dump() for cue in pre_output_cues],
+        "pre_output_alignment": pre_output_alignment.model_dump(),
+        "pre_output_flags": [flag.model_dump() for flag in pre_output_flags],
+        "output_segmentation": {
+            "expansions": segmented.expansions, "caption_pages": segmented.caption_pages,
+            "composition_expansions": composition.expansions,
+        },
         **({
             "pre_annotation_cues": [cue.model_dump() for cue in pre_annotation_cues],
             "pre_annotation_cue_word_indices": pre_annotation_ownership,
@@ -3262,7 +3794,7 @@ def _song_caption_note(cue_id: int, *, absent_from_voice_track: bool) -> QCFlag:
     return QCFlag(
         kind=_SONG_CAPTION_NOTE_KIND, cue_ids=[cue_id], severity="info",
         message=(
-            "Song caption is not part of the voice track; its source text and timing were kept."
+            "Song caption is not part of the voice track; its source text was kept."
             if absent_from_voice_track
             else "Song caption kept its source text; audio inside its span is dialogue, not a new lyric."
         ),

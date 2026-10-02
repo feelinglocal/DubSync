@@ -185,7 +185,9 @@ def test_dialogue_word_never_overwrites_a_song_caption(tmp_path):
     assert caption_kinds.count("song_lyric_source_kept") == 1
     # The caption itself is neither a hold error nor an unmatched-cue finding;
     # only the (real) overlap with the spoken reaction remains reviewable.
-    assert not {kind for kind in caption_kinds if "overlap" not in kind} - {"song_lyric_source_kept"}
+    assert not {kind for kind in caption_kinds if "overlap" not in kind} - {
+        "song_lyric_source_kept", "output_line_limit_reflow",
+    }
 
 
 def test_song_caption_absent_from_the_voice_track_has_one_informational_note(tmp_path):
@@ -196,8 +198,42 @@ def test_song_caption_absent_from_the_voice_track_has_one_informational_note(tmp
     caption = next(cue for cue in cues if "♪" in cue.plain_text)
     assert (caption.plain_text, caption.start_ms, caption.end_ms) == ("♪Essa décima milésima luz acesa♪", 5000, 9000)
     caption_flags = [flag for flag in flags if 2 in flag["cue_ids"]]
-    assert [(flag["kind"], flag["severity"]) for flag in caption_flags] == [("song_lyric_source_kept", "info")]
+    assert [(flag["kind"], flag["severity"]) for flag in caption_flags] == [
+        ("song_lyric_source_kept", "info"), ("output_line_limit_reflow", "info"),
+    ]
+    assert len(caption.lines) <= 2
     assert not any(flag["severity"] == "error" for flag in flags)
+
+
+def test_untimed_song_caption_yields_to_early_spoken_reaction_without_hiding_readability(tmp_path):
+    cues, flags = _sync(tmp_path, _SRT, _episode_words(("Uhum.", 5.207, 5.607)), _use_audio("Uhum."))
+    caption = next(cue for cue in cues if "♪" in cue.text)
+    reaction = next(cue for cue in cues if cue.plain_text == "Uhum.")
+    assert caption.start_ms == 5000
+    assert caption.end_ms == reaction.start_ms
+    assert caption.plain_text == "♪Essa décima milésima luz acesa♪"
+    assert reaction.start_ms <= 5207 and reaction.end_ms >= 5607
+    assert not any(flag["kind"] == "output_overlap_unresolved" for flag in flags)
+    assert any(flag["kind"] == "impossible_cps_fast" and caption.index in flag["cue_ids"] for flag in flags)
+
+
+@pytest.mark.parametrize("control", ["ordinary_dialogue", "owned_lyric", "fixed_lyric", "too_short"])
+def test_early_caption_exception_does_not_shorten_held_speech_or_fixed_timing(control):
+    from dubsync.output_order import finalize_cues_for_output
+    caption = Cue(index=1, start_ms=1000, end_ms=3400,
+                  lines=["Keep this whole dialogue." if control == "ordinary_dialogue" else "♪Leve-me para fugir♪"])
+    start = 1033 if control == "too_short" else 1207
+    reaction = Cue(index=2, start_ms=start, end_ms=1707, lines=["Uhum."])
+    spans = {2: (start, 1630)}
+    if control == "owned_lyric":
+        spans[1] = (1000, 3350)
+    cues, flags = finalize_cues_for_output(
+        [caption, reaction], StyleProfile(), preserve_timing=True,
+        protected_cue_ids={1}, fixed_cue_ids={1} if control == "fixed_lyric" else set(),
+        spoken_spans=spans, untimed_song_caption_ids={1},
+    )
+    assert cues == [caption, reaction]
+    assert any(flag.kind == "output_overlap_unresolved" for flag in flags)
 
 
 @pytest.mark.parametrize("first,second", [

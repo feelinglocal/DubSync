@@ -362,11 +362,15 @@ class HybridAdjudicationAdapter:
 
         available = []
         for span in batch:
-            if _complete_clip(span, audio_snippets.get(span.case_id)):
+            pair_complete = (not span.case_id.startswith("source-pair-timing-v2-")
+                             or span.case_id + "-candidate" in audio_snippets)
+            if _complete_clip(span, audio_snippets.get(span.case_id)) and pair_complete:
                 available.append(span)
             else:
                 record(span, _held(span, "case_audio_unavailable"), "held", ["case_audio_unavailable"])
         exact_clips = {span.case_id: audio_snippets[span.case_id].model_copy(deep=True) for span in available}
+        exact_clips.update({span.case_id + "-candidate": audio_snippets[span.case_id + "-candidate"].model_copy(deep=True)
+                            for span in available if span.case_id.startswith("source-pair-timing-v2-")})
         primary_method = getattr(self.primary, "adjudicate_with_audio", None)
         indexed, reasons = {}, {}
         if available:
@@ -387,6 +391,8 @@ class HybridAdjudicationAdapter:
                 record(span, _routed(indexed[span.case_id], "primary"), "primary", [])
         if selected:
             selected_clips = {span.case_id: exact_clips[span.case_id] for span in selected}
+            selected_clips.update({span.case_id + "-candidate": exact_clips[span.case_id + "-candidate"]
+                                   for span in selected if span.case_id.startswith("source-pair-timing-v2-")})
             stray_review_entries = False
             try:
                 review_raw, events = self.reviewer(

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from math import isfinite
 import unicodedata
 
 from .models import Cue, CueContext, DivergenceSpan, TokenMatch, Word
 from .subtitle_annotations import cue_has_bracketed_screen_text, is_bracketed_screen_text_cue
-from .text_metrics import join_word_texts
+from .text_metrics import join_word_texts, token_texts
 from .tokenize import SRTToken, alphanumeric_signature, normalize_token, tokenize_cues
 
 
@@ -330,6 +330,153 @@ def _protected_repeat_pair(
             start=cue.start_ms / 1000, end=cue.end_ms / 1000) for cue in cues[first:first + 2]],
     })
     return [source_span, speech_span]
+
+
+def _boundary_literal(text: str) -> tuple[str, ...]:
+    return tuple(unicodedata.normalize("NFC", token).casefold() for token in token_texts(text))
+
+
+def _boundary_accent_collision(token: SRTToken, word: Word) -> bool:
+    source, audio = _boundary_literal(token.text), _boundary_literal(word.text)
+    if (
+        len(source) != 1 or len(audio) != 1 or source == audio
+        or len(source[0]) != 1 or len(audio[0]) != 1
+        or not source[0].isalpha() or not audio[0].isalpha()
+        or len(token.normalized) != 1 or token.normalized != normalize_token(word.text)
+    ):
+        return False
+
+    def unaccented(value: str) -> str:
+        return "".join(character for character in unicodedata.normalize("NFD", value)
+                       if unicodedata.category(character) != "Mn")
+
+    return unaccented(source[0]) == unaccented(audio[0])
+
+
+def _reliable_boundary_word(word: Word) -> bool:
+    return (
+        isfinite(word.start) and isfinite(word.end) and word.start >= 0
+        and .020 + 1e-7 < word.end - word.start <= 2.0
+        and (word.confidence is None or word.confidence >= .8)
+        and bool(word.speaker_id)
+    )
+
+
+def extend_boundary_anchor_regions(
+    spans: list[DivergenceSpan], matches: list[TokenMatch], cues: list[Cue],
+    tokens: list[SRTToken], words: list[Word], *, protected_cue_ids: set[int],
+    cue_word_indices: dict[int, list[int]],
+) -> list[DivergenceSpan]:
+    """Make a same-cue accent collision explicit before a fresh native hearing.
+
+    A normalized match such as source ``E`` / ASR ``É`` is not literal evidence
+    for either word. A partial case may consume that one adjacent anchor only
+    when it completes the anchor's own source cue. No original token match,
+    word, or cue ownership is changed. Existing decisions for the old scope
+    must not be reused: the expanded fields change the normal case cache key.
+    """
+    if (
+        tokens != tokenize_cues(cues) or len({cue.index for cue in cues}) != len(cues)
+        or len({span.case_id for span in spans}) != len(spans)
+    ):
+        return spans
+    by_cue = {cue.index: cue for cue in cues}
+    cue_tokens: dict[int, list[int]] = defaultdict(list)
+    by_token: dict[int, list[TokenMatch]] = defaultdict(list)
+    word_match_counts = Counter(match.asr_word_index for match in matches)
+    source_claims = Counter(index for span in spans for index in span.srt_token_indices)
+    audio_claims = Counter(index for span in spans for index in span.asr_word_indices)
+    owners: dict[int, set[int]] = defaultdict(set)
+    for token in tokens:
+        cue_tokens[token.cue_id].append(token.token_index)
+    for match in matches:
+        by_token[match.srt_token_index].append(match)
+    for cue_id, indices in cue_word_indices.items():
+        for index in indices:
+            owners[index].add(cue_id)
+
+    candidates: dict[int, list[tuple[str, int, int]]] = defaultdict(list)
+    for position, span in enumerate(spans):
+        source, audio = span.srt_token_indices, span.asr_word_indices
+        if (
+            span.case_id.startswith((JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SPEECH_REPEAT_PREFIX,
+                                     SONG_CAPTION_PREFIX, "song-source-"))
+            or not source or not audio or span.insertion_token_offset is not None
+            or source != list(range(source[0], source[-1] + 1))
+            or audio != list(range(audio[0], audio[-1] + 1))
+            or source[0] < 0 or source[-1] >= len(tokens) or audio[0] < 0 or audio[-1] >= len(words)
+            or span.cue_ids != list(dict.fromkeys(tokens[index].cue_id for index in source))
+            or set(span.cue_ids) & protected_cue_ids
+            or any(cue_has_bracketed_screen_text(by_cue[cue_id]) or is_song_caption_cue(by_cue[cue_id])
+                   for cue_id in span.cue_ids)
+            or any(source_claims[index] != 1 for index in source)
+            or any(audio_claims[index] != 1 for index in audio)
+            or _boundary_literal(span.srt_text) != _boundary_literal(" ".join(tokens[index].text for index in source))
+            or _boundary_literal(span.asr_text) != _boundary_literal(" ".join(words[index].text for index in audio))
+            or span.start is None or span.end is None or not isfinite(span.start) or not isfinite(span.end)
+            or abs(span.start - words[audio[0]].start) > 1e-7 or abs(span.end - words[audio[-1]].end) > 1e-7
+            or any(not isfinite(words[index].start) or not isfinite(words[index].end)
+                   or not 0 <= words[index].start < words[index].end for index in audio)
+        ):
+            continue
+        for side, source_index, word_index in (
+            ("left", source[0] - 1, audio[0] - 1), ("right", source[-1] + 1, audio[-1] + 1),
+        ):
+            if not 0 <= source_index < len(tokens) or not 0 <= word_index < len(words):
+                continue
+            token, word = tokens[source_index], words[word_index]
+            if not _boundary_accent_collision(token, word):
+                continue
+            token_matches = by_token[source_index]
+            if (
+                len(token_matches) != 1 or word_match_counts[word_index] != 1
+                or token_matches[0].asr_word_index != word_index or token_matches[0].score != 1.0
+                or token_matches[0].cue_id != token.cue_id or owners[word_index] != {token.cue_id}
+                or source_claims[source_index] or audio_claims[word_index]
+                or token.cue_id != span.cue_ids[0 if side == "left" else -1]
+                or sorted([index for index in source if tokens[index].cue_id == token.cue_id] + [source_index])
+                   != cue_tokens[token.cue_id]
+            ):
+                continue
+            edge = words[audio[0 if side == "left" else -1]]
+            gap = edge.start - word.end if side == "left" else word.start - edge.end
+            anchor_time = span.left_anchor_end if side == "left" else span.right_anchor_start
+            if (
+                not _reliable_boundary_word(word) or not _reliable_boundary_word(edge)
+                or word.speaker_id != edge.speaker_id or not -1e-7 <= gap <= .2 + 1e-7
+                or getattr(span, f"{side}_anchor_cue_id") != token.cue_id
+                or getattr(span, f"{side}_anchor_speaker_id") != word.speaker_id
+                or anchor_time is None or not isfinite(anchor_time)
+                or abs(anchor_time - (word.end if side == "left" else word.start)) > 1e-7
+                or _boundary_literal(word.text) == _boundary_literal(edge.text)
+            ):
+                continue
+            candidates[position].append((side, source_index, word_index))
+
+    # A retained occurrence cannot become editable in two different questions.
+    candidate_owners = Counter((source, audio) for entries in candidates.values() for _, source, audio in entries)
+    result = []
+    for position, span in enumerate(spans):
+        accepted = [entry for entry in candidates[position] if candidate_owners[entry[1:]] == 1]
+        if not accepted:
+            result.append(span)
+            continue
+        source = sorted([*span.srt_token_indices, *(entry[1] for entry in accepted)])
+        audio = sorted([*span.asr_word_indices, *(entry[2] for entry in accepted)])
+        update = {
+            "srt_token_indices": source, "asr_word_indices": audio,
+            "srt_text": join_word_texts(tokens[index].text for index in source),
+            "asr_text": join_word_texts(words[index].text for index in audio),
+            "start": words[audio[0]].start, "end": words[audio[-1]].end,
+        }
+        for side, _, _ in accepted:
+            # The consumed word is no longer a read-only anchor. Its outside
+            # neighbour can belong to another case, so do not invent an anchor.
+            update[f"{side}_anchor_cue_id"] = None
+            update[f"{side}_anchor_{'end' if side == 'left' else 'start'}"] = None
+            update[f"{side}_anchor_speaker_id"] = None
+        result.append(span.model_copy(update=update))
+    return result
 
 
 def join_isolated_anchor_regions(

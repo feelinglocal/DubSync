@@ -297,6 +297,51 @@ def test_minor_timing_refinements_are_one_note_and_large_ones_are_changes():
     _assert_every_raw_finding_is_mapped(review, flags, [])
 
 
+@pytest.mark.parametrize("resolved_kind", [
+    "missing_dialogue_audio_reconciled", "accepted_anchor_omission_reconciled",
+])
+@pytest.mark.parametrize("scenario", [
+    "removed", "retained", "mixed", "insertion", "partial", "uncertain", "unresolved", "retimed",
+])
+def test_failed_hearing_is_diagnostic_only_after_complete_confirmed_omission(resolved_kind, scenario):
+    source = [_cue(2, 26_500, 27_365, "いいかしら？"), _cue(3, 32_300, 32_630, "あなたは…")]
+    cues = source if scenario == "retained" else source[:1]
+    old = QCFlag(
+        kind="low_confidence_adjudication", cue_ids=[3], confidence=0.0,
+        message="Adjudication audio evidence is unclear or inaudible; source SRT was preserved.",
+        old_text="あなたは", new_text="あなたは", start=27.440, end=27.479,
+    )
+    resolved = QCFlag(
+        kind=resolved_kind, cue_ids=[3], confidence=1.0, severity="info",
+        message="Complete anchored audio confirmed this source cue was omitted.",
+        old_text="あなたは…", new_text="", start=27.365, end=32.155,
+    )
+    if scenario == "mixed":
+        old.cue_ids = [2, 3]
+    elif scenario == "insertion":
+        old.cue_ids = []
+    elif scenario == "partial":
+        resolved.new_text = "あなた"
+    elif scenario == "uncertain":
+        resolved.confidence = 0.9
+    elif scenario == "retimed":
+        old.kind = "collapsed_singleton_timing_held"
+    flags = [old] if scenario == "unresolved" else [old, resolved]
+    before = [flag.model_dump() for flag in flags]
+
+    review = build_review(flags, [], cues, source_cues=source)
+
+    if scenario == "removed":
+        assert review.review == []
+        diagnostic, = [item for item in review.diagnostics if 0 in item.raw_flags]
+        assert diagnostic.kind == "resolved_omission_adjudication"
+        assert diagnostic.cue_ids == [3]
+    else:
+        assert any(0 in item.raw_flags for item in review.review)
+    assert [flag.model_dump() for flag in flags] == before
+    _assert_every_raw_finding_is_mapped(review, flags, [])
+
+
 def test_operator_diagnostics_are_aggregated_by_kind():
     cues = [_cue(1, 0, 1_000, "Hello.")]
     flags = [
@@ -358,10 +403,25 @@ def _emitted_kind_literals(constructor: str) -> set[str]:
             for keyword in node.keywords:
                 if keyword.arg != "kind":
                     continue
-                for constant in ast.walk(keyword.value):
+                for constant in _emitted_value_nodes(keyword.value):
                     if isinstance(constant, ast.Constant) and isinstance(constant.value, str):
                         kinds.add(constant.value)
     return kinds
+
+
+def _emitted_value_nodes(value):
+    if isinstance(value, ast.IfExp):
+        yield from _emitted_value_nodes(value.body)
+        yield from _emitted_value_nodes(value.orelse)
+    else:
+        yield from ast.walk(value)
+
+
+def test_kind_registry_scan_keeps_both_branches_without_treating_conditions_as_kinds():
+    expression = ast.parse("'unknown_branch' if voice == 'different' else 'registered_branch'", mode="eval").body
+    values = {node.value for node in _emitted_value_nodes(expression)
+              if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+    assert values == {"unknown_branch", "registered_branch"}
 
 
 @pytest.mark.parametrize(

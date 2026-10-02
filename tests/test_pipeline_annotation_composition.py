@@ -14,12 +14,14 @@ from dubsync.srt_io import parse_srt_text, write_srt
 from dubsync.timing_refinement import SpeechEvidence
 
 
-def _run_case(tmp_path, monkeypatch, *, speech_lines=None, no_overlaps=True):
+def _run_case(tmp_path, monkeypatch, *, speech_lines=None, no_overlaps=True, case_override=None):
     cues = [
         Cue(index=1, start_ms=1000, end_ms=2400, lines=["[Station]"]),
         Cue(index=2, start_ms=1600, end_ms=2250, lines=speech_lines or ["Hello there."]),
     ]
     words = [Word(text="Hello", start=1.6, end=1.85), Word(text="there.", start=1.9, end=2.2)]
+    if case_override is not None:
+        cues, words = case_override
     source, audio, fixture, config = (tmp_path / name for name in (
         "episode.srt", "episode.wav", "words.json", "providers.yaml",
     ))
@@ -31,12 +33,35 @@ def _run_case(tmp_path, monkeypatch, *, speech_lines=None, no_overlaps=True):
     config.write_text(yaml.safe_dump({"asr": {"fixture_path": str(fixture)},
                                     "output": {"no_overlaps": no_overlaps}}), encoding="utf-8")
     monkeypatch.setattr(pipeline, "speech_evidence_for_words", lambda *_a, **_k: SpeechEvidence(
-        words=words, regions=[SpeechRegion(start=1.6, end=2.2)], detected=True,
+        words=words, regions=[SpeechRegion(start=words[0].start, end=words[-1].end)], detected=True,
     ))
     def run(**kwargs):
         return pipeline.sync_episode(source, audio, tmp_path / "output.srt", tmp_path / "work",
                                      providers_path=config, no_llm=True, **kwargs)
     return cues, run
+
+
+@pytest.mark.parametrize("mode", ["fresh", "cache", "rebuild", "verify"])
+def test_short_first_caption_page_keeps_its_own_duration_warning(tmp_path, monkeypatch, mode):
+    from dubsync.style_profile import StyleProfile
+
+    cues = [Cue(index=1, start_ms=0, end_ms=1320,
+                lines=["[Luan Nian: todo mundo da empresa pode sair mais cedo.]"]),
+            Cue(index=2, start_ms=100, end_ms=1120, lines=["Hum."])]
+    _, run = _run_case(tmp_path, monkeypatch,
+                       case_override=(cues, [Word(text="Hum.", start=.1, end=1.1)]))
+    profile = StyleProfile(max_chars_per_line=47, lead_in_ms=0, tail_ms=0)
+    result = run(style_profile=profile)
+    if mode != "fresh":
+        result = run(style_profile=profile, **({} if mode == "cache" else {"resume": mode}))
+    payload = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    delivered = [Cue.model_validate(cue) for cue in payload["cues"]]
+    assert delivered[0].lines == ["[Luan Nian:]"]
+    assert delivered[0].duration_ms == 100
+    assert any(issue["kind"] == "min_duration" and issue["cue_id"] == delivered[0].index
+               for issue in result.report["style_issues"])
+    assert not any(issue["kind"] == "min_duration" and issue["cue_id"] == delivered[-1].index
+                   for issue in result.report["style_issues"])
 
 
 @pytest.mark.parametrize("mode", ["fresh", "cache", "rebuild", "verify"])
@@ -64,11 +89,20 @@ def test_pipeline_composes_screen_text_without_changing_speech_or_inventing_word
     assert len(parse_srt_text(result.output_srt.read_text(encoding="utf-8"))) == len(delivered)
 
 
-def test_composed_display_still_reports_real_three_line_crowding(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["fresh", "cache", "rebuild", "verify"])
+def test_composed_display_reflows_crowded_speech_to_two_lines(tmp_path, monkeypatch, mode):
     _, run = _run_case(tmp_path, monkeypatch, speech_lines=["Hello", "there."])
     result = run()
-    assert any(issue["kind"] == "line_count" and issue["cue_id"] == 2 for issue in result.report["style_issues"])
-    assert any("line" in item["title"].lower() and 2 in item["cue_ids"] for item in result.report["review"])
+    first_bytes = result.output_srt.read_bytes()
+    if mode != "fresh":
+        result = run(**({} if mode == "cache" else {"resume": mode}))
+        assert result.output_srt.read_bytes() == first_bytes
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 2 for cue in delivered)
+    spoken = next(cue for cue in delivered if "Hello" in cue.text)
+    assert spoken.lines == ["Hello there.", "[Station]"]
+    assert not [issue for issue in result.report["style_issues"] if issue["kind"] == "line_count"]
+    assert not [item for item in result.report["changes"] if item["change"] in {"added", "edited", "removed"}]
 
 
 def test_annotation_trace_keeps_real_spoken_edit_and_final_display_number():
