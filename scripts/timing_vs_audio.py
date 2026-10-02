@@ -3,7 +3,8 @@
     python scripts/timing_vs_audio.py --manifest suite.json [--json metrics.json]
 
 Per run: final start-onset / end-offset distributions (historical benchmark definition:
-10 ms envelope, -45 dBFS bursts, isolated edges), first-word-cut count, overlap pairs in the exported SRT,
+10 ms envelope, -45 dBFS bursts, isolated edges), first-word-cut count, starts more than 80 ms after an
+isolated onset (with the population they are drawn from), overlap pairs in the exported SRT,
 cues under the minimum duration with free room, and counts of timing-related QC flags.
 The manifest contains timing_runs: a list of directories from replay_offline.py
 (replay-evidence.json, output.srt, stages/<episode>) or the historical timing
@@ -29,7 +30,8 @@ from bisect import bisect_left, bisect_right
 
 TIMING_FLAG_KINDS = [
     "timing_refined", "asr_word_clamped", "asr_word_edges_repaired", "cue_without_speech_activity",
-    "cue_with_excessive_trailing_silence", "cue_on_silence", "timing_outlier_trimmed", "min_duration_unattainable",
+    "cue_with_excessive_trailing_silence", "cue_starts_after_speech_onset", "cue_on_silence", "timing_outlier_trimmed",
+    "min_duration_unattainable",
     "timing_evidence_held", "timing_refinement_held", "overlap_stacked", "output_overlap_unresolved",
     "output_overlap_preserved", "output_overlap_resolved", "adlib_removed_without_speech_activity",
     "dropped_line_candidate", "unmatched_cue", "output_order_inversion",
@@ -189,12 +191,14 @@ def main(root: Path, out_json: Path | None, manifest: Path | None = None, word_e
         if word_evidence != "raw":
             row["word_evidence"] = word_evidence
         # --- A. final start/end vs bursts (refine_effect definition), for both ownership maps
+        late_starts, owned_cues = [], 0
         for label, mapping in (("align", align_cwi), ("final", cwi)):
             fin_s, fin_e = [], []
             for cue in reb:
                 idx = [i for i in mapping.get(cue["index"], []) if 0 <= i < len(words)]
                 if not idx:
                     continue
+                owned_cues += label == "final"
                 src = source.get(cue["index"])
                 # an edge still at its source time is a hold, not an acoustic boundary
                 src_start = bool(src) and src["start_ms"] == cue["start_ms"] and label == "final"
@@ -204,6 +208,9 @@ def main(root: Path, out_json: Path | None, manifest: Path | None = None, word_e
                 k = burst_of(first["start"] + 0.03, bs45, be45)
                 if k is not None and bs45[k] > prev_end(first["start"]) and not src_start:
                     fin_s.append(cue["start_ms"] / 1000 - bs45[k])
+                    if label == "final" and fin_s[-1] > 0.08:
+                        late_starts.append((cue["index"], round(fin_s[-1] * 1000), first["text"], first["start"],
+                                            round(bs45[k], 3), cue["start_ms"] / 1000))
                 probe = max(last["start"], last["end"] - 0.05)
                 k = burst_of(probe, bs45, be45)
                 if k is not None and not src_end:
@@ -212,6 +219,14 @@ def main(root: Path, out_json: Path | None, manifest: Path | None = None, word_e
                         fin_e.append(cue["end_ms"] / 1000 - be45[k])
             row[f"start_minus_onset[{label}]"] = pcts(fin_s)
             row[f"end_minus_offset[{label}]"] = pcts(fin_e)
+        # Starts of the population above that lie more than 80 ms after their isolated onset. Section B
+        # cannot count them: it skips every first word that itself starts after the onset.
+        row["late_isolated_start"] = {
+            "count": len(late_starts), "late_ms": sorted(item[1] for item in late_starts),
+            "examples": late_starts[:25],
+            "population": {"cues": len(reb), "cues_with_owned_words": owned_cues,
+                           "isolated_onset_starts": row["start_minus_onset[final]"]["n"]},
+        }
         # --- B. first word cut: cue starts > 80 ms after the onset of the burst in which its first word is spoken
         cut = []
         for cue in reb:
@@ -282,6 +297,10 @@ def main(root: Path, out_json: Path | None, manifest: Path | None = None, word_e
             print(f"   start-onset[{label}]: {fmt(row[f'start_minus_onset[{label}]'])}")
             print(f"   end-offset [{label}]: {fmt(row[f'end_minus_offset[{label}]'])}")
         print(f"   first_word_cut={len(cut)} late_ms={row['first_word_cut']['late_ms']} (flag-based: {flag_cut})")
+        population = row["late_isolated_start"]["population"]
+        print(f"   late_isolated_start(>80 ms)={len(late_starts)} late_ms={row['late_isolated_start']['late_ms']} "
+              f"of {population['isolated_onset_starts']} isolated-onset starts "
+              f"({population['cues_with_owned_words']} cues with words, {population['cues']} cues)")
         print(f"   overlap_pairs={pairs} (dialogue-only {pairs_dialogue})  under_min_dur={short} with_free_room={short_room}")
         print(f"   timing flags: {row['timing_flags']}")
         print(f"   style: {row['style_issues']}")

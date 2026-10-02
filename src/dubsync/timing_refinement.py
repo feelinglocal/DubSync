@@ -19,7 +19,7 @@ from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags, select_c
 from .region_index import SpeechRegionIndex
 from .style_profile import StyleProfile
 from .subtitle_annotations import is_bracketed_screen_text_cue
-from .vad import SpeechActivityAdapter
+from .vad import SpeechActivityAdapter, SpeechLevels
 
 
 # Another word may begin this close to a burst offset without sharing the burst.
@@ -108,6 +108,9 @@ class SpeechEvidence:
     fallback_used: bool = False
     # How far (seconds) a phrase-initial word start was moved back onto its burst onset.
     start_snap: float = PhraseEdgeSnap().start_advance
+    # The same limit for a recording whose phrase starts lag, and the level track that decided it.
+    lagging_start_snap: float = PhraseEdgeSnap().lagging_start_advance
+    levels: SpeechLevels | None = None
 
 
 def speech_evidence_for_words(
@@ -131,12 +134,15 @@ def speech_evidence_for_words(
         # a different word-level limit would only make the stages disagree.
         default_end_extension=boundary.max_end_extension_ms / 1000.0,
     )
+    # Only the energy detector measures levels; other detectors leave the fixed start window.
+    levels = getattr(adapter, "last_levels", None)
     repaired, word_flags = repair_asr_word_edges(
         words,
         regions,
         max_word_duration=max_word_duration,
         max_region_overrun=boundary.max_trailing_silence_ms / 1000.0,
         snap=snap,
+        levels=levels,
     )
     return SpeechEvidence(
         words=repaired,
@@ -145,6 +151,8 @@ def speech_evidence_for_words(
         detected=True,
         fallback_used=bool(getattr(adapter, "fallback_used", False)),
         start_snap=snap.start_advance,
+        lagging_start_snap=snap.lagging_start_advance,
+        levels=levels,
     )
 
 

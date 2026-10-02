@@ -3140,8 +3140,14 @@ def _run_verify_stage(
     flags = [*reconcile_overlap_flags(flags, rebuilt, final_order_flags), *final_order_flags]
     # A lead inside the phrase-edge snap window was already moved onto the burst
     # onset. The default window stays the limit when the snap is narrowed or off.
+    # Beyond the widest window a late timestamp can explain, and where the level
+    # track shows no speech-level sound, the lead is not the cue's own speech.
     late_start_options = dict(
         max_onset_lead_ms=max(speech_evidence.start_snap, PhraseEdgeSnap().start_advance) * 1000,
+        max_review_lead_ms=max(
+            speech_evidence.lagging_start_snap, PhraseEdgeSnap().lagging_start_advance,
+        ) * 1000,
+        levels=speech_evidence.levels,
         frame_ms=profile.frame_ms,
         end_pad_ms=max(profile.tail_ms, boundary_refinement.end_pad_ms),
     )

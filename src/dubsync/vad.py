@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 from operator import mul
 from pathlib import Path
+from statistics import median
 from typing import Protocol
 
 from .region_index import SpeechRegionIndex
@@ -24,6 +25,11 @@ WORD_ENERGY_PAD_SECONDS = 0.05
 # Another word may reach this far into a burst without owning its onset
 # (the tolerance word repair applies before it snaps a phrase start).
 _LEAD_EDGE_TOLERANCE_SECONDS = 0.01
+# The sound between a burst onset and a later phrase start is that phrase's own
+# voice only when at least this share of it is within this many dB of the speech
+# that follows. A breath before the phrase is 15-25 dB quieter than the phrase.
+LEAD_SPEECH_MARGIN_DB = 10.0
+MIN_LEAD_SPEECH_SHARE = 0.5
 
 # Energy VAD defaults (measured on clean dub stems; see EnergySpeechActivityAdapter).
 DEFAULT_HOP_MS = 10
@@ -61,6 +67,33 @@ class FixtureSpeechActivityAdapter:
         payload = json.loads(self.fixture_path.read_text(encoding="utf-8"))
         rows = payload.get("regions", payload)
         return [SpeechRegion.model_validate(row) for row in rows]
+
+
+@dataclass(frozen=True)
+class SpeechLevels:
+    """Level track of one recording: the dBFS values the energy VAD measured in its single pass.
+
+    Value ``i`` describes the ``hop_seconds`` long slice that begins at
+    ``i * hop_seconds + offset_seconds``, the grid the speech regions lie on.
+    """
+
+    levels: array
+    hop_seconds: float
+    offset_seconds: float = 0.0
+
+    def between(self, start: float, end: float) -> array:
+        first = max(0, round((start - self.offset_seconds) / self.hop_seconds))
+        last = min(len(self.levels), round((end - self.offset_seconds) / self.hop_seconds))
+        return self.levels[first:last]
+
+    def lead_is_speech(self, onset: float, start: float, burst_end: float) -> bool:
+        """Whether a burst sounds like the phrase itself from ``onset`` up to the phrase start at ``start``."""
+        lead = self.between(onset, start)
+        body = self.between(start, burst_end)
+        if not lead or not body:
+            return False
+        floor = median(body) - LEAD_SPEECH_MARGIN_DB
+        return sum(level >= floor for level in lead) >= MIN_LEAD_SPEECH_SHARE * len(lead)
 
 
 @dataclass(frozen=True)
@@ -117,9 +150,11 @@ class EnergySpeechActivityAdapter:
         self.merge_gap_ms = merge_gap_ms
         self.edge_rise_db = edge_rise_db
         self.last_thresholds: EnergyThresholds | None = None
+        self.last_levels: SpeechLevels | None = None
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
         self.last_thresholds = None
+        self.last_levels = None
         with wave.open(str(audio_path), "rb") as wav:
             channels = wav.getnchannels()
             sample_width = wav.getsampwidth()
@@ -140,6 +175,7 @@ class EnergySpeechActivityAdapter:
         # Frame i of the overlapping analysis describes the 10 ms slice centred
         # in its 20 ms window; legacy windows describe themselves.
         offset_frames = 0 if legacy_windows else hop_frames // 2
+        self.last_levels = SpeechLevels(levels, hop_frames / frame_rate, offset_frames / frame_rate)
         regions: list[SpeechRegion] = []
         pending: tuple[int, int] | None = None
         bursts = _active_runs(
@@ -202,9 +238,11 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
         self.sampling_rate = sampling_rate
         self.min_region_ms = 100 if min_region_ms is None else min_region_ms
         self.fallback_used = False
+        self.last_levels: SpeechLevels | None = None
 
     def detect(self, audio_path: Path) -> list[SpeechRegion]:
         self.fallback_used = False
+        self.last_levels = None
         try:
             import torch
 
@@ -225,7 +263,9 @@ class SileroSpeechActivityAdapter:  # pragma: no cover - optional local model pa
             )
         except Exception:
             self.fallback_used = True
-            return self.fallback.detect(audio_path)
+            regions = self.fallback.detect(audio_path)
+            self.last_levels = self.fallback.last_levels
+            return regions
         return [
             SpeechRegion(
                 start=round(float(region["start"]), 3),
@@ -376,19 +416,24 @@ def late_start_flags_for_cues(
     end_pad_ms: float = 0.0,
     cue_ids: set[int] | None = None,
     excluded_cue_ids: set[int] | None = None,
+    max_review_lead_ms: float | None = None,
+    levels: SpeechLevels | None = None,
 ) -> list[QCFlag]:
     """Flag cues that start after their own speech burst has begun.
 
     A cue starts on its first owned word (``spoken_spans`` holds that word's
     onset in ms). When the ASR places the word more than ``max_onset_lead_ms``
     after the onset of the burst that contains it, word repair leaves it there
-    and the cue begins inside its own speech. That is reported when the cue
-    still starts that late (frame flooring allowed) and the speech before it
-    belongs to nobody else: no other word reaches into it and no other spoken
-    cue is on screen there for longer than its display padding
-    (``end_pad_ms`` plus one frame). A punctuation-only ASR token is not a
-    word here: its duration is no speech. ``cues`` is the delivered list;
-    ``cue_ids`` limits which of them are checked.
+    unless the recording shows that its phrase starts lag, and the cue begins
+    inside its own speech. That is reported when the cue still starts that late
+    (frame flooring allowed) and the speech before it belongs to nobody else:
+    no other word reaches into it and no other spoken cue is on screen there
+    for longer than its display padding (``end_pad_ms`` plus one frame). A
+    punctuation-only ASR token is not a word here: its duration is no speech.
+    A word more than ``max_review_lead_ms`` after the onset is not reported: a
+    lead that long is another sound, not a late timestamp. Neither is a lead
+    that ``levels`` shows to be quieter than the phrase (a breath). ``cues`` is
+    the delivered list; ``cue_ids`` limits which of them are checked.
     """
     region_index = SpeechRegionIndex(regions)
     if not region_index.regions:
@@ -413,6 +458,10 @@ def late_start_flags_for_cues(
         onset_ms = burst[1].start * 1000.0
         lead_ms = cue.start_ms - onset_ms
         if span[0] - onset_ms <= max_onset_lead_ms or lead_ms <= max_onset_lead_ms - frame_ms:
+            continue
+        if max_review_lead_ms is not None and span[0] - onset_ms > max_review_lead_ms:
+            continue
+        if levels is not None and not levels.lead_is_speech(burst[1].start, span[0] / 1000.0, burst[1].end):
             continue
         own = set(cue_word_indices.get(cue.index, ()))
         # A neighbouring word may touch the onset by this much without owning it, as in word repair.

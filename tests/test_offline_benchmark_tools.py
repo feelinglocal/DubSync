@@ -114,6 +114,50 @@ def test_timing_envelope_is_streamed_and_measures_fixture_audio(corpus):
                                         "within40": 100.0, "within80": 100.0}
 
 
+def test_timing_counts_a_late_start_on_an_isolated_onset_that_first_word_cut_cannot_see(tmp_path):
+    tool = load_tool("timing_vs_audio")
+    run, audio = tmp_path / "runs" / "clip", tmp_path / "audio.wav"
+    work = run / "work" / "episode"
+    work.mkdir(parents=True)
+    # Speech from 10.00 s; the ASR word and the cue start at 10.24 s. A second cue sits on its onset.
+    with wave.open(str(audio), "wb") as stream:
+        stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        stream.writeframes(b"".join(struct.pack("<h", int(9000 * math.sin(i * math.tau * 400 / 16000))
+                                                 if 160000 <= i < 176000 or 208000 <= i < 224000 else 0)
+                                    for i in range(256000)))
+    words = [{"text": "late", "start": 10.24, "end": 10.9}, {"text": "fine", "start": 13.0, "end": 13.9}]
+    cues = [{"index": 1, "start_ms": 10240, "end_ms": 11000, "lines": ["late"]},
+            {"index": 2, "start_ms": 13000, "end_ms": 14000, "lines": ["fine"]},
+            {"index": 3, "start_ms": 15000, "end_ms": 15500, "lines": ["[sign]"]}]
+    ownership = {"1": [0], "2": [1]}
+    late_flag = {"kind": "cue_starts_after_speech_onset", "cue_ids": [1], "message": "late", "severity": "warning"}
+    for name, payload in {
+        "asr.json": {"words": words}, "verify_inputs.json": {"words": words, "cue_word_indices": ownership},
+        "align.json": {"cue_word_indices": ownership}, "rebuild.json": {"cues": cues},
+        "qc_report.json": {"flags": [late_flag], "style_issues": []},
+        "ingest.json": {"cues": [{**cue, "start_ms": cue["start_ms"] + 500} for cue in cues]},
+        "style_profile.json": {"min_cue_dur": 0.5},
+    }.items():
+        (work / name).write_text(json.dumps(payload), encoding="utf-8")
+    (run / "replay-info.json").write_text(json.dumps({
+        "audio": str(audio), "flags": 1, "errors": 0, "warnings": 1, "style_violations": 0,
+    }), encoding="utf-8")
+    (run / "synced.srt").write_text(
+        "1\n00:00:10,240 --> 00:00:11,000\nlate\n\n2\n00:00:13,000 --> 00:00:14,000\nfine\n", encoding="utf-8",
+    )
+
+    row = tool.main(tmp_path / "runs", None)["clip"]
+
+    # The historical count skips a first word that itself starts after the onset.
+    assert row["first_word_cut"]["count"] == 0
+    late = row["late_isolated_start"]
+    # The benchmark envelope places a burst edge one 10 ms hop before the first loud sample.
+    assert (late["count"], late["late_ms"]) == (1, [250])
+    assert late["examples"][0][:2] == (1, 250)
+    assert late["population"] == {"cues": 3, "cues_with_owned_words": 2, "isolated_onset_starts": 2}
+    assert row["timing_flags"] == {"cue_starts_after_speech_onset": 1}
+
+
 def test_saved_verdicts_report_exact_loose_and_ambiguous_coverage(tmp_path):
     tool = load_tool("replay_offline")
     spans = [{"case_id": name, "srt_text": source, "asr_text": heard,

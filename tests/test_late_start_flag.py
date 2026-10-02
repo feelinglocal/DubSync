@@ -1,4 +1,7 @@
-"""A cue that starts after its own speech began is reported for review; its timing is not moved."""
+"""A cue that starts after its own speech began is reported for review where word repair has no evidence to move it.
+
+The move itself (a recording whose phrase starts lag, heard on the VAD level track) is in test_late_start_move.py.
+"""
 from __future__ import annotations
 
 import json
@@ -61,7 +64,7 @@ def test_first_word_past_the_snap_window_is_flagged_and_the_cue_is_not_moved(fir
 
     flags = _late_start_flags(cues, words, alignment, [BURST])
 
-    # Detector only: the cue still starts on its late first word.
+    # One phrase and no level track say nothing about the recording: the cue still starts on its late first word.
     assert words[0].start == first_word_start
     assert cues[0].start_ms == PROFILE.snap_floor(first_word_start * 1000)
     assert [(flag.kind, flag.cue_ids, flag.severity) for flag in flags] == [(KIND, [1], "warning")]

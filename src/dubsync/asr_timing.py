@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from statistics import median
 
 from .models import QCFlag, SpeechRegion, Word
+from .vad import SpeechLevels
 
 # A speech burst must cover this much of a word (or half of a shorter word)
 # before the word's edges are moved onto it.
@@ -17,6 +20,14 @@ MIN_WHOLE_WORD_SECONDS = 0.1
 MIN_SECONDS_PER_LETTER = 0.03
 # Neighbouring words may touch a burst edge by this much without owning it.
 _EDGE_TOLERANCE_SECONDS = 0.01
+# A recording's phrase starts lag when its typical burst-initial word starts
+# more than LAGGING_MEDIAN_SECONDS after the burst onset and at least
+# LAGGING_SHARE of them lie beyond the start snap window. Measured: Scribe
+# Japanese 105-165 ms and 24-43 %; every other model, language and clip at most
+# 85 ms and 14 %. Fewer burst-initial words than the minimum decide nothing.
+MIN_LAG_SAMPLE_WORDS = 20
+LAGGING_MEDIAN_SECONDS = 0.1
+LAGGING_SHARE = 0.2
 
 
 @dataclass(frozen=True)
@@ -29,13 +40,19 @@ class PhraseEdgeSnap:
     moves back to it and a phrase-final end within ``end_extension`` seconds
     before the burst offset moves forward to it. Edges that lie in silence are
     always moved onto the burst, whatever the distance.
+
+    In a recording whose phrase starts lag as a rule, a phrase-initial start up
+    to ``lagging_start_advance`` seconds after the onset moves back as well,
+    provided the burst sounds like the phrase from its onset on. It widens the
+    start snap, so it does nothing while ``start_advance`` is zero.
     """
 
     start_advance: float = 0.2
     end_extension: float = 0.3
+    lagging_start_advance: float = 0.7
 
     def __post_init__(self) -> None:
-        if self.start_advance < 0 or self.end_extension < 0:
+        if self.start_advance < 0 or self.end_extension < 0 or self.lagging_start_advance < 0:
             raise ValueError("phrase edge snap limits must be non-negative")
 
 
@@ -67,6 +84,7 @@ def phrase_edge_snap_from_config(
     return PhraseEdgeSnap(
         start_advance=_snap_seconds(merged, "start_advance_ms", defaults.start_advance),
         end_extension=_snap_seconds(merged, "end_extension_ms", defaults.end_extension),
+        lagging_start_advance=_snap_seconds(merged, "lagging_start_advance_ms", defaults.lagging_start_advance),
     )
 
 
@@ -147,6 +165,7 @@ def repair_asr_word_edges(
     max_region_overrun: float = 0.3,
     max_region_gap: float = 0.2,
     snap: PhraseEdgeSnap | None = None,
+    levels: SpeechLevels | None = None,
 ) -> tuple[list[Word], list[QCFlag]]:
     """Move ASR word edges that lie in silence onto the speech they belong to.
 
@@ -161,6 +180,11 @@ def repair_asr_word_edges(
     interval is retained for downstream uncertainty handling; energy cannot
     identify which burst contains that word. The returned list keeps the order
     and length of ``words``.
+
+    Scribe's Japanese character timestamps start phrases 100-650 ms after the
+    voice. ``levels`` (the VAD's level track of the same audio) lets such a
+    recording be recognised and its late phrase starts moved onto their burst
+    onsets; without it only the fixed start window applies.
 
     A word whose edge moved by more than ``max_region_overrun`` seconds, or that
     needed the duration limit, is reported as ``asr_word_clamped``. Retained
@@ -201,6 +225,18 @@ def repair_asr_word_edges(
             end = start + max_word_duration
         repaired.append((start, end))
 
+    # The wider start window needs the level track and a recording that lags.
+    lagging_advance = 0.0
+    latest_end_before: list[float] = []
+    earliest_start_after: list[float] = []
+    if levels is not None and snap.lagging_start_advance > snap.start_advance > 0 and _phrase_starts_lag(
+        words, repaired, ambiguous, ordered_regions, region_starts, prefix_max_ends, snap.start_advance,
+    ):
+        lagging_advance = snap.lagging_start_advance
+        # Over this distance any word of the stream may lie in the lead, not only the previous one.
+        latest_end_before = _running_extreme((end for _, end in repaired), max, float("-inf"))
+        earliest_start_after = _running_extreme((start for start, _ in reversed(repaired)), min, float("inf"))[::-1]
+
     result: list[Word] = []
     flags: list[QCFlag] = []
     for index, word in enumerate(words):
@@ -232,6 +268,15 @@ def repair_asr_word_edges(
                 onset is not None
                 and onset.start < start <= onset.start + snap.start_advance
                 and previous_end <= onset.start + _EDGE_TOLERANCE_SECONDS
+            ):
+                start = onset.start
+            elif (
+                onset is not None
+                and levels is not None
+                and onset.start + snap.start_advance < start <= onset.start + lagging_advance
+                and latest_end_before[index] <= onset.start + _EDGE_TOLERANCE_SECONDS
+                and earliest_start_after[index] >= start
+                and levels.lead_is_speech(onset.start, start, onset.end)
             ):
                 start = onset.start
             offset = _containing_region(end, ordered_regions, region_starts, prefix_max_ends)
@@ -272,6 +317,49 @@ def repair_asr_word_edges(
                 )
             )
     return result, flags
+
+
+def _phrase_starts_lag(
+    words: list[Word],
+    repaired: list[tuple[float, float]],
+    ambiguous: dict[int, list[tuple[float, float]]],
+    regions: list[SpeechRegion],
+    region_starts: list[float],
+    prefix_max_ends: list[float],
+    start_advance: float,
+) -> bool:
+    """Whether this recording's phrase-initial words start late as a rule, not as an exception."""
+    lags: list[float] = []
+    beyond_window = 0
+    for index, word in enumerate(words):
+        start, end = repaired[index]
+        if index in ambiguous or not (isfinite(start) and isfinite(end) and end > start):
+            continue
+        if not any(character.isalnum() for character in word.text):
+            continue
+        onset = _containing_region(start, regions, region_starts, prefix_max_ends)
+        previous_end = repaired[index - 1][1] if index > 0 else float("-inf")
+        if onset is not None and previous_end <= onset.start + _EDGE_TOLERANCE_SECONDS:
+            lags.append(start - onset.start)
+            beyond_window += start > onset.start + start_advance
+    return (
+        len(lags) >= MIN_LAG_SAMPLE_WORDS
+        and median(lags) > LAGGING_MEDIAN_SECONDS
+        and beyond_window >= LAGGING_SHARE * len(lags)
+    )
+
+
+def _running_extreme(
+    values: Iterable[float], extreme: Callable[[float, float], float], initial: float,
+) -> list[float]:
+    """For each position, the extreme of the finite values before it."""
+    result: list[float] = []
+    current = initial
+    for value in values:
+        result.append(current)
+        if isfinite(value):
+            current = extreme(current, value)
+    return result
 
 
 def clamp_asr_word_durations(

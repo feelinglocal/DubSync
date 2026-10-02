@@ -80,9 +80,13 @@ timing:
   # ASR phrase edges are moved onto the edge of the speech burst they belong
   # to. Measured on Scribe v2 and MAI-Transcribe 2 the same windows fit both,
   # so no per-model values are set; models.<asr model id> can override them.
+  # Where a recording's phrase starts lag their speech onsets as a rule (Scribe
+  # Japanese), a start up to lagging_start_advance_ms after the onset moves
+  # back too, if the energy VAD hears the phrase from the onset on; 0 disables.
   # phrase_edge_snap:
   #   start_advance_ms: 200
   #   end_extension_ms: 300
+  #   lagging_start_advance_ms: 700
   #   models:
   #     scribe_v2: {start_advance_ms: 200}
   max_cps: 30

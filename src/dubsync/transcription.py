@@ -4,7 +4,9 @@ from math import isfinite
 from pathlib import Path
 
 from .audio import AudioNormalizationLimits, normalize_audio
-from .asr_timing import ambiguous_word_indices, phrase_edge_snap_from_config, repair_asr_word_edges
+from .asr_timing import (
+    PhraseEdgeSnap, ambiguous_word_indices, phrase_edge_snap_from_config, repair_asr_word_edges,
+)
 from .cache import JsonDiskCache, write_json_atomic, write_text_atomic
 from .config import load_style_profile, load_yaml
 from .cost import CostMeter, asr_dollars_per_hour, audio_seconds, record_llm_usage
@@ -31,6 +33,7 @@ from .style_profile import GenerationConstraints, StyleProfile
 from .text_metrics import join_word_texts, wrap_visual_width
 from .timing_refinement import boundary_refinement_config_from_config, refine_cues_to_speech_activity
 from .vad import (
+    late_start_flags_for_cues,
     min_coverage_from_config,
     speech_activity_adapter_from_config,
     speech_activity_flags_for_cues,
@@ -278,16 +281,20 @@ def generate_srt_from_audio(
     timing_config = provider_config.get("timing", {})
     if not isinstance(timing_config, dict):
         raise ValueError("providers.yaml timing section must be a mapping")
+    phrase_edge_snap = phrase_edge_snap_from_config(
+        provider_config,
+        model,
+        default_end_extension=boundary_refinement.max_end_extension_ms / 1000.0,
+    )
+    # Only the energy detector measures levels; other detectors leave the fixed start window.
+    speech_levels = getattr(speech_activity_adapter, "last_levels", None)
     words, word_clamp_flags = repair_asr_word_edges(
         words,
         speech_regions,
         max_word_duration=_positive_float(timing_config, "max_word_duration", 2.0),
         max_region_overrun=boundary_refinement.max_trailing_silence_ms / 1000.0,
-        snap=phrase_edge_snap_from_config(
-            provider_config,
-            model,
-            default_end_extension=boundary_refinement.max_end_extension_ms / 1000.0,
-        ),
+        snap=phrase_edge_snap,
+        levels=speech_levels,
     )
     flags.extend(word_clamp_flags)
     uncertain_word_indices = ambiguous_word_indices(words, word_clamp_flags)
@@ -398,6 +405,18 @@ def generate_srt_from_audio(
         flags.extend(speech_activity_flags_for_cues(acoustic_cues, speech_regions, min_coverage_from_config(provider_config)))
         flags.extend(trailing_silence_flags_for_cues(
             acoustic_cues, speech_regions, max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
+        ))
+        # Same limits as synchronization: see the verify stage of the pipeline.
+        flags.extend(late_start_flags_for_cues(
+            cues, speech_regions, words, alignment.cue_word_indices, generated_spoken_spans(words, alignment),
+            max_onset_lead_ms=max(phrase_edge_snap.start_advance, PhraseEdgeSnap().start_advance) * 1000,
+            max_review_lead_ms=max(
+                phrase_edge_snap.lagging_start_advance, PhraseEdgeSnap().lagging_start_advance,
+            ) * 1000,
+            levels=speech_levels,
+            frame_ms=profile.frame_ms,
+            end_pad_ms=max(profile.tail_ms, boundary_refinement.end_pad_ms),
+            excluded_cue_ids=ambiguous_cue_ids,
         ))
     flags.extend(cps_sanity_flags(cues, max_cps=constraints.max_cps, min_cps=constraints.min_cps))
     flags = censor_german_profanity_flags(flags)
