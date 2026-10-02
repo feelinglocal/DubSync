@@ -372,6 +372,8 @@ _DIAGNOSTIC_TITLES = {
     "missing_audio_source_cue_held": "Held cues were not sent to AI review",
     "impossible_cps_slow": "Slow reading speed on your own timing",
     "cue_with_excessive_trailing_silence": "Cue ends up to 0.5 s after the detected speech",
+    # A line-limit pass that recorded the same lines as old and new text.
+    **{f"{kind}:unchanged": "Line limit checked; the lines were left as they are" for kind in _LAYOUT_CHANGE_KINDS},
 }
 
 
@@ -1064,8 +1066,13 @@ class _FindingSorter:
         for index in unclaimed:
             if index in delivered:
                 continue
+            flag = self.flags[index]
+            if flag.kind in _LAYOUT_CHANGE_KINDS and flag.old_text is not None and flag.old_text == flag.new_text:
+                # The line-limit pass kept the lines it found: nothing was changed or undone.
+                self._diagnostic(f"{flag.kind}:unchanged", index, flag)
+                continue
             # The edit was undone later (restored hold, guard) and is not in the delivery.
-            self._diagnostic(f"{self.flags[index].kind}:not_delivered", index, self.flags[index])
+            self._diagnostic(f"{flag.kind}:not_delivered", index, flag)
         return items
 
     def _wording_raw(self, text_flags: dict[int, list[int]], cue_id: int) -> list[int]:
@@ -1078,7 +1085,8 @@ class _FindingSorter:
 
         A timing recovery is judged by its speech cue's timing, a reflow or a
         caption page by the delivered display cues. A flag whose cue kept its
-        pre-change lines and timing stays unclaimed (``:not_delivered``).
+        pre-change lines and timing stays unclaimed: ``:not_delivered`` when
+        its change was undone, ``:unchanged`` when its pass changed nothing.
         """
 
         claimed: set[int] = set()

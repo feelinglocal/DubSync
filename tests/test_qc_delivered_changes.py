@@ -225,6 +225,29 @@ def test_recovery_and_reflow_that_were_reverted_stay_not_delivered():
     assert all("later undone" in item.title for item in review.diagnostics)
 
 
+@pytest.mark.parametrize(("kind", "window"), [
+    ("output_line_limit_reflow", (60_100, 62_900)),      # speech cue, retimed to its words as usual
+    ("annotation_line_limit_reflow", (60_000, 63_000)),
+    ("annotation_line_limit_pagination", (60_000, 63_000)),  # one page shown for the caption's own interval
+])
+def test_line_limit_pass_that_kept_the_customers_lines_is_not_reported_as_undone(kind, window):
+    # testing-004 cue 21: the pass could not re-break the cue and recorded the same lines as old and new.
+    source = [Cue(index=21, start_ms=60_000, end_ms=63_000,
+                  lines=["warum zahlt die Duvall-Gruppe", "ihren Arbeitern nicht?"])]
+    delivered = [source[0].with_timing(*window)]
+    flags = [QCFlag(kind=kind, cue_ids=[21], severity="info",
+                    message="A safe spoken split was unavailable. Text was reflowed within its existing interval.",
+                    old_text=source[0].text, new_text=source[0].text, start=60.1, end=62.9)]
+
+    review = build_review(flags, [], delivered, source_cues=source)
+
+    assert review.changes == []
+    diagnostic, = review.diagnostics
+    assert (diagnostic.kind, diagnostic.count, diagnostic.raw_flags) == (f"{kind}:unchanged", 1, [0])
+    assert "undone" not in diagnostic.title and "not in the delivered" not in diagnostic.title
+    assert diagnostic.title == "Line limit checked; the lines were left as they are"
+
+
 @pytest.mark.parametrize("heard", ["", "三分だ"])
 def test_recovery_whose_heard_wording_is_not_delivered_is_not_logged_as_a_retime(heard):
     source = [Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hello."]),
