@@ -102,7 +102,11 @@ def test_composed_display_reflows_crowded_speech_to_two_lines(tmp_path, monkeypa
     spoken = next(cue for cue in delivered if "Hello" in cue.text)
     assert spoken.lines == ["Hello there.", "[Station]"]
     assert not [issue for issue in result.report["style_issues"] if issue["kind"] == "line_count"]
-    assert not [item for item in result.report["changes"] if item["change"] in {"added", "edited", "removed"}]
+    # The delivered reflow is logged against the customer's lines, not reported as undone.
+    reflow, = [item for item in result.report["changes"] if item["change"] in {"added", "edited", "removed"}]
+    assert (reflow["kind"], reflow["old_text"], reflow["new_text"]) == (
+        "output_line_limit_reflow", "Hello\nthere.", "Hello there.")
+    assert not [item for item in result.report["diagnostics"] if item["kind"].endswith(":not_delivered")]
 
 
 def test_annotation_trace_keeps_real_spoken_edit_and_final_display_number():

@@ -325,6 +325,13 @@ _TIMING_CHANGE_KINDS = frozenset({
     "timing_refined", "forced_alignment_refined", "media_boundary_clamped", "cps_duration_extended",
     "output_overlap_resolved", "speaker_transition_gap_inserted",
 })
+# Change kinds that can keep the customer's wording: a native-audio retime or a
+# display layout. They are judged by delivered timing and lines, not wording.
+_TIMING_RECOVERY_KINDS = frozenset({"missing_dialogue_audio_reconciled", "collapsed_singleton_audio_reconciled"})
+# Screen-text composition runs after the wording snapshot (pre_annotation_cues);
+# these flags name delivered display cues only.
+_DISPLAY_CHANGE_KINDS = frozenset({"annotation_line_limit_pagination", "annotation_line_limit_reflow"})
+_LAYOUT_CHANGE_KINDS = frozenset({"output_line_limit_reflow", *_DISPLAY_CHANGE_KINDS})
 _MOVE_THRESHOLD_KINDS = frozenset({"timing_refined", "forced_alignment_refined"})
 # Diagnostic buckets that do not correspond to one raw kind.
 _DIAGNOSTIC_TITLES = {
@@ -527,6 +534,9 @@ class _FindingSorter:
         # changing the wording. Compare edits before that display-only step;
         # all locations and display-style findings still use delivered cues.
         self.wording_cues = list(pre_annotation_cues) if pre_annotation_cues is not None else self.cues
+        self.wording_by_id = {cue.index: cue for cue in reversed(self.wording_cues)}
+        # Line-break-only change items; they never approve a spelling finding.
+        self.layout_change_ids: set[int] = set()
         self.position: dict[int, int] = {}
         for position, cue in enumerate(self.cues):
             self.position.setdefault(cue.index, position)
@@ -1003,7 +1013,7 @@ class _FindingSorter:
             source = self.source.get(cue.index)
             if source is not None and source.plain_text == cue.plain_text:
                 continue
-            raw = sorted(set(text_flags.get(cue.index, [])))
+            raw = self._wording_raw(text_flags, cue.index)
             claimed.update(raw)
             items.append(self._text_item(
                 "edited" if source is not None else "added",
@@ -1020,17 +1030,150 @@ class _FindingSorter:
         for cue_id, source in self.source.items():
             if cue_id in wording_ids:
                 continue
-            raw = sorted(set(text_flags.get(cue_id, [])))
+            raw = self._wording_raw(text_flags, cue_id)
             claimed.update(raw)
             items.append(self._text_item(
                 "removed", cue_id, raw, old_text=source.text, new_text=None,
                 start_ms=source.start_ms, end_ms=source.end_ms, position=None,
             ))
         self._redistributions(items, text_flags)
-        for index in {index for raw in text_flags.values() for index in raw} - claimed:
+        unclaimed = {index for raw in text_flags.values() for index in raw} - claimed
+        delivered = self._unworded_changes(sorted(unclaimed), items)
+        for index in unclaimed:
+            if index in delivered:
+                continue
             # The edit was undone later (restored hold, guard) and is not in the delivery.
             self._diagnostic(f"{self.flags[index].kind}:not_delivered", index, self.flags[index])
         return items
+
+    def _wording_raw(self, text_flags: dict[int, list[int]], cue_id: int) -> list[int]:
+        # Screen-text composition flags name display cues; _unworded_changes resolves them.
+        return sorted({index for index in text_flags.get(cue_id, [])
+                       if self.flags[index].kind not in _DISPLAY_CHANGE_KINDS})
+
+    def _unworded_changes(self, unclaimed: list[int], items: list[ChangeItem]) -> set[int]:
+        """Log delivered retimes and layouts that kept the customer's wording.
+
+        A timing recovery is judged by its speech cue's timing, a reflow or a
+        caption page by the delivered display cues. A flag whose cue kept its
+        pre-change lines and timing stays unclaimed (``:not_delivered``).
+        """
+
+        claimed: set[int] = set()
+        shown: dict[int, ChangeItem] = {}
+        for index in unclaimed:
+            flag = self.flags[index]
+            if flag.kind in _TIMING_RECOVERY_KINDS:
+                found = [item for cue_id in flag.cue_ids
+                         if (item := self._recovered_timing(index, flag, cue_id)) is not None]
+            elif flag.kind in _LAYOUT_CHANGE_KINDS:
+                pages = flag.kind == "annotation_line_limit_pagination"
+                item = self._caption_pages(index, flag) if pages else self._reflowed_lines(index, flag)
+                found = [item] if item is not None else []
+                if item is not None:
+                    for cue_id in self.delivered_ids(flag.cue_ids) if pages else [item.cue_id]:
+                        shown.setdefault(cue_id, item)
+                    if item.change == "edited":
+                        self.layout_change_ids.add(id(item))
+            else:
+                continue
+            if found:
+                claimed.add(index)
+                items.extend(found)
+        for index in unclaimed:
+            if index in claimed or self.flags[index].kind not in _LAYOUT_CHANGE_KINDS:
+                continue
+            # A later layout of the same display cue replaced this one, or this
+            # pass changed nothing there: the delivered lines are that item's.
+            item = next((shown[cue_id] for cue_id in self.flags[index].cue_ids if cue_id in shown), None)
+            if item is not None:
+                item.raw_flags = sorted({*item.raw_flags, index})
+                claimed.add(index)
+        return claimed
+
+    def _recovered_timing(self, index: int, flag: QCFlag, cue_id: int) -> ChangeItem | None:
+        cue, source = self.wording_by_id.get(cue_id), self.source.get(cue_id)
+        if (
+            cue is None or source is None or (cue.start_ms, cue.end_ms) == (source.start_ms, source.end_ms)
+            # Only a wording-preserving recovery is a retime; an undone omission is not.
+            or not flag.new_text or alphanumeric_signature(flag.new_text) != alphanumeric_signature(cue.plain_text)
+        ):
+            return None
+        return self._retime_item(index, flag, cue_id, (source.start_ms, source.end_ms), (cue.start_ms, cue.end_ms))
+
+    def _caption_pages(self, index: int, flag: QCFlag) -> ChangeItem | None:
+        shown = sorted(self.delivered_ids(flag.cue_ids), key=self.position.__getitem__)
+        window = self._delivered_window(shown)
+        if window is None:
+            return None
+        # The composed caption is the wording cue whose text the flag recorded.
+        track = min((cue for cue in self.wording_cues
+                     if cue.text == flag.old_text and cue.start_ms < window[1] and window[0] < cue.end_ms),
+                    key=lambda cue: (cue.index not in flag.cue_ids, cue.start_ms), default=None)
+        before = self._customer_cue(track.index, track.text) if track is not None else None
+        if before is None:
+            before = track
+        if flag.old_text != flag.new_text:
+            return self._text_item(
+                "edited", shown[0], [index], old_text=before.text if before is not None else flag.old_text,
+                new_text=flag.new_text, start_ms=window[0], end_ms=window[1], position=self.position[shown[0]],
+            )
+        if before is None or (before.start_ms, before.end_ms) == window:
+            return None
+        # One page shown later or with gaps: the change is when it is on screen.
+        return self._retime_item(index, flag, shown[0], (before.start_ms, before.end_ms), window)
+
+    def _reflowed_lines(self, index: int, flag: QCFlag) -> ChangeItem | None:
+        if not flag.cue_ids:
+            return None
+        lines = (flag.new_text or "").split("\n")
+        shown = [self.by_id[cue_id] for cue_id in self.delivered_ids(flag.cue_ids)]
+        start_ms, end_ms = _flag_window_ms(flag)
+        if flag.kind == "annotation_line_limit_reflow" and start_ms is not None and end_ms is not None:
+            # A caption page can be composed into an overlapping speech cue.
+            shown += [cue for cue in self.cues if cue.start_ms < end_ms and start_ms < cue.end_ms]
+        cue = next((cue for cue in shown if _contains_lines(cue.lines, lines)), None)
+        if cue is None:
+            return None
+        owner = cue.index if cue.index in flag.cue_ids else flag.cue_ids[0]
+        before = self._customer_cue(owner, flag.old_text or "")
+        old_text = before.text if before is not None else flag.old_text
+        if old_text is None or old_text.split("\n") == lines:
+            return None
+        return self._text_item(
+            "edited", cue.index, [index], old_text=old_text, new_text=flag.new_text,
+            start_ms=cue.start_ms, end_ms=cue.end_ms, position=self.position[cue.index],
+        )
+
+    def _customer_cue(self, cue_id: int, text: str) -> Cue | None:
+        """The customer's cue, when ``text`` still has its wording."""
+
+        source = self.source.get(cue_id)
+        if source is None or alphanumeric_signature(source.plain_text) != alphanumeric_signature(text):
+            return None
+        return source
+
+    def _retime_item(
+        self, index: int, flag: QCFlag, cue_id: int, old: tuple[int, int], new: tuple[int, int],
+    ) -> ChangeItem:
+        position = self.position.get(cue_id)
+        return ChangeItem(
+            id="",
+            change="timing",
+            kind=flag.kind,
+            title=KIND_REGISTRY[flag.kind].title,
+            srt_number=position + 1 if position is not None else None,
+            srt_label=f"#{position + 1}" if position is not None else "",
+            after_srt_number=None if position is not None else self._after_number(new[0]),
+            timecode=format_timestamp(new[0]),
+            start=new[0] / 1000.0,
+            end=new[1] / 1000.0,
+            cue_id=cue_id,
+            old_timing=_ms_timing_label(*old),
+            new_timing=_ms_timing_label(*new),
+            reason=clean_customer_text(flag.message),
+            raw_flags=[index],
+        )
 
     def _flag_text_changes(self, text_flags: dict[int, list[int]]) -> list[ChangeItem]:
         """Generate mode: no script to compare with, so log the change flags themselves."""
@@ -1167,7 +1310,8 @@ class _FindingSorter:
     def _sort_spelling(self, changes: list[ChangeItem]) -> None:
         by_cue: dict[int, ChangeItem] = {}
         for item in changes:
-            if item.change in ("edited", "added") and item.cue_id is not None:
+            layout_only = id(item) in self.layout_change_ids
+            if item.change in ("edited", "added") and item.cue_id is not None and not layout_only:
                 by_cue.setdefault(item.cue_id, item)
         for index in self.deferred_spelling:
             flag = self.flags[index]
@@ -1587,6 +1731,14 @@ def _parse_word_timing_window(text: str | None) -> tuple[float, float] | None:
 def _timing_label(window: tuple[float, float]) -> str:
     start, end = (max(0, round(value * 1000)) for value in window)
     return f"{format_timestamp(start)} --> {format_timestamp(end)}"
+
+
+def _ms_timing_label(start_ms: int, end_ms: int) -> str:
+    return f"{format_timestamp(start_ms)} --> {format_timestamp(end_ms)}"
+
+
+def _contains_lines(lines: Sequence[str], part: Sequence[str]) -> bool:
+    return any(list(lines[start:start + len(part)]) == list(part) for start in range(len(lines) - len(part) + 1))
 
 
 def _short_time(ms: int) -> str:
