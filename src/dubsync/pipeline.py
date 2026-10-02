@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import asdict
 import json
 import hashlib
 import re
@@ -413,6 +414,9 @@ def sync_episode(
             _validate_word_timing_provenance(
                 episode_workdir / "rebuild.json", word_timing_provenance, require_alignment=True,
             )
+            _validate_verify_checkpoint(
+                episode_workdir / "rebuild.json", _verify_timing_settings(provider_config, profile),
+            )
         resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
         _validate_alignment_screen_text_provenance(resume_alignment, cues)
         prepared = _alignment_with_boundary_anchor_regions(
@@ -456,7 +460,9 @@ def sync_episode(
                 "Cannot resume verify with decisions below the current confidence gate; "
                 "resume from rebuild to preserve uncertain source text and timing."
             )
-        rebuilt = _load_rebuild_artifact(episode_workdir / "rebuild.json")
+        rebuilt, verify_alignment, verify_flags, verify_decisions, held_cue_ids = _load_verify_input(
+            episode_workdir / "rebuild.json",
+        )
         unsafe_cases = _unsafe_incomplete_source_resume_case_ids(
             resume_alignment.divergence_spans,
             provider_config,
@@ -483,19 +489,22 @@ def sync_episode(
             source_cues=cues,
             rebuilt=rebuilt,
             words=words,
-            alignment=_load_rebuild_alignment(episode_workdir / "rebuild.json"),
-            flags=[
-                *_load_verify_input_flags(episode_workdir),
+            alignment=verify_alignment,
+            # The saved findings already hold the source, frame-rate and ASR
+            # findings; only one new on resume (such as legacy provenance) is added.
+            flags=_unique_flags([
+                *verify_flags,
                 *source_order_flags,
                 *fps_override_flags,
                 *fps_detection_flags,
                 *asr_repair_flags,
                 *detect_source_errors(cues),
-            ],
+            ]),
             cost_meter=cost_meter,
-            include_dropped_line_flags=False,
-            decisions=_load_late_decisions(episode_workdir, resume_decisions),
+            include_dropped_line_flags=True,
+            decisions=verify_decisions,
             fps_summary_metadata=fps_summary_metadata,
+            source_timing_held_cue_ids=held_cue_ids,
             speech_evidence=speech_evidence,
             word_timing_provenance=word_timing_provenance,
             missing_dialogue=missing_dialogue,
@@ -1523,6 +1532,33 @@ def _validate_rebuild_policy(path: Path) -> None:
         )
 
 
+def _verify_timing_settings(provider_config: dict[str, object], profile: StyleProfile) -> dict[str, object]:
+    """Settings that finished the checkpoint's cues and that verify cannot redo."""
+    return {
+        "fps": profile.fps,
+        "min_duration_policy": min_duration_policy_from_config(provider_config),
+        "boundary_refinement": asdict(_boundary_refinement_config(provider_config)),
+    }
+
+
+def _validate_verify_checkpoint(path: Path, timing_settings: dict[str, object]) -> None:
+    # The rebuilt cues were placed on the checkpoint's frame grid and finished
+    # under its minimum-duration and refinement policy. Verify cannot redo
+    # that part, so another setting would leave cues timed under both.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload.get("verify_input"), dict):
+        raise ValueError(
+            "Cannot resume verify from a checkpoint that does not record its verification input; "
+            "resume from rebuild to keep every source-timing hold."
+        )
+    if payload.get("timing_settings") != timing_settings:
+        raise ValueError(
+            "Cannot resume verify from a checkpoint timed under other frame-rate, minimum-duration "
+            "or boundary-refinement settings; resume from rebuild to time the cues under the "
+            "current settings."
+        )
+
+
 def _confidence_gate_decisions(
     spans: list[DivergenceSpan], decisions: list[AdjudicationDecision],
     provider_config: dict[str, object], existing_flags: list[QCFlag],
@@ -2078,41 +2114,22 @@ def _load_alignment_artifact(path: Path) -> AlignmentResult:
     return AlignmentResult.model_validate(json.loads(path.read_text(encoding="utf-8")))
 
 
-def _load_rebuild_artifact(path: Path) -> list[Cue]:
-    if not path.exists():
-        raise FileNotFoundError(f"Cannot resume verify without rebuild artifact: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    items = payload.get("pre_source_pair_cues", payload.get("pre_output_cues", payload.get("pre_annotation_cues", payload.get("cues", []))))
-    return [Cue.model_validate(item) for item in items]
+def _load_verify_input(
+    path: Path,
+) -> tuple[list[Cue], AlignmentResult, list[QCFlag], list[AdjudicationDecision], set[int]]:
+    """Replay verification from exactly what the rebuild handed it.
 
-
-def _load_rebuild_alignment(path: Path) -> AlignmentResult:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if "pre_source_pair_alignment" in payload:
-        return AlignmentResult.model_validate(payload["pre_source_pair_alignment"])
-    if "pre_output_alignment" in payload:
-        return AlignmentResult.model_validate(payload["pre_output_alignment"])
-    saved = payload["alignment"]
-    if "pre_annotation_cue_word_indices" in payload:
-        saved = {**saved, "cue_word_indices": payload["pre_annotation_cue_word_indices"]}
-    return AlignmentResult.model_validate(saved)
-
-
-def _load_verify_input_flags(episode_workdir: Path) -> list[QCFlag]:
-    """Resume from findings before display pagination created child IDs."""
-    payload = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
-    if "pre_source_pair_flags" in payload:
-        return [QCFlag.model_validate(item) for item in payload["pre_source_pair_flags"]]
-    if "pre_output_flags" in payload:
-        return [QCFlag.model_validate(item) for item in payload["pre_output_flags"]]
-    return _load_report_flags(episode_workdir / "qc_report.json")
-
-
-def _load_late_decisions(episode_workdir: Path, fallback: list[AdjudicationDecision]) -> list[AdjudicationDecision]:
-    """Replay the decisions after word-placement and ownership transforms."""
-    payload = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
-    saved = payload.get("pre_source_pair_decisions")
-    return [AdjudicationDecision.model_validate(item) for item in saved] if saved is not None else fallback
+    Its cues, word ownership, findings, decisions and source-timing holds,
+    including a hold folded into its wording finding that no flag names.
+    """
+    saved = json.loads(path.read_text(encoding="utf-8"))["verify_input"]
+    return (
+        [Cue.model_validate(item) for item in saved["cues"]],
+        AlignmentResult.model_validate(saved["alignment"]),
+        [QCFlag.model_validate(item) for item in saved["flags"]],
+        [AdjudicationDecision.model_validate(item) for item in saved["decisions"]],
+        {int(cue_id) for cue_id in saved["source_timing_held_cue_ids"]},
+    )
 
 
 def _boundary_anchor_bindings(
@@ -2860,6 +2877,17 @@ def _run_verify_stage(
     enforce_line_width: bool = False,
 ) -> PipelineResult:
     decisions = list(decisions or [])
+    # Verify-resume replays this stage from exactly these inputs. Its finished
+    # cues are no input: refining or restoring them again moves edges and
+    # reports restorations the first run never made.
+    verify_input = {
+        "cues": [cue.model_dump() for cue in rebuilt],
+        "alignment": alignment.model_dump(),
+        "flags": [flag.model_dump() for flag in flags],
+        "decisions": [decision.model_dump() for decision in decisions],
+        # A rebuild hold folded into its wording finding is named by no flag.
+        "source_timing_held_cue_ids": sorted(source_timing_held_cue_ids or ()),
+    }
     if speech_evidence is None:
         speech_evidence = speech_evidence_for_words(
             speech_activity_adapter_from_config(provider_config), words, audio_for_asr, provider_config,
@@ -3216,8 +3244,8 @@ def _run_verify_stage(
     )
     flags = censor_german_profanity_flags(flags, source_cues)
     flags = _unique_flags(_without_song_caption_silence_duplicates(flags))
-    # Keep the acoustic result intact for verify-resume. Display-only splits
-    # must not become new source cues or be refined a second time on resume.
+    # Keep the acoustic result before display-only splits, which must not
+    # become new source cues.
     pre_output_cues, pre_output_alignment, pre_output_flags = rebuilt, alignment, flags
     # The two-line ceiling always applies. A cue within it keeps its layout
     # unless the style's width is enforced; its width stays a style finding.
@@ -3314,6 +3342,8 @@ def _run_verify_stage(
     _write_json(episode_workdir / "rebuild.json", {
         "policy_version": _REBUILD_POLICY_VERSION,
         "word_timing": word_timing_provenance or _word_timing_provenance(words, speech_evidence),
+        "timing_settings": _verify_timing_settings(provider_config, profile),
+        "verify_input": verify_input,
         "missing_dialogue_receipt_sha256": missing_dialogue.artifact()["receipt_sha256"] if missing_dialogue is not None else None,
         "source_pair_receipt_sha256": source_pair.artifact()["receipt_sha256"] if source_pair is not None else None,
         "collapsed_singleton_receipt_sha256": collapsed_singleton.artifact()["receipt_sha256"] if collapsed_singleton is not None else None,
