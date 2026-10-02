@@ -288,6 +288,63 @@ def test_sync_reports_a_late_start_when_the_snap_is_disabled(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["fresh", "verify"])
+def test_sync_does_not_report_a_late_start_on_a_cue_held_at_its_script_timing(tmp_path, monkeypatch, mode):
+    srt, audio, wordstream, vad_fixture, providers = (
+        tmp_path / name for name in ("episode.srt", "episode.wav", "words.json", "vad.json", "providers.yaml")
+    )
+    srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nhello there\n\n"
+        "2\n00:00:05,300 --> 00:00:06,400\ntell him now\n\n",
+        encoding="utf-8",
+    )
+    with wave.open(str(audio), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"\0\0" * 128000)
+    # The ASR collapsed the second phrase into 40 ms, half a second into its burst:
+    # no timing can be taken from these words, so the cue keeps its script timing.
+    wordstream.write_text(json.dumps({"words": [
+        {"text": "hello", "start": 0.0, "end": 0.2, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "there", "start": 0.25, "end": 0.55, "confidence": 0.97, "speaker_id": "A"},
+        {"text": "tell", "start": 5.5, "end": 5.51, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "him", "start": 5.515, "end": 5.525, "confidence": 0.98, "speaker_id": "A"},
+        {"text": "now", "start": 5.53, "end": 5.54, "confidence": 0.97, "speaker_id": "A"},
+    ]}), encoding="utf-8")
+    vad_fixture.write_text(json.dumps({"regions": [
+        {"start": 0.0, "end": 0.6, "confidence": 0.9}, {"start": 5.0, "end": 6.3, "confidence": 0.9},
+    ]}), encoding="utf-8")
+    providers.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(wordstream)}, "vad": {"fixture_path": str(vad_fixture)},
+    }), encoding="utf-8")
+    detector, calls = pipeline.late_start_flags_for_cues, []
+
+    def recording_detector(*args, **kwargs):
+        calls.append((args, kwargs))
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "late_start_flags_for_cues", recording_detector)
+
+    def run(**kwargs):
+        return pipeline.sync_episode(srt, audio, tmp_path / "output.srt", tmp_path / "work",
+                                     providers_path=providers, no_llm=True, fps=30.0, **kwargs)
+
+    result = run()
+    if mode != "fresh":
+        calls.clear()
+        result = run(resume=mode)
+
+    held = [flag for flag in result.report["flags"] if flag["kind"] == "timing_evidence_held"]
+    assert [flag["cue_ids"] for flag in held] == [[2]]
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert delivered[1].start_ms == 5300
+    assert _late_flags(result.report) == []
+    # The hold is the only reason: the same inputs without it name this cue.
+    (args, kwargs), = calls
+    assert 2 in kwargs["excluded_cue_ids"]
+    unheld = detector(*args, **{**kwargs, "excluded_cue_ids": set()})
+    assert [(flag.kind, flag.cue_ids) for flag in unheld] == [(KIND, [2])]
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify"])
 def test_late_start_of_a_split_cue_is_reported_on_its_first_delivered_child_only(tmp_path, monkeypatch, mode):
     lines = ["We finished the work.", "Now we can go home.", "Please bring the keys."]
     tokens = " ".join(lines).split()
