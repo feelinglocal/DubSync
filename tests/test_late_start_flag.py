@@ -379,3 +379,61 @@ def test_late_start_of_a_split_cue_is_reported_on_its_first_delivered_child_only
     flags = _late_flags(result.report)
     assert [flag["cue_ids"] for flag in flags] == [[delivered[0]["index"]]]
     assert (flags[0]["start"], flags[0]["end"]) == (.5, 1.0)
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify"])
+def test_sync_excludes_held_cues_from_the_late_start_check_of_split_children_too(tmp_path, monkeypatch, mode):
+    lines = ["We finished the work.", "Now we can go home.", "Please bring the keys."]
+    tokens = " ".join(lines).split()
+    spoken = [{"text": token, "start": round(1 + index * .3, 3), "end": round(1.22 + index * .3, 3),
+               "confidence": 0.98, "speaker_id": "A"} for index, token in enumerate(tokens)]
+    # The ASR collapsed the second cue into 40 ms, half a second into its burst: it keeps its script timing.
+    collapsed = [{"text": text, "start": start, "end": end, "confidence": 0.98, "speaker_id": "A"}
+                 for text, start, end in [("tell", 7.5, 7.51), ("him", 7.515, 7.525), ("now", 7.53, 7.54)]]
+    audio, wordstream, vad_fixture, providers, source = (
+        tmp_path / name for name in ("episode.wav", "words.json", "vad.json", "providers.yaml", "episode.srt")
+    )
+    with wave.open(str(audio), "wb") as wav:
+        wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        wav.writeframes(b"\0\0" * 160000)
+    wordstream.write_text(json.dumps({"words": [*spoken, *collapsed]}), encoding="utf-8")
+    vad_fixture.write_text(json.dumps({"regions": [
+        {"start": 0.5, "end": spoken[-1]["end"], "confidence": 0.9}, {"start": 7.0, "end": 8.3, "confidence": 0.9},
+    ]}), encoding="utf-8")
+    providers.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(wordstream)}, "vad": {"fixture_path": str(vad_fixture)},
+    }), encoding="utf-8")
+    source.write_text(write_srt([Cue(index=1, start_ms=1000, end_ms=5000, lines=lines),
+                                 Cue(index=2, start_ms=7300, end_ms=8400, lines=["tell him now"])]), encoding="utf-8")
+    profile = StyleProfile(max_chars_per_line=24, max_lines_per_cue=4, min_cue_dur=.1, tail_ms=0)
+    detector, calls = pipeline.late_start_flags_for_cues, []
+
+    def recording_detector(*args, **kwargs):
+        calls.append(kwargs)
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "late_start_flags_for_cues", recording_detector)
+
+    def run(**kwargs):
+        return pipeline.sync_episode(source, audio, tmp_path / "output.srt", tmp_path / "work",
+                                     providers_path=providers, style_profile=profile, no_llm=True, **kwargs)
+
+    result = run()
+    if mode != "fresh":
+        calls.clear()
+        result = run(resume=mode)
+
+    payload = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    delivered = sorted(payload["cues"], key=lambda cue: cue["start_ms"])
+    held = [flag for flag in result.report["flags"] if flag["kind"] == "timing_evidence_held"]
+    assert [flag["cue_ids"] for flag in held] == [[2]]
+    # The first cue is split by the line limit; the held cue is delivered whole at its script timing.
+    children = {cue["index"] for cue in delivered[:-1]}
+    assert len(children) >= 2 and 1 in children
+    assert (delivered[-1]["index"], delivered[-1]["start_ms"], delivered[-1]["lines"]) == (2, 7300, ["tell him now"])
+    assert [flag["cue_ids"] for flag in _late_flags(result.report)] == [[1]]
+    # One check of every delivered cue, one of the split children: both leave held cues out.
+    everything, split_children = calls
+    assert everything.get("cue_ids") is None and split_children["cue_ids"] == children
+    assert 2 in everything["excluded_cue_ids"]
+    assert split_children.get("excluded_cue_ids") == everything["excluded_cue_ids"]
