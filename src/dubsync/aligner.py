@@ -80,6 +80,8 @@ UNTIMED_PUNCTUATION_SECONDS = 0.020
 OMISSION_WORD_OVERLAP_SECONDS = 0.05
 # Two copies of one re-decoded word follow each other this closely.
 REPEATED_WORD_GAP_SECONDS = 0.1
+# A re-decoded copy has no time of its own: it lies over its twin or has no duration.
+REDECODED_COPY_SECONDS = 0.020
 _BACK_NONE, _BACK_MATCH, _BACK_DELETE, _BACK_INSERT = range(4)
 # ``compound`` pairs a token of a concatenation-equal group with the provider
 # word it starts in; ``absorb`` hands a further word of that group to the cue.
@@ -1069,10 +1071,12 @@ def _absorb_touching_repeats(
 ) -> list[_Op]:
     """Give a word re-decoded twice back to the cue that owns its twin.
 
-    MAI sometimes emits one utterance as two touching copies ("7," 1932.20 and
-    "7," 1932.40). The cue matches one copy; the other used to open its own
-    insertion case and cut the cue's start. A pure-insertion word that touches
-    an exactly matched word with the same key joins that word's cue.
+    MAI sometimes emits one utterance as two copies at one time ("Flora."
+    727.39-727.89 and "Flora." 727.44-727.89). The cue matches one copy; the
+    other used to open its own insertion case and cut the cue's start. A
+    pure-insertion word that shares the time of an exactly matched word with
+    the same key joins that word's cue. A copy that follows its twin ("por que
+    que ela", "Schnell, schnell!") may be spoken, so it stays an insertion case.
     """
 
     matched = {
@@ -1097,7 +1101,7 @@ def _absorb_touching_repeats(
                 for neighbor in (op.asr_index + 1, op.asr_index - 1)
                 if neighbor in matched
                 and words_norm[neighbor] == words_norm[op.asr_index]
-                and _words_touch(words[min(neighbor, op.asr_index)], words[max(neighbor, op.asr_index)])
+                and _decoded_twice([words[min(neighbor, op.asr_index)]], [words[max(neighbor, op.asr_index)]])
             ),
             None,
         )
@@ -1114,6 +1118,19 @@ def _words_touch(left: Word, right: Word) -> bool:
         (left.start, left.end) != (right.start, right.end)
         and math.isfinite(left.end) and math.isfinite(right.start)
         and -IMPLAUSIBLE_MATCHED_WORD_SECONDS < right.start - left.end <= REPEATED_WORD_GAP_SECONDS
+    )
+
+
+def _decoded_twice(first: list[Word], second: list[Word]) -> bool:
+    """Whether two touching copies of the same words share one time.
+
+    A provider that decodes an utterance twice writes the copy over its twin
+    or without a duration of its own. A copy that follows its twin is what a
+    spoken repetition looks like; timing cannot tell that from a provider copy.
+    """
+    return _words_touch(first[-1], second[0]) and (
+        second[0].start < first[-1].end - 1e-9
+        or any(copy[-1].end - copy[0].start <= REDECODED_COPY_SECONDS + 1e-9 for copy in (first, second))
     )
 
 

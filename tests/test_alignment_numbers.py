@@ -86,23 +86,40 @@ def test_words_the_language_keeps_distinct_stay_reviewable(source, spoken, srt_t
     assert (span.srt_text, span.asr_text) == (srt_text, asr_text)
 
 
+_COUNTDOWN_CUES = [
+    Cue(index=1, start_ms=1_000, end_ms=1_900, lines=["Dez."]),
+    Cue(index=2, start_ms=2_000, end_ms=2_900, lines=["Nove."]),
+    Cue(index=3, start_ms=3_000, end_ms=3_900, lines=["Oito."]),
+]
+
+
 def test_countdown_with_re_decoded_digit_copies_keeps_each_cue_whole():
-    # MAI ep11: "Dez. / Nove. / Oito." heard as "10, 10, 9, 9, 8, 8," with touching copies.
-    cues = [
-        Cue(index=1, start_ms=1_000, end_ms=1_900, lines=["Dez."]),
-        Cue(index=2, start_ms=2_000, end_ms=2_900, lines=["Nove."]),
-        Cue(index=3, start_ms=3_000, end_ms=3_900, lines=["Oito."]),
+    # "Dez. / Nove. / Oito." heard as "10, 10, 9, 9, 8, 8," with each copy written over its twin.
+    words = [
+        Word(text="10,", start=1.00, end=1.50), Word(text="10,", start=1.20, end=1.70),
+        Word(text="9,", start=2.00, end=2.50), Word(text="9,", start=2.20, end=2.70),
+        Word(text="8,", start=3.00, end=3.50), Word(text="8.", start=3.20, end=3.70),
     ]
+
+    result = align_cues_to_words(_COUNTDOWN_CUES, words)
+
+    assert result.divergence_spans == []
+    assert result.cue_word_indices == {1: [0, 1], 2: [2, 3], 3: [4, 5]}
+
+
+def test_countdown_numbers_heard_twice_one_after_the_other_stay_reviewable():
+    # MAI ep11 wrote "10, 10, 9, 9, 8, 8," with each copy after its twin. The MAI
+    # adapter collapses such a counted run; a pair that reaches the aligner may be spoken.
     words = [
         Word(text="10,", start=1.00, end=1.18), Word(text="10,", start=1.20, end=1.70),
         Word(text="9,", start=2.00, end=2.18), Word(text="9,", start=2.20, end=2.70),
         Word(text="8,", start=3.00, end=3.18), Word(text="8.", start=3.20, end=3.70),
     ]
 
-    result = align_cues_to_words(cues, words)
+    result = align_cues_to_words(_COUNTDOWN_CUES, words)
 
-    assert result.divergence_spans == []
-    assert result.cue_word_indices == {1: [0, 1], 2: [2, 3], 3: [4, 5]}
+    assert [(span.cue_ids, span.srt_text, len(span.asr_word_indices)) for span in result.divergence_spans] == [([], "", 1)] * 3
+    assert sorted(len(indices) for indices in result.cue_word_indices.values()) == [1, 1, 1]
 
 
 def test_repetition_after_a_pause_stays_reviewable():

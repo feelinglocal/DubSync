@@ -26,7 +26,7 @@ from .adjudication_regions import (
     validated_protected_source_regions,
 )
 from .adjudication_snippets import BoundedAudioSnippetBatchSource
-from .aligner import MISSING_AUDIO_GUARD_VERSION, _words_touch, align_cues_to_words
+from .aligner import MISSING_AUDIO_GUARD_VERSION, _decoded_twice, _words_touch, align_cues_to_words
 from .annotation_composition import AnnotationComposition, compose_bracketed_annotations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
@@ -4340,13 +4340,19 @@ def _absorb_redecoded_insertions(
 ) -> tuple[AlignmentResult, list[AdjudicationDecision]]:
     """Never insert words that only repeat the adjacent owned words at the same time.
 
-    A provider can decode one utterance twice ('manda umas flores. Manda umas
-    flores', "Você..." / "Você..." with overlapping timestamps). The aligner
-    gives a single touching copy back to the cue of its exactly matched twin;
-    a copied phrase, or a copy left as its own case, reached the adjudicator
-    and came back as approved new dialogue. Such a copy is an ASR artefact,
-    not speech: nothing is inserted or reported, and its words time the cue
-    that owns the twin, because both copies are that cue's utterance.
+    A provider can decode one utterance twice ("Você..." / "Você..." with
+    overlapping timestamps). The aligner gives a single copy written over its
+    exactly matched twin back to that twin's cue; a copied phrase, or a copy
+    left as its own case, reached the adjudicator and came back as approved
+    new dialogue. Such a copy is an ASR artefact, not speech: nothing is
+    inserted or reported, and its words time the cue that owns the twin,
+    because both copies are that cue's utterance.
+
+    A copy that follows its twin ('por que que ela', 'Vem cá, vem cá.') is
+    what a spoken repetition looks like, so the adjudicator's approval stands,
+    and a clear hearing is never overruled. A touching copy that was not
+    approved still times the cue of its twin, also as the first or last word
+    of a longer case.
     """
     owners: dict[int, set[int]] = {}
     for cue_id, indices in alignment.cue_word_indices.items():
@@ -4369,14 +4375,15 @@ def _absorb_redecoded_insertions(
         keys = [normalize_token(words[index].text) for index in indices]
         decision = by_case.get(span.case_id)
         approved = decision is not None and decision.verdict != "keep_srt" and bool(decision.final_text.strip())
-        if not all(keys) or (
-            approved and alphanumeric_signature(decision.final_text) != alphanumeric_signature(span.asr_text)
+        if approved and (
+            not all(keys) or decision.evidence == "heard_clearly"
+            or alphanumeric_signature(decision.final_text) != alphanumeric_signature(span.asr_text)
         ):
             continue
         length = len(indices)
         # The case and the owned words around it are two touching copies of
         # one phrase; alignment may have matched any part of either copy.
-        for first in range(indices[0] - length, indices[0] + 1):
+        for first in range(indices[0] - length, indices[0] + 1) if all(keys) else ():
             if first < 0 or first + 2 * length > len(words):
                 continue
             twin = [index for index in range(first, first + 2 * length) if not indices[0] <= index <= indices[-1]]
@@ -4390,6 +4397,7 @@ def _absorb_redecoded_insertions(
                     for index in range(first, first + length)
                 )
                 or not _words_touch(words[first + length - 1], words[first + length])
+                or approved and not _decoded_twice(words[first:first + length], words[first + length:first + 2 * length])
             ):
                 continue
             (owner,) = twin_owners[0]
@@ -4405,6 +4413,21 @@ def _absorb_redecoded_insertions(
                     ),
                 })
             break
+        else:
+            # The case is more than a copy, but its first or last word can be
+            # one ("eu, | eu, eu não sou"): unapproved, it times its twin's cue.
+            for position, neighbor in ((0, indices[0] - 1), (-1, indices[-1] + 1)):
+                index, owner = indices[position], owners.get(neighbor, set())
+                if (
+                    approved or length == 1 or not keys[position] or len(owner) != 1 or owner & protected
+                    or neighbor in (ambiguous_word_indices or set())
+                    or normalize_token(words[neighbor].text) != keys[position]
+                    or not _words_touch(words[min(index, neighbor)], words[max(index, neighbor)])
+                ):
+                    continue
+                (cue_id,) = owner
+                cue_word_indices[cue_id] = sorted({*cue_word_indices.get(cue_id, []), index})
+                absorbed = True
     if not absorbed and not dropped:
         return alignment, decisions
     return (
