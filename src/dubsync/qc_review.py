@@ -377,16 +377,13 @@ _DIAGNOSTIC_TITLES = {
 }
 # The raw message of such a flag describes a reflow or pages; its row says what the pass did instead.
 _UNCHANGED_LAYOUT_DETAIL = (
-    "No safe split or re-break was found, so the same lines were recorded before and after; "
+    "The pass found no other line breaks and recorded the same lines before and after; "
     "any width overflow stays in style QC."
 )
 _DIAGNOSTIC_MESSAGES = {
     "output_line_limit_reflow:unchanged": _UNCHANGED_LAYOUT_DETAIL,
     "annotation_line_limit_reflow:unchanged": _UNCHANGED_LAYOUT_DETAIL,
-    "annotation_line_limit_pagination:unchanged": (
-        "The screen text stays on one page with the same lines; its display intervals are recorded in "
-        "caption provenance."
-    ),
+    "annotation_line_limit_pagination:unchanged": "The pass kept the screen text on one page with the same lines.",
 }
 
 
