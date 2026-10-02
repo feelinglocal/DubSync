@@ -121,11 +121,11 @@ def test_overlapping_copy_is_dropped_and_its_words_time_the_cue_that_owns_the_tw
                           start=10.60, end=10.62, left_anchor_cue_id=1, right_anchor_cue_id=2)
     decision = AdjudicationDecision(case_id="case-1", verdict="use_audio", final_text="a", confidence=0.95, reason="heard")
 
-    alignment, decisions = pipeline._absorb_redecoded_insertions(_alignment(span), [decision], _words(10.60))
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [decision], _words(10.60))
 
     assert [(item.verdict, item.final_text) for item in decisions] == [("keep_srt", "")]
     assert alignment.cue_word_indices[2] == [1, 2, 3]
-    assert alignment.flags == []
+    assert alignment.flags == [] and flags == []
 
 
 def test_insertion_with_other_wording_or_far_from_its_twin_is_left_alone():
@@ -135,8 +135,8 @@ def test_insertion_with_other_wording_or_far_from_its_twin_is_left_alone():
     same = changed.model_copy(update={"final_text": "a"})
 
     for decision, words in ((changed, _words(10.60)), (same, _words(10.20))):
-        alignment, decisions = pipeline._absorb_redecoded_insertions(_alignment(span), [decision], words)
-        assert decisions == [decision]
+        alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [decision], words)
+        assert decisions == [decision] and flags == []
         assert alignment.cue_word_indices[2] == [2, 3]
 
 
@@ -145,9 +145,9 @@ def test_clearly_heard_insertion_is_never_taken_back_as_a_provider_copy():
                           start=10.60, end=10.62, left_anchor_cue_id=1, right_anchor_cue_id=2)
     heard = AdjudicationDecision.model_validate(_heard("case-1", "a"))
 
-    alignment, decisions = pipeline._absorb_redecoded_insertions(_alignment(span), [heard], _words(10.60))
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [heard], _words(10.60))
 
-    assert decisions == [heard]
+    assert decisions == [heard] and flags == []
     assert alignment.cue_word_indices[2] == [2, 3]
 
 
@@ -162,15 +162,28 @@ def test_approved_copy_is_only_taken_back_when_it_shares_the_time_of_its_twin():
     span = DivergenceSpan(case_id="case-1", cue_ids=[], srt_text="", asr_text="Vem", asr_word_indices=[1],
                           start=10.00, end=10.10, left_anchor_cue_id=1, right_anchor_cue_id=2)
     approved = AdjudicationDecision(case_id="case-1", verdict="use_audio", final_text="Vem", confidence=0.95, reason="heard")
+    heard = AdjudicationDecision.model_validate(_heard("case-1", "Vem"))
 
-    # Spoken one after the other (20 ms apart): the approved repetition stays.
-    alignment, decisions = pipeline._absorb_redecoded_insertions(_alignment(span), [approved], _come_words((10.00, 10.10)))
-    assert decisions == [approved]
+    # Spoken one after the other (20 ms apart) and heard clearly: the approved repetition stays.
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [heard], _come_words((10.00, 10.10)))
+    assert decisions == [heard] and flags == []
     assert alignment.cue_word_indices[2] == [2, 3]
 
-    # Written over its twin: one utterance decoded twice.
-    alignment, decisions = pipeline._absorb_redecoded_insertions(_alignment(span), [approved], _come_words((10.04, 10.16)))
+    # The same copy approved without audio evidence: timing cannot tell a repetition from a
+    # re-decode, so the source is kept, the hold is reported and the words time the twin's cue.
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [approved], _come_words((10.00, 10.10)))
     assert [(item.verdict, item.final_text) for item in decisions] == [("keep_srt", "")]
+    assert "no audio evidence" in decisions[0].reason and "Proposed use_audio: 'Vem'" in decisions[0].reason
+    assert [(flag.kind, flag.severity, flag.cue_ids, flag.new_text, flag.confidence) for flag in flags] == [
+        ("low_confidence_adjudication", "warning", [], "Vem", 0.95),
+    ]
+    assert (flags[0].start, flags[0].end) == (10.00, 10.10)
+    assert alignment.cue_word_indices[2] == [1, 2, 3]
+
+    # Written over its twin: one utterance decoded twice, taken back without a review item.
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(_alignment(span), [approved], _come_words((10.04, 10.16)))
+    assert [(item.verdict, item.final_text) for item in decisions] == [("keep_srt", "")]
+    assert "decoded one utterance twice" in decisions[0].reason and flags == []
     assert alignment.cue_word_indices[2] == [1, 2, 3]
 
 
@@ -180,8 +193,8 @@ def test_touching_copy_the_adjudicator_did_not_approve_still_times_the_cue_of_it
     kept = AdjudicationDecision(case_id="case-1", verdict="keep_srt", final_text="", confidence=0.95, reason="one utterance")
 
     for decisions in ([kept], []):
-        alignment, returned = pipeline._absorb_redecoded_insertions(_alignment(span), decisions, _come_words((10.00, 10.10)))
-        assert returned == decisions
+        alignment, returned, flags = pipeline._absorb_redecoded_insertions(_alignment(span), decisions, _come_words((10.00, 10.10)))
+        assert returned == decisions and flags == []
         assert alignment.cue_word_indices[2] == [1, 2, 3]
 
 
@@ -203,13 +216,13 @@ def test_unapproved_case_that_begins_with_a_touching_copy_still_times_the_cue_of
     kept = AdjudicationDecision(case_id="case-1", verdict="keep_srt", final_text="", confidence=0.0, reason="held")
     approved = AdjudicationDecision.model_validate(_heard("case-1", heard))
 
-    alignment, decisions = pipeline._absorb_redecoded_insertions(aligned, [kept], words)
-    assert decisions == [kept]
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(aligned, [kept], words)
+    assert decisions == [kept] and flags == []
     assert alignment.cue_word_indices == {1: [0], 2: [1, 2], 3: [4, 5]}
 
     # Approved, the words of the case belong to the inserted wording.
-    alignment, decisions = pipeline._absorb_redecoded_insertions(aligned, [approved], words)
-    assert decisions == [approved]
+    alignment, decisions, flags = pipeline._absorb_redecoded_insertions(aligned, [approved], words)
+    assert decisions == [approved] and flags == []
     assert alignment.cue_word_indices == aligned.cue_word_indices
 
 
@@ -343,10 +356,39 @@ _COME_WORDS = [
 ]
 
 
-@pytest.mark.parametrize("answer", [_heard, _decide], ids=["heard-clearly", "approved"])
-def test_phrase_the_adjudicator_approved_right_after_its_twin_is_delivered(tmp_path, answer):
-    cues, flags, workdir = _sync_episode(tmp_path, _COME_SRT, _COME_WORDS, {"case-1": answer("case-1", "Vem cá,")})
+def test_phrase_the_adjudicator_heard_clearly_right_after_its_twin_is_delivered(tmp_path):
+    cues, flags, workdir = _sync_episode(tmp_path, _COME_SRT, _COME_WORDS, {"case-1": _heard("case-1", "Vem cá,")})
 
     assert " ".join(cue.plain_text for cue in cues).casefold().count("vem cá") == 2
     assert {"adlib_inserted", "text_changed"} & {flag["kind"] for flag in flags}
     assert all(len(_word_owners(workdir, index)) == 1 for index in range(2, 6))
+
+
+def _hold_flags(flags: list[dict]) -> list[dict]:
+    return [flag for flag in flags
+            if flag["kind"] == "low_confidence_adjudication" and "no audio evidence" in flag["message"]]
+
+
+def test_phrase_approved_without_audio_evidence_right_after_its_twin_is_held_and_reported(tmp_path):
+    # A text-only route (or an answer from before the evidence field) approved the repetition
+    # without hearing it: the script is kept, the customer is asked to listen, both copies time cue 2.
+    cues, flags, workdir = _sync_episode(tmp_path, _COME_SRT, _COME_WORDS, {"case-1": _decide("case-1", "Vem cá,")})
+
+    assert [cue.plain_text for cue in cues] == ["Rápido, rápido.", "Vem cá.", "Mais perto."]
+    assert not {"adlib_inserted", "text_changed"} & {flag["kind"] for flag in flags}
+    assert [(flag["severity"], flag["new_text"]) for flag in _hold_flags(flags)] == [("warning", "Vem cá,")]
+    assert all(_word_owners(workdir, index) == ["2"] for index in range(2, 6))
+    assert cues[1].start_ms <= 1520 and cues[1].end_ms >= 1979
+
+
+def test_golden_rewind_copy_approved_by_a_text_only_answer_is_shown_once_and_reported(tmp_path):
+    # ep11 MAI 321.2 s: 'manda umas flores.' then 'Manda umas flores' 20 ms later; the hybrid-v8
+    # text-only stage approved the copy (evidence None); the human reference has it once.
+    cues, flags = _sync(tmp_path, _FLOWERS_SRT, _flowers_words(0.02), _COPY_CASE)
+
+    assert [cue.plain_text for cue in cues] == [
+        "Se quer ficar bem com ela,", "manda umas flores", "pra acalmar a garota.",
+    ]
+    assert abs(cues[1].start_ms - 21200) <= 34 and abs(cues[1].end_ms - round(22.52 * 1000)) <= 45
+    assert not {"adlib_inserted", "text_changed", "timing_outlier_trimmed"} & {flag["kind"] for flag in flags}
+    assert [flag["new_text"] for flag in _hold_flags(flags)] == ["umas flores. Manda"]

@@ -839,9 +839,12 @@ def sync_episode(
             alignment=alignment,
         )
 
-    alignment, decisions = _absorb_redecoded_insertions(
+    # Recomputed from the saved answers on every rebuild, so the artifact keeps
+    # the adjudicator's own decisions and the hold is reproduced on resume.
+    alignment, decisions, redecoded_hold_flags = _absorb_redecoded_insertions(
         alignment, decisions, words, ambiguous_word_indices=uncertain_word_indices,
     )
+    flags.extend(redecoded_hold_flags)
 
     # One case can hold words that are seconds apart. Only the group spoken at
     # a cue's own time may edit that cue; the others are placed on their own.
@@ -4339,7 +4342,7 @@ def _adlib_cue_ids_by_case(
 def _absorb_redecoded_insertions(
     alignment: AlignmentResult, decisions: list[AdjudicationDecision], words: list[Word],
     *, ambiguous_word_indices: set[int] | None = None,
-) -> tuple[AlignmentResult, list[AdjudicationDecision]]:
+) -> tuple[AlignmentResult, list[AdjudicationDecision], list[QCFlag]]:
     """Never insert words that only repeat the adjacent owned words at the same time.
 
     A provider can decode one utterance twice ("Você..." / "Você..." with
@@ -4351,10 +4354,13 @@ def _absorb_redecoded_insertions(
     because both copies are that cue's utterance.
 
     A copy that follows its twin ('por que que ela', 'Vem cá, vem cá.') is
-    what a spoken repetition looks like, so the adjudicator's approval stands,
-    and a clear hearing is never overruled. A touching copy that was not
-    approved still times the cue of its twin, also as the first or last word
-    of a longer case.
+    what a spoken repetition looks like, and timing cannot tell the two apart:
+    only hearing can. An approval with clear audio evidence stands and is
+    never overruled. An approval without audio evidence (a text-only route or
+    an answer from before the evidence field) is held for review instead: the
+    source wording is kept, a ``low_confidence_adjudication`` flag says why,
+    and the words time the cue of their twin as any unapproved touching copy
+    does, also as the first or last word of a longer case.
     """
     owners: dict[int, set[int]] = {}
     for cue_id, indices in alignment.cue_word_indices.items():
@@ -4364,6 +4370,7 @@ def _absorb_redecoded_insertions(
     by_case = {decision.case_id: decision for decision in decisions}
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     dropped: dict[str, AdjudicationDecision] = {}
+    flags: list[QCFlag] = []
     absorbed = False
     for span in alignment.divergence_spans:
         indices = span.asr_word_indices
@@ -4399,14 +4406,13 @@ def _absorb_redecoded_insertions(
                     for index in range(first, first + length)
                 )
                 or not _words_touch(words[first + length - 1], words[first + length])
-                or approved and not _decoded_twice(words[first:first + length], words[first + length:first + 2 * length])
             ):
                 continue
             (owner,) = twin_owners[0]
             if owner not in protected:
                 cue_word_indices[owner] = sorted({*cue_word_indices.get(owner, []), *indices})
                 absorbed = True
-            if approved:
+            if approved and _decoded_twice(words[first:first + length], words[first + length:first + 2 * length]):
                 dropped[span.case_id] = decision.model_copy(update={
                     "verdict": "keep_srt", "final_text": span.srt_text,
                     "reason": (
@@ -4414,6 +4420,33 @@ def _absorb_redecoded_insertions(
                         f"utterance twice); nothing was inserted. Proposed {decision.verdict}: {decision.final_text!r}."
                     ),
                 })
+            elif approved:
+                # Spoken right after its twin, approved without hearing it: the
+                # evidence that would tell a repetition from a re-decode is missing.
+                hold_reason = (
+                    "Approved repetition has no audio evidence: the words repeat the adjacent words of "
+                    f"cue {owner} right after them and the decision was made without hearing the audio"
+                )
+                dropped[span.case_id] = decision.model_copy(update={
+                    "verdict": "keep_srt", "final_text": span.srt_text,
+                    "reason": (
+                        f"{hold_reason}; preserved source SRT for review. "
+                        f"Proposed {decision.verdict}: {decision.final_text!r}."
+                    ),
+                })
+                flags.append(QCFlag(
+                    kind="low_confidence_adjudication",
+                    cue_ids=span.cue_ids,
+                    message=(
+                        f"{hold_reason}; source SRT was preserved. "
+                        f"Proposed verdict: {decision.verdict}. Reason: {decision.reason}"
+                    ),
+                    confidence=decision.confidence,
+                    old_text=span.srt_text,
+                    new_text=decision.final_text,
+                    start=span.start,
+                    end=span.end,
+                ))
             break
         else:
             # The case is more than a copy, but its first or last word can be
@@ -4431,10 +4464,11 @@ def _absorb_redecoded_insertions(
                 cue_word_indices[cue_id] = sorted({*cue_word_indices.get(cue_id, []), index})
                 absorbed = True
     if not absorbed and not dropped:
-        return alignment, decisions
+        return alignment, decisions, flags
     return (
         alignment.model_copy(update={"cue_word_indices": cue_word_indices}),
         [dropped.get(decision.case_id, decision) for decision in decisions],
+        flags,
     )
 
 

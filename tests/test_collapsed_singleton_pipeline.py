@@ -112,9 +112,9 @@ def test_singleton_verify_restores_the_exact_post_adjudication_decision_state(tm
     _, adapter, run, _ = _native_case(tmp_path, monkeypatch)
     original = pipeline._absorb_redecoded_insertions
     def transformed(*args, **kwargs):
-        alignment, decisions = original(*args, **kwargs)
+        alignment, decisions, flags = original(*args, **kwargs)
         return alignment, [decision.model_copy(update={"reason": decision.reason + " Post-adjudication mapping."})
-                           for decision in decisions]
+                           for decision in decisions], flags
     monkeypatch.setattr(pipeline, "_absorb_redecoded_insertions", transformed)
     first = run()
     original_output = first.output_srt.read_bytes()
