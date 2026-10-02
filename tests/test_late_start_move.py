@@ -463,17 +463,21 @@ def test_generation_starts_the_cues_of_a_lagging_recording_on_their_speech_onset
     assert _late_flags(result.report) == []
 
 
-@pytest.mark.parametrize(("lead_amplitude", "reported"), [(6000, True), (1000, False)])
-def test_generation_reports_a_late_start_it_cannot_move(tmp_path, lead_amplitude, reported):
+@pytest.mark.parametrize(("lead_amplitude", "last_lag", "reported"), [
+    (6000, 0.41, True), (1000, 0.41, False),
+    # Generation follows the sync policy: no upper bound on the lead of the review item either.
+    (6000, 0.9, True),
+])
+def test_generation_reports_a_late_start_it_cannot_move(tmp_path, lead_amplitude, last_lag, reported):
     _, audio, providers, regions = _episode(
-        tmp_path, ON_TIME, last_lag=0.41, lead_amplitude=lead_amplitude, generation=True,
+        tmp_path, ON_TIME, last_lag=last_lag, lead_amplitude=lead_amplitude, generation=True,
     )
 
     result = generate_srt_from_audio(audio, tmp_path / "output.srt", tmp_path / "work", providers_path=providers,
                                      no_llm=True, style_profile=PROFILE)
 
     cues = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
-    assert cues[-1].start_ms == PROFILE.snap_floor(49410)
+    assert cues[-1].start_ms == PROFILE.snap_floor(49000 + round(last_lag * 1000))
     flags = _late_flags(result.report)
     assert len(flags) == (1 if reported else 0)
     if reported:
