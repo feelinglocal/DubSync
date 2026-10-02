@@ -9,6 +9,8 @@ from __future__ import annotations
 import html
 import json
 
+import pytest
+
 from dubsync import pipeline
 from dubsync.annotation_composition import compose_bracketed_annotations
 from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, TokenMatch, Word
@@ -221,6 +223,23 @@ def test_recovery_and_reflow_that_were_reverted_stay_not_delivered():
     assert sorted(_undone(review.diagnostics)) == [
         "missing_dialogue_audio_reconciled:not_delivered", "output_line_limit_reflow:not_delivered"]
     assert all("later undone" in item.title for item in review.diagnostics)
+
+
+@pytest.mark.parametrize("heard", ["", "三分だ"])
+def test_recovery_whose_heard_wording_is_not_delivered_is_not_logged_as_a_retime(heard):
+    source = [Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hello."]),
+              Cue(index=2, start_ms=64666, end_ms=65466, lines=["三分？"])]
+    # The confirmed omission ("") or the heard wording was undone: the cue kept the
+    # customer's words, and its timing moved for another reason.
+    delivered = [source[0], source[1].with_timing(64366, 65133)]
+    flags = [QCFlag(kind="missing_dialogue_audio_reconciled", cue_ids=[2], severity="info", confidence=1.0,
+                    message="Native audio confirmed this whole cue.", old_text="三分？", new_text=heard,
+                    start=64.375, end=65.135)]
+
+    review = build_review(flags, [], delivered, source_cues=source)
+
+    assert review.changes == []
+    assert _undone(review.diagnostics) == ["missing_dialogue_audio_reconciled:not_delivered"]
 
 
 def test_layout_change_does_not_approve_a_spelling_finding():
