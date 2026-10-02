@@ -447,13 +447,17 @@ def split_crowded_output_cues(cues: list[Cue], words: list[Word],
                              cue_word_indices: Mapping[int, list[int]], profile: StyleProfile,
                              *, max_lines: int | None = None, min_parts: int = 1,
                              protected_cue_ids: set[int] | None = None,
-                             enforce_width: bool = True) -> OutputSegmentation:
+                             enforce_width: bool = True,
+                             reserved_cue_ids: set[int] | None = None) -> OutputSegmentation:
     """Apply the final two-line ceiling without estimating speech timestamps.
 
     With ``enforce_width`` false the width is the customer's own (derived from
     the source file): a cue within the line limit keeps its lines whatever
     their width, which ordinary line-length QC reports. Only a cue over the
     line limit is reflowed or split.
+
+    ``reserved_cue_ids`` are identities a new child must never take, such as
+    source cues removed earlier in the run or cues a finding still names.
     """
     limit = min(2, profile.max_lines_per_cue, max_lines if max_lines is not None else 2)
     if limit < 1 or min_parts < 1:
@@ -461,7 +465,7 @@ def split_crowded_output_cues(cues: list[Cue], words: list[Word],
     ownership = {index: list(indices) for index, indices in cue_word_indices.items()}
     counts = Counter(index for indices in ownership.values() for index in indices)
     protected = protected_cue_ids or set()
-    next_id = max([0, *ownership, *(cue.index for cue in cues)]) + 1
+    next_id = max([0, *ownership, *(cue.index for cue in cues), *(reserved_cue_ids or ())]) + 1
     output, flags, expansions, visual_pages = [], [], {}, {}
     for cue in cues:
         fits_width = not enforce_width or all(display_width(line) <= profile.max_chars_per_line for line in cue.lines)

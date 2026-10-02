@@ -3247,11 +3247,15 @@ def _run_verify_stage(
     # Keep the acoustic result before display-only splits, which must not
     # become new source cues.
     pre_output_cues, pre_output_alignment, pre_output_flags = rebuilt, alignment, flags
+    # The change log and QC are keyed by cue id: a display child never takes
+    # the id of a source cue removed earlier or of a cue a finding still names.
+    reserved_cue_ids = {cue.index for cue in source_cues} | {cue_id for flag in flags for cue_id in flag.cue_ids}
     # The two-line ceiling always applies. A cue within it keeps its layout
     # unless the style's width is enforced; its width stays a style finding.
     segmented = split_crowded_output_cues(
         rebuilt, effective_words, alignment.cue_word_indices, profile,
         protected_cue_ids=protected_cue_ids, enforce_width=enforce_line_width,
+        reserved_cue_ids=reserved_cue_ids,
     )
     rebuilt = segmented.cues
     alignment = alignment.model_copy(update={"cue_word_indices": segmented.cue_word_indices})
@@ -3262,6 +3266,7 @@ def _run_verify_stage(
         compose_bracketed_annotations(
             rebuilt, pre_annotation_ownership, words=effective_words, profile=profile,
             protected_cue_ids=protected_cue_ids, enforce_width=enforce_line_width,
+            reserved_cue_ids=reserved_cue_ids,
         )
         if _output_no_overlaps(provider_config)
         else AnnotationComposition(list(rebuilt), dict(pre_annotation_ownership), {}, {})
@@ -3271,6 +3276,9 @@ def _run_verify_stage(
     flags = [*expand_output_flags(flags, composition.expansions), *composition.flags]
     expanded_ids = {child for expansion in (segmented.expansions, composition.expansions)
                     for children in expansion.values() for child in children}
+    if any(child in reserved_cue_ids for expansion in (segmented.expansions, composition.expansions)
+           for children in expansion.values() for child in children[1:]):
+        raise ValueError("a display child reused the id of a source cue or of a cue a finding names")
     if expanded_ids:
         # Child display windows have their own readability and acoustic QC.
         # Findings about the previous unsplit window are no longer current.

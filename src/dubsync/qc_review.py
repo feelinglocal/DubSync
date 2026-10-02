@@ -22,6 +22,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import combinations
 from math import isfinite
 from typing import Literal
 
@@ -891,8 +892,21 @@ class _FindingSorter:
         if len(ids) < 2:
             self._candidate(index, flag, "output_overlap_unresolved", "warning")
             return
-        pair = tuple(sorted(ids[:2], key=lambda cue_id: self.position.get(cue_id, cue_id)))
-        self._overlap_pair(pair, flag_index=index, start=flag.start, end=flag.end, message=flag.message, kind=flag.kind)
+        pairs = [ids[:2]]
+        if len(ids) > 2:
+            # A display split lists every child of a flagged cue. Separate
+            # siblings are not the overlap: each delivered pair still on screen
+            # together is reviewed, and only a flag with none left is stale.
+            delivered = [cue_id for cue_id in ids if cue_id in self.by_id]
+            pairs = [
+                [left, right] for left, right in combinations(delivered, 2)
+                if min(self.by_id[left].end_ms, self.by_id[right].end_ms)
+                > max(self.by_id[left].start_ms, self.by_id[right].start_ms)
+            ] or pairs
+        for members in pairs:
+            pair = tuple(sorted(members, key=lambda cue_id: self.position.get(cue_id, cue_id)))
+            self._overlap_pair(pair, flag_index=index, start=flag.start, end=flag.end, message=flag.message,
+                               kind=flag.kind)
 
     def _overlap_pair(
         self,

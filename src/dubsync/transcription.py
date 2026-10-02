@@ -393,6 +393,7 @@ def generate_srt_from_audio(
     flags.extend(profanity_flags)
     segmented = split_crowded_output_cues(
         cues, words, alignment.cue_word_indices, profile, protected_cue_ids=ambiguous_cue_ids,
+        reserved_cue_ids={cue_id for flag in flags for cue_id in flag.cue_ids},
     )
     cues = segmented.cues
     alignment = alignment.model_copy(update={"cue_word_indices": segmented.cue_word_indices})

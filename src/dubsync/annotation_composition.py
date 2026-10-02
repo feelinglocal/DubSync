@@ -33,6 +33,7 @@ def compose_bracketed_annotations(
     cues: list[Cue], cue_word_indices: Mapping[int, list[int]] | None = None,
     *, words: list[Word] | None = None, profile: StyleProfile | None = None,
     protected_cue_ids: set[int] | None = None, enforce_width: bool = True,
+    reserved_cue_ids: set[int] | None = None,
 ) -> AnnotationComposition:
     """Compose screen captions around exact incoming speech intervals.
 
@@ -42,16 +43,18 @@ def compose_bracketed_annotations(
     children at exact word boundaries. Caption wording is retained, spoken
     words never repeat, and actual page intervals are recorded. Legacy calls
     retain continuous full-caption composition. With ``enforce_width`` false
-    (a source-derived width) only the line count crowds a display.
+    (a source-derived width) only the line count crowds a display. A new
+    display cue never takes one of ``reserved_cue_ids`` (removed source cues
+    or cues a finding still names).
     """
     if profile is not None:
         return _compose_bounded_annotations(cues, cue_word_indices or {}, words or [], profile, protected_cue_ids,
-                                            enforce_width)
-    return _compose_unbounded_annotations(cues, cue_word_indices)
+                                            enforce_width, reserved_cue_ids)
+    return _compose_unbounded_annotations(cues, cue_word_indices, reserved_cue_ids)
 
 
 def _compose_unbounded_annotations(
-    cues: list[Cue], cue_word_indices: Mapping[int, list[int]] | None,
+    cues: list[Cue], cue_word_indices: Mapping[int, list[int]] | None, reserved: set[int] | None = None,
 ) -> AnnotationComposition:
     ownership = {index: list(indices) for index, indices in (cue_word_indices or {}).items()}
     annotations = sorted((cue for cue in cues if cue.start_ms < cue.end_ms
@@ -95,7 +98,7 @@ def _compose_unbounded_annotations(
         else:
             residuals.append((start, end, active))
     used = {cue.index for cue in result}
-    next_id = max([0, *ownership, *(cue.index for cue in cues)]) + 1
+    next_id = max([0, *ownership, *(cue.index for cue in cues), *(reserved or ())]) + 1
     for track in tracks:
         ownership.pop(track.index, None)  # Eligible tracks have no owned words.
     for start, end, active in residuals:
@@ -159,17 +162,18 @@ def _caption_pages(track: Cue, profile: StyleProfile, limit: int, enforce_width:
 
 def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[int]], words: list[Word],
                                  profile: StyleProfile, protected: set[int] | None,
-                                 enforce_width: bool = True) -> AnnotationComposition:
+                                 enforce_width: bool = True,
+                                 reserved: set[int] | None = None) -> AnnotationComposition:
     """Paginate crowded visual tracks while keeping each spoken word once.
 
     A caption page can occupy a whole spoken child or a known visual gap.
     Its actual interval, delay and uncovered original intervals are recorded;
     sequential pages never claim continuous display of the full parent text.
     """
-    legacy = _compose_unbounded_annotations(cues, incoming)
+    legacy = _compose_unbounded_annotations(cues, incoming, reserved)
     if not legacy.tracks:
         segmented = split_crowded_output_cues(cues, words, incoming, profile, protected_cue_ids=protected,
-                                              enforce_width=enforce_width)
+                                              enforce_width=enforce_width, reserved_cue_ids=reserved)
         return AnnotationComposition(segmented.cues, segmented.cue_word_indices, {}, {}, segmented.flags,
                                      segmented.expansions, 2)
     limit = min(2, profile.max_lines_per_cue)
@@ -194,7 +198,7 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
                                    for track in contained))
             segmented = split_crowded_output_cues([cue], words, ownership, profile, max_lines=budget,
                                                   min_parts=requested, protected_cue_ids=protected,
-                                                  enforce_width=enforce_width)
+                                                  enforce_width=enforce_width, reserved_cue_ids=reserved)
             speech.extend(segmented.cues)
             ownership = segmented.cue_word_indices
             flags.extend(segmented.flags)
@@ -261,7 +265,8 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
             slot["page_refs"].append((track.index, page_position))
             slot["capacity"] -= len(page)
     used = {cue.index for cue in speech}
-    next_id = max([0, *ownership, *(cue.index for cue in cues), *(cue.index for cue in speech)]) + 1
+    next_id = max([0, *ownership, *(cue.index for cue in cues), *(cue.index for cue in speech),
+                   *(reserved or ())]) + 1
     for track in tracks:
         ownership.pop(track.index, None)
     result, cue_annotations = [], {}
