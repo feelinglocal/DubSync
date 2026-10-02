@@ -170,6 +170,9 @@ KIND_REGISTRY: dict[str, KindSpec] = {
     "cue_without_speech_activity": _review_kind(
         "No speech detected under this cue", _LISTEN, 42, "warning"),
     "cue_on_silence": _review_kind("Cue is on silence", _LISTEN, 42, "warning"),
+    "cue_starts_after_speech_onset": _review_kind(
+        "Cue starts after the speech begins", "Check the cue start; move it earlier if the first words are cut.",
+        44, "warning"),
     "output_overlap_unresolved": _review_kind(
         "Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),
     "output_overlap_preserved": _review_kind("Cues overlap", "Trim the earlier cue or merge the two lines.", 45, "warning"),

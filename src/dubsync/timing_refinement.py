@@ -6,6 +6,7 @@ from math import isfinite
 from pathlib import Path
 
 from .asr_timing import (
+    PhraseEdgeSnap,
     ambiguous_word_indices_from_regions,
     asr_model_from_artifact,
     clamp_asr_word_durations,
@@ -105,6 +106,8 @@ class SpeechEvidence:
     word_flags: list[QCFlag] = field(default_factory=list)
     detected: bool = False
     fallback_used: bool = False
+    # How far (seconds) a phrase-initial word start was moved back onto its burst onset.
+    start_snap: float = PhraseEdgeSnap().start_advance
 
 
 def speech_evidence_for_words(
@@ -121,18 +124,19 @@ def speech_evidence_for_words(
         return SpeechEvidence(words=words)
     regions = adapter.detect(audio_path)
     boundary = boundary_refinement_config_from_config(provider_config)
+    snap = phrase_edge_snap_from_config(
+        provider_config,
+        asr_model_from_artifact(asr_artifact_path),
+        # Refinement follows a burst past the last word by the same limit;
+        # a different word-level limit would only make the stages disagree.
+        default_end_extension=boundary.max_end_extension_ms / 1000.0,
+    )
     repaired, word_flags = repair_asr_word_edges(
         words,
         regions,
         max_word_duration=max_word_duration,
         max_region_overrun=boundary.max_trailing_silence_ms / 1000.0,
-        snap=phrase_edge_snap_from_config(
-            provider_config,
-            asr_model_from_artifact(asr_artifact_path),
-            # Refinement follows a burst past the last word by the same limit;
-            # a different word-level limit would only make the stages disagree.
-            default_end_extension=boundary.max_end_extension_ms / 1000.0,
-        ),
+        snap=snap,
     )
     return SpeechEvidence(
         words=repaired,
@@ -140,6 +144,7 @@ def speech_evidence_for_words(
         word_flags=word_flags,
         detected=True,
         fallback_used=bool(getattr(adapter, "fallback_used", False)),
+        start_snap=snap.start_advance,
     )
 
 

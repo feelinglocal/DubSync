@@ -30,7 +30,7 @@ from .aligner import MISSING_AUDIO_GUARD_VERSION, _words_touch, align_cues_to_wo
 from .annotation_composition import AnnotationComposition, compose_bracketed_annotations
 from .audio import AudioNormalizationLimits, normalize_audio
 from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
-from .asr_timing import ambiguous_word_indices, has_sufficient_speech_overlap
+from .asr_timing import PhraseEdgeSnap, ambiguous_word_indices, has_sufficient_speech_overlap
 from .asr_crosscheck import classify_spans, compare_word_streams
 from .asr_crosscheck_config import resolve_cross_check_config
 from .asr_crosscheck_runtime import (
@@ -124,6 +124,7 @@ from .tokenize import alphanumeric_signature, normalize_token, tokenize_cues
 from .vad import (
     cue_ids_with_audible_words,
     dropped_line_flags_for_unmatched_cues,
+    late_start_flags_for_cues,
     min_coverage_from_config,
     speech_activity_adapter_from_config,
     speech_activity_flags_for_cues,
@@ -141,6 +142,7 @@ VERIFY_STAGE_FLAG_KINDS = frozenset(
         "cue_on_silence",
         "cue_without_speech_activity",
         "cue_with_excessive_trailing_silence",
+        "cue_starts_after_speech_onset",
         "adlib_removed_without_speech_activity",
         "duplicate_cue_merged",
         "forced_alignment_refined",
@@ -3107,6 +3109,17 @@ def _run_verify_stage(
         cue_id for flag in flags if flag.kind == _SONG_CAPTION_NOTE_KIND for cue_id in flag.cue_ids
         if cue_id in alignment.diagnostics.missing_audio_cue_ids and not alignment.cue_word_indices.get(cue_id)
     }
+
+    def spoken_spans_for(timed_cues: list[Cue], ownership: AlignmentResult) -> dict[int, tuple[int, int]]:
+        return {**cue_spoken_spans(
+            timed_cues, effective_words, ownership,
+            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
+            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+            ambiguous_word_indices=uncertain_word_indices,
+            protected_cue_ids=protected_cue_ids,
+        ), **missing_dialogue_spoken_spans}
+
+    spoken_spans = spoken_spans_for(rebuilt, alignment)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
@@ -3116,15 +3129,16 @@ def _run_verify_stage(
         untimed_song_caption_ids=untimed_song_caption_ids,
         preserve_timing=bool(effective_words or forced_alignments or speech_regions),
         media_duration_ms=_known_audio_duration_ms(audio_for_asr),
-        spoken_spans={**cue_spoken_spans(
-            rebuilt, effective_words, alignment,
-            max_word_duration=_timing_float_config(provider_config, "max_word_duration", 2.0),
-            max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
-            ambiguous_word_indices=uncertain_word_indices,
-            protected_cue_ids=protected_cue_ids,
-        ), **missing_dialogue_spoken_spans},
+        spoken_spans=spoken_spans,
     )
     flags = [*reconcile_overlap_flags(flags, rebuilt, final_order_flags), *final_order_flags]
+    # A lead inside the phrase-edge snap window was already moved onto the burst
+    # onset. The default window stays the limit when the snap is narrowed or off.
+    late_start_options = dict(
+        max_onset_lead_ms=max(speech_evidence.start_snap, PhraseEdgeSnap().start_advance) * 1000,
+        frame_ms=profile.frame_ms,
+        end_pad_ms=max(profile.tail_ms, boundary_refinement.end_pad_ms),
+    )
     if speech_regions:
         # A cue held for the minimum display time is not an overrun and its
         # short utterance still counts as speech activity.
@@ -3145,6 +3159,13 @@ def _run_verify_stage(
                 speech_regions,
                 max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
                 min_cue_duration_ms=readability_floor_ms,
+            )
+        )
+        # Held cues keep source timing and already carry their own finding.
+        flags.extend(
+            late_start_flags_for_cues(
+                rebuilt, speech_regions, effective_words, alignment.cue_word_indices, spoken_spans,
+                excluded_cue_ids=protected_cue_ids | ambiguous_cue_ids, **late_start_options,
             )
         )
     flags.extend(
@@ -3203,7 +3224,10 @@ def _run_verify_stage(
     if expanded_ids:
         # Child display windows have their own readability and acoustic QC.
         # Findings about the previous unsplit window are no longer current.
-        activity_kinds = {"cue_without_speech_activity", "cue_with_excessive_trailing_silence", "cue_on_silence"}
+        activity_kinds = {
+            "cue_without_speech_activity", "cue_with_excessive_trailing_silence", "cue_on_silence",
+            "cue_starts_after_speech_onset",
+        }
         flags = [flag for flag in flags if not (
             flag.kind in activity_kinds and expanded_ids.intersection(flag.cue_ids)
         )]
@@ -3217,6 +3241,11 @@ def _run_verify_stage(
                 children, speech_regions,
                 max_trailing_silence_ms=boundary_refinement.max_trailing_silence_ms,
                 min_cue_duration_ms=round(profile.min_cue_dur * 1000 + profile.frame_ms),
+            ))
+            flags.extend(late_start_flags_for_cues(
+                rebuilt, speech_regions, effective_words, alignment.cue_word_indices,
+                spoken_spans_for(children, alignment), cue_ids=expanded_ids,
+                excluded_cue_ids=protected_cue_ids | ambiguous_cue_ids, **late_start_options,
             ))
         if audio_for_asr != audio_path:
             flags.extend(silence_flags_for_cues(audio_for_asr, children))

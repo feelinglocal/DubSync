@@ -4,8 +4,10 @@ import json
 import math
 import wave
 from array import array
-from collections.abc import Iterator
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from itertools import accumulate
 from operator import mul
 from pathlib import Path
 from typing import Protocol
@@ -19,6 +21,9 @@ from .subtitle_annotations import cue_has_spoken_text
 WORD_ENERGY_THRESHOLD_DBFS = -45.0
 WORD_ENERGY_MIN_ACTIVE_MS = 30
 WORD_ENERGY_PAD_SECONDS = 0.05
+# Another word may reach this far into a burst without owning its onset
+# (the tolerance word repair applies before it snaps a phrase start).
+_LEAD_EDGE_TOLERANCE_SECONDS = 0.01
 
 # Energy VAD defaults (measured on clean dub stems; see EnergySpeechActivityAdapter).
 DEFAULT_HOP_MS = 10
@@ -354,6 +359,84 @@ def trailing_silence_flags_for_cues(
                 old_text=cue.text,
                 start=last_speech_end,
                 end=cue_end,
+            )
+        )
+    return flags
+
+
+def late_start_flags_for_cues(
+    cues: list[Cue],
+    regions: list[SpeechRegion],
+    words: list[Word],
+    cue_word_indices: Mapping[int, list[int]],
+    spoken_spans: Mapping[int, tuple[int, int]],
+    *,
+    max_onset_lead_ms: float,
+    frame_ms: float,
+    end_pad_ms: float = 0.0,
+    cue_ids: set[int] | None = None,
+    excluded_cue_ids: set[int] | None = None,
+) -> list[QCFlag]:
+    """Flag cues that start after their own speech burst has begun.
+
+    A cue starts on its first owned word (``spoken_spans`` holds that word's
+    onset in ms). When the ASR places the word more than ``max_onset_lead_ms``
+    after the onset of the burst that contains it, word repair leaves it there
+    and the cue begins inside its own speech. That is reported when the cue
+    still starts that late (frame flooring allowed) and the speech before it
+    belongs to nobody else: no other word reaches into it and no other spoken
+    cue is on screen there for longer than its display padding
+    (``end_pad_ms`` plus one frame). ``cues`` is the delivered list;
+    ``cue_ids`` limits which of them are checked.
+    """
+    region_index = SpeechRegionIndex(regions)
+    if not region_index.regions:
+        return []
+    excluded = excluded_cue_ids or set()
+    spoken_cues = [cue for cue in cues if cue_has_spoken_text(cue)]
+    timed_words = sorted(
+        (word.start, word.end, index) for index, word in enumerate(words)
+        if math.isfinite(word.start) and math.isfinite(word.end)
+    )
+    word_starts = [start for start, _, _ in timed_words]
+    latest_word_ends = list(accumulate((end for _, end, _ in timed_words), max))
+    flags: list[QCFlag] = []
+    for cue in spoken_cues:
+        span = spoken_spans.get(cue.index)
+        if span is None or cue.index in excluded or (cue_ids is not None and cue.index not in cue_ids):
+            continue
+        burst = region_index.first_containing(span[0] / 1000.0)
+        if burst is None:
+            continue
+        onset_ms = burst[1].start * 1000.0
+        lead_ms = cue.start_ms - onset_ms
+        if span[0] - onset_ms <= max_onset_lead_ms or lead_ms <= max_onset_lead_ms - frame_ms:
+            continue
+        own = set(cue_word_indices.get(cue.index, ()))
+        # A neighbouring word may touch the onset by this much without owning it, as in word repair.
+        lead_start = burst[1].start + _LEAD_EDGE_TOLERANCE_SECONDS
+        in_lead = timed_words[
+            bisect_right(latest_word_ends, lead_start):bisect_left(word_starts, cue.start_ms / 1000.0)
+        ]
+        if any(index not in own and end > lead_start for _, end, index in in_lead):
+            continue
+        if any(
+            other.index != cue.index
+            and min(other.end_ms, cue.start_ms) - max(other.start_ms, onset_ms) > end_pad_ms + frame_ms
+            for other in spoken_cues
+        ):
+            continue
+        flags.append(
+            QCFlag(
+                kind="cue_starts_after_speech_onset",
+                cue_ids=[cue.index],
+                message=(
+                    f"Cue starts {round(lead_ms)} ms after the detected speech onset; "
+                    "no other cue or recognised word covers that speech."
+                ),
+                old_text=cue.text,
+                start=burst[1].start,
+                end=cue.start_ms / 1000.0,
             )
         )
     return flags
