@@ -1,7 +1,8 @@
 """Conservative wording policies that require no model or invented audio text.
 
 The comparison forms below never become output text. Keeps retain the original
-span verbatim; the default spoken register policy can only return exact ASR text.
+span verbatim; the default spoken register policy can only swap in the performed
+ASR register words, in the source's case, keeping every other source character.
 Unknown languages get the existing punctuation/casing comparison only.
 """
 from __future__ import annotations
@@ -83,21 +84,102 @@ def _form_map(forms: Sequence[tuple[str, str]]) -> dict[tuple[str, ...], tuple[s
     return {_keys(short): _keys(full) for short, full in forms}
 
 
-def _expand(tokens: tuple[str, ...], forms: dict[tuple[str, ...], tuple[str, ...]]) -> tuple[str, ...]:
-    result: list[str] = []
+def _expansion_steps(
+    tokens: tuple[str, ...], forms: dict[tuple[str, ...], tuple[str, ...]],
+) -> list[tuple[int, tuple[str, ...]]]:
+    """Greedy (consumed token count, expanded tokens) steps behind ``_expand``."""
+    steps: list[tuple[int, tuple[str, ...]]] = []
     cursor = 0
     max_length = max(map(len, forms), default=0)
     while cursor < len(tokens):
         for size in range(min(max_length, len(tokens) - cursor), 0, -1):
             replacement = forms.get(tokens[cursor:cursor + size])
             if replacement is not None:
-                result.extend(replacement)
+                steps.append((size, replacement))
                 cursor += size
                 break
         else:
-            result.append(tokens[cursor])
+            steps.append((1, tokens[cursor:cursor + 1]))
             cursor += 1
-    return tuple(result)
+    return steps
+
+
+def _expand(tokens: tuple[str, ...], forms: dict[tuple[str, ...], tuple[str, ...]]) -> tuple[str, ...]:
+    return tuple(token for _, expanded in _expansion_steps(tokens, forms) for token in expanded)
+
+
+def _expansion_groups(
+    source: tuple[str, ...], audio: tuple[str, ...], forms: dict[tuple[str, ...], tuple[str, ...]],
+) -> list[tuple[range, range]]:
+    """Smallest source/audio token ranges that expand to the same words.
+
+    Callers have already proved that both sides expand to one sequence.
+    """
+    def boundaries(tokens: tuple[str, ...]) -> dict[int, int]:
+        result, consumed, produced = {0: 0}, 0, 0
+        for size, expanded in _expansion_steps(tokens, forms):
+            consumed, produced = consumed + size, produced + len(expanded)
+            result[produced] = consumed
+        return result
+
+    source_bounds, audio_bounds = boundaries(source), boundaries(audio)
+    cuts = sorted(source_bounds.keys() & audio_bounds.keys())
+    return [
+        (range(source_bounds[left], source_bounds[right]), range(audio_bounds[left], audio_bounds[right]))
+        for left, right in zip(cuts, cuts[1:])
+    ]
+
+
+def _bare_asr_word(text: str, bounds: tuple[int, int]) -> bool:
+    """The whitespace-delimited ASR word holds this token plus punctuation only."""
+    start, end = bounds
+    while start and not text[start - 1].isspace():
+        start -= 1
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    return all(unicodedata.category(char).startswith("P") for char in text[start:bounds[0]] + text[bounds[1]:end])
+
+
+def _source_cased(source: str, words: list[str]) -> list[str]:
+    """Spell lower-case register words with the replaced source words' capitals."""
+    letters = [char for char in source if char.isalpha()]
+    if len(letters) > 1 and all(char.isupper() for char in letters):
+        return [word.upper() for word in words]
+    if letters and letters[0].isupper():
+        return [words[0][:1].upper() + words[0][1:], *words[1:]]
+    return words
+
+
+def _spoken_register_text(span: DivergenceSpan, forms: dict[tuple[str, ...], tuple[str, ...]]) -> str | None:
+    """Put the performed register words into the authored span text.
+
+    The audio decides only which register form was spoken. The script keeps
+    sentence case and every character outside the replaced words, so ASR
+    capitals and attached punctuation never reach the subtitle. An ASR word that
+    carries more than its register word, or authored punctuation between the
+    replaced words, is left to adjudication.
+    """
+    source_words, audio_words = token_texts(span.srt_text), token_texts(span.asr_text)
+    source_bounds = token_character_spans(span.srt_text, source_words)
+    audio_bounds = token_character_spans(span.asr_text, audio_words)
+    if source_bounds is None or audio_bounds is None:
+        return None
+    source, audio = _keys(span.srt_text), _keys(span.asr_text)
+    pieces: list[str] = []
+    cursor = 0
+    for source_range, audio_range in _expansion_groups(source, audio, forms):
+        if source[source_range.start:source_range.stop] == audio[audio_range.start:audio_range.stop]:
+            continue
+        replaced = source_bounds[source_range.start:source_range.stop]
+        if any(not span.srt_text[left[1]:right[0]].isspace() for left, right in zip(replaced, replaced[1:])):
+            return None
+        if not all(_bare_asr_word(span.asr_text, audio_bounds[index]) for index in audio_range):
+            return None
+        start, end = replaced[0][0], replaced[-1][1]
+        words = _source_cased(span.srt_text[start:end], [audio_words[index].lower() for index in audio_range])
+        pieces += [span.srt_text[cursor:start], " ".join(words)]
+        cursor = end
+    return "".join(pieces) + span.srt_text[cursor:]
 
 
 def _name_key(tokens: tuple[str, ...]) -> str:
@@ -264,12 +346,18 @@ class DeterministicAdjudicationPolicy:
             or markup_spans(span.srt_text) or "\n" in span.srt_text or "\r" in span.srt_text
         ):
             return None
-        return _decision(span, "Register policy spoken; used exact ASR wording.", spoken=True)
+        spoken_text = _spoken_register_text(span, self._register)
+        if spoken_text is None:
+            return None
+        return _decision(
+            span, "Register policy spoken; used the performed register form in source case and punctuation.",
+            spoken_text=spoken_text,
+        )
 
 
-def _decision(span: DivergenceSpan, reason: str, *, spoken: bool = False) -> AdjudicationDecision:
+def _decision(span: DivergenceSpan, reason: str, *, spoken_text: str | None = None) -> AdjudicationDecision:
     return AdjudicationDecision(
-        case_id=span.case_id, verdict="use_audio" if spoken else "keep_srt",
-        final_text=span.asr_text if spoken else span.srt_text, confidence=DETERMINISTIC_KEEP_CONFIDENCE,
+        case_id=span.case_id, verdict="keep_srt" if spoken_text is None else "use_audio",
+        final_text=span.srt_text if spoken_text is None else spoken_text, confidence=DETERMINISTIC_KEEP_CONFIDENCE,
         speaker=span.speaker_ids[0] if span.speaker_ids else None, character="unknown", reason=reason,
     )

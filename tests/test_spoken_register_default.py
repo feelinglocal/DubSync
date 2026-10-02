@@ -20,20 +20,24 @@ def _span(source="Eu estou para sair.", asr="Eu tô pra sair!"):
                           asr_text=asr, start=1.0, end=2.0)
 
 
+# The performed register words keep the script's punctuation (review F8).
+_SPOKEN_TEXT = "Eu tô pra sair."
+
+
 class NoCallAdapter:
     def adjudicate(self, spans):
         pytest.fail("A proven register equivalent must not call a provider")
 
 
-@pytest.mark.parametrize("language,source,asr", [
-    ("pt", "Eu estou para sair.", "Eu tô pra sair!"),
-    ("de", "Ich habe es gesagt.", "Ich hab es gesagt."),
-    ("en", "I am going to leave.", "I am gonna leave!"),
+@pytest.mark.parametrize("language,source,asr,expected", [
+    ("pt", "Eu estou para sair.", "Eu tô pra sair!", _SPOKEN_TEXT),
+    ("de", "Ich habe es gesagt.", "Ich hab es gesagt.", "Ich hab es gesagt."),
+    ("en", "I am going to leave.", "I am gonna leave!", "I am gonna leave."),
 ])
-def test_default_engine_returns_exact_performed_register(language, source, asr):
+def test_default_engine_returns_exact_performed_register(language, source, asr, expected):
     decisions, flags = AdjudicationEngine(NoCallAdapter(), language=language).adjudicate([_span(source, asr)])
     assert decisions[0].verdict == "use_audio"
-    assert decisions[0].final_text == asr
+    assert decisions[0].final_text == expected
     assert decisions[0].confidence == 1.0
     assert flags == []
 
@@ -41,7 +45,7 @@ def test_default_engine_returns_exact_performed_register(language, source, asr):
 def test_explicit_script_policy_keeps_authored_form_and_has_distinct_cache_identity():
     default = DeterministicAdjudicationPolicy(language="pt")
     script = DeterministicAdjudicationPolicy(language="pt", register_policy="script")
-    assert default.decide(_span()).final_text == _span().asr_text
+    assert default.decide(_span()).final_text == _SPOKEN_TEXT
     assert script.decide(_span()).final_text == _span().srt_text
     assert script.decide(_span()).verdict == "keep_srt"
     assert default.cache_context()["register_policy"] == "spoken"
@@ -80,7 +84,7 @@ def test_hybrid_context_defaults_to_spoken_and_forwards_explicit_script():
     assert adapter.register_policy == "spoken"
     adapter.set_adjudication_context(language="pt")
     assert contexts[-1] == {"language": "pt", "register_policy": "spoken"}
-    assert adapter._wording_policy.decide(_span()).final_text == _span().asr_text
+    assert adapter._wording_policy.decide(_span()).final_text == _SPOKEN_TEXT
     adapter.set_adjudication_context(language="pt", register_policy="script")
     assert contexts[-1] == {"language": "pt", "register_policy": "script"}
     assert adapter._wording_policy.decide(_span()).final_text == _span().srt_text

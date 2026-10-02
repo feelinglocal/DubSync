@@ -125,12 +125,16 @@ def test_script_keep_preserves_markup_linebreaks_and_has_no_audio_dependency():
     assert flags == []
 
 
-@pytest.mark.parametrize(("source", "audio"), [("Eu estou para sair", "Eu tô pra sair!"), ("Eu tô aqui", "Eu estou aqui.")])
-def test_spoken_register_uses_only_exact_proven_asr_text(source, audio):
+@pytest.mark.parametrize(("source", "audio", "expected"), [
+    # The performed register words, with the script's punctuation (review F8).
+    ("Eu estou para sair", "Eu tô pra sair!", "Eu tô pra sair"),
+    ("Eu tô aqui", "Eu estou aqui.", "Eu estou aqui"),
+])
+def test_spoken_register_uses_only_exact_proven_asr_text(source, audio, expected):
     decision, flags, adapter = decide(source, audio, language="pt", register_policy="spoken")
     assert adapter.calls == []
     assert decision.verdict == "use_audio"
-    assert decision.final_text == audio
+    assert decision.final_text == expected
     assert decision.confidence == 1.0
     assert flags == []
 
