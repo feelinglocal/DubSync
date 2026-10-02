@@ -100,6 +100,27 @@ def test_lead_holding_a_word_no_cue_owns_is_not_flagged():
     assert _late_start_flags(timed, words, alignment, [burst]) == []
 
 
+@pytest.mark.parametrize(("mark", "mark_start", "mark_end"), [
+    ("？", 44.92, 45.32),    # 1B-scribe cue 14: the question mark's duration reaches 25 ms into the next burst
+    ("、", 45.295, 45.341),  # 2B-scribe cue 32: word repair snapped a comma onto the burst onset
+    ("…", 45.31, 45.45),    # a punctuation token that lies wholly inside the lead
+])
+def test_punctuation_token_in_the_lead_does_not_hide_a_late_start(mark, mark_start, mark_end):
+    regions = [SpeechRegion(start=43.9, end=44.93), SpeechRegion(start=45.295, end=46.9)]
+    raw = [*_characters("誰だ", 44.0, 44.9), Word(text=mark, start=mark_start, end=mark_end),
+           *_characters("南山県のボス", 45.5, 46.85)]
+    cues = [Cue(index=13, start_ms=44000, end_ms=44900, lines=["誰だ？"]),
+            Cue(index=14, start_ms=45200, end_ms=46900, lines=["南山県のボス"])]
+    timed, words, alignment = _timed(cues, raw, regions, {13: [0, 1], 14: list(range(3, 9))})
+
+    # The punctuation token is no speech: nobody owns the 205 ms before the first word.
+    assert words[2].text == mark and words[2].end > 45.295 + 0.01
+    assert (timed[1].start_ms, words[3].start) == (45500, 45.5)
+    flags = _late_start_flags(timed, words, alignment, regions)
+    assert [(flag.kind, flag.cue_ids) for flag in flags] == [(KIND, [14])]
+    assert (flags[0].start, flags[0].end) == (pytest.approx(45.295), pytest.approx(45.5))
+
+
 def test_lead_under_another_displayed_cue_is_not_flagged():
     burst = SpeechRegion(start=10.0, end=12.0)
     raw = _characters("行くぞ", 10.5, 11.9)

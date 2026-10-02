@@ -386,7 +386,8 @@ def late_start_flags_for_cues(
     still starts that late (frame flooring allowed) and the speech before it
     belongs to nobody else: no other word reaches into it and no other spoken
     cue is on screen there for longer than its display padding
-    (``end_pad_ms`` plus one frame). ``cues`` is the delivered list;
+    (``end_pad_ms`` plus one frame). A punctuation-only ASR token is not a
+    word here: its duration is no speech. ``cues`` is the delivered list;
     ``cue_ids`` limits which of them are checked.
     """
     region_index = SpeechRegionIndex(regions)
@@ -397,6 +398,7 @@ def late_start_flags_for_cues(
     timed_words = sorted(
         (word.start, word.end, index) for index, word in enumerate(words)
         if math.isfinite(word.start) and math.isfinite(word.end)
+        and any(character.isalnum() for character in word.text)
     )
     word_starts = [start for start, _, _ in timed_words]
     latest_word_ends = list(accumulate((end for _, end, _ in timed_words), max))
