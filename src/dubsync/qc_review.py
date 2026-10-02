@@ -1146,7 +1146,8 @@ class _FindingSorter:
         return self._retime_item(index, flag, shown[0], (before.start_ms, before.end_ms), window)
 
     def _reflowed_lines(self, index: int, flag: QCFlag) -> ChangeItem | None:
-        if not flag.cue_ids:
+        if not flag.cue_ids or flag.old_text == flag.new_text:
+            # A pass that changed nothing is not a second change of the cue's lines.
             return None
         lines = (flag.new_text or "").split("\n")
         shown = [self.by_id[cue_id] for cue_id in self.delivered_ids(flag.cue_ids)]

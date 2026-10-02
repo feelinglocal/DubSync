@@ -172,6 +172,36 @@ def test_caption_reflowed_into_a_speech_cue_is_logged_on_that_display_cue(tmp_pa
     assert "+ [Aviso: entrada proibida para estranhos.]" in (tmp_path / "changes.diff.srt").read_text(encoding="utf-8")
 
 
+def test_second_reflow_pass_that_changed_nothing_does_not_log_the_reflow_twice(tmp_path):
+    # testing-002 cue 40: the reflowed cue still has an over-wide line, so the
+    # line-limit pass runs again and reports the same lines as old and new.
+    source = [Cue(index=39, start_ms=100_000, end_ms=101_000, lines=["Was ist los?"]),
+              Cue(index=40, start_ms=101_500, end_ms=105_000,
+                  lines=["Äh, sie haben mich seit", "drei Monaten nicht bezahlt."])]
+    reflowed = source[1].with_lines(["Äh,", "sie haben mich seit drei Monaten nicht bezahlt."])
+    delivered = [source[0], reflowed]
+    flags = [
+        QCFlag(kind="output_line_limit_reflow", cue_ids=[40], severity="info",
+               message="The complete spoken phrase fits the available display lines.",
+               old_text=source[1].text, new_text=reflowed.text, start=101.5, end=105.0),
+        QCFlag(kind="output_line_limit_reflow", cue_ids=[40], severity="info",
+               message="A safe spoken split was unavailable. Text was reflowed within its existing interval.",
+               old_text=reflowed.text, new_text=reflowed.text, start=101.5, end=105.0),
+    ]
+
+    report = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", delivered, flags, [], source_cues=source)
+    write_change_log(tmp_path / "changes.diff.srt", report["changes"])
+
+    change, = report["changes"]
+    assert (change["change"], change["kind"], change["srt_number"]) == ("edited", "output_line_limit_reflow", 2)
+    assert (change["old_text"], change["new_text"]) == (source[1].text, reflowed.text)
+    assert change["raw_flags"] == [0, 1]
+    assert report["summary"]["change_count"] == 1
+    assert _undone(report["diagnostics"]) == []
+    diff = (tmp_path / "changes.diff.srt").read_text(encoding="utf-8")
+    assert diff.count("# SRT #2 edited (cue 40)") == 1
+
+
 def test_recovery_and_reflow_that_were_reverted_stay_not_delivered():
     source = [Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hello there,", "my friend."]),
               Cue(index=2, start_ms=64666, end_ms=65466, lines=["三分？"])]
