@@ -375,6 +375,19 @@ _DIAGNOSTIC_TITLES = {
     # A line-limit pass that recorded the same lines as old and new text.
     **{f"{kind}:unchanged": "Line limit checked; the lines were left as they are" for kind in _LAYOUT_CHANGE_KINDS},
 }
+# The raw message of such a flag describes a reflow or pages; its row says what the pass did instead.
+_UNCHANGED_LAYOUT_DETAIL = (
+    "No safe split or re-break was found, so the same lines were recorded before and after; "
+    "any width overflow stays in style QC."
+)
+_DIAGNOSTIC_MESSAGES = {
+    "output_line_limit_reflow:unchanged": _UNCHANGED_LAYOUT_DETAIL,
+    "annotation_line_limit_reflow:unchanged": _UNCHANGED_LAYOUT_DETAIL,
+    "annotation_line_limit_pagination:unchanged": (
+        "The screen text stays on one page with the same lines; its display intervals are recorded in "
+        "caption provenance."
+    ),
+}
 
 
 class ReviewItem(BaseModel):
@@ -1621,6 +1634,7 @@ class _FindingSorter:
             message = clean_customer_text(bucket.messages[0]) if bucket.messages else ""
             if key == "asr_word_clamped":
                 message = self._word_clamp_summary(bucket)
+            message = _DIAGNOSTIC_MESSAGES.get(key, message)
             items.append(DiagnosticItem(
                 id=f"D{len(items) + 1}",
                 kind=key,

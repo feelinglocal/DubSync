@@ -282,6 +282,44 @@ def test_line_limit_pass_that_kept_the_customers_lines_is_not_reported_as_undone
     assert diagnostic.title == "Line limit checked; the lines were left as they are"
 
 
+@pytest.mark.parametrize(("kind", "raw_message", "detail"), [
+    ("output_line_limit_reflow",
+     "A safe spoken split was unavailable. Text was reflowed within its existing interval; "
+     "width overflow remains visible to style QC.",
+     "No safe split or re-break was found, so the same lines were recorded before and after; "
+     "any width overflow stays in style QC."),
+    ("annotation_line_limit_reflow",
+     "All visual caption wording was retained within the two-line display limit; "
+     "any width overflow remains visible to style QC.",
+     "No safe split or re-break was found, so the same lines were recorded before and after; "
+     "any width overflow stays in style QC."),
+    ("annotation_line_limit_pagination",
+     "Visual caption wording was shown as ordered pages to keep the display within two lines; actual page "
+     "intervals and any delayed visual onset are recorded in caption provenance.",
+     "The screen text stays on one page with the same lines; its display intervals are recorded in "
+     "caption provenance."),
+], ids=["speech-reflow", "screen-text-reflow", "screen-text-pages"])
+def test_unchanged_line_limit_diagnostic_does_not_describe_a_change(tmp_path, kind, raw_message, detail):
+    # testing-004 cue 21: the row said the lines were left as they are, next to "Text was reflowed ...".
+    source = [Cue(index=21, start_ms=60_000, end_ms=63_000,
+                  lines=["warum zahlt die Duvall-Gruppe", "ihren Arbeitern nicht?"])]
+    flags = [QCFlag(kind=kind, cue_ids=[21], severity="info", message=raw_message,
+                    old_text=source[0].text, new_text=source[0].text, start=60.0, end=63.0)]
+
+    report = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", source, flags, [], source_cues=source)
+
+    diagnostic, = report["diagnostics"]
+    assert (diagnostic["kind"], diagnostic["title"]) == (
+        f"{kind}:unchanged", "Line limit checked; the lines were left as they are")
+    assert diagnostic["message"] == detail
+    assert "reflowed" not in diagnostic["message"] and "pages" not in diagnostic["message"]
+    # The raw flag keeps its own message; only the summary row is reworded.
+    assert report["flags"][0]["message"] == raw_message
+    row = (f"<td>{kind}:unchanged</td><td class=\"num\">1</td><td>{diagnostic['title']}</td>"
+           f"<td class=\"muted\">{html.escape(detail)}</td>")
+    assert row in (tmp_path / "qc.html").read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("heard", ["", "三分だ"])
 def test_recovery_whose_heard_wording_is_not_delivered_is_not_logged_as_a_retime(heard):
     source = [Cue(index=1, start_ms=1000, end_ms=2000, lines=["Hello."]),
