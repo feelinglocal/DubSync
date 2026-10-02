@@ -1084,41 +1084,51 @@ class _FindingSorter:
         """Log delivered retimes and layouts that kept the customer's wording.
 
         A timing recovery is judged by its speech cue's timing, a reflow or a
-        caption page by the delivered display cues. A flag whose cue kept its
-        pre-change lines and timing stays unclaimed: ``:not_delivered`` when
+        caption page by the delivered display cues. A flag whose cue kept the
+        customer's lines and timing stays unclaimed: ``:not_delivered`` when
         its change was undone, ``:unchanged`` when its pass changed nothing.
         """
 
         claimed: set[int] = set()
         shown: dict[int, ChangeItem] = {}
+
+        def layout_item(index: int, flag: QCFlag) -> ChangeItem | None:
+            pages = flag.kind == "annotation_line_limit_pagination"
+            item = self._caption_pages(index, flag) if pages else self._reflowed_lines(index, flag)
+            if item is not None:
+                for cue_id in self.delivered_ids(flag.cue_ids) if pages else [item.cue_id]:
+                    shown.setdefault(cue_id, item)
+                if item.change == "edited":
+                    self.layout_change_ids.add(id(item))
+            return item
+
         for index in unclaimed:
             flag = self.flags[index]
             if flag.kind in _TIMING_RECOVERY_KINDS:
                 found = [item for cue_id in flag.cue_ids
                          if (item := self._recovered_timing(index, flag, cue_id)) is not None]
-            elif flag.kind in _LAYOUT_CHANGE_KINDS:
-                pages = flag.kind == "annotation_line_limit_pagination"
-                item = self._caption_pages(index, flag) if pages else self._reflowed_lines(index, flag)
+            elif flag.kind in _LAYOUT_CHANGE_KINDS and not _kept_its_lines(flag):
+                item = layout_item(index, flag)
                 found = [item] if item is not None else []
-                if item is not None:
-                    for cue_id in self.delivered_ids(flag.cue_ids) if pages else [item.cue_id]:
-                        shown.setdefault(cue_id, item)
-                    if item.change == "edited":
-                        self.layout_change_ids.add(id(item))
             else:
                 continue
             if found:
                 claimed.add(index)
                 items.extend(found)
         for index in unclaimed:
-            if index in claimed or self.flags[index].kind not in _LAYOUT_CHANGE_KINDS:
+            flag = self.flags[index]
+            if index in claimed or flag.kind not in _LAYOUT_CHANGE_KINDS:
                 continue
             # A later layout of the same display cue replaced this one, or this
             # pass changed nothing there: the delivered lines are that item's.
-            item = next((shown[cue_id] for cue_id in self.flags[index].cue_ids if cue_id in shown), None)
+            item = next((shown[cue_id] for cue_id in flag.cue_ids if cue_id in shown), None)
             if item is not None:
                 item.raw_flags = sorted({*item.raw_flags, index})
                 claimed.add(index)
+            elif _kept_its_lines(flag) and (item := layout_item(index, flag)) is not None:
+                # No pass recorded the change, yet the lines it kept are not the customer's: log them once.
+                claimed.add(index)
+                items.append(item)
         return claimed
 
     def _recovered_timing(self, index: int, flag: QCFlag, cue_id: int) -> ChangeItem | None:
@@ -1154,8 +1164,7 @@ class _FindingSorter:
         return self._retime_item(index, flag, shown[0], (before.start_ms, before.end_ms), window)
 
     def _reflowed_lines(self, index: int, flag: QCFlag) -> ChangeItem | None:
-        if not flag.cue_ids or flag.old_text == flag.new_text:
-            # A pass that changed nothing is not a second change of the cue's lines.
+        if not flag.cue_ids:
             return None
         lines = (flag.new_text or "").split("\n")
         shown = [self.by_id[cue_id] for cue_id in self.delivered_ids(flag.cue_ids)]
@@ -1766,6 +1775,12 @@ def _timing_label(window: tuple[float, float]) -> str:
 
 def _ms_timing_label(start_ms: int, end_ms: int) -> str:
     return f"{format_timestamp(start_ms)} --> {format_timestamp(end_ms)}"
+
+
+def _kept_its_lines(flag: QCFlag) -> bool:
+    """A reflow pass that recorded the same lines before and after: it is not a change of its own."""
+
+    return flag.kind != "annotation_line_limit_pagination" and flag.old_text == flag.new_text
 
 
 def _contains_lines(lines: Sequence[str], part: Sequence[str]) -> bool:

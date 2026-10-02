@@ -14,7 +14,7 @@ import pytest
 from dubsync import pipeline
 from dubsync.annotation_composition import compose_bracketed_annotations
 from dubsync.models import AlignmentResult, Cue, QCFlag, SpeechRegion, TokenMatch, Word
-from dubsync.qc_review import build_review
+from dubsync.qc_review import build_review, is_layout_only_change
 from dubsync.reports import write_change_log, write_qc_report
 from dubsync.srt_io import format_timestamp
 from dubsync.style_profile import StyleProfile
@@ -200,6 +200,40 @@ def test_second_reflow_pass_that_changed_nothing_does_not_log_the_reflow_twice(t
     assert change["raw_flags"] == [0, 1]
     assert report["summary"]["change_count"] == 1
     assert _undone(report["diagnostics"]) == []
+    diff = (tmp_path / "changes.diff.srt").read_text(encoding="utf-8")
+    assert diff.count("# SRT #2 edited (cue 40)") == 1
+
+
+@pytest.mark.parametrize(("kind", "customer_lines", "delivered_lines"), [
+    ("output_line_limit_reflow", ["Äh, sie haben mich seit", "drei Monaten nicht bezahlt."],
+     ["Äh,", "sie haben mich seit drei Monaten nicht bezahlt."]),
+    ("annotation_line_limit_reflow", ["[Aviso: entrada proibida", "para estranhos.]"],
+     ["[Aviso: entrada proibida para estranhos.]"]),
+])
+@pytest.mark.parametrize("passes", [1, 2])
+def test_pass_that_changed_nothing_still_logs_delivered_lines_that_are_not_the_customers(
+    tmp_path, kind, customer_lines, delivered_lines, passes,
+):
+    # No flag recorded the re-break itself: every line-limit pass found the delivered lines and kept them.
+    source = [Cue(index=39, start_ms=100_000, end_ms=101_000, lines=["Was ist los?"]),
+              Cue(index=40, start_ms=101_500, end_ms=105_000, lines=customer_lines)]
+    rebroken = source[1].with_lines(delivered_lines)
+    delivered = [source[0], rebroken]
+    flags = [QCFlag(kind=kind, cue_ids=[40], severity="info", message=f"Line-limit pass {number}.",
+                    old_text=rebroken.text, new_text=rebroken.text, start=101.5, end=105.0)
+             for number in range(passes)]
+
+    report = write_qc_report(tmp_path / "qc.json", tmp_path / "qc.html", delivered, flags, [], source_cues=source)
+    write_change_log(tmp_path / "changes.diff.srt", report["changes"])
+
+    # The customer's line breaks are not in the delivery, so the cue is in the change log once.
+    change, = report["changes"]
+    assert (change["change"], change["kind"], change["srt_number"]) == ("edited", kind, 2)
+    assert (change["old_text"], change["new_text"]) == (source[1].text, rebroken.text)
+    assert change["raw_flags"] == list(range(passes))
+    assert is_layout_only_change(change)
+    assert report["summary"]["change_count"] == 1
+    assert report["diagnostics"] == []
     diff = (tmp_path / "changes.diff.srt").read_text(encoding="utf-8")
     assert diff.count("# SRT #2 edited (cue 40)") == 1
 
