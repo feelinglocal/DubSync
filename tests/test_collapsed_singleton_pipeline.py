@@ -4,7 +4,6 @@ import pytest
 import yaml
 
 from dubsync import pipeline
-from dubsync.asr_crosscheck_config import cross_check_context
 from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, SpeechRegion, TokenMatch, Word
 from test_missing_dialogue_reconciliation import _pipeline_case
 
@@ -26,13 +25,13 @@ def _native_case(tmp_path, monkeypatch):
     regions = [SpeechRegion(start=start, end=end) for start, end in
                [(1.9, 2.105), (4.605, 5.305), (6.515, 6.585), (6.975, 7.245), (8.655, 9.045)]]
     _, adapter, run = _pipeline_case(tmp_path, monkeypatch, case_override=(source, words, alignment, regions))
+    secondary_path = tmp_path / "secondary-asr-fixture.json"
+    secondary_path.write_text(json.dumps({"words": [word.model_dump() for word in secondary]}), encoding="utf-8")
     config_path = tmp_path / "provider.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config["asr"].update(provider="elevenlabs", model_id="scribe_v2", cross_check={
-        "provider": "openrouter", "model": "microsoft/mai-transcribe-2"})
+        "provider": "openrouter", "model": "microsoft/mai-transcribe-2", "fixture_path": str(secondary_path)})
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    context = cross_check_context(secondary, {"asr": config["asr"]["cross_check"]})
-    monkeypatch.setattr(pipeline, "run_cross_check", lambda *_a, **_k: (secondary, context))
 
     def hear(spans, snippets):
         adapter.seen.extend(spans)

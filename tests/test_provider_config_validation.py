@@ -21,7 +21,8 @@ def _write_fixture_sync_inputs(tmp_path: Path, provider_overrides: dict[str, obj
         json.dumps({"words": [{"text": "hello", "start": 0.0, "end": 0.5}]}),
         encoding="utf-8",
     )
-    providers = {"asr": {"fixture_path": str(wordstream_path)}, **provider_overrides}
+    # A fixture LLM keeps the punctuation pass that runs before these sections are read offline.
+    providers = {"asr": {"fixture_path": str(wordstream_path)}, "llm": {"provider": "fixture"}, **provider_overrides}
     providers_path.write_text(yaml.safe_dump(providers), encoding="utf-8")
     return srt_path, audio_path, providers_path
 

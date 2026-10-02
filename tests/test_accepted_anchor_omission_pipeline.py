@@ -4,10 +4,15 @@ import pytest
 import yaml
 
 from dubsync import pipeline
-from dubsync.asr_crosscheck_config import cross_check_context
 from dubsync.models import AdjudicationDecision
 from test_accepted_anchor_omission import _case
 from test_missing_dialogue_reconciliation import _pipeline_case
+
+
+def _secondary_fixture(tmp_path, words):
+    path = tmp_path / "secondary-asr-fixture.json"
+    path.write_text(json.dumps({"words": [word.model_dump() for word in words]}), encoding="utf-8")
+    return str(path)
 
 
 def _native_case(tmp_path, monkeypatch):
@@ -27,11 +32,9 @@ def _native_case(tmp_path, monkeypatch):
     config_path = tmp_path / "provider.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config["asr"].update(provider="elevenlabs", model_id="scribe_v2", cross_check={
-        "provider": "openrouter", "model": "microsoft/mai-transcribe-2", "language_code": "pt"})
+        "provider": "openrouter", "model": "microsoft/mai-transcribe-2", "language_code": "pt",
+        "fixture_path": _secondary_fixture(tmp_path, case["secondary_words"])})
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    secondary = case["secondary_words"]
-    context = cross_check_context(secondary, {"asr": config["asr"]["cross_check"]})
-    monkeypatch.setattr(pipeline, "run_cross_check", lambda *_a, **_k: (secondary, context))
 
     def hear(spans, snippets):
         adapter.seen.extend(spans)
@@ -147,10 +150,9 @@ def test_accepted_anchor_route_preserves_an_already_confirmed_ordinary_omission(
     config_path = tmp_path / "provider.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config["asr"].update(provider="elevenlabs", model_id="scribe_v2", cross_check={
-        "provider": "openrouter", "model": "microsoft/mai-transcribe-2"})
+        "provider": "openrouter", "model": "microsoft/mai-transcribe-2",
+        "fixture_path": _secondary_fixture(tmp_path, secondary)})
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    context = cross_check_context(secondary, {"asr": config["asr"]["cross_check"]})
-    monkeypatch.setattr(pipeline, "run_cross_check", lambda *_a, **_k: (secondary, context))
     result = run()
     receipt = json.loads((result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
     assert receipt["outcomes"][0]["outcome"] == "audio_confirmed_omission"

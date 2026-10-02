@@ -17,6 +17,7 @@ from dubsync.models import (
     AudioSnippet,
     Cue,
     DivergenceSpan,
+    Word,
 )
 import dubsync.pipeline as pipeline_module
 from dubsync.pipeline import (
@@ -645,7 +646,10 @@ def test_cli_sync_loads_dotenv_before_provider_resolution(tmp_path, monkeypatch)
                 }
             ]
 
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # delenv records nothing for an absent key; setting it first registers the
+    # undo that removes the value the CLI loads from .env into os.environ.
+    monkeypatch.setenv("GEMINI_API_KEY", "replaced-by-this-test")
+    monkeypatch.delenv("GEMINI_API_KEY")
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("GEMINI_API_KEY=dotenv-key\n", encoding="utf-8")
     monkeypatch.setattr("dubsync.pipeline.llm_adapter_from_config", lambda _config, pass_name=None: EnvCapturingLLMAdapter())
@@ -1445,6 +1449,7 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
         ]
 
     monkeypatch.setattr("dubsync.pipeline.llm_adapter_from_config", lambda _config, pass_name=None: snippet_adapter)
+    monkeypatch.setattr("dubsync.pipeline.punctuation_adapter_from_config", lambda _config: None)
     monkeypatch.setattr("dubsync.pipeline.extract_audio_snippets", fake_extract_audio_snippets, raising=False)
     srt_path.write_text(
         "1\n00:00:00,000 --> 00:00:01,000\nhello there\n\n"
@@ -1518,6 +1523,7 @@ def test_cli_sync_audio_snippet_double_check_passes_snippets_to_adjudication(tmp
     assert artifact["snippets"][0]["case_id"] == "case-1"
     report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     assert any(flag["new_text"] == "new spoken line" for flag in report["flags"] if flag["kind"] == "text_changed")
+    assert not any(flag["kind"] == "punctuation_provider_unavailable" for flag in report["flags"])
 
 
 def test_cli_sync_preserves_source_when_required_audio_budget_is_exhausted(tmp_path, monkeypatch):
@@ -3170,7 +3176,9 @@ def test_cli_sync_resume_rebuild_preserves_adjudication_qc_flags(tmp_path):
         ),
         encoding="utf-8",
     )
-    resumed_providers_path.write_text(yaml.safe_dump({"asr": {"provider": "not-real"}}), encoding="utf-8")
+    resumed_providers_path.write_text(
+        yaml.safe_dump({"asr": {"provider": "not-real"}, "llm": {"provider": "fixture"}}), encoding="utf-8"
+    )
 
     first = CliRunner().invoke(
         app,
@@ -3211,6 +3219,7 @@ def test_cli_sync_resume_rebuild_preserves_adjudication_qc_flags(tmp_path):
     assert resumed.exit_code == 0, resumed.output
     resumed_report = json.loads((workdir / "episode" / "qc_report.json").read_text(encoding="utf-8"))
     assert any(flag["kind"] == "low_confidence_adjudication" for flag in resumed_report["flags"])
+    assert not any(flag["kind"] == "punctuation_provider_unavailable" for flag in resumed_report["flags"])
 
 
 def test_cli_sync_resume_adjudicate_uses_prior_stage_artifacts(tmp_path):
@@ -3431,10 +3440,11 @@ def test_cli_sync_resume_adjudicate_uses_normalized_audio_artifact_for_verify(tm
     assert silence_paths == [str(normalized_audio)]
 
 
-def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
+def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path, monkeypatch):
     srt_path = tmp_path / "episode.srt"
     audio_path = tmp_path / "episode.wav"
     out_path = tmp_path / "episode.synced.srt"
+    transcribed_models: list[str] = []
 
     srt_path.write_text("1\n00:00:00,000 --> 00:00:00,500\nhello\n\n", encoding="utf-8")
     with wave.open(str(audio_path), "wb") as wav:
@@ -3442,6 +3452,13 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
         wav.setsampwidth(2)
         wav.setframerate(16000)
         wav.writeframes(b"\x00\x00" * 1600)
+
+    def fake_whisperx_transcribe(self, _audio_path):
+        # The route must reach WhisperX; loading its models would download them.
+        transcribed_models.append(self.model)
+        return [Word(text="hello", start=0.0, end=0.09, confidence=0.99)]
+
+    monkeypatch.setattr("dubsync.providers.WhisperXAdapter.transcribe", fake_whisperx_transcribe)
 
     result = CliRunner().invoke(
         app,
@@ -3457,10 +3474,11 @@ def test_cli_local_mode_routes_to_whisperx_without_cloud_keys(tmp_path):
         ],
     )
 
-    if result.exit_code == 0:
-        assert out_path.exists()
-    else:
-        assert "whisperx" in result.output.casefold()
+    assert result.exit_code == 0, result.output
+    assert out_path.exists()
+    assert transcribed_models == ["large-v3"]
+    asr_artifact = json.loads((tmp_path / "work" / "episode" / "asr.json").read_text(encoding="utf-8"))
+    assert asr_artifact["metadata"]["provider"] == "whisperx"
     assert "Traceback" not in result.output
 
 
