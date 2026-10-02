@@ -242,6 +242,43 @@ def test_default_sync_delivers_every_customer_layout_byte_for_byte(tmp_path, mod
 
 
 @pytest.mark.parametrize("mode", ["fresh", "verify", "verify_from_saved_style"])
+@pytest.mark.parametrize("filler,targets", [(_GERMAN_FILLER, _GERMAN_TARGETS),
+                                            (_JAPANESE_FILLER, _JAPANESE_TARGETS)], ids=["german", "japanese"])
+def test_web_maximum_lines_option_keeps_every_one_or_two_line_customer_cue(tmp_path, mode, filler, targets):
+    # web/jobs.py "Maximum lines per cue: 2": the source-derived profile with only the line count set.
+    # The customer chose a line count, not a width, so the inferred width changes nothing.
+    cues = _customer_cues(filler, targets)
+    profile = derive_style_profile(cues).model_copy(update={"max_lines_per_cue": 2})
+
+    result = _sync(tmp_path, cues, style_profile=profile)
+    first = result.output_srt.read_bytes()
+    if mode != "fresh":
+        result = _sync(tmp_path, cues, resume="verify", **({"style_profile": profile} if mode == "verify" else {}))
+        assert result.output_srt.read_bytes() == first
+
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert [cue.lines for cue in delivered] == [cue.lines for cue in cues]
+    assert not [flag for flag in result.report["flags"]
+                if flag["kind"] in _LINE_LIMIT_KINDS or flag["kind"].startswith("sync_cue_line_limit")]
+    wide = {cue.index for cue in cues if any(display_width(line) > profile.max_chars_per_line for line in cue.lines)}
+    assert wide and {issue["cue_id"] for issue in result.report["style_issues"] if issue["kind"] == "line_length"} == wide
+
+
+def test_web_maximum_lines_option_still_reduces_a_three_line_customer_cue(tmp_path):
+    crowded = ["Wir haben die Arbeit beendet.", "Jetzt gehen wir nach Hause.", "Bring bitte die Schlüssel mit."]
+    cues = _customer_cues(_GERMAN_FILLER, [_GERMAN_TARGETS[0], crowded], filler_count=12)
+    cues[-1] = cues[-1].with_timing(cues[-1].start_ms, cues[-1].start_ms + 6000)
+    profile = derive_style_profile(cues).model_copy(update={"max_lines_per_cue": 2})
+
+    result = _sync(tmp_path, cues, style_profile=profile)
+
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 2 for cue in delivered)
+    assert [cue.lines for cue in delivered[:len(cues) - 1]] == [cue.lines for cue in cues[:-1]]
+    assert " ".join(cue.plain_text for cue in delivered[len(cues) - 1:]) == " ".join(crowded)
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify", "verify_from_saved_style"])
 def test_explicit_narrower_style_still_reflows_a_wide_customer_line(tmp_path, mode):
     cues = _customer_cues(_GERMAN_FILLER, [["schob mein Stiefsohn Rafael"]])
     profile = derive_style_profile(cues).model_copy(update={"max_chars_per_line": 24})

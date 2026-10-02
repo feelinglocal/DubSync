@@ -705,11 +705,18 @@ def split_overlong_existing_cues(
     source_cue_ids: set[int] | None = None,
     max_gap_seconds: float,
     max_cue_duration_seconds: float,
+    enforce_width: bool = True,
 ) -> tuple[list[Cue], AlignmentResult, list[QCFlag], dict[int, list[int]]]:
     """Split source-backed cues that cannot satisfy the active line limit.
 
     This is deliberately timing-gated: when a cue cannot be mapped to valid ASR
     word timing, it is kept and flagged instead of being split by text alone.
+
+    A cue exceeds the limit by its own line count or, with ``enforce_width``,
+    because its text needs more lines at the style width. Without it the width
+    is the customer's own (derived from the source file) and only the line
+    count decides, so a one- or two-line cue keeps its lines whatever their
+    width; the split children are still wrapped to the width.
     """
 
     next_cue_id = max((cue.index for cue in cues), default=0) + 1
@@ -729,7 +736,9 @@ def split_overlong_existing_cues(
             split_cues.append(cue)
             continue
         exceeds_explicit_lines = len(cue.lines) > profile.max_lines_per_cue
-        exceeds_wrapped_lines = len(wrap_visual_width(cue.plain_text, profile.max_chars_per_line)) > profile.max_lines_per_cue
+        exceeds_wrapped_lines = enforce_width and (
+            len(wrap_visual_width(cue.plain_text, profile.max_chars_per_line)) > profile.max_lines_per_cue
+        )
         if not exceeds_explicit_lines and not exceeds_wrapped_lines:
             split_cues.append(cue)
             continue

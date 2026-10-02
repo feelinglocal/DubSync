@@ -246,12 +246,19 @@ def sync_episode(
     )
     if fps is not None:
         profile = profile.model_copy(update={"fps": fps})
-    # A source-derived style describes the customer's own layout: its line
-    # limits change an existing cue only when a style was explicitly chosen or
-    # is stricter than the source.
+    # A source-derived style describes the customer's own layout. Its line
+    # count changes an existing cue only when a style was explicitly chosen or
+    # is stricter than the source; its width only when the width itself was
+    # chosen (a style file, or a profile whose width is not the source's) or
+    # is stricter than the source. The web option "maximum lines per cue"
+    # passes the source-derived profile with only the line count changed: the
+    # customer chose a line count, not a width, which stays a style finding.
     enforce_existing_line_limit = explicit_style_override or (
         profile.max_lines_per_cue < source_profile.max_lines_per_cue
         or profile.max_chars_per_line < source_profile.max_chars_per_line
+    )
+    enforce_line_width = (
+        style_path is not None or profile.max_chars_per_line != source_profile.max_chars_per_line
     )
     fps_summary_metadata = _fps_summary_metadata(
         profile,
@@ -494,7 +501,7 @@ def sync_episode(
             missing_dialogue=missing_dialogue,
             source_pair_hearing_mode="verify",
             secondary_words=secondary_words, secondary_context=secondary_context,
-            enforce_line_width=enforce_existing_line_limit,
+            enforce_line_width=enforce_line_width,
         )
 
     if resume_stage in {"adjudicate", "rebuild"}:
@@ -974,6 +981,7 @@ def sync_episode(
                 "max_cue_duration_seconds",
                 5.0,
             ),
+            enforce_width=enforce_line_width,
         )
         flags.extend(sync_line_flags)
     def rebuild(cue_list: list[Cue]) -> tuple[list[Cue], list[QCFlag]]:
@@ -1134,7 +1142,7 @@ def sync_episode(
         missing_dialogue=missing_dialogue,
         source_pair_hearing_mode=("disabled" if llm_disabled_for_episode else "rebuild" if resume_stage == "rebuild" else "fresh"),
         secondary_words=secondary_words, secondary_context=secondary_context,
-        enforce_line_width=enforce_existing_line_limit,
+        enforce_line_width=enforce_line_width,
     )
 
 

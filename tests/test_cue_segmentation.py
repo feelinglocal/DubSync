@@ -267,6 +267,35 @@ def test_existing_sync_cue_splits_by_line_limit_with_word_timing():
     assert [flag.kind for flag in flags] == ["sync_cue_line_limit_split"]
 
 
+def test_existing_sync_cue_within_the_line_count_is_kept_when_the_width_is_not_enforced():
+    # The same one-line cue under a source-derived width: only the line count decides.
+    words = [
+        Word(text="Team", start=1.00, end=1.18), Word(text="Falcon", start=1.20, end=1.48),
+        Word(text="hat", start=1.50, end=1.62), Word(text="eigenmächtig", start=1.64, end=2.05),
+        Word(text="die", start=2.07, end=2.20), Word(text="Position", start=2.22, end=2.55),
+        Word(text="verraten.", start=2.57, end=2.95),
+    ]
+    source = Cue(index=12, start_ms=1_000, end_ms=2_950, lines=["Team Falcon hat eigenmächtig die Position verraten."])
+    alignment = AlignmentResult(cue_word_indices={12: list(range(len(words)))})
+    profile = _profile().model_copy(update={"max_chars_per_line": 18, "max_lines_per_cue": 2})
+
+    cues, updated_alignment, flags, expansions = split_overlong_existing_cues(
+        [source], words, alignment, profile, max_gap_seconds=0.8, max_cue_duration_seconds=5.0, enforce_width=False,
+    )
+
+    assert cues == [source] and flags == [] and expansions == {}
+    assert updated_alignment.cue_word_indices == alignment.cue_word_indices
+    # A cue over the line count is still split, and its children are wrapped to the width.
+    three_lines = source.with_lines(["Team Falcon hat", "eigenmächtig die", "Position verraten."])
+    cues, _, flags, expansions = split_overlong_existing_cues(
+        [three_lines], words, alignment, profile, max_gap_seconds=0.8, max_cue_duration_seconds=5.0,
+        enforce_width=False,
+    )
+    assert len(cues) == 2 and [flag.kind for flag in flags] == ["sync_cue_line_limit_split"]
+    assert all(len(cue.lines) <= 2 and all(len(line) <= 18 for line in cue.lines) for cue in cues)
+    assert " ".join(cue.plain_text for cue in cues) == source.plain_text
+
+
 def test_existing_sync_cue_does_not_split_when_word_mapping_is_unavailable():
     source = Cue(
         index=12,
