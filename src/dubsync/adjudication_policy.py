@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from .models import AdjudicationDecision, Cue, DivergenceSpan
 from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import markup_spans, token_character_spans, token_texts
-from .tokenize import alphanumeric_signature, normalize_token
+from .tokenize import alphanumeric_signature, normalize_token, tokenize_cues
 
 
 DETERMINISTIC_ADJUDICATION_POLICY_VERSION = 2
@@ -59,6 +59,20 @@ _NAME_STOPWORDS = frozenset({
     "i", "you", "he", "she", "it", "we", "they", "the", "a", "an", "and", "but", "no", "yes",
     "ich", "du", "er", "sie", "es", "wir", "ihr", "der", "die", "das", "ein", "eine", "und",
 }) | _NAME_TITLES
+# Japanese has no capitals. A kanji or katakana run followed by an honorific,
+# title or place suffix is a name even once (山下様, 天衡グループ, 南山県); a run
+# that recurs in two cues and extends such a name is one too (山下森彦). A
+# recurring run alone is not: 部下, 屋台 and 今夜 recur as well. Without readings
+# only a divergence wholly inside a name keeps the source spelling; a
+# same-reading respelling of any other word is still asked.
+_JAPANESE_HONORIFICS = (
+    "様", "さま", "さん", "君", "くん", "ちゃん", "氏", "殿", "先生", "先輩", "社長", "会長", "グループ",
+    "県", "市", "町", "村",
+)
+_JAPANESE_MIN_NAME_LENGTH = 2
+# A respelled name stays name-sized (a kanji reads as a few kana); a longer
+# hearing can hold other spoken words.
+_JAPANESE_MAX_READING_RATIO = 3
 _SENTENCE_END_RE = re.compile(r"[.!?…。！？]")
 _HYPHEN_RE = re.compile("[-\u2010\u2011]")
 
@@ -244,6 +258,68 @@ def _source_name_lexicon(
     return recurring, frozenset(observed)
 
 
+def _japanese_run_script(token: str) -> str | None:
+    name = unicodedata.name(token[0], "")
+    if token[0] in "々〆" or name.startswith(("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")):
+        return "kanji"
+    return "katakana" if "KATAKANA" in name else None
+
+
+def _japanese_source_names(
+    source_cues: Sequence[Cue], language: str | None,
+) -> tuple[frozenset[str], tuple[range, ...], tuple[str, ...]]:
+    """Japanese names, their source token ranges and the source token keys.
+
+    Tokens are the aligner's ``tokenize_cues`` stream (one per kana or kanji),
+    so a divergence span finds itself through its source token indices. Runs
+    of one script are split by any other character, including a space.
+    """
+    if language != "ja":
+        return frozenset(), (), ()
+    tokens = tokenize_cues(list(source_cues))
+    runs: list[tuple[int, tuple[str, ...]]] = []
+    cues_by_name: dict[str, set[int]] = defaultdict(set)
+    marked: set[str] = set()
+    cursor = 0
+    for position, cue in enumerate(source_cues):
+        text = speech_text_for_alignment(cue)
+        count = sum(1 for word in token_texts(text) if normalize_token(word))
+        cue_tokens = tokens[cursor:cursor + count]
+        cursor += count
+        bounds = token_character_spans(text, [token.text for token in cue_tokens])
+        if bounds is None:
+            continue
+        start = 0
+        while start < len(cue_tokens):
+            # A prolonged-sound or iteration mark continues a word, never starts one.
+            script = None if cue_tokens[start].text[0] in "ー々" else _japanese_run_script(cue_tokens[start].text)
+            end = start + 1
+            while (script is not None and end < len(cue_tokens) and bounds[end - 1][1] == bounds[end][0]
+                   and _japanese_run_script(cue_tokens[end].text) == script):
+                end += 1
+            if script is not None:
+                run = tuple(token.text for token in cue_tokens[start:end])
+                runs.append((cue_tokens[start].token_index, run))
+                # 山下様 names 山下; 貴様, 皆様 or a bare title name nobody.
+                title = next((title for title in _JAPANESE_HONORIFICS if "".join(run).endswith(title)), None)
+                name = "".join(run[:len(run) - len(title)] if title else run)
+                if len(name) >= _JAPANESE_MIN_NAME_LENGTH:
+                    cues_by_name[name].add(position)
+                    following = unicodedata.normalize("NFKC", text[bounds[end - 1][1]:])
+                    if title or following.startswith(_JAPANESE_HONORIFICS):
+                        marked.add(name)
+            start = end
+    names = frozenset(marked | {
+        name for name, cue_positions in cues_by_name.items()
+        if len(cue_positions) >= 2 and any(name.startswith(known) for known in marked)
+    })
+    ranges = tuple(
+        range(first, first + size)
+        for first, run in runs for size in range(1, len(run) + 1) if "".join(run[:size]) in names
+    )
+    return names, ranges, tuple(token.normalized for token in tokens)
+
+
 def build_source_name_lexicon(
     source_cues: Sequence[Cue], language: str | None = None,
 ) -> frozenset[tuple[str, ...]]:
@@ -274,6 +350,9 @@ class DeterministicAdjudicationPolicy:
         self._abbreviations = _form_map(_ABBREVIATIONS.get(self.language, ()))
         self._spacing = _form_map(_SPACING_FORMS.get(self.language, ()))
         self._register = _form_map(_REGISTER_FORMS.get(self.language, ()))
+        self._japanese_names, self._japanese_name_ranges, self._source_token_keys = _japanese_source_names(
+            source_cues or (), self.language,
+        )
 
     def cache_context(self) -> dict[str, object]:
         """Every source-derived policy input, including ambiguous name spellings."""
@@ -282,7 +361,23 @@ class DeterministicAdjudicationPolicy:
             "language": self.language, "register_policy": self.register_policy,
             "source_names": sorted(self.source_names),
             "name_forms": dict(sorted(self._name_forms.items())),
+            "japanese_names": sorted(self._japanese_names),
         }
+
+    def _inside_japanese_name(self, span: DivergenceSpan) -> bool:
+        """The span's source tokens all lie in one occurrence of a source name."""
+        indices = span.srt_token_indices
+        if not self._japanese_name_ranges or not indices:
+            return False
+        first, last = indices[0], indices[-1]
+        if list(indices) != list(range(first, last + 1)) or first < 0 or last >= len(self._source_token_keys):
+            return False
+        # Indices into another cue list or text cannot borrow this protection.
+        if list(self._source_token_keys[first:last + 1]) != alphanumeric_signature(span.srt_text):
+            return False
+        if len(alphanumeric_signature(span.asr_text)) > _JAPANESE_MAX_READING_RATIO * len(indices):
+            return False
+        return any(first in occurrence and last in occurrence for occurrence in self._japanese_name_ranges)
 
     def _names(self, tokens: tuple[str, ...], *, source: bool) -> tuple[str, ...]:
         result: list[str] = []
@@ -305,6 +400,10 @@ class DeterministicAdjudicationPolicy:
         return tuple(result)
 
     def decide(self, span: DivergenceSpan) -> AdjudicationDecision | None:
+        if not alphanumeric_signature(span.srt_text) and not alphanumeric_signature(span.asr_text):
+            # MAI and Scribe time punctuation (。、？ , . ?) as words. Alone it
+            # opens an insertion span in which no letter or digit is spoken.
+            return _decision(span, "Punctuation/casing-only difference; preserved source SRT.")
         source, audio = _keys(span.srt_text), _keys(span.asr_text)
         if not source or not audio:
             return None
@@ -320,6 +419,9 @@ class DeterministicAdjudicationPolicy:
             return _decision(span, "Punctuation/casing-only difference; preserved source SRT.")
         if not self.language:
             return None
+        if self._inside_japanese_name(span):
+            # The audio cannot choose between homophone spellings of a name.
+            return _decision(span, "Recurring source-name spelling equivalent; preserved source SRT.")
 
         source_spelling = _expand(_expand(source, self._spacing), self._abbreviations)
         audio_spelling = _expand(_expand(audio, self._spacing), self._abbreviations)

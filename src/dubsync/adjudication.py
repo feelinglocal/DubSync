@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from .adjudication_policy import DETERMINISTIC_KEEP_CONFIDENCE, DeterministicAdjudicationPolicy
 from .models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan, QCFlag
 from .providers import ProviderError
+from .tokenize import alphanumeric_signature
 
 
 _MAX_ADJUDICATION_BATCH_SPANS = 25
@@ -436,6 +437,12 @@ def confidence_gated_decision(
     from .hybrid_adjudication import _evidence_supports_wording
 
     uncertain_audio = decision.evidence in {"heard_unclear", "not_audible"}
+    if uncertain_audio and not any(alphanumeric_signature(text) for text in (
+        span.srt_text, span.asr_text, decision.final_text, decision.heard_text or "",
+    )):
+        # Source, ASR and hearing all agree that no word is spoken (an ASR
+        # punctuation mark between cues). The absence is confirmed, not held.
+        return decision.model_copy(update={"verdict": "keep_srt", "final_text": span.srt_text}), None
     uncertain_source_keep = (
         decision.verdict == "keep_srt" and decision.final_text == span.srt_text
         and decision.evidence == "heard_clearly" and not _evidence_supports_wording(decision, policy)

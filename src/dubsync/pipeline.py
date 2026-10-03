@@ -1519,8 +1519,8 @@ def _episode_language_code(provider_config: dict[str, object], language: str | N
 
 
 def _is_punctuation_only_span(span: DivergenceSpan) -> bool:
-    source_signature = alphanumeric_signature(span.srt_text)
-    return bool(source_signature) and source_signature == alphanumeric_signature(span.asr_text)
+    # Includes an ASR punctuation mark between cues: no word on either side.
+    return alphanumeric_signature(span.srt_text) == alphanumeric_signature(span.asr_text)
 
 
 def _validate_rebuild_policy(path: Path) -> None:

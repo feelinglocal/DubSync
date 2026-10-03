@@ -114,6 +114,39 @@ def test_punctuation_only_span_is_not_an_unresolved_divergence_without_llm(tmp_p
     assert "divergence_unresolved" not in [flag["kind"] for flag in flags]
 
 
+@pytest.mark.parametrize("no_llm", [False, True])
+def test_punctuation_only_asr_insertion_is_neither_a_question_nor_a_review_item(tmp_path, monkeypatch, no_llm):
+    # Delivered 1B-mai/2B-mai: MAI emits 。 and ？ as timed words between and after
+    # cues. Both form ASR-only insertion spans that hold no spoken word.
+    srt = "1\n00:00:01,000 --> 00:00:02,000\n放したぞ\n\n2\n00:00:03,000 --> 00:00:04,000\nいやいや\n"
+    words = [{"text": text, "start": start, "end": end, "confidence": None} for text, start, end in [
+        ("放した", 1.10, 1.50), ("ぞ", 1.50, 1.70), ("。", 1.70, 1.78), ("いやいや", 3.10, 3.70), ("？", 3.70, 3.735),
+    ]]
+    absent = {f"case-{number}": {
+        "case_id": f"case-{number}", "verdict": "keep_srt", "final_text": "", "evidence": "not_audible",
+        "heard_text": "", "reason": "ASR proposes punctuation where no spoken dialogue exists.",
+    } for number in (1, 2)}
+    asked: list[list[str]] = []
+    adjudicate = StaticLLMAdapter.adjudicate
+    monkeypatch.setattr(StaticLLMAdapter, "adjudicate",
+                        lambda self, spans: asked.append([span.case_id for span in spans]) or adjudicate(self, spans))
+
+    cues, flags = _sync(tmp_path, srt, words, responses=absent, no_llm=no_llm)
+
+    assert [cue.plain_text for cue in cues] == ["放したぞ", "いやいや"]
+    assert asked == []
+    assert not {"low_confidence_adjudication", "divergence_unresolved"} & {flag["kind"] for flag in flags}
+    workdir = tmp_path / "work"
+    alignment, = (json.loads(path.read_text(encoding="utf-8")) for path in workdir.rglob("align.json"))
+    adjudication, = (json.loads(path.read_text(encoding="utf-8")) for path in workdir.rglob("adjudicate.json"))
+    assert [(span["srt_text"], span["asr_text"]) for span in alignment["divergence_spans"]] == [("", "。"), ("", "？")]
+    assert [(decision["verdict"], decision["confidence"], decision["reason"]) for decision in adjudication["decisions"]] == [
+        ("keep_srt", 1.0, "Punctuation/casing-only difference; preserved source SRT."),
+    ] * 2
+    report, = (json.loads(path.read_text(encoding="utf-8")) for path in workdir.rglob("qc_report.json"))
+    assert not [item for item in report["review"] if not item["srt_numbers"]]
+
+
 def test_one_ownership_failure_is_reported_once(tmp_path):
     # MAI ep11 cue 114 (case-32): the approved replacement spans three speech
     # groups. The text hold and the word-mapping hold describe the same failure.
