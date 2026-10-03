@@ -132,3 +132,32 @@ def test_explicit_allow_overlap_preserves_authored_annotation_segmentation(tmp_p
     assert payload["cues"][0] == source[0].model_dump()
     assert payload["cues"][1]["lines"] == source[1].lines
     assert "annotation_composition" not in payload
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify"])
+def test_held_dialogue_around_a_caption_keeps_two_lines_and_moves_the_caption_for_review(tmp_path, monkeypatch, mode):
+    # W4R-1: a held two-turn cue fills the display for the caption's whole
+    # time. The delivery never shows three lines; the caption is shown on its
+    # own beside the speech, and the move is a review reason.
+    turns = ["- Você vem com a gente?", "- Não, fico aqui."]
+    cues = [Cue(index=1, start_ms=500, end_ms=2500, lines=turns),
+            Cue(index=2, start_ms=1000, end_ms=2000, lines=["[Station]"]),
+            Cue(index=3, start_ms=3000, end_ms=3800, lines=["Hello there."])]
+    words = [Word(text="Hello", start=3.1, end=3.4), Word(text="there.", start=3.5, end=3.7)]
+    _, run = _run_case(tmp_path, monkeypatch, case_override=(cues, words))
+    result = run()
+    first_bytes = result.output_srt.read_bytes()
+    if mode == "verify":
+        result = run(resume="verify")
+        assert result.output_srt.read_bytes() == first_bytes
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 2 for cue in delivered), [cue.lines for cue in delivered]
+    assert all(left.end_ms <= right.start_ms for left, right in zip(delivered, delivered[1:]))
+    speech = next(cue for cue in delivered if cue.lines[0] == turns[0])
+    assert speech.lines == turns
+    caption, = [cue for cue in delivered if "[Station]" in cue.lines]
+    assert caption.lines == ["[Station]"]
+    assert caption.end_ms <= speech.start_ms or caption.start_ms >= speech.end_ms
+    assert not [issue for issue in result.report["style_issues"] if issue["kind"] == "line_count"]
+    moved = [item for item in result.report["review"] if "annotation_display_full" in item["reasons"]]
+    assert moved and caption.index in moved[0]["srt_numbers"]

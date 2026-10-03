@@ -198,6 +198,9 @@ KIND_REGISTRY: dict[str, KindSpec] = {
         "Possible name spelling drift", "Check the spelling against the script.", 60, "warning"),
     "unsourced_word_substitution": _review_kind(
         "Word not found in the script", "Check the word against the audio.", 60, "warning"),
+    "annotation_display_full": _review_kind(
+        "Screen text moved out of a full two-line display",
+        "Check the screen text against the picture and place it where it belongs.", 58, "warning"),
     # Episode-level problems: one item per kind.
     "alignment_unresolved": _review_kind(
         "The script could not be aligned to the audio", "Check that the SRT belongs to this audio.", 1, "error",

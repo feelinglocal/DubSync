@@ -14,6 +14,7 @@ import pytest
 
 from dubsync.annotation_composition import compose_bracketed_annotations
 from dubsync.models import Cue, Word
+from dubsync.qc_review import build_review
 from dubsync.semantic_output import compact_lines, split_crowded_output_cues, wrap_semantic_lines
 from dubsync.style_profile import StyleProfile
 from dubsync.text_metrics import _NONSTARTING_KANA, _can_break_between, display_width
@@ -182,22 +183,122 @@ def test_dash_dialogue_beside_a_caption_divides_only_between_turns():
      ["[Hospital Central]"], 47),
     (["- Você vem?", "- Não, fico aqui."], ["[Rua das Flores]"], 47),
 ])
-def test_held_two_line_speech_beside_a_caption_keeps_its_lines_instead_of_one_overwide_line(
+def test_full_two_line_speech_around_a_caption_never_makes_a_three_line_display(
         speech_lines, caption_lines, width, enforce_width):
+    # W4R-1: the caption lies wholly inside speech that can be neither divided
+    # nor fitted to one line. The two-line ceiling is never given up for it.
     speech = Cue(index=1, start_ms=1000, end_ms=4000, lines=speech_lines)
     caption = Cue(index=2, start_ms=1500, end_ms=3500, lines=caption_lines)
     profile = StyleProfile(fps=30, max_chars_per_line=width, min_cue_dur=.5)
     composed = compose_bracketed_annotations([speech, caption], {1: [], 2: []}, words=[], profile=profile,
                                              enforce_width=enforce_width)
+    assert all(len(cue.lines) <= 2 for cue in composed.cues), [cue.lines for cue in composed.cues]
+    assert all(left.end_ms <= right.start_ms for left, right in zip(composed.cues, composed.cues[1:]))
     shown = [line for cue in composed.cues for line in cue.lines]
-    assert all(display_width(line) <= width for line in shown), shown
-    # Screen text and dialogue never share a line; the speech keeps its own lines.
+    # Screen text and dialogue never share a line.
     assert all(line.startswith("[") == line.endswith("]") for line in shown), shown
     assert all(not ("[" in line and not line.startswith("[")) for line in shown), shown
     display, = [cue for cue in composed.cues if cue.start_ms < 4000 and 1000 < cue.end_ms]
-    assert display.lines[:2] == speech_lines
-    assert caption_lines[0] in display.lines
+    assert (display.index, display.start_ms, display.end_ms) == (1, 1000, 4000)
+    if not enforce_width and not speech_lines[0].startswith("- "):
+        # The width is the customer's advisory one: plain speech joins its own
+        # lines, the caption keeps its time and line-length QC shows the width.
+        assert display.lines == [" ".join(speech_lines), *caption_lines]
+        reflow, = [flag for flag in composed.flags if flag.kind == "output_line_limit_reflow"]
+        assert (reflow.cue_ids, reflow.severity, reflow.old_text) == ([1], "info", speech.text)
+        assert not [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+        return
+    # Dialogue turns or an enforced width keep the speech lines. The caption is
+    # shown on its own just beside the speech (no display follows, so before it).
+    assert display.lines == speech_lines
+    assert all(display_width(line) <= width for line in shown), shown
+    moved, = [cue for cue in composed.cues if cue.index != 1]
+    assert (moved.start_ms, moved.end_ms, moved.lines) == (0, 1000, caption_lines)
+    flag, = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+    assert (flag.severity, flag.cue_ids, flag.old_text) == ("warning", [moved.index, 1], caption.text)
+    assert "just before that speech" in flag.message
+    assert composed.tracks[2]["display_intervals"] == [[0, 1000]]
+    assert composed.tracks[2]["coverage_gaps_ms"] == [[1500, 3500]]
+    assert composed.tracks[2]["early_extension_ms"] == 1500
     assert not [flag for flag in composed.flags if flag.kind == "output_line_limit_reflow"]
+
+
+_FULL_SPEECH = {
+    "plain": ["Eu não sei o que vou fazer da minha", "vida com essa empresa agora."],
+    "short": ["Eu não sei.", "Vamos embora."],
+    "dash": ["- Você vem com a gente amanhã?", "- Não, fico aqui em casa."],
+    "mixed": ["[Esta empresa não é para você]", "A Lime não é para você."],
+    "one": ["Eu não sei o que vou fazer."],
+}
+_NEIGHBORS = {
+    "alone": [],
+    # Displays touch the speech on both sides: no free interval beside it.
+    "boxed": [Cue(index=5, start_ms=8000, end_ms=10000, lines=["Antes."]),
+              Cue(index=6, start_ms=14000, end_ms=16000, lines=["Depois."])],
+    # Too little room before; a free interval after, up to the next display.
+    "room_after": [Cue(index=5, start_ms=9800, end_ms=9900, lines=["Antes."]),
+                   Cue(index=6, start_ms=17000, end_ms=18000, lines=["Depois."])],
+}
+
+
+@pytest.mark.parametrize("neighbors", sorted(_NEIGHBORS))
+@pytest.mark.parametrize("shape", sorted(_FULL_SPEECH))
+@pytest.mark.parametrize("enforce_width", [True, False])
+@pytest.mark.parametrize("max_lines", [1, 2])
+def test_no_composed_display_exceeds_the_line_limit_around_a_contained_caption(
+        max_lines, enforce_width, shape, neighbors):
+    profile = StyleProfile(fps=25.0, max_chars_per_line=42, min_cue_dur=.5, max_lines_per_cue=max_lines)
+    speech = Cue(index=1, start_ms=10000, end_ms=14000, lines=_FULL_SPEECH[shape])
+    caption = Cue(index=2, start_ms=11000, end_ms=13000, lines=["[PLACA: SAÍDA DE EMERGÊNCIA]"])
+    source = sorted([speech, caption, *_NEIGHBORS[neighbors]], key=lambda cue: (cue.start_ms, cue.index))
+    # As in the pipeline: the line limit applies to every cue before captions are composed.
+    segmented = split_crowded_output_cues(source, [], {cue.index: [] for cue in source}, profile,
+                                          enforce_width=enforce_width)
+    composed = compose_bracketed_annotations(segmented.cues, segmented.cue_word_indices, words=[], profile=profile,
+                                             enforce_width=enforce_width)
+    limit = min(2, max_lines)
+    assert all(len(cue.lines) <= limit for cue in composed.cues), [cue.lines for cue in composed.cues]
+    assert all(left.end_ms <= right.start_ms for left, right in zip(composed.cues, composed.cues[1:]))
+    words = [token for cue in composed.cues for line in cue.lines for token in line.split()]
+    spoken = [token for line in speech.lines for token in line.split()]
+    assert words.count(spoken[-1]) == 1 and all(token in words for token in spoken)
+    hidden = [flag for flag in composed.flags if flag.kind == "annotation_display_full" and flag.new_text is None]
+    if "[PLACA:" in words:
+        assert not hidden
+        moved = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+        if moved:
+            display, = [cue for cue in composed.cues if "[PLACA:" in cue.lines[0]]
+            assert display.end_ms <= speech.start_ms or display.start_ms >= speech.end_ms
+            assert moved[0].severity == "warning"
+    else:
+        # Not shown at all only when no free interval beside the speech exists.
+        assert neighbors == "boxed"
+        flag, = hidden
+        assert (flag.severity, flag.cue_ids, flag.old_text) == ("warning", [1], caption.text)
+        assert composed.tracks[2]["display_intervals"] == [] and composed.tracks[2]["display_cue_ids"] == []
+        assert composed.tracks[2]["coverage_gaps_ms"] == [[11000, 13000]]
+        assert composed.tracks[2]["pages"][0]["delay_ms"] is None
+        review = build_review(composed.flags, [], composed.cues, source_cues=source)
+        item, = [item for item in review.review if item.kind == "annotation_display_full"]
+        assert item.severity == "warning" and item.old_text == caption.text
+
+
+def test_a_caption_moved_out_of_full_speech_prefers_the_free_interval_after_it():
+    profile = StyleProfile(fps=25.0, max_chars_per_line=42, min_cue_dur=.5)
+    source = [Cue(index=5, start_ms=9800, end_ms=9900, lines=["Antes."]),
+              Cue(index=1, start_ms=10000, end_ms=14000, lines=_FULL_SPEECH["dash"]),
+              Cue(index=2, start_ms=11000, end_ms=13000, lines=["[PLACA: SAÍDA DE EMERGÊNCIA]"]),
+              Cue(index=6, start_ms=15000, end_ms=16000, lines=["Depois."])]
+    composed = compose_bracketed_annotations(source, {5: [], 1: [], 2: [], 6: []}, words=[], profile=profile)
+    assert [(cue.index, cue.start_ms, cue.end_ms, cue.lines) for cue in composed.cues] == [
+        (5, 9800, 9900, ["Antes."]), (1, 10000, 14000, _FULL_SPEECH["dash"]),
+        (2, 14000, 15000, ["[PLACA: SAÍDA DE EMERGÊNCIA]"]), (6, 15000, 16000, ["Depois."])]
+    flag, = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+    assert flag.cue_ids == [2, 1] and "just after that speech" in flag.message
+    assert composed.tracks[2]["late_extension_ms"] == 2000
+    review = build_review(composed.flags, [], composed.cues, source_cues=source)
+    item, = [item for item in review.review if item.kind == "annotation_display_full"]
+    assert item.srt_numbers == [2, 3]
 
 
 def test_mixed_caption_dialogue_cue_keeps_its_lines_and_the_earlier_caption_keeps_its_own_time():
