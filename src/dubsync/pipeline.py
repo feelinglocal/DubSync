@@ -2986,6 +2986,7 @@ def _run_verify_stage(
             fixed_cue_ids=shared_source_cue_ids - unresolved_shared_cue_ids,
             ambiguous_word_indices=uncertain_word_indices,
             source_words=speech_evidence.source_words,
+            levels=speech_evidence.levels,
         )
         flags.extend(timing_flags)
         if include_dropped_line_flags:

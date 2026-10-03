@@ -9,6 +9,7 @@ from .asr_timing import (
     PhraseEdgeSnap,
     ambiguous_word_indices_from_regions,
     asr_model_from_artifact,
+    burst_owns_word_start,
     clamp_asr_word_durations,
     has_sufficient_speech_overlap,
     phrase_edge_snap_from_config,
@@ -181,6 +182,7 @@ def refine_cues_to_speech_activity(
     fixed_cue_ids: set[int] | None = None,
     ambiguous_word_indices: set[int] | None = None,
     source_words: list[Word] | None = None,
+    levels: SpeechLevels | None = None,
 ) -> tuple[list[Cue], list[QCFlag]]:
     """Fit cue edges to the speech bursts of their own words.
 
@@ -189,6 +191,9 @@ def refine_cues_to_speech_activity(
     only when it covers enough of the provider's word, the rule word repair
     applied; a phrase snap that later put the word's start on the burst is no
     evidence of ownership. Without them ``words`` are judged as given.
+    ``levels`` (the detector's level track) lets a burst that only the first
+    word's tail reaches start the cue when nothing is heard before it
+    (``burst_owns_word_start``).
     """
     if source_words is not None and words is not None and len(source_words) != len(words):
         raise ValueError("source_words must give the provider timing of every word, in the order of words")
@@ -265,7 +270,9 @@ def refine_cues_to_speech_activity(
             else {}
         )
         cue_regions = (
-            _regions_from_word_window(word_window, region_index, options, provider_words.get(id(word_window[0])))
+            _regions_from_word_window(
+                word_window, region_index, options, provider_words.get(id(word_window[0])), levels,
+            )
             if word_window is not None
             else _regions_overlapping_cue(cue, region_index)
         )
@@ -454,6 +461,7 @@ def _regions_from_word_window(
     region_index: SpeechRegionIndex,
     config: BoundaryRefinementConfig,
     first_provider_word: Word | None = None,
+    levels: SpeechLevels | None = None,
 ) -> tuple[SpeechRegion, SpeechRegion] | None:
     first_word = word_window[0]
     last_word = word_window[-1]
@@ -461,11 +469,14 @@ def _regions_from_word_window(
     if start_region is None:
         start_region = _region_overlapping_word(first_word, region_index)
         # A word that starts in silence belongs to the burst after it only when
-        # that burst covers enough of the word, as in word repair; a burst it
-        # merely touches is no start, and the cue keeps its timing as it does
-        # when the word touches no burst at all.
+        # that burst covers enough of the word, as in word repair, or when the
+        # level track verifies the silence before the burst; a burst it merely
+        # touches is no start, and the cue keeps its timing as it does when the
+        # word touches no burst at all.
         owner = first_provider_word if first_provider_word is not None else first_word
-        if start_region is not None and not has_sufficient_speech_overlap(owner, start_region.start, start_region.end):
+        if start_region is not None and not burst_owns_word_start(
+            owner, start_region.start, start_region.end, levels,
+        ):
             start_region = None
     end_probe = last_word.start if _is_word_duration_outlier(last_word, config) else last_word.end
     end_region = _region_containing_timestamp(end_probe, region_index)

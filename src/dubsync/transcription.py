@@ -333,6 +333,7 @@ def generate_srt_from_audio(
             protected_cue_ids=ambiguous_cue_ids,
             ambiguous_word_indices=uncertain_word_indices,
             source_words=provider_words,
+            levels=speech_levels,
         )
         flags.extend(timing_flags)
 
