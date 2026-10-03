@@ -61,11 +61,14 @@ def test_positive_omission_window_retains_its_existing_word_boundaries():
 
 @pytest.mark.parametrize("defect", [
     "low-confidence", "overlong-word", "overlap",
-    "speaker-change", "remote-flank",
+    "speaker-change", "remote-flank", "outer-collapsed-1-ms", "outer-collapsed-20-ms",
 ])
 def test_unreliable_flanking_words_do_not_reclassify_missing_audio(defect):
     cues, words = _supported_omission()
-    if defect == "low-confidence":
+    if defect.startswith("outer-collapsed-"):
+        # The outer anchor 'Hoje' collapses onto the start of 'eu' (F32).
+        words[0] = words[0].model_copy(update={"start": 1.299 if defect.endswith("1-ms") else 1.28})
+    elif defect == "low-confidence":
         words[1] = words[1].model_copy(update={"confidence": .4})
     elif defect == "overlong-word":
         words[0] = words[0].model_copy(update={"start": -1.0})
@@ -96,6 +99,33 @@ def test_short_internal_word_uses_reliable_outer_anchors_for_the_whole_clause_qu
     omission = next(span for span in alignment.divergence_spans if span.srt_text == "realmente")
     assert (omission.start, omission.end) == (1.05, 2.35)
     assert omission.asr_word_indices == []
+    assert [word.model_dump() for word in words] == before
+
+
+@pytest.mark.parametrize("flank,update,window", [
+    ("left", {"end": 1.301}, (1.301, 1.5)),
+    ("left", {"end": 1.32}, (1.32, 1.5)),
+    ("right", {"start": 1.799}, (1.5, 1.799)),
+    ("right", {"start": 1.78}, (1.5, 1.78)),
+], ids=["left-1-ms", "left-20-ms", "right-1-ms", "right-20-ms"])
+def test_collapsed_flank_that_leaves_a_gap_bounds_only_the_real_gap(flank, update, window):
+    # F32: a 1-20 ms flank collapsed away from the omitted word leaves a real gap.
+    # That gap is an ordinary positive omission window (as for any other flank
+    # defect); the collapse never widens it into the outer anchors, never lends
+    # the window ASR words or confidence and never rewrites a timestamp. Only a
+    # flank collapsed onto the omission point (above) cannot bound a window.
+    cues, words = _supported_omission()
+    index = 1 if flank == "left" else 2
+    words[index] = words[index].model_copy(update=update)
+    before = [word.model_dump() for word in words]
+
+    alignment = aligner.align_cues_to_words(cues, words)
+
+    assert alignment.diagnostics.missing_audio_cue_ids == []
+    assert alignment.cue_word_indices == {1: [0, 1, 2, 3, 4], 2: [6, 7]}
+    omission = next(span for span in alignment.divergence_spans if span.srt_text == "realmente")
+    assert (omission.start, omission.end) == window
+    assert omission.asr_word_indices == [] and omission.confidence == 0.0
     assert [word.model_dump() for word in words] == before
 
 

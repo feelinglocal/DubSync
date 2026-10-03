@@ -318,3 +318,35 @@ def test_impossibly_narrow_japanese_wrapper_keeps_visible_overflow_without_text_
     assert "".join(result.cues[0].lines) == "".join(source.lines)
     assert (result.cues[0].start_ms, result.cues[0].end_ms) == (1000, 2000)
     assert any(issue.kind == "line_length" for issue in lint_cues(result.cues, profile))
+
+
+@pytest.mark.parametrize("displayed", ["spoken", "retained-customer-word"])
+def test_timed_split_requires_the_displayed_words_to_be_the_owned_words(displayed):
+    # F32: a held cue may keep customer text the actor did not say ('realmente').
+    # Splitting it at word-count positions would time 'porque' in one child and
+    # display it in the next, so only an exact text/word signature may split.
+    spoken = ("Hoje eu preciso ir embora para casa, porque amanhã cedo eu tenho uma reunião "
+              "muito importante no escritório")
+    text = spoken if displayed == "spoken" else spoken.replace("eu preciso", "eu realmente preciso")
+    words, time = [], 1.0
+    for token in spoken.split():
+        words.append(Word(text=token, start=round(time, 3), end=round(time + .25, 3), speaker_id="A"))
+        time += .9 if token.endswith(",") else .3  # a real pause after "casa,"
+    tokens = text.split()
+    cue = Cue(index=7, start_ms=1000, end_ms=int(time * 1000) + 200,
+              lines=[" ".join(tokens[:7]), " ".join(tokens[7:13]), " ".join(tokens[13:])])
+    result = split_crowded_output_cues([cue], words, {7: list(range(len(words)))},
+                                       StyleProfile(fps=25.0, max_chars_per_line=42, max_lines_per_cue=2))
+    for child in result.cues:
+        owned = [token for i in result.cue_word_indices.get(child.index, []) for token in alphanumeric_signature(words[i].text)]
+        if len(result.cues) > 1:
+            assert alphanumeric_signature(" ".join(child.lines)) == owned
+    if displayed == "spoken":
+        assert [flag.kind for flag in result.flags] == ["output_line_limit_split"]
+        assert len(result.cues) == 2
+    else:
+        assert [flag.kind for flag in result.flags] == ["output_line_limit_reflow"]
+        reflowed, = result.cues
+        assert (reflowed.index, reflowed.start_ms, reflowed.end_ms) == (7, cue.start_ms, cue.end_ms)
+        assert " ".join(reflowed.lines) == text
+        assert result.cue_word_indices[7] == list(range(len(words)))

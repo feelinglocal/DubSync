@@ -216,3 +216,41 @@ def test_fresh_positive_whole_cue_hearing_and_unchanged_bound_evidence_are_requi
         flags = [QCFlag(kind="adjudication_audio_unavailable", cue_ids=[2], message="No audio.")]
     result = _resolve(case, questions, heard=heard, evidence=evidence, flags=flags)
     assert result.cues == case[0] and result.resolved_cue_ids == set()
+
+
+@pytest.mark.parametrize("uncertain", [{1}, {2}], ids=["first-evidence-word", "last-evidence-word"])
+def test_ambiguous_timing_evidence_word_rejects_the_whole_utterance_question(uncertain):
+    # F32: an evidence word whose timing the VAD repair could not place proves no
+    # burst. With the shipped VAD such a word cannot lie inside the one released
+    # burst, so this guard is pinned on the builder's own input contract.
+    case = _case("mismatch")
+    assert len(_questions(case)) == 1
+    assert build_whole_utterance_timing_questions(case[0], case[2], case[1], case[3], audio_duration_seconds=100,
+                                                  uncertain_word_indices=uncertain) == []
+
+
+def _with_unowned_word_after_left_anchor(kind, word):
+    cues, words, alignment, regions = _case(kind)
+    position = len(alignment.cue_word_indices[1])
+    def shift(index):
+        return index + 1 if index >= position else index
+    words.insert(position, word)
+    alignment.cue_word_indices = {cue: [shift(i) for i in owned] for cue, owned in alignment.cue_word_indices.items()}
+    alignment.token_matches = [m.model_copy(update={"asr_word_index": shift(m.asr_word_index)}) for m in alignment.token_matches]
+    alignment.divergence_spans = [s.model_copy(update={"asr_word_indices": [shift(i) for i in s.asr_word_indices]})
+                                  for s in alignment.divergence_spans]
+    return cues, words, alignment, regions
+
+
+@pytest.mark.parametrize("kind,word", [("empty", Word(text="uh", start=1.31, end=1.34, confidence=1)),
+                                       ("mismatch", Word(text="ね", start=72.88, end=72.895, confidence=1))],
+                         ids=["empty-gap", "mismatch-gap"])
+def test_unexplained_word_inside_an_anchor_owned_region_blocks_release(kind, word):
+    # F32: the left anchor's raw region runs past its last word. An unowned
+    # lexical word in that tail is activity no hearing accounts for, so the
+    # region cannot be released to the target cue.
+    assert len(_questions(_case(kind))) == 1
+    case = _with_unowned_word_after_left_anchor(kind, word)
+    left_region = next(r for r in case[3] if r.start <= case[1][0].start < r.end)
+    assert left_region.start < word.start < word.end <= left_region.end
+    assert _questions(case) == []
