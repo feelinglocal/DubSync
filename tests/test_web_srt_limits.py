@@ -54,6 +54,33 @@ def test_single_sync_rejects_excess_srt_lines_before_creating_a_job(tmp_path):
     assert list(settings.data_dir.glob("job-*")) == []
 
 
+def test_single_sync_rejects_a_cue_timestamp_without_number_or_separator(tmp_path):
+    # Accepting it would merge two cues and deliver the timestamp line as dialogue.
+    settings = _settings(tmp_path)
+    app = create_app(settings=settings, processor=_unexpected_processor)
+    subtitle = (
+        "1\n00:00:01,000 --> 00:00:02,000\nHallo Welt.\n"
+        "00:00:03,000 --> 00:00:04,000\nWie geht es dir?\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nGut, danke.\n"
+    ).encode()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/jobs",
+            data={"mode": "sync", "fps": "30"},
+            files={
+                "audio": ("001.wav", b"audio", "audio/wav"),
+                "subtitle": ("001.srt", subtitle, "application/x-subrip"),
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"].startswith(
+        "Could not read the SRT: subtitle line 4 is a cue timestamp"
+    )
+    assert list(settings.data_dir.glob("job-*")) == []
+
+
 def test_batch_sync_rejects_an_overlong_srt_line_before_creating_jobs(tmp_path):
     settings = replace(_settings(tmp_path), max_srt_line_bytes=40)
     app = create_app(settings=settings, processor=_unexpected_processor)

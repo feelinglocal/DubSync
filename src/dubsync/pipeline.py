@@ -1802,6 +1802,16 @@ def _source_cues_for_run(
             cues,
             {key: payload[key] for key in _INGEST_METADATA_KEYS if key in payload},
         )
+    return read_source_cues(srt_path)
+
+
+def read_source_cues(srt_path: Path) -> tuple[list[Cue], dict[str, object]]:
+    """Read a customer SRT exactly as a fresh sync run ingests it.
+
+    Anything derived from the source before the run, such as the web
+    "maximum lines per cue" style, must use these repaired cues; the raw file
+    can hold durations that fail or distort a style profile.
+    """
     text, notice = decode_srt_bytes(srt_path.read_bytes())
     cues, metadata = _hardened_source_cues(parse_srt_text(text))
     if notice is not None:

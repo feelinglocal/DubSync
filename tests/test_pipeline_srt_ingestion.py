@@ -53,3 +53,14 @@ def test_legacy_empty_ingest_requires_restart_before_paid_work(tmp_path, stage, 
     with pytest.raises(ValueError, match="resume from ingest"):
         _source_cues_for_run(tmp_path / "source.srt", tmp_path, stage)
     assert artifact.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_bom_unicode_source_is_not_reported_as_a_legacy_encoding(tmp_path, encoding):
+    # A BOM identifies UTF-16/32 losslessly, so there are no accented characters to check.
+    source = tmp_path / "source.srt"
+    source.write_bytes(("\ufeff1\r\n00:00:00,000 --> 00:00:01,000\r\nCafé déjà vu.\r\n").encode(encoding))
+    cues, metadata = _source_cues_for_run(source, tmp_path, None)
+    assert cues[0].text == "Café déjà vu."
+    assert "ingest_flags" not in metadata
+

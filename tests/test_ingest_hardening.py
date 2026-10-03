@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from dubsync import pipeline
-from dubsync.srt_io import parse_srt_text
+from dubsync.srt_io import SRTParseError, parse_srt_text
 from dubsync.style_profile import StyleProfile
 
 _WORDS = [
@@ -116,3 +116,18 @@ def test_unusable_source_cue_duration_is_repaired_before_any_paid_stage(tmp_path
     assert [(flag["cue_ids"], flag["severity"]) for flag in repaired] == [([2], "warning")]
     ingest = json.loads((result.episode_workdir / "ingest.json").read_text(encoding="utf-8"))
     assert all(cue["end_ms"] > cue["start_ms"] for cue in ingest["cues"])
+
+
+def test_cue_timestamp_without_number_or_separator_fails_before_any_paid_stage(tmp_path):
+    # Kept as text, the timestamp line would merge two speakers' cues and be
+    # delivered as dialogue; the customer is told which line to fix instead.
+    srt = (
+        "1\n00:00:01,000 --> 00:00:02,000\nHallo Welt.\n"
+        "00:00:03,000 --> 00:00:04,000\nWie geht es dir?\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nGut, danke.\n"
+    )
+
+    with pytest.raises(SRTParseError, match="subtitle line 4 is a cue timestamp"):
+        _sync(tmp_path, srt)
+
+    assert not (tmp_path / "work" / "episode" / "ingest.json").exists()

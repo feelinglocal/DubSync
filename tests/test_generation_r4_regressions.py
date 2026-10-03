@@ -161,11 +161,31 @@ def test_srt_missing_blank_separator_does_not_merge_dialogue():
     assert [cue.plain_text for cue in cues] == ["One.", "Two."]
 
 
+@pytest.mark.parametrize("source, line_number", [
+    ("1\n00:00:01,000 --> 00:00:02,000\nHallo Welt.\n00:00:03,000 --> 00:00:04,000\nWie geht es dir?\n", 4),
+    ("1\r\n00:00:01,000 --> 00:00:02,000\r\nHallo\r\nWelt.\r\n00:00:03.000 --> 00:00:04.000\r\nWie geht es dir?\r\n", 5),
+    ("1\n00:00:01,000 --> 00:00:02,000\n00:00:03,000 --> 00:00:04,000\nWie geht es dir?\n", 3),
+])
+def test_srt_cue_timestamp_without_number_or_separator_is_rejected_not_merged(source, line_number):
+    # Kept as text, the timestamp would merge two cues and be delivered as dialogue.
+    from dubsync.srt_io import SRTParseError
+    with pytest.raises(SRTParseError, match=f"subtitle line {line_number} is a cue timestamp"):
+        parse_srt_text(source + "\n3\n00:00:05,000 --> 00:00:06,000\nGut, danke.\n")
+
+
 def test_srt_writer_removes_interior_empty_lines_and_embedded_newlines():
     cues = [Cue(index=1, start_ms=1000, end_ms=2000, lines=["First", "", "Second\n\nThird"])]
     text = write_srt(cues)
     assert len(parse_srt_text(text)) == 1
     assert parse_srt_text(text)[0].lines == ["First", "Second", "Third"]
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85", "\x0b", "\x0c"])
+def test_srt_writer_breaks_lines_only_at_line_feeds(separator):
+    # Only CR/LF end an SRT line when it is read, so any other separator inside
+    # an authored line is kept instead of becoming an extra subtitle line.
+    cues = [Cue(index=1, start_ms=1000, end_ms=2000, lines=[f"A.{separator}B.", "C."])]
+    assert parse_srt_text(write_srt(cues)) == cues
 
 
 def test_sample_style_uses_robust_percentiles_and_detected_fps():
@@ -199,7 +219,8 @@ def test_legacy_srt_upload_preserves_authored_bytes_and_decodes_text(encoding):
     ))
     assert result.data == data
     assert result.cues[0].plain_text == "Grüße."
-    assert result.encoding_notice
+    # A BOM identifies UTF-16/32 losslessly; only a legacy fallback needs checking.
+    assert bool(result.encoding_notice) is (encoding == "cp1252")
 
 
 def test_srt_encoding_does_not_guess_windows_for_japanese():

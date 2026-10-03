@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from dubsync.audio import AudioNormalizationLimits, tree_size_bytes
-from dubsync.pipeline import sync_episode
+from dubsync.pipeline import read_source_cues, sync_episode
 from dubsync.providers import (
     GEMINI_TRANSCRIBE_DISABLED_MESSAGE,
     GEMINI_TRANSCRIBE_MODEL,
@@ -22,7 +22,6 @@ from dubsync.providers import (
     ProviderError,
     SCRIBE_TRANSCRIBE_MODEL,
 )
-from dubsync.srt_io import read_srt
 from dubsync.source_order import sort_cues_chronologically
 from dubsync.style_profile import derive_style_profile
 from dubsync.transcription import generate_srt_from_audio
@@ -799,7 +798,9 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
             max_lines_per_cue = sync_style.max_lines_per_cue
             if max_lines_per_cue is None:  # Defensive for manually persisted job records.
                 raise ValueError("Sync maximum lines per cue is required")
-            source_cues = read_srt(job.srt_path)
+            # The same repaired cues the run ingests: a raw zero or reversed
+            # duration would fail the profile or switch off the minimum duration.
+            source_cues, _ = read_source_cues(job.srt_path)
             source_cues, _ = sort_cues_chronologically(source_cues)
             profile = derive_style_profile(source_cues).model_copy(
                 update={"max_lines_per_cue": max_lines_per_cue}

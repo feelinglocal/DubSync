@@ -53,6 +53,27 @@ def test_profile_derivation_uses_robust_limits_instead_of_single_outliers():
     assert profile.observed_min_duration == 0.1
 
 
+@pytest.mark.parametrize("timing", ["00:00:03,500 --> 00:00:03,000", "00:00:03,500 --> 00:00:03,500"])
+def test_profile_ignores_zero_and_reversed_source_durations(timing):
+    # An unusable source duration is a timing error, not a house style: it must
+    # neither fail the profile nor switch off the minimum display duration.
+    cues = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHallo Welt.\n\n"
+        f"2\n{timing}\nWie geht es dir?\n\n"
+        "3\n00:00:05,000 --> 00:00:06,500\nGut, danke.\n"
+    )
+
+    profile = derive_style_profile(cues)
+
+    assert profile.min_cue_dur == 0.5
+    assert profile.observed_min_duration == 1.0
+    assert profile.observed_max_duration == 1.5
+    assert profile.cue_count == 3
+    only_unusable = derive_style_profile(cues[1:2])
+    assert only_unusable.min_cue_dur == 0.5
+    assert only_unusable.observed_min_duration is None
+
+
 def test_detect_fps_low_confidence_unsnapped_file_falls_back_to_default():
     cues = [
         Cue(index=1, start_ms=101, end_ms=923, lines=["alpha"]),

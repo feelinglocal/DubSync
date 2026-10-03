@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import dubsync.web.app as web_app_module
+from dubsync.pipeline import sync_episode
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import derive_style_profile
 from dubsync.web.app import create_app
@@ -1365,6 +1366,67 @@ def test_default_processor_applies_sync_max_lines_override(tmp_path, monkeypatch
     assert calls["style_profile"] == expected_profile
     assert calls["fps"] == 25
     assert calls["style_path"] is None
+
+
+@pytest.mark.parametrize("timing", [
+    "00:00:03,500 --> 00:00:03,000",   # end before start: used to fail the job
+    "00:00:03,500 --> 00:00:03,500",   # zero duration: used to set the minimum duration to 0
+])
+def test_sync_max_lines_profile_uses_the_repaired_source_cues(tmp_path, monkeypatch, timing):
+    # The default style repairs an unusable source cue duration with a warning.
+    # Choosing "Maximum lines per cue" must process the same repaired cues.
+    settings = _settings(tmp_path)
+    fixture = tmp_path / "words.json"
+    fixture.write_text(json.dumps({"words": [
+        {"text": text, "start": start, "end": end}
+        for text, start, end in [
+            ("Hallo", 1.2, 1.5), ("Welt.", 1.55, 1.9), ("Wie", 3.1, 3.3), ("geht", 3.35, 3.6),
+            ("es", 3.65, 3.8), ("dir?", 3.85, 4.2), ("Gut,", 5.3, 5.6), ("danke.", 5.65, 6.1),
+        ]
+    ]}), encoding="utf-8")
+    settings.providers_path.write_text(
+        f"asr:\n  provider: fixture\n  fixture_path: {json.dumps(str(fixture))}\n", encoding="utf-8"
+    )
+    settings.ensure_directories()
+    directory = settings.data_dir / "job-sync-max-lines-repaired"
+    directory.mkdir()
+    audio = directory / "audio.wav"
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    source = directory / "original.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHallo Welt.\n\n"
+        f"2\n{timing}\nWie geht es dir?\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nGut, danke.\n",
+        encoding="utf-8",
+    )
+    job = new_job_record(
+        job_id="sync-max-lines-repaired",
+        token_hash=hash_job_token("token"),
+        mode="sync",
+        directory=directory,
+        audio_path=audio,
+        srt_path=source,
+        fps=25,
+        language="auto",
+        style=json.dumps({"source": "source_max_lines", "max_lines_per_cue": 2}),
+        retention_hours=24,
+    )
+    calls = {}
+
+    def capturing_sync(*args, **kwargs):
+        calls.update(kwargs)
+        return sync_episode(*args, **kwargs)
+
+    monkeypatch.setattr("dubsync.web.jobs.sync_episode", capturing_sync)
+
+    artifacts = default_processor(job, settings)
+
+    assert calls["style_profile"].max_lines_per_cue == 2
+    assert calls["style_profile"].min_cue_dur == 0.5
+    report = json.loads(artifacts.qc_json.read_text(encoding="utf-8"))
+    repaired = [flag for flag in report["flags"] if flag["kind"] == "source_cue_timing_repaired"]
+    assert [flag["cue_ids"] for flag in repaired] == [[2]]
+    assert artifacts.cue_count == 3
 
 
 def test_web_settings_loads_dotenv_from_current_working_directory(tmp_path, monkeypatch):

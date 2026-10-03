@@ -163,7 +163,9 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
         for line in text_without_bracketed_screen_text(cue.text).splitlines()
         if line.strip()
     ]
-    durations = [cue.duration_ms / 1000.0 for cue in dialogue_cues]
+    # A zero or reversed source duration is a timing error, not a house style:
+    # it must neither fail the profile nor switch off the minimum duration.
+    durations = [cue.duration_ms / 1000.0 for cue in dialogue_cues if cue.duration_ms > 0]
     line_counts = [
         max(
             1,
@@ -186,8 +188,7 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
         left.end_ms == right.start_ms
         for left, right in zip(dialogue_cues, dialogue_cues[1:])
     )
-    observed_min_duration = min(durations)
-    min_duration = _robust_lower_limit(durations)
+    min_duration = _robust_lower_limit(durations) if durations else 0.5
 
     notes: list[str] = []
     if any(line != line.rstrip() for cue in dialogue_cues for line in cue.lines):
@@ -197,11 +198,11 @@ def derive_style_profile(cues: list[Cue]) -> StyleProfile:
         fps=detect_fps(dialogue_cues),
         max_lines_per_cue=max(2, max_lines),
         max_chars_per_line=max(26, max_chars),
-        min_cue_dur=min(round(min_duration, 3), 0.5),
+        min_cue_dur=max(0.0, min(round(min_duration, 3), 0.5)),
         allow_zero_gap=allow_zero_gap,
         cue_count=len(cues),
-        observed_min_duration=round(observed_min_duration, 3),
-        observed_max_duration=round(max(durations), 3),
+        observed_min_duration=round(min(durations), 3) if durations else None,
+        observed_max_duration=round(max(durations), 3) if durations else None,
         notes=notes,
     )
 

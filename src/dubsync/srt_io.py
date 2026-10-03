@@ -25,16 +25,20 @@ class SubtitleEncodingWarning(UserWarning):
 def decode_srt_bytes(data: bytes, *, encoding: str | None = None) -> tuple[str, str | None]:
     """Decode common subtitle encodings, reporting every legacy conversion.
 
-    BOMs are authoritative. An unmarked Western file can use Windows-1252,
+    BOMs are authoritative, and a BOM-marked UTF-16/32 file decodes without
+    loss, so it needs no notice. An unmarked Western file can use Windows-1252,
     but ambiguous Japanese byte streams require an explicit encoding instead
     of silently becoming plausible-looking Western text.
     """
     codec = encoding
+    unicode_bom = False
     if codec is None:
         if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
             codec = "utf-32"
+            unicode_bom = True
         elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
             codec = "utf-16"
+            unicode_bom = True
         else:
             try:
                 decoded_utf8 = data.decode("utf-8-sig")
@@ -69,8 +73,10 @@ def decode_srt_bytes(data: bytes, *, encoding: str | None = None) -> tuple[str, 
         ) from exc
     if "\x00" in text:
         raise SRTParseError("subtitle contains NUL characters; check its encoding and save it as UTF-8")
-    label = "Windows-1252" if codec.lower().replace("-", "") in {"cp1252", "windows1252"} else codec
-    notice = f"Subtitle decoded as {label}; verify accented characters. UTF-8 is recommended for interchange."
+    notice = None
+    if not unicode_bom:
+        label = "Windows-1252" if codec.lower().replace("-", "") in {"cp1252", "windows1252"} else codec
+        notice = f"Subtitle decoded as {label}; verify accented characters. UTF-8 is recommended for interchange."
     return text.lstrip("\ufeff"), notice
 
 
@@ -161,7 +167,7 @@ def _validate_line_limit(
 
 def _split_blocks(text: str, limits: SRTParseLimits | None = None) -> Iterator[list[str]]:
     current: list[str] = []
-    for _, line in _iter_lines(text, limits):
+    for line_number, line in _iter_lines(text, limits):
         if line.strip() == "":
             if current:
                 yield current
@@ -174,6 +180,13 @@ def _split_blocks(text: str, limits: SRTParseLimits | None = None) -> Iterator[l
             next_index = current.pop()
             yield current
             current = [next_index, line]
+        elif len(current) >= 2 and TIMESTAMP_RE.match(line.strip()):
+            # Without its cue number the cue cannot be told apart from text:
+            # kept, it would merge two cues and show the timestamp as dialogue.
+            raise SRTParseError(
+                f"subtitle line {line_number} is a cue timestamp inside the previous cue; "
+                "add a blank line and the cue number before it"
+            )
         else:
             current.append(line)
     if current:
@@ -236,10 +249,12 @@ def write_srt(cues: list[Cue], *, renumber: bool = False) -> str:
         if not cue.plain_text:
             raise ValueError(f"cue {cue.index} has no subtitle text")
         cue_index = output_index if renumber else cue.index
+        # Break only where a reader breaks (CR/LF); str.splitlines would also
+        # turn other separators inside an authored line into an extra line.
         lines = [
             str(cue_index),
             f"{format_timestamp(cue.start_ms)} --> {format_timestamp(cue.end_ms)}",
-            *[part.rstrip() for line in cue.lines for part in line.splitlines() if part.strip()],
+            *[part.rstrip() for line in cue.lines for part in re.split(r"\r\n?|\n", line) if part.strip()],
         ]
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n"
