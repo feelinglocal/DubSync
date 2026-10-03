@@ -382,3 +382,103 @@ def test_held_keep_word_between_the_cues_own_words_stays_owned():
     updated, _, _, _ = _replay_keep(cues, words, span, alignment, answer)
 
     assert updated.cue_word_indices == {1: [0, 1, 2]}
+
+
+def _german_name_case(pause):
+    # Delivered German Scribe case-8 geometry with the pause after the
+    # spoken name lengthened: "„Damian," is the only hearing of the cue's own
+    # first source words "Damien aber".
+    name_end = 94.745 - pause
+    cues = [
+        Cue(index=41, start_ms=90883, end_ms=91970, lines=["als mitzukommen."]),
+        Cue(index=42, start_ms=93000, end_ms=96400, lines=["Damien, aber ich kann", "gar nicht reiten!"]),
+    ]
+    words = [Word(text=text, start=start, end=end, speaker_id="speaker_0") for text, start, end in [
+        ("als", 90.9, 91.08), ("mitzukommen.", 91.12, 91.775), ("„Damian,", name_end - 0.45, name_end),
+        ("ich", 94.745, 94.94), ("kann", 95.0, 95.16), ("gar", 95.2, 95.3), ("nicht", 95.34, 95.5),
+        ("reiten.\"", 95.56, 96.035),
+    ]]
+    span = DivergenceSpan(
+        case_id="case-8", cue_ids=[42], srt_text="Damien aber", asr_text="„Damian,", start=words[2].start,
+        end=name_end, srt_token_indices=[2, 3], asr_word_indices=[2], left_anchor_cue_id=41,
+        right_anchor_cue_id=42, left_anchor_end=91.775, right_anchor_start=94.745, speaker_ids=["speaker_0"],
+    )
+    return cues, words, span, AlignmentResult(cue_word_indices={41: [0, 1], 42: [3, 4, 5, 6, 7]})
+
+
+_INVALID_HOLD = (
+    AdjudicationDecision(case_id="case-8", verdict="keep_srt", final_text="Damien aber", confidence=0.0,
+                         reason="Invalid LLM response; preserved source SRT."),
+    [QCFlag(kind="invalid_llm_response", cue_ids=[42], severity="error",
+            message="LLM response failed schema validation.")],
+)
+_UNCLEAR_HOLD = (
+    AdjudicationDecision(case_id="case-8", verdict="keep_srt", final_text="Damien aber", confidence=0.0,
+                         reason="unclear", evidence="heard_unclear", heard_text=""),
+    [],
+)
+
+
+@pytest.mark.parametrize("hold", [_INVALID_HOLD, _UNCLEAR_HOLD], ids=["invalid", "heard-unclear"])
+@pytest.mark.parametrize("pause", [1.1, 1.3])
+def test_held_keep_keeps_the_only_hearing_of_its_own_first_words_across_a_longer_pause(pause, hold):
+    # W3R-1: the trim cannot tell an inserted word from the hearing of the
+    # cue's own edge source words. "Damien aber" has no other counterpart,
+    # so dropping "„Damian," started the cue after its spoken first word.
+    cues, words, span, alignment = _german_name_case(pause)
+    answer, hold_flags = hold
+
+    updated, kept, rebuilt, flags = _replay_keep(cues, words, span, alignment, answer, hold_flags=hold_flags)
+
+    assert updated.cue_word_indices == {41: [0, 1], 42: [2, 3, 4, 5, 6, 7]}
+    assert kept == cues
+    assert next(cue for cue in rebuilt if cue.index == 42).start_ms == StyleProfile().snap_floor(words[2].start * 1000)
+    # The case stays held for review.
+    assert any(flag.kind in {"invalid_llm_response", "low_confidence_adjudication"} and 42 in flag.cue_ids
+               for flag in flags)
+
+
+def test_held_keep_keeps_the_only_hearing_of_its_own_last_word_across_a_longer_pause():
+    # The same rule at the cue's end: "agora" is the only hearing of the
+    # trailing source word, said 1.2 s after the rest of the cue.
+    cues = [
+        Cue(index=1, start_ms=1000, end_ms=4000, lines=["Vamos embora já."]),
+        Cue(index=2, start_ms=6000, end_ms=7000, lines=["Certo."]),
+    ]
+    words = [Word(text=text, start=start, end=end) for text, start, end in [
+        ("Vamos", 1.0, 1.3), ("embora", 1.35, 1.8), ("agora.", 3.0, 3.4), ("Certo.", 6.0, 6.4),
+    ]]
+    span = DivergenceSpan(
+        case_id="tail", cue_ids=[1], srt_text="já", asr_text="agora.", start=3.0, end=3.4,
+        srt_token_indices=[2], asr_word_indices=[2], left_anchor_cue_id=1, right_anchor_cue_id=2,
+        left_anchor_end=1.8, right_anchor_start=6.0,
+    )
+    alignment = AlignmentResult(cue_word_indices={1: [0, 1], 2: [3]})
+    answer = AdjudicationDecision(
+        case_id="tail", verdict="keep_srt", final_text="já", confidence=0.0,
+        reason="unclear", evidence="heard_unclear", heard_text="",
+    )
+
+    updated, _, rebuilt, _ = _replay_keep(cues, words, span, alignment, answer)
+
+    assert updated.cue_word_indices == {1: [0, 1, 2], 2: [3]}
+    assert next(cue for cue in rebuilt if cue.index == 1).end_ms >= 3400
+
+
+def test_held_inserted_word_before_a_longer_pause_is_still_not_lent_to_the_cue():
+    # A span with no source tokens has no edge word to hear: the trim stays.
+    cues, words, span, alignment = _episode_11_interjection_case(_MAI_REST)
+    span = span.model_copy(update={
+        "case_id": "insert", "cue_ids": [406], "srt_text": "", "asr_text": "Ah,", "srt_token_indices": [],
+        "asr_word_indices": [4], "start": words[4].start, "end": words[4].end, "left_anchor_cue_id": 403,
+        "right_anchor_cue_id": 406, "right_anchor_start": words[5].start,
+    })
+    alignment = AlignmentResult(cue_word_indices={403: [0, 1, 2, 3], 406: [5, 6, 7]})
+    answer = AdjudicationDecision(
+        case_id="insert", verdict="keep_srt", final_text="", confidence=0.0,
+        reason="unclear", evidence="heard_unclear", heard_text="",
+    )
+
+    updated, _, _, _ = _replay_keep(cues, words, span, alignment, answer)
+
+    assert updated.cue_word_indices == {403: [0, 1, 2, 3], 406: [5, 6, 7]}

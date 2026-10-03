@@ -4912,6 +4912,7 @@ def _alignment_with_decision_words(
     protected_cue_ids = set(alignment.diagnostics.missing_audio_cue_ids)
     cue_word_indices = {cue_id: list(indices) for cue_id, indices in alignment.cue_word_indices.items()}
     mapping_flags = list(alignment.flags)
+    source_tokens = None
 
     def hold_mapping(flag: QCFlag) -> None:
         mapping_flags.append(flag)
@@ -5087,9 +5088,14 @@ def _alignment_with_decision_words(
                 if not existing:
                     continue
                 if held_keep and words is not None:
-                    spoken_indices = _held_keep_continuous_words(
-                        spoken_indices, existing, words, max_intra_cue_gap,
-                    )
+                    if source_tokens is None:
+                        source_tokens = tokenize_cues(source_cues or [])
+                    edge_tokens = _span_edge_source_token_counts(span, cue_id, source_tokens)
+                    if edge_tokens is not None:
+                        spoken_indices = _held_keep_continuous_words(
+                            spoken_indices, existing, words, max_intra_cue_gap,
+                            leading_tokens=edge_tokens[0], trailing_tokens=edge_tokens[1],
+                        )
             combined = sorted(set(cue_word_indices.get(cue_id, []) + spoken_indices))
             if combined:
                 cue_word_indices[cue_id] = combined
@@ -5236,14 +5242,45 @@ def _kept_words_join_own_anchors(
 _HELD_KEEP_MAX_CONTINUATION_GAP_SECONDS = 1.0
 
 
+def _span_edge_source_token_counts(span, cue_id, tokens) -> tuple[int, int] | None:
+    """Count the span's source tokens of a cue before and after its other tokens.
+
+    These are the cue's own edge words that the span's audio words may be
+    the only hearing of; an inserted span has none. None when the span's
+    token indices do not resolve against the source tokens, so nothing can
+    be counted and no word is dropped.
+    """
+    indices = span.srt_token_indices
+    if not indices:
+        return 0, 0
+    if any(index < 0 or index >= len(tokens) for index in indices):
+        return None
+    in_span = set(indices)
+    cue_tokens = [index for index, token in enumerate(tokens) if token.cue_id == cue_id]
+    others = [index for index in cue_tokens if index not in in_span]
+    mine = [index for index in cue_tokens if index in in_span]
+    if not others:
+        return len(mine), len(mine)
+    return (
+        sum(1 for index in mine if index < others[0]),
+        sum(1 for index in mine if index > others[-1]),
+    )
+
+
 def _held_keep_continuous_words(
     added: list[int], anchors: list[int], words: list[Word], max_gap: float,
+    *, leading_tokens: int = 0, trailing_tokens: int = 0,
 ) -> list[int]:
     """Drop unconfirmed words that a pause separates from the cue's own words.
 
     Words between the cue's first and last own word stay, so the cue keeps
-    its inner pauses bridged. Before and after them, a word joins only when
-    no longer pause than the continuation gap lies between it and those words.
+    its inner pauses bridged. Before and after them, a word joins when no
+    longer pause than the continuation gap lies between it and those words.
+    A word across a longer pause may still be the only hearing of the cue's
+    own first (or last) source words: each side keeps its added words
+    nearest the cue's own words, up to the number of the span's source
+    tokens on that side of the cue, so a cue never starts after its spoken
+    first word. Only the surplus beyond the pause is dropped.
     """
     gap = min(_HELD_KEEP_MAX_CONTINUATION_GAP_SECONDS, max_gap)
     own = {index for index in anchors if 0 <= index < len(words)}
@@ -5261,7 +5298,22 @@ def _held_keep_continuous_words(
         end = max(end, words[index].end)
     anchored = [position for position, group in enumerate(groups) if own.intersection(group)]
     continuous = {index for group in groups[anchored[0] : anchored[-1] + 1] for index in group}
-    return [index for index in added if index in continuous]
+    added_set = set(added)
+    first_own = min(ordered.index(index) for index in own)
+    last_own = max(ordered.index(index) for index in own)
+    kept = continuous & added_set
+    for side, allowance in (
+        (list(reversed(ordered[:first_own])), leading_tokens),
+        (ordered[last_own + 1 :], trailing_tokens),
+    ):
+        remaining = allowance - sum(1 for index in side if index in kept)
+        for index in side:
+            if remaining <= 0:
+                break
+            if index in added_set and index not in kept:
+                kept.add(index)
+                remaining -= 1
+    return [index for index in added if index in kept]
 
 
 def _indexed_replacement_word_indices(
