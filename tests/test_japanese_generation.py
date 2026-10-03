@@ -84,6 +84,9 @@ def test_japanese_narrow_cues_keep_standalone_punctuation_with_dialogue():
     ("散歩に行きませんか？", 16, ["散歩に", "行きませんか？"]),
     ("ちょっと待ってくださいね。", 16, ["ちょっと待って", "くださいね。"]),
     ("俺はただ正当防衛をしたまでだ。", 16, ["俺はただ正当防衛", "をしたまでだ。"]),
+    # Greedy wrapping broke inside these kanji and katakana runs (看|護師, スマート|フォン).
+    ("彼は大学病院の看護師です。", 16, ["彼は大学病院の", "看護師です。"]),
+    ("これは最新型スマートフォンだよ。", 20, ["これは最新型", "スマートフォンだよ。"]),
 ])
 def test_japanese_generation_wraps_like_synchronized_output(tmp_path, sentence, width, expected):
     # MAI and Scribe return one Japanese character per word.
