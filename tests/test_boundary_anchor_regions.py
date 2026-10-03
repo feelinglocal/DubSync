@@ -187,6 +187,18 @@ def test_collapsed_accent_anchor_still_enters_the_question():
     assert result[0].start == 1.198 and result[0].left_anchor_cue_id is None
 
 
+def test_a_collapsed_homophone_anchor_never_expands():
+    # W3R-7: the collapsed-anchor fault used to pin "a collapsed anchor never expands"; since F9 only
+    # a heard accent (é/e) expands when collapsed. "À" and "a" sound alike, so a 1 ms "À" is no
+    # evidence and the script word stays read-only. (A timed À/A collision expands as before F9.)
+    case = _case()
+    case["cues"][1] = case["cues"][1].model_copy(update={"lines": ["A aí, o que você está sentindo agora?"]})
+    case["tokens"] = tokenize_cues(case["cues"])
+    case["words"][1] = case["words"][1].model_copy(update={"text": "À", "start": 1.198})
+
+    assert _extend(case) == case["spans"]
+
+
 def _aligned(cues, raw_words, **word_fields):
     from dubsync.aligner import align_cues_to_words
     words = [Word(text=text, start=start, end=end, speaker_id="s", **word_fields) for text, start, end in raw_words]
