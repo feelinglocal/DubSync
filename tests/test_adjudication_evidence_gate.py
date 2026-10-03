@@ -58,3 +58,48 @@ def test_uncertain_hearing_with_a_spoken_side_stays_customer_review(source, asr,
     assert flag is not None and flag.kind == "low_confidence_adjudication"
     review = build_review([flag], [], _SOURCE, source_cues=_SOURCE)
     assert [item.raw_flags for item in review.review] == [[0]]
+
+
+_2B_CUE = [Cue(index=79, start_ms=109_100, end_ms=110_900, lines=["大井周治 いい度胸だな！"])]
+
+
+def _2b_scribe_case_36(final_text, *, srt_text="大井周治", asr_text="おい秀二"):
+    # Delivered 2B-scribe case-36: the MAI run of the same audio hears 大井周治 clearly.
+    span = DivergenceSpan(case_id="case-36", cue_ids=[79], srt_text=srt_text, asr_text=asr_text,
+                          start=109.16, end=109.9, srt_token_indices=[547, 548, 549, 550],
+                          asr_word_indices=[582, 583, 585, 586])
+    decision = AdjudicationDecision(
+        case_id="case-36", verdict="hybrid", final_text=final_text, confidence=1.0,
+        reason="Speaker says interjection 'おい' followed by the character's name '周治'.",
+        evidence="heard_clearly", heard_text=final_text,
+    )
+    return span, decision
+
+
+def test_a_clear_hearing_that_respells_source_kanji_in_kana_is_held_for_review():
+    # W3R-3 / F10: 大井 and おい sound alike; the hearing cannot tell the customer's name from the
+    # interjection, so the confident rewrite 大井周治 -> おい周治 is held, not applied silently.
+    span, decision = _2b_scribe_case_36("おい周治")
+
+    selected, flag = confidence_gated_decision(span, decision, .7)
+
+    assert (selected.verdict, selected.final_text) == ("keep_srt", "大井周治")
+    assert flag is not None and flag.kind == "low_confidence_adjudication"
+    assert (flag.old_text, flag.new_text, flag.cue_ids) == ("大井周治", "おい周治", [79])
+    review = build_review([flag], [], _2B_CUE, source_cues=_2B_CUE)
+    assert [item.raw_flags for item in review.review] == [[0]]
+
+
+@pytest.mark.parametrize("srt_text,final_text", [
+    ("山下様", "山下さん"),  # one kanji: a real honorific change (delivered 1B 様 -> さん)
+    ("いい度胸", "いい根性"),  # kanji to kanji stays a model decision
+    ("そうだね", "そうだよ"),  # kana only
+    ("大井周治", "大井周治さん"),  # an addition keeps every kanji
+])
+def test_other_confident_rewrites_still_apply(srt_text, final_text):
+    span, decision = _2b_scribe_case_36(final_text, srt_text=srt_text, asr_text=final_text)
+
+    selected, flag = confidence_gated_decision(span, decision, .7)
+
+    assert flag is None
+    assert selected.final_text == final_text

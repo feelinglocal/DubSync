@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
+from difflib import SequenceMatcher
 from math import isfinite
 from typing import Protocol
 
@@ -427,6 +429,45 @@ def _is_request_timeout(exc: BaseException) -> bool:
     return False
 
 
+# The audio cannot tell a kanji spelling from kana of the same sound: 大井 and
+# おい, a name and an interjection. A clear hearing that spells two or more of
+# the source's kanji in kana is therefore no evidence for the change; the
+# customer's spelling stays and the proposal is reviewed. One kanji (様 -> さん)
+# is a real wording change and still applies.
+_KANA_RESPELLING_HOLD = (
+    "The proposed wording spells source kanji in kana; the audio cannot tell a same-sounding "
+    "respelling (such as a name) from a different word"
+)
+_MIN_RESPELLED_KANJI = 2
+
+
+def _japanese_script(character: str) -> str:
+    name = unicodedata.name(character, "")
+    if character in "々〆" or name.startswith(("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")):
+        return "kanji"
+    if "HIRAGANA" in name or "KATAKANA" in name:
+        return "kana"
+    return "other"
+
+
+def respells_kanji_in_kana(source: str, proposed: str) -> bool:
+    """Whether ``proposed`` replaces a run of two or more source kanji with kana only."""
+    source = unicodedata.normalize("NFKC", source)
+    proposed = unicodedata.normalize("NFKC", proposed)
+    matcher = SequenceMatcher(None, source, proposed, autojunk=False)
+    for operation, first, last, start, end in matcher.get_opcodes():
+        if operation != "replace":
+            continue
+        replaced, replacement = source[first:last], proposed[start:end]
+        if (
+            len(replaced) >= _MIN_RESPELLED_KANJI
+            and all(_japanese_script(character) == "kanji" for character in replaced)
+            and all(_japanese_script(character) == "kana" for character in replacement)
+        ):
+            return True
+    return False
+
+
 def confidence_gated_decision(
     span: DivergenceSpan,
     decision: AdjudicationDecision,
@@ -447,10 +488,18 @@ def confidence_gated_decision(
         decision.verdict == "keep_srt" and decision.final_text == span.srt_text
         and decision.evidence == "heard_clearly" and not _evidence_supports_wording(decision, policy)
     )
-    if not uncertain_audio and not uncertain_source_keep and decision.confidence >= confidence_gate:
+    kana_respelling = (
+        not uncertain_audio and decision.verdict != "keep_srt"
+        and respells_kanji_in_kana(span.srt_text, decision.final_text)
+    )
+    if (
+        not uncertain_audio and not uncertain_source_keep and not kana_respelling
+        and decision.confidence >= confidence_gate
+    ):
         return decision, None
     hold_reason = ("Reported hearing differs from the preserved source wording and their equivalence is unresolved"
                    if uncertain_source_keep else "Adjudication audio evidence is unclear or inaudible" if uncertain_audio
+                   else _KANA_RESPELLING_HOLD if kana_respelling
                    else "Adjudication confidence is below the configured gate")
     flag = QCFlag(
         kind="low_confidence_adjudication",
