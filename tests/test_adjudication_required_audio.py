@@ -8,7 +8,8 @@ import wave
 import pytest
 import yaml
 
-from dubsync.adjudication import AdjudicationEngine
+from dubsync.adjudication import AdjudicationEngine, _snippet_covers_span
+from dubsync.hybrid_adjudication import _complete_clip
 from dubsync.models import AudioSnippet, DivergenceSpan
 from dubsync import pipeline
 from dubsync.providers import ProviderError
@@ -150,6 +151,37 @@ def test_required_clip_must_cover_the_complete_finite_case_window(tmp_path, boun
 
     _assert_held(decisions[0], flags, span)
     assert adapter.calls == []
+
+
+def test_required_clip_must_contain_the_retained_words_of_the_cue_it_edits(tmp_path):
+    # ep17 case-199: 'na Lime' ends cue 485 after 'cargos.' (1816.745 s); the
+    # case's only ASR word is 'Oi.' 90 s later. The clip was cut around 'Oi.',
+    # passed this guard, and the reviewer could only keep the source unheard.
+    span = DivergenceSpan(
+        case_id="case-199", cue_ids=[485], srt_text="na Lime", asr_text="Oi.",
+        srt_token_indices=[2250, 2251], asr_word_indices=[2070], start=1906.635, end=1906.895,
+        left_anchor_cue_id=485, right_anchor_cue_id=486, left_anchor_end=1816.745, right_anchor_start=1907.155,
+    )
+    around_word = AudioSnippet(case_id=span.case_id, path=str(_wav(tmp_path / "far.wav")),
+                               start=1904.635, end=1908.895)
+    adapter = _AudioAdapter()
+    decisions, flags = AdjudicationEngine(
+        adapter, audio_snippet_batches=_loader({span.case_id: around_word}), require_audio_snippets=True,
+    ).adjudicate([span])
+
+    _assert_held(decisions[0], flags, span)
+    assert adapter.calls == []
+    assert not _snippet_covers_span(around_word, span) and not _complete_clip(span, around_word)
+    reaching_cue = around_word.model_copy(update={"start": 1814.745})
+    assert _snippet_covers_span(reaching_cue, span) and _complete_clip(span, reaching_cue)
+    # Words spoken at the cue's own time need no extra padding to reach it.
+    beside = span.model_copy(update={"start": 1817.145, "end": 1817.4})
+    assert _snippet_covers_span(around_word.model_copy(update={"start": 1817.145, "end": 1817.4}), beside)
+    # One edge suffices for a cue whose retained words surround the case; a cue
+    # without retained words beside the case sets no edge.
+    surrounded = span.model_copy(update={"right_anchor_cue_id": 485})
+    assert _snippet_covers_span(around_word, surrounded)
+    assert _snippet_covers_span(around_word, span.model_copy(update={"left_anchor_cue_id": 484}))
 
 
 def test_zero_confidence_gate_cannot_override_missing_audio_protection():

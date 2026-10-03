@@ -10,14 +10,19 @@ with its own timing. When no group is spoken at the cue's time, the replaced
 tokens are removed and every group is inserted where it is spoken. A wording
 that cannot be divided is held as a whole, and kept source text is timed only
 by the words at its own time.
+
+Before adjudication, a partly retained cue whose unmatched tail or head shares
+a case with words spoken seconds away gets its own question at the cue's own
+time: a clip cut around those words would not contain the cue.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from math import isfinite
 
 from .adjudication_regions import (
-    JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SONG_CAPTION_PREFIX, SPEECH_REPEAT_PREFIX,
+    JOINT_REGION_PREFIX, PROTECTED_SOURCE_PREFIX, SONG_CAPTION_PREFIX, SPEECH_REPEAT_PREFIX, is_song_caption_cue,
 )
 from .aligner import SONG_SOURCE_PREFIX
 from .changes import indexed_span_bounds, replacement_text_cuts
@@ -25,7 +30,7 @@ from .edit_consistency import held_decisions
 from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, SpeechRegion, Word
 from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import join_word_texts
-from .tokenize import alphanumeric_signature
+from .tokenize import SRTToken, alphanumeric_signature, tokenize_cues
 
 DETACHED_SPEECH_PREFIX = "detached-"
 _DERIVED_PREFIXES = (
@@ -33,6 +38,8 @@ _DERIVED_PREFIXES = (
     SONG_SOURCE_PREFIX, DETACHED_SPEECH_PREFIX,
 )
 _HELD_KIND = "adjudication_replacement_ownership_held"
+# Only an aligner case is divided before hearing; derived questions keep their scope.
+_ALIGNER_CASE_ID = re.compile(r"case-\d+")
 # A cue without retained words is expected near its source time, moved by the
 # offset its matched neighbours show.
 _EXPECTED_WINDOW_PAD_SECONDS = 0.5
@@ -104,6 +111,109 @@ def separate_detached_speech(
     for decision in decisions:
         divided.extend(replaced.get(decision.case_id, [decision]))
     return alignment.model_copy(update={"divergence_spans": spans}), divided, flags
+
+
+def separate_unheard_cue_edges(
+    spans: list[DivergenceSpan],
+    cues: list[Cue],
+    words: list[Word],
+    *,
+    max_intra_cue_gap: float = 1.5,
+    protected_cue_ids: set[int] | None = None,
+) -> list[DivergenceSpan]:
+    """Ask about a partly retained cue's unmatched edge at the cue's own time.
+
+    A case runs from one matched word to the next and is timed by its words
+    only. The unmatched tail of a cue can therefore share a case with the next
+    unmatched word although that word is spoken seconds later ("cargos na
+    Lime." with "Oi." 90 s away): the clip is cut around the word, does not
+    contain the cue, and the reviewer can only keep the source. When no word
+    of a case lies within ``max_intra_cue_gap`` of a cue's retained words,
+    that cue's unmatched tokens become their own source-only question, timed
+    from the retained edge over the pause in which they would be spoken. The
+    rest keeps the case id and every word, as a pure insertion when no source
+    token is left, so a far word is still heard and placed or held at its own
+    time. A cue whose retained words surround the case keeps its own pause.
+    """
+    tokens = tokenize_cues(cues)
+    cues_by_id = {cue.index: cue for cue in cues}
+    protected = protected_cue_ids or set()
+    result: list[DivergenceSpan] = []
+    for span in spans:
+        result.extend(_unheard_edge_questions(span, cues_by_id, tokens, words, max_intra_cue_gap, protected))
+    return result
+
+
+def _unheard_edge_questions(
+    span: DivergenceSpan, cues_by_id: dict[int, Cue], tokens: list[SRTToken], words: list[Word],
+    max_gap: float, protected: set[int],
+) -> list[DivergenceSpan]:
+    source, audio = span.srt_token_indices, span.asr_word_indices
+    if (
+        not _ALIGNER_CASE_ID.fullmatch(span.case_id) or not source or not audio
+        or span.insertion_token_offset is not None
+        or any(not 0 <= index < len(tokens) for index in source)
+        or any(not 0 <= index < len(words) for index in audio)
+        or set(span.cue_ids) & protected
+        or any(cue_id not in cues_by_id or is_song_caption_cue(cues_by_id[cue_id]) for cue_id in span.cue_ids)
+    ):
+        return [span]
+    spoken = [words[index] for index in audio]
+    if any(not isfinite(word.start) or not isfinite(word.end) or word.end < word.start for word in spoken):
+        return [span]
+    left_cue, right_cue = span.left_anchor_cue_id, span.right_anchor_cue_id
+    if left_cue is not None and left_cue == right_cue:
+        # The cue's own retained words surround the case: the pause is its own.
+        return [span]
+    first_start, last_end = min(word.start for word in spoken), max(word.end for word in spoken)
+    tail = [index for index in source if tokens[index].cue_id == left_cue]
+    head = [index for index in source if tokens[index].cue_id == right_cue]
+    split_tail = bool(tail) and source[:len(tail)] == tail and _finite(span.left_anchor_end) and (
+        first_start - span.left_anchor_end > max_gap
+    )
+    split_head = bool(head) and source[len(source) - len(head):] == head and _finite(span.right_anchor_start) and (
+        span.right_anchor_start - last_end > max_gap
+    )
+    if not split_tail and not split_head:
+        return [span]
+    rest = source[len(tail) if split_tail else 0:len(source) - len(head) if split_head else len(source)]
+    questions: list[DivergenceSpan] = []
+    if split_tail:
+        questions.append(_edge_question(
+            span, tail, tokens, f"{DETACHED_SPEECH_PREFIX}tail-{span.case_id}",
+            span.left_anchor_end, span.left_anchor_end + max_gap, keep="left",
+        ))
+    questions.append(span.model_copy(update={
+        "cue_ids": sorted({tokens[index].cue_id for index in rest}),
+        "srt_text": join_word_texts(tokens[index].text for index in rest),
+        "srt_token_indices": rest,
+    }))
+    if split_head:
+        questions.append(_edge_question(
+            span, head, tokens, f"{DETACHED_SPEECH_PREFIX}head-{span.case_id}",
+            span.right_anchor_start - max_gap, span.right_anchor_start, keep="right",
+        ))
+    return questions
+
+
+def _edge_question(
+    span: DivergenceSpan, indices: list[int], tokens: list[SRTToken], case_id: str, start: float, end: float,
+    *, keep: str,
+) -> DivergenceSpan:
+    # Like any source-only deletion it borders only its own cue's retained
+    # word; the far words beyond the pause are no anchor of it.
+    other = "right" if keep == "left" else "left"
+    return span.model_copy(update={
+        "case_id": case_id,
+        "cue_ids": [tokens[indices[0]].cue_id],
+        "srt_text": join_word_texts(tokens[index].text for index in indices),
+        "srt_token_indices": list(indices),
+        "asr_text": "", "asr_word_indices": [], "speaker_ids": [], "confidence": 0.0,
+        "insertion_token_offset": None, "start": start, "end": end,
+        f"{other}_anchor_cue_id": None,
+        f"{other}_anchor_{'start' if other == 'right' else 'end'}": None,
+        f"{other}_anchor_speaker_id": None,
+    })
 
 
 def _separate(

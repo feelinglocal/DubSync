@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import json
+import wave
 
+import pytest
 import yaml
 
 from dubsync import pipeline
-from dubsync.detached_speech import DETACHED_SPEECH_PREFIX, separate_detached_speech
-from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, SpeechRegion, Word
+from dubsync.aligner import align_cues_to_words
+from dubsync.audio_snippets import _snippet_window
+from dubsync.detached_speech import DETACHED_SPEECH_PREFIX, separate_detached_speech, separate_unheard_cue_edges
+from dubsync.models import (
+    AdjudicationDecision, AlignmentResult, AudioSnippet, Cue, DivergenceSpan, SpeechRegion, Word,
+)
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
 
@@ -325,8 +331,12 @@ _ONLY_FAR_WORDS = [
 def test_single_approved_word_spoken_far_from_the_cue_is_not_written_into_it(tmp_path):
     # The case's only word is spoken 14 s after the cue's retained "no": the
     # approved wording replaced "Natal" inside the cue, shown 14 s early.
+    # 'Natal' is now asked about at the cue's own time, "Alô?" at its own.
     srt = _NEW_YEAR_SRT.replace("00:00:02,670", "00:00:02,400")
-    cues, flags = _sync(tmp_path, srt, _ONLY_FAR_WORDS, {"case-1": _decide("case-1", "Alô?")})
+    cues, flags = _sync(tmp_path, srt, _ONLY_FAR_WORDS, {
+        "case-1": _decide("case-1", "Alô?"),
+        f"{DETACHED_SPEECH_PREFIX}tail-case-1": _decide(f"{DETACHED_SPEECH_PREFIX}tail-case-1", ""),
+    })
 
     assert [cue.plain_text for cue in cues] == ["Realizem seus desejos", "no.", "Alô?", "Quem está falando agora?"]
     assert _near(cues[1].start_ms, 1.68) and _near(cues[2].start_ms, 15.90)
@@ -349,18 +359,24 @@ def test_far_word_directly_before_the_next_line_still_joins_that_line(tmp_path):
         ("a", 13.98, 14.02), ("vítima,", 14.06, 14.60),
     ]
 
-    cues, _ = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "E")})
+    cues, _ = _sync(tmp_path, srt, words, {
+        "case-1": _decide("case-1", "E"),
+        f"{DETACHED_SPEECH_PREFIX}tail-case-1": _decide(f"{DETACHED_SPEECH_PREFIX}tail-case-1", ""),
+    })
 
     assert [cue.plain_text for cue in cues] == ["eu vou estar ferrada.", "E se não for só eu a vítima,"]
     assert _near(cues[0].end_ms, 8.96) and _near(cues[1].start_ms, 13.04)
 
 
-def test_far_wording_with_other_words_than_the_audio_is_not_placed(tmp_path):
+def test_far_wording_with_other_words_than_the_audio_is_not_placed():
     # The approved text keeps a source word: it is not the far speech alone.
-    cues, flags = _sync(tmp_path, _NEW_YEAR_SRT, _ONLY_FAR_WORDS, {"case-1": _decide("case-1", "Natal, alô?", "hybrid")})
+    # (An aligner case asks about 'Natal' and "Alô?" apart before hearing; a
+    # derived question is still divided only after it.)
+    far_only = _span(asr_text="Alô?", asr_word_indices=[6], start=15.90, end=16.30)
+    alignment, decisions, flags = _separate(far_only, "Natal, alô?", "hybrid")
 
-    assert [cue.plain_text for cue in cues][1] in {"no Natal, alô?", "no Natal."}
-    assert "adlib_inserted" not in _kinds(flags)
+    assert alignment.divergence_spans == [far_only] and flags == []
+    assert [(decision.case_id, decision.final_text) for decision in decisions] == [("case-1", "Natal, alô?")]
 
 
 def test_single_far_word_does_not_time_the_kept_cue(tmp_path):
@@ -375,7 +391,8 @@ def test_single_far_word_does_not_time_the_kept_cue(tmp_path):
         ("Até", 13.00, 13.20), ("amanhã", 13.22, 13.60), ("então.", 13.62, 13.95),
     ]
 
-    cues, flags = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "primeiro", "keep_srt")})
+    tail = f"{DETACHED_SPEECH_PREFIX}tail-case-1"
+    cues, flags = _sync(tmp_path, srt, words, {tail: _decide(tail, "primeiro", "keep_srt")})
 
     assert [cue.plain_text for cue in cues] == ["Vou voltar primeiro.", "Até amanhã então."]
     assert _near(cues[0].start_ms, 5.255) and cues[0].end_ms < 7000
@@ -399,3 +416,205 @@ def test_kept_source_text_is_timed_only_by_the_words_at_its_own_time(tmp_path):
     assert [cue.plain_text for cue in cues] == ["Realizem seus desejos", "no Natal.", "Quem está falando agora?"]
     assert _near(cues[1].start_ms, 1.68) and _near(cues[1].end_ms, 2.52)
     assert "timing_outlier_trimmed" not in _kinds(report_flags)
+
+
+def _aligned(srt: str, words: list[tuple]):
+    cues = parse_srt_text(srt)
+    spoken = [Word(text=text, start=start, end=end, confidence=None) for text, start, end in words]
+    return cues, spoken, align_cues_to_words(cues, spoken).divergence_spans
+
+
+_FAR_TAIL_SRT = (
+    "1\n00:00:05,110 --> 00:00:05,870\nVou voltar primeiro.\n\n"
+    "2\n00:00:12,520 --> 00:00:13,400\nO que você quer?\n"
+)
+# ep17 cue 140 shape: 'primeiro' is not spoken; "Ah!" is spoken 3 s after 'voltar.'.
+_FAR_TAIL_WORDS = [
+    ("Vou", 5.24, 5.38), ("voltar.", 5.48, 5.88), ("Ah!", 8.88, 9.08),
+    ("O", 12.64, 12.68), ("que", 12.72, 12.82), ("você", 12.86, 13.10), ("quer?", 13.12, 13.40),
+]
+
+
+def test_cue_tail_and_far_word_are_asked_about_at_their_own_times():
+    cues, words, spans = _aligned(_FAR_TAIL_SRT, _FAR_TAIL_WORDS)
+    (shared,) = spans
+    assert (shared.cue_ids, shared.srt_text, shared.asr_text) == ([1], "primeiro", "Ah!")
+
+    tail, far = separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5)
+
+    assert tail.case_id == f"{DETACHED_SPEECH_PREFIX}tail-case-1"
+    assert (tail.cue_ids, tail.srt_text, tail.srt_token_indices) == ([1], "primeiro", shared.srt_token_indices)
+    assert (tail.asr_word_indices, tail.asr_text, tail.start, tail.end) == ([], "", 5.88, 5.88 + 1.5)
+    assert (tail.left_anchor_cue_id, tail.left_anchor_end, tail.right_anchor_cue_id, tail.right_anchor_start) == (
+        1, 5.88, None, None)
+    assert (far.case_id, far.cue_ids, far.srt_text, far.srt_token_indices) == ("case-1", [], "", [])
+    assert (far.asr_word_indices, far.asr_text, far.start, far.end) == ([2], "Ah!", 8.88, 9.08)
+    assert (far.left_anchor_cue_id, far.right_anchor_cue_id, far.insertion_token_offset) == (1, 2, None)
+
+
+def test_retained_cue_edge_far_from_the_words_of_a_shared_case_is_asked_alone():
+    # ep17 case-212: 'do seu prédio' ends cue 527; the case's only word "Sem"
+    # is spoken 11 s later, directly before the next cue's retained words.
+    srt = (
+        "1\n00:00:10,000 --> 00:00:11,300\nEu moro no último andar do seu prédio.\n\n"
+        "2\n00:00:21,700 --> 00:00:22,900\nNão tenho medo de altura.\n"
+    )
+    cues, words, spans = _aligned(srt, [
+        ("Eu", 10.00, 10.10), ("moro", 10.12, 10.30), ("no", 10.32, 10.40), ("último", 10.42, 10.70),
+        ("andar.", 10.72, 11.00), ("Sem", 21.82, 22.02),
+        ("medo", 22.12, 22.30), ("de", 22.32, 22.38), ("altura.", 22.40, 22.80),
+    ])
+    (shared,) = spans
+    assert (shared.cue_ids, shared.asr_text) == ([1, 2], "Sem")
+
+    tail, rest = separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5)
+
+    assert (tail.case_id, tail.cue_ids, tail.srt_text, tail.asr_word_indices) == (
+        f"{DETACHED_SPEECH_PREFIX}tail-case-1", [1], "do seu prédio", [])
+    assert (tail.start, tail.end) == (11.00, 11.00 + 1.5)
+    assert (rest.case_id, rest.cue_ids, rest.srt_text, rest.asr_text) == ("case-1", [2], "Não tenho", "Sem")
+    assert (rest.start, rest.end, rest.right_anchor_cue_id) == (21.82, 22.02, 2)
+
+
+def test_words_near_the_cue_or_inside_its_own_pause_keep_the_shared_case():
+    near = [*_FAR_TAIL_WORDS[:2], ("primeira.", 6.10, 6.50), *_FAR_TAIL_WORDS[3:]]
+    cues, words, spans = _aligned(_FAR_TAIL_SRT, near)
+    assert separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5) == spans
+
+    # The cue's own retained words surround the far word: the pause is its own.
+    cues, words, spans = _aligned("1\n00:00:01,000 --> 00:00:07,500\nEu vou agora mesmo embora.\n", [
+        ("Eu", 1.00, 1.20), ("vou", 1.22, 1.40), ("Hã?", 4.00, 4.20), ("mesmo", 6.60, 6.90), ("embora.", 6.92, 7.40),
+    ])
+    assert [span.asr_text for span in spans] == ["Hã?"]
+    assert separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5) == spans
+
+
+class _ClipRecordingAdapter:
+    """Records each question with its clip; answers like a reviewer who heard it."""
+
+    def __init__(self, approve: bool):
+        self.approve = approve
+        self.questions: list[tuple[DivergenceSpan, AudioSnippet]] = []
+
+    def adjudicate(self, spans):
+        raise AssertionError("a required-audio case must not be answered from text")
+
+    def adjudicate_with_audio(self, spans, snippets):
+        self.questions.extend((span, snippets[span.case_id]) for span in spans)
+        if not self.approve:
+            return []
+        # The cue tail is not heard at the cue's time; the far word is heard at its own.
+        return [{"case_id": span.case_id, "verdict": "use_audio", "final_text": span.asr_text, "confidence": 0.95,
+                 "evidence": "heard_clearly", "heard_text": span.asr_text, "reason": "heard in the clip"}
+                for span in spans]
+
+
+def _silent_wav(path, seconds: float):
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\x00\x00" * int(16000 * seconds))
+    return path
+
+
+def _hearing_run(tmp_path, monkeypatch, srt: str, words: list[tuple], adapter: _ClipRecordingAdapter):
+    # Clip windows come from the real window rule; only ffmpeg is replaced.
+    def extract(_audio, spans, directory, *, pad_seconds, max_duration_seconds, max_covering_duration_seconds,
+                **_kwargs):
+        directory.mkdir(parents=True, exist_ok=True)
+        snippets = []
+        for span in spans:
+            start, end = _snippet_window(
+                span.start, span.end, pad_seconds, max_duration_seconds, max_covering_duration_seconds,
+            )
+            path = _silent_wav(directory / f"{span.case_id}.wav", 0.1)
+            snippets.append(AudioSnippet(
+                case_id=span.case_id, path=str(path), start=round(start, 3), end=round(end, 3),
+            ))
+        return snippets
+
+    original = pipeline.llm_adapter_from_config
+    monkeypatch.setattr(pipeline, "extract_audio_snippets", extract)
+    monkeypatch.setattr(pipeline, "llm_adapter_from_config", lambda config, pass_name=None: (
+        adapter if pass_name == "adjudication" else original(config, pass_name=pass_name)))
+    source = tmp_path / "episode.srt"
+    source.write_text(srt, encoding="utf-8")
+    audio = _silent_wav(tmp_path / "episode.wav", 15)
+    fixture = tmp_path / "words.json"
+    fixture.write_text(json.dumps({"words": [
+        {"text": text, "start": start, "end": end, "confidence": None} for text, start, end in words
+    ]}, ensure_ascii=False), encoding="utf-8")
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(fixture)},
+        "llm": {"provider": "fixture", "responses": {}, "adjudication": {
+            "audio_snippet_double_check": {"enabled": True, "pad_seconds": 2.0, "max_duration_seconds": 20.0},
+        }},
+    }, allow_unicode=True), encoding="utf-8")
+    output = tmp_path / "episode.synced.srt"
+
+    def run(**kwargs):
+        result = pipeline.sync_episode(
+            source, audio, output, tmp_path / "work", providers_path=providers,
+            style_profile=StyleProfile(fps=30, min_cue_dur=0.5), **kwargs,
+        )
+        return parse_srt_text(output.read_text(encoding="utf-8")), result.report["flags"]
+
+    return run
+
+
+def _contains(snippet: AudioSnippet, start: float, end: float) -> bool:
+    return snippet.start <= start and snippet.end >= end
+
+
+def test_cue_tail_is_heard_at_its_own_time_and_an_unanswered_far_word_is_flagged(tmp_path, monkeypatch):
+    # The clip of the shared case was cut around "Ah!" and did not contain the
+    # cue; the reviewer kept 'primeiro' unheard and "Ah!" ended in no cue and no flag.
+    adapter = _ClipRecordingAdapter(approve=False)
+    cues, flags = _hearing_run(tmp_path, monkeypatch, _FAR_TAIL_SRT, _FAR_TAIL_WORDS, adapter)()
+
+    asked = {span.case_id: (span, clip) for span, clip in adapter.questions}
+    assert sorted(asked) == ["case-1", f"{DETACHED_SPEECH_PREFIX}tail-case-1"]
+    tail, tail_clip = asked[f"{DETACHED_SPEECH_PREFIX}tail-case-1"]
+    far, far_clip = asked["case-1"]
+    assert (tail.cue_ids, tail.srt_text, tail.asr_text) == ([1], "primeiro", "")
+    assert _contains(tail_clip, 5.11, 5.88)  # the cue as written and as spoken
+    assert (far.cue_ids, far.asr_text) == ([], "Ah!") and _contains(far_clip, 8.88, 9.08)
+
+    assert [cue.plain_text for cue in cues] == ["Vou voltar primeiro.", "O que você quer?"]
+    assert _near(cues[0].start_ms, 5.24) and cues[0].end_ms < 7000
+    assert [flag["kind"] for flag in flags if flag["cue_ids"] == [1]] == ["invalid_llm_response"]
+    # The far word is held for review at its own time.
+    assert [flag["kind"] for flag in flags if not flag["cue_ids"] and flag["start"] is not None
+            and abs(flag["start"] - 8.88) < 0.01 and abs(flag["end"] - 9.08) < 0.01] == ["invalid_llm_response"]
+
+
+def test_approved_cue_tail_deletion_and_far_word_place_the_word_once(tmp_path, monkeypatch):
+    adapter = _ClipRecordingAdapter(approve=True)
+    cues, flags = _hearing_run(tmp_path, monkeypatch, _FAR_TAIL_SRT, _FAR_TAIL_WORDS, adapter)()
+
+    assert len(adapter.questions) == 2
+    assert [cue.plain_text for cue in cues] == ["Vou voltar.", "Ah!", "O que você quer?"]
+    assert _near(cues[0].start_ms, 5.24) and _near(cues[1].start_ms, 8.88)
+    assert sum(cue.plain_text.count("Ah!") for cue in cues) == 1
+    kinds = _kinds(flags)
+    assert kinds.count("text_changed") == 1 and kinds.count("adlib_inserted") == 1
+    assert not [flag for flag in flags if flag["severity"] == "error"]
+
+
+@pytest.mark.parametrize("mode", ["rebuild", "verify"])
+def test_answer_heard_away_from_the_cue_cannot_resume_without_its_own_questions(tmp_path, monkeypatch, mode):
+    adapter = _ClipRecordingAdapter(approve=True)
+    run = _hearing_run(tmp_path, monkeypatch, _FAR_TAIL_SRT, _FAR_TAIL_WORDS, adapter)
+    with monkeypatch.context() as legacy:
+        legacy.setattr(pipeline, "_alignment_with_unheard_cue_edges", lambda alignment, *_a, **_k: alignment)
+        run()
+    adapter.questions.clear()
+
+    with pytest.raises(ValueError, match="resume from adjudicate"):
+        run(resume=mode)
+    assert adapter.questions == []
+    cues, _ = run(resume="adjudicate")
+    assert sorted(span.case_id for span, _ in adapter.questions) == ["case-1", f"{DETACHED_SPEECH_PREFIX}tail-case-1"]
+    assert [cue.plain_text for cue in cues] == ["Vou voltar.", "Ah!", "O que você quer?"]

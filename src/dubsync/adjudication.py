@@ -19,6 +19,9 @@ from .tokenize import alphanumeric_signature
 _MAX_ADJUDICATION_BATCH_SPANS = 25
 _MAX_UNPACKED_SCENE_BATCHES = 16
 REQUIRED_AUDIO_HEARING_POLICY_VERSION = 1
+# Words this close to a cue's retained word are spoken at that cue's time (the
+# default timing.max_intra_cue_gap): a clip reaching this close is at the cue.
+_RETAINED_EDGE_REACH_SECONDS = 1.5
 
 
 class LLMAdapter(Protocol):
@@ -405,6 +408,30 @@ def _snippet_covers_span(snippet: AudioSnippet | None, span: DivergenceSpan) -> 
         and span.start <= span.end
         and snippet.start <= span.start + 0.001
         and snippet.end >= span.end - 0.001
+        and _snippet_hears_retained_cues(snippet, span)
+    )
+
+
+def _snippet_hears_retained_cues(snippet: AudioSnippet, span: DivergenceSpan) -> bool:
+    """Each edited cue that keeps words beside the case is heard where they end.
+
+    A case is timed by its ASR words alone. When they are seconds away from
+    the retained words of the cue whose text it edits, a clip around them does
+    not contain that cue, and its answer cannot judge the cue's source text.
+    The clip must contain or reach within one intra-cue gap of a retained edge
+    of every such cue (either edge of a cue whose words surround the case).
+    """
+    if not span.srt_token_indices:
+        return True
+    edges: dict[int, list[float]] = {}
+    for cue_id, time in (
+        (span.left_anchor_cue_id, span.left_anchor_end), (span.right_anchor_cue_id, span.right_anchor_start),
+    ):
+        if cue_id in span.cue_ids and time is not None and isfinite(time):
+            edges.setdefault(cue_id, []).append(time)
+    reach = _RETAINED_EDGE_REACH_SECONDS + 0.001
+    return all(
+        any(snippet.start - reach <= time <= snippet.end + reach for time in times) for times in edges.values()
     )
 
 

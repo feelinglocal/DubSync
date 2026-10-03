@@ -79,7 +79,9 @@ def test_interjection_before_the_next_line_is_not_appended_to_a_cue_spoken_long_
         ("vista", 28.44, 28.68), ("é", 28.70, 28.76), ("linda.", 28.84, 29.20),
     ]
 
-    cues, _ = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "Ah, que")})
+    # 'deste ano' is asked about at its own cue's time, apart from "Ah, que".
+    tail = "detached-tail-case-1"
+    cues, _ = _sync(tmp_path, srt, words, {"case-1": _decide("case-1", "Ah, que"), tail: _decide(tail, "")})
 
     assert [cue.plain_text for cue in cues] == ["na nossa viagem anual?", "Ah, que vista é linda."]
     assert _near(cues[0].end_ms, 5.72)

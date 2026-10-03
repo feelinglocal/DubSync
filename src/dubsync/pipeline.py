@@ -49,7 +49,7 @@ from .cue_segmentation import (
     segment_generated_adlib_cues, settle_collapsed_generated_adlibs,
     split_at_generated_interruptions, split_overlong_existing_cues, split_speaker_turn_cues,
 )
-from .detached_speech import separate_detached_speech
+from .detached_speech import separate_detached_speech, separate_unheard_cue_edges
 from .edit_consistency import (
     held_decisions as decisions_with_held_cases, hold_edits_beside_accent_anchors, hold_fragmenting_replacements,
     settle_edits_with_held_timing, settle_one_letter_residues,
@@ -420,7 +420,10 @@ def sync_episode(
         resume_alignment = _load_alignment_artifact(episode_workdir / "align.json")
         _validate_alignment_screen_text_provenance(resume_alignment, cues)
         prepared = _alignment_with_boundary_anchor_regions(
-            resume_alignment, cues, words, allow_expansion=resume_stage == "adjudicate",
+            _alignment_with_unheard_cue_edges(
+                resume_alignment, cues, words, provider_config, allow_split=resume_stage == "adjudicate",
+            ),
+            cues, words, allow_expansion=resume_stage == "adjudicate",
         )
         if prepared != resume_alignment:
             resume_alignment = _alignment_with_adjudication_context(prepared, cues)
@@ -522,6 +525,7 @@ def sync_episode(
             align_cues_to_words(cues, words, language=episode_language) if episode_language
             else align_cues_to_words(cues, words)
         )
+        alignment = _alignment_with_unheard_cue_edges(alignment, cues, words, provider_config)
         alignment = _alignment_with_boundary_anchor_regions(alignment, cues, words)
         alignment = _alignment_with_adjudication_context(alignment, cues)
         alignment = _alignment_with_song_caption_guard(alignment, cues, words)
@@ -1976,6 +1980,28 @@ def _alignment_summary_metadata(
 
 def _spoken_source_cue_count(cues: list[Cue]) -> int:
     return sum(1 for cue in cues if cue_has_spoken_text(cue))
+
+
+def _alignment_with_unheard_cue_edges(
+    alignment: AlignmentResult, cues: list[Cue], words: list[Word], provider_config: dict[str, object],
+    *, allow_split: bool = True,
+) -> AlignmentResult:
+    """Ask about a partly retained cue's unmatched edge where the cue is spoken."""
+    if alignment.diagnostics.unresolved:
+        return alignment
+    spans = separate_unheard_cue_edges(
+        alignment.divergence_spans, cues, words,
+        max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
+        protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+    )
+    if spans == alignment.divergence_spans:
+        return alignment
+    if not allow_split:
+        raise ValueError(
+            "Cannot reuse an answer heard away from its cue for a separated cue-edge question; "
+            "resume from adjudicate to hear each part at its own time."
+        )
+    return alignment.model_copy(update={"divergence_spans": spans})
 
 
 def _alignment_with_boundary_anchor_regions(
