@@ -14,6 +14,7 @@ asr:
 
 adjudication:
   # Follow the actor's performed register. Set script to keep authored variants.
+  # Spoken register words keep the script's case and punctuation.
   register_policy: spoken
 
 llm:
@@ -83,6 +84,9 @@ timing:
   # Where a recording's phrase starts lag their speech onsets as a rule (Scribe
   # Japanese), a start up to lagging_start_advance_ms after the onset moves
   # back too, if the energy VAD hears the phrase from the onset on; 0 disables.
+  # A collapsed token (40 ms or shorter) stays where the provider put it. A cue
+  # that still starts after its own speech onset gets the review item
+  # cue_starts_after_speech_onset.
   # phrase_edge_snap:
   #   start_advance_ms: 200
   #   end_extension_ms: 300
@@ -99,6 +103,9 @@ generation:
   max_generated_adlib_duration_seconds: 20.0
 
 output:
+  # Under a style derived from the source SRT, one- and two-line cues keep their
+  # lines; only cues over two lines, or any cue under an explicit or stricter
+  # style, are rewrapped or split.
   no_overlaps: true
 
 # Optional local overlap backstop. Requires pyannote model access and a

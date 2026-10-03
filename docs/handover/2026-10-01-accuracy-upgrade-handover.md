@@ -2,6 +2,8 @@
 
 This document hands the unfinished accuracy upgrade to the next engineer or agent. It is self-contained for planning. Supporting material (analysis notes, benchmark scripts, test media, cached transcripts) lives only on the owner's Windows machine under `E:\Work Files\SRT Sync\`, mostly in git-ignored folders.
 
+Note (2026-10-03): this brief records the state on October 1, 2026. Two statements that were wrong at the time are corrected inline (overlap errors, detector saturation). Later behaviour, including the cue-start rule and repeat handling, is in [the accuracy-upgrade report](../testing/accuracy-upgrade-2026-10-01.md).
+
 Read sections 1 to 6 before changing code. Sections 7 and 8 are the remaining work and the order to do it in.
 
 ---
@@ -69,7 +71,7 @@ Offline replay of 87 runs from the test corpus through the current code, with st
 | QC errors | 723 | 215 |
 | Dialogue cues left at source timing | 412 | 112 |
 | Cues under a confidence hold | 664 | 248 (all are harness "no saved decision" cases) |
-| Overlap errors (`output_overlap_unresolved`) | 127 | 10 |
+| Overlap errors (`output_overlap_unresolved`) | 127 | 12 (corrected 2026-10-03: the preserved 87-run bench records 12, not 10) |
 | `timing_refined` warnings | 1,775 | about 71 |
 
 Against the human-corrected files (replays with stored LLM decisions):
@@ -130,7 +132,7 @@ Things that will trip you up:
 - The shell on this machine has a stale `OPENROUTER_API_KEY` that overrides `.env`. Unset it for CLI runs. `scripts/run_local.py` already handles this for the web app.
 - Windows console encoding is cp1252. Set `PYTHONIOENCODING=utf-8` before printing subtitle text.
 - Scribe is not deterministic, even with temperature 0 and a seed (probed). MAI is deterministic and returns no per-word confidence.
-- The energy detector saturates on full mixes with music (episode 02): it cannot see pauses there.
+- Corrected 2026-10-03: the adaptive energy detector does not saturate on full mixes. On episode 02 its thresholds reach the -40 dBFS cap and it fragments speech into syllable-size bursts, so word repair can cut cue endings without a cue-level finding.
 
 ---
 

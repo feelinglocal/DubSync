@@ -11,6 +11,7 @@ asr:
 
 adjudication:
   # Follow the actor's performed register. Set script to keep authored variants.
+  # Spoken register words keep the script's case and punctuation.
   register_policy: spoken
 
 llm:
