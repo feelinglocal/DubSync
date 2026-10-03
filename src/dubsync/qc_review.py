@@ -201,9 +201,11 @@ KIND_REGISTRY: dict[str, KindSpec] = {
         "Possible name spelling drift", "Check the spelling against the script.", 60, "warning"),
     "unsourced_word_substitution": _review_kind(
         "Word not found in the script", "Check the word against the audio.", 60, "warning"),
+    # Composition found no time to show a screen caption beside full speech:
+    # the customer's text is missing from the delivery (also a removed change).
     "annotation_display_full": _review_kind(
-        "Screen text moved out of a full two-line display",
-        "Check the screen text against the picture and place it where it belongs.", 58, "warning"),
+        "Screen text could not be displayed",
+        "Add the screen text back where the picture needs it.", 58, "error"),
     # Episode-level problems: one item per kind.
     "alignment_unresolved": _review_kind(
         "The script could not be aligned to the audio", "Check that the SRT belongs to this audio.", 1, "error",
@@ -604,6 +606,8 @@ class _FindingSorter:
         self.notes: dict[str, _Bucket] = {}
         self.diagnostics: dict[str, _Bucket] = {}
         self.change_flags: list[int] = []
+        # Screen captions composition could not display; also removed lines in the change log.
+        self.undisplayed_captions: list[int] = []
         self.deferred_spelling: list[int] = []
         self.overlaps: dict[tuple[int, int], _Candidate] = {}
 
@@ -717,6 +721,8 @@ class _FindingSorter:
         if spec.category == "diagnostic":
             self._diagnostic(kind, index, flag)
             return
+        if kind == "annotation_display_full" and flag.new_text is None:
+            self.undisplayed_captions.append(index)
         self._sort_review_flag(index, flag, spec)
 
     def _sort_review_flag(self, index: int, flag: QCFlag, spec: KindSpec) -> None:
@@ -1050,6 +1056,7 @@ class _FindingSorter:
                 text_flags[cue_id].append(index)
 
         items = self._text_changes(text_flags) if self.has_source else self._flag_text_changes(text_flags)
+        self._undisplayed_caption_changes(items)
         items.extend(timing_items)
         for index in minor_timing:
             self._note("minor_timing_adjustments", index, self.flags[index])
@@ -1106,6 +1113,32 @@ class _FindingSorter:
             # The edit was undone later (restored hold, guard) and is not in the delivery.
             self._diagnostic(f"{flag.kind}:not_delivered", index, flag)
         return items
+
+    def _undisplayed_caption_changes(self, items: list[ChangeItem]) -> None:
+        """Log each screen caption that composition could not display as a removed line.
+
+        Composition runs after the wording snapshot, so the snapshot still has
+        the caption. Its review item says why; the change log must say the
+        delivery lacks it. One entry per caption, also when the snapshot is
+        the delivery (and the comparison already found the cue removed).
+        """
+
+        for index in self.undisplayed_captions:
+            flag = self.flags[index]
+            cue_id = next((cue_id for cue_id in flag.cue_ids if cue_id not in self.position
+                           and (cue := self.wording_by_id.get(cue_id) or self.source.get(cue_id)) is not None
+                           and cue.text == flag.old_text), None)
+            earlier = [item for item in items if cue_id is not None and item.change == "removed"
+                       and item.cue_id == cue_id]
+            before = self._customer_cue(cue_id, flag.old_text or "") if cue_id is not None else None
+            start_ms, end_ms = _flag_window_ms(flag)
+            item = self._text_item(
+                "removed", cue_id, [index], old_text=before.text if before is not None else flag.old_text,
+                new_text=None, start_ms=start_ms, end_ms=end_ms, position=None,
+            )
+            item.raw_flags = sorted({index, *(raw for found in earlier for raw in found.raw_flags)})
+            items[:] = [found for found in items if not any(found is other for other in earlier)]
+            items.append(item)
 
     def _wording_raw(self, text_flags: dict[int, list[int]], cue_id: int) -> list[int]:
         # Screen-text composition flags name display cues; _unworded_changes resolves them.
@@ -1178,9 +1211,11 @@ class _FindingSorter:
         window = self._delivered_window(shown)
         if window is None:
             return None
-        # The composed caption is the wording cue whose text the flag recorded.
+        # The composed caption is the wording cue whose text the flag recorded:
+        # at the page's time, or shown under its own id outside that time.
         track = min((cue for cue in self.wording_cues
-                     if cue.text == flag.old_text and cue.start_ms < window[1] and window[0] < cue.end_ms),
+                     if cue.text == flag.old_text
+                     and (cue.start_ms < window[1] and window[0] < cue.end_ms or cue.index in flag.cue_ids)),
                     key=lambda cue: (cue.index not in flag.cue_ids, cue.start_ms), default=None)
         before = self._customer_cue(track.index, track.text) if track is not None else None
         if before is None:

@@ -241,13 +241,16 @@ def test_full_two_line_speech_around_a_caption_never_makes_a_three_line_display(
         assert not [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
         return
     # Dialogue turns or an enforced width keep the speech lines. The caption is
-    # shown on its own just beside the speech (no display follows, so before it).
+    # shown on its own just beside the speech (no display follows, so before it),
+    # logged as a display change that says where it went (W4C-4).
     assert display.lines == speech_lines
     assert all(display_width(line) <= width for line in shown), shown
     moved, = [cue for cue in composed.cues if cue.index != 1]
     assert (moved.start_ms, moved.end_ms, moved.lines) == (0, 1000, caption_lines)
-    flag, = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
-    assert (flag.severity, flag.cue_ids, flag.old_text) == ("warning", [moved.index, 1], caption.text)
+    assert not [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+    flag, = [flag for flag in composed.flags if flag.kind == "annotation_line_limit_pagination"]
+    assert (flag.severity, flag.cue_ids, flag.old_text, flag.new_text) == ("info", [moved.index], caption.text,
+                                                                          caption.text)
     assert "just before that speech" in flag.message
     assert composed.tracks[2]["display_intervals"] == [[0, 1000]]
     assert composed.tracks[2]["coverage_gaps_ms"] == [[1500, 3500]]
@@ -294,25 +297,30 @@ def test_no_composed_display_exceeds_the_line_limit_around_a_contained_caption(
     words = [token for cue in composed.cues for line in cue.lines for token in line.split()]
     spoken = [token for line in speech.lines for token in line.split()]
     assert words.count(spoken[-1]) == 1 and all(token in words for token in spoken)
-    hidden = [flag for flag in composed.flags if flag.kind == "annotation_display_full" and flag.new_text is None]
+    hidden = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
     if "[PLACA:" in words:
         assert not hidden
-        moved = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+        moved = [flag for flag in composed.flags
+                 if flag.kind == "annotation_line_limit_pagination" and "that speech" in flag.message]
         if moved:
             display, = [cue for cue in composed.cues if "[PLACA:" in cue.lines[0]]
             assert display.end_ms <= speech.start_ms or display.start_ms >= speech.end_ms
-            assert moved[0].severity == "warning"
+            assert (moved[0].severity, moved[0].cue_ids) == ("info", [display.index])
     else:
-        # Not shown at all only when no free interval beside the speech exists.
+        # Not shown at all only when no free interval beside the speech exists:
+        # an error at the caption's own time and a removed line (W4C-4).
         assert neighbors == "boxed"
         flag, = hidden
-        assert (flag.severity, flag.cue_ids, flag.old_text) == ("warning", [1], caption.text)
+        assert (flag.severity, flag.cue_ids, flag.old_text, flag.new_text) == ("error", [2], caption.text, None)
+        assert caption.text in flag.message and "could not be displayed" in flag.message
         assert composed.tracks[2]["display_intervals"] == [] and composed.tracks[2]["display_cue_ids"] == []
         assert composed.tracks[2]["coverage_gaps_ms"] == [[11000, 13000]]
         assert composed.tracks[2]["pages"][0]["delay_ms"] is None
         review = build_review(composed.flags, [], composed.cues, source_cues=source)
         item, = [item for item in review.review if item.kind == "annotation_display_full"]
-        assert item.severity == "warning" and item.old_text == caption.text
+        assert item.severity == "error" and item.old_text == caption.text
+        removed, = [change for change in review.changes if change.change == "removed"]
+        assert (removed.kind, removed.cue_id, removed.old_text) == ("annotation_display_full", 2, caption.text)
 
 
 def test_a_caption_moved_out_of_full_speech_prefers_the_free_interval_after_it():
@@ -325,12 +333,17 @@ def test_a_caption_moved_out_of_full_speech_prefers_the_free_interval_after_it()
     assert [(cue.index, cue.start_ms, cue.end_ms, cue.lines) for cue in composed.cues] == [
         (5, 9800, 9900, ["Antes."]), (1, 10000, 14000, _FULL_SPEECH["dash"]),
         (2, 14000, 15000, ["[PLACA: SAÍDA DE EMERGÊNCIA]"]), (6, 15000, 16000, ["Depois."])]
-    flag, = [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
-    assert flag.cue_ids == [2, 1] and "just after that speech" in flag.message
+    assert not [flag for flag in composed.flags if flag.kind == "annotation_display_full"]
+    flag, = [flag for flag in composed.flags if flag.kind == "annotation_line_limit_pagination"]
+    assert flag.cue_ids == [2] and "just after that speech" in flag.message
     assert composed.tracks[2]["late_extension_ms"] == 2000
-    review = build_review(composed.flags, [], composed.cues, source_cues=source)
-    item, = [item for item in review.review if item.kind == "annotation_display_full"]
-    assert item.srt_numbers == [2, 3]
+    review = build_review(composed.flags, [], composed.cues, source_cues=source, pre_annotation_cues=source)
+    assert not [item for item in review.review if "annotation_display_full" in item.reasons]
+    change, = review.changes
+    assert (change.kind, change.change, change.cue_id, change.srt_number) == (
+        "annotation_line_limit_pagination", "timing", 2, 3)
+    assert (change.old_timing, change.new_timing) == (
+        "00:00:11,000 --> 00:00:13,000", "00:00:14,000 --> 00:00:15,000")
 
 
 def test_mixed_caption_dialogue_cue_keeps_its_lines_and_the_earlier_caption_keeps_its_own_time():

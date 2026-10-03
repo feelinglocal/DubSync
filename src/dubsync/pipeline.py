@@ -3283,6 +3283,7 @@ def _run_verify_stage(
         ), **missing_dialogue_spoken_spans}
 
     spoken_spans = spoken_spans_for(rebuilt, alignment)
+    media_duration_ms = _known_audio_duration_ms(audio_for_asr)
     rebuilt, final_order_flags = finalize_cues_for_output(
         rebuilt,
         profile,
@@ -3291,7 +3292,7 @@ def _run_verify_stage(
         fixed_cue_ids=ambiguous_cue_ids,
         untimed_song_caption_ids=untimed_song_caption_ids,
         preserve_timing=bool(effective_words or forced_alignments or speech_regions),
-        media_duration_ms=_known_audio_duration_ms(audio_for_asr),
+        media_duration_ms=media_duration_ms,
         spoken_spans=spoken_spans,
     )
     flags = [*reconcile_overlap_flags(flags, rebuilt, final_order_flags), *final_order_flags]
@@ -3383,7 +3384,7 @@ def _run_verify_stage(
         compose_bracketed_annotations(
             rebuilt, pre_annotation_ownership, words=effective_words, profile=profile,
             protected_cue_ids=protected_cue_ids, enforce_width=enforce_line_width,
-            reserved_cue_ids=reserved_cue_ids,
+            reserved_cue_ids=reserved_cue_ids, media_end_ms=media_duration_ms,
         )
         if _output_no_overlaps(provider_config)
         else AnnotationComposition(list(rebuilt), dict(pre_annotation_ownership), {}, {})

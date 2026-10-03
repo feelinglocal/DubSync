@@ -10,7 +10,7 @@ import yaml
 from dubsync import pipeline
 from dubsync.models import Cue, SpeechRegion, Word
 from dubsync.qc_review import build_review
-from dubsync.srt_io import parse_srt_text, write_srt
+from dubsync.srt_io import format_timestamp, parse_srt_text, write_srt
 from dubsync.timing_refinement import SpeechEvidence
 
 
@@ -135,10 +135,11 @@ def test_explicit_allow_overlap_preserves_authored_annotation_segmentation(tmp_p
 
 
 @pytest.mark.parametrize("mode", ["fresh", "verify"])
-def test_held_dialogue_around_a_caption_keeps_two_lines_and_moves_the_caption_for_review(tmp_path, monkeypatch, mode):
+def test_held_dialogue_around_a_caption_keeps_two_lines_and_moves_the_caption_as_a_logged_change(
+        tmp_path, monkeypatch, mode):
     # W4R-1: a held two-turn cue fills the display for the caption's whole
     # time. The delivery never shows three lines; the caption is shown on its
-    # own beside the speech, and the move is a review reason.
+    # own beside the speech, and the change log says where it went (W4C-4).
     turns = ["- Você vem com a gente?", "- Não, fico aqui."]
     cues = [Cue(index=1, start_ms=500, end_ms=2500, lines=turns),
             Cue(index=2, start_ms=1000, end_ms=2000, lines=["[Station]"]),
@@ -159,5 +160,77 @@ def test_held_dialogue_around_a_caption_keeps_two_lines_and_moves_the_caption_fo
     assert caption.lines == ["[Station]"]
     assert caption.end_ms <= speech.start_ms or caption.start_ms >= speech.end_ms
     assert not [issue for issue in result.report["style_issues"] if issue["kind"] == "line_count"]
-    moved = [item for item in result.report["review"] if "annotation_display_full" in item["reasons"]]
-    assert moved and caption.index in moved[0]["srt_numbers"]
+    assert not [item for item in result.report["review"] if "annotation_display_full" in item["reasons"]]
+    _assert_caption_move_logged(result, delivered, caption, cues[1])
+
+
+def _assert_caption_move_logged(result, delivered, caption, source_caption):
+    number = delivered.index(caption) + 1
+    moved, = [item for item in result.report["changes"] if item["kind"] == "annotation_line_limit_pagination"]
+    assert (moved["change"], moved["srt_number"], moved["cue_id"]) == ("timing", number, source_caption.index)
+    assert moved["old_timing"] == f"{format_timestamp(source_caption.start_ms)} --> {format_timestamp(source_caption.end_ms)}"
+    assert moved["new_timing"] == f"{format_timestamp(caption.start_ms)} --> {format_timestamp(caption.end_ms)}"
+    assert "that speech" in moved["reason"]
+
+
+_TURNS = ["- Você vem com a gente?", "- Não, fico aqui."]
+
+
+def _boxed_turns_case(tmp_path, monkeypatch, *, after=True):
+    cues = [Cue(index=1, start_ms=200, end_ms=1000, lines=["Hello there."]),
+            Cue(index=2, start_ms=1000, end_ms=3000, lines=_TURNS),
+            Cue(index=3, start_ms=1500, end_ms=2500, lines=["[Station]"])]
+    words = [Word(text="Hello", start=.25, end=.5), Word(text="there.", start=.55, end=.95)]
+    if after:
+        cues.append(Cue(index=4, start_ms=3000, end_ms=3900, lines=["Okay then."]))
+        words += [Word(text="Okay", start=3.0, end=3.3), Word(text="then.", start=3.35, end=3.85)]
+    return _run_case(tmp_path, monkeypatch, case_override=(cues, words))
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify"])
+def test_caption_beside_the_last_full_speech_is_shown_before_the_end_of_the_media(tmp_path, monkeypatch, mode):
+    # W4C-4: nothing follows the speech, but the media does (the audio is 4 s long).
+    cues, run = _boxed_turns_case(tmp_path, monkeypatch, after=False)
+    result = run()
+    first_bytes = result.output_srt.read_bytes()
+    if mode == "verify":
+        result = run(resume="verify")
+        assert result.output_srt.read_bytes() == first_bytes
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 2 for cue in delivered) and delivered[-1].end_ms <= 4000
+    assert all(left.end_ms <= right.start_ms for left, right in zip(delivered, delivered[1:]))
+    speech = next(cue for cue in delivered if cue.lines == _TURNS)
+    assert (speech.start_ms, speech.end_ms) == (1000, 3000)
+    caption, = [cue for cue in delivered if "[Station]" in cue.lines]
+    assert (caption.start_ms, caption.end_ms, caption.lines) == (3000, 4000, ["[Station]"])
+    assert not [item for item in result.report["review"] if "annotation_display_full" in item["reasons"]]
+    _assert_caption_move_logged(result, delivered, caption, cues[2])
+
+
+@pytest.mark.parametrize("mode", ["fresh", "verify"])
+def test_caption_with_no_room_beside_full_speech_is_an_error_and_a_removed_line_in_the_change_log(
+        tmp_path, monkeypatch, mode):
+    # W4C-4: never silently lose the customer's caption.
+    cues, run = _boxed_turns_case(tmp_path, monkeypatch)
+    result = run()
+    first_bytes = result.output_srt.read_bytes()
+    if mode == "verify":
+        result = run(resume="verify")
+        assert result.output_srt.read_bytes() == first_bytes
+    delivered = parse_srt_text(result.output_srt.read_text(encoding="utf-8"))
+    assert all(len(cue.lines) <= 2 for cue in delivered)
+    assert all(left.end_ms <= right.start_ms for left, right in zip(delivered, delivered[1:]))
+    assert not [cue for cue in delivered if "[Station]" in cue.lines]
+    speech = next(cue for cue in delivered if cue.lines == _TURNS)
+    assert (speech.start_ms, speech.end_ms) == (1000, 3000)
+    report = result.report
+    item, = [item for item in report["review"] if "annotation_display_full" in item["reasons"]]
+    assert (item["kind"], item["severity"], item["srt_numbers"], item["after_srt_number"]) == (
+        "annotation_display_full", "error", [], delivered.index(speech) + 1)
+    assert "[Station]" in item["detail"] and "could not be displayed" in item["detail"]
+    assert report["summary"]["verdict"] == "attention"
+    removed, = [change for change in report["changes"] if change["change"] == "removed"]
+    assert (removed["kind"], removed["cue_id"], removed["old_text"], removed["new_text"]) == (
+        "annotation_display_full", 3, "[Station]", None)
+    diff = (result.episode_workdir / "changes.diff.srt").read_text(encoding="utf-8")
+    assert "removed after SRT #" in diff and "(cue 3)" in diff and "- [Station]" in diff

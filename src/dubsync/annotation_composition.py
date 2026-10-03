@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from .models import Cue, QCFlag, Word
 from .semantic_output import _dialogue_turns, compact_lines, paginate_annotation_lines, split_crowded_output_cues
+from .srt_io import format_timestamp
 from .style_profile import StyleProfile
 from .subtitle_annotations import cue_has_bracketed_screen_text, is_bracketed_screen_text_cue
 
@@ -33,7 +34,7 @@ def compose_bracketed_annotations(
     cues: list[Cue], cue_word_indices: Mapping[int, list[int]] | None = None,
     *, words: list[Word] | None = None, profile: StyleProfile | None = None,
     protected_cue_ids: set[int] | None = None, enforce_width: bool = True,
-    reserved_cue_ids: set[int] | None = None,
+    reserved_cue_ids: set[int] | None = None, media_end_ms: int | None = None,
 ) -> AnnotationComposition:
     """Compose screen captions around exact incoming speech intervals.
 
@@ -45,11 +46,12 @@ def compose_bracketed_annotations(
     retain continuous full-caption composition. With ``enforce_width`` false
     (a source-derived width) only the line count crowds a display. A new
     display cue never takes one of ``reserved_cue_ids`` (removed source cues
-    or cues a finding still names).
+    or cues a finding still names). ``media_end_ms`` (the known media
+    length) bounds the free time after the last display.
     """
     if profile is not None:
         return _compose_bounded_annotations(cues, cue_word_indices or {}, words or [], profile, protected_cue_ids,
-                                            enforce_width, reserved_cue_ids)
+                                            enforce_width, reserved_cue_ids, media_end_ms)
     return _compose_unbounded_annotations(cues, cue_word_indices, reserved_cue_ids)
 
 
@@ -172,17 +174,20 @@ def _speech_can_join(slot: dict[str, object], limit: int, enforce_width: bool) -
 
 
 def _interval_beside(slots: list[dict[str, object]], full: list[dict[str, object]], track: Cue,
-                     min_ms: int) -> tuple[int, int] | None:
+                     min_ms: int, media_end_ms: int | None = None) -> tuple[int, int] | None:
     """The nearest free interval just before or after full speech displays.
 
     It holds at least the minimum display and lies between displays that
-    exist (or the media start), so it never reaches past known timing. A tie
-    goes to the later side: a two-line display delays a visual page.
+    exist, the media start or a known media end, so it never reaches past
+    known timing. A tie goes to the later side: a two-line display delays a
+    visual page.
     """
     start, end = min(slot["start"] for slot in full), max(slot["end"] for slot in full)
     duration = max(track.end_ms - track.start_ms, min_ms)
     options: list[tuple[int, int, int, int]] = []
     following = [slot["start"] for slot in slots if slot["start"] >= end]
+    if media_end_ms is not None:
+        following.append(media_end_ms)
     if following and not any(slot["start"] < end < slot["end"] for slot in slots) and min(following) - end >= min_ms:
         options.append((end - track.end_ms, 0, end, min(min(following), end + duration)))
     previous = max((slot["end"] for slot in slots if slot["end"] <= start), default=0)
@@ -197,7 +202,8 @@ def _interval_beside(slots: list[dict[str, object]], full: list[dict[str, object
 def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[int]], words: list[Word],
                                  profile: StyleProfile, protected: set[int] | None,
                                  enforce_width: bool = True,
-                                 reserved: set[int] | None = None) -> AnnotationComposition:
+                                 reserved: set[int] | None = None,
+                                 media_end_ms: int | None = None) -> AnnotationComposition:
     """Paginate crowded visual tracks while keeping each spoken word once.
 
     A caption page can occupy a whole spoken child or a known visual gap.
@@ -267,9 +273,8 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
     slots.extend(residuals)
     slots.sort(key=lambda slot: (slot["start"], slot["end"], slot["cue"].index if slot["cue"] else -1))
     track_pages: dict[int, list[dict[str, object]]] = {}
-    # Captions that full speech displays moved out of their own time or hid:
-    # track id -> the speech cue ids that fill the display.
-    beside: dict[int, list[int]] = {}
+    # Captions that full speech displays moved out of their own time or hid.
+    beside: set[int] = set()
     min_display_ms = max(1, round(profile.min_cue_dur * 1000))
     for track_position, track in enumerate(tracks):
         eligible = [slot for slot in slots if slot["start"] < track.end_ms and slot["end"] > track.start_ms]
@@ -292,13 +297,14 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
                 available = [joined]
         if not available and shared is None:
             # Spoken lines fill the display for the caption's whole time. The
-            # two-line ceiling holds: the caption is shown on its own in the
-            # nearest free interval beside them, or not at all, for review.
+            # two-line ceiling holds and speech keeps its timing: the caption
+            # is shown on its own in the nearest free interval beside them, or
+            # it is not delivered, as an error and a removed line.
             pages = _caption_pages(track, profile, limit, enforce_width)
             page = pages[0] if len(pages) == 1 else compact_lines(track.text, limit, profile.max_chars_per_line)
             track_pages[track.index] = [{"page": 1, "lines": list(page), "display_cue_ids": [], "display_intervals": []}]
-            beside[track.index] = [slot["cue"].index for slot in eligible if slot["cue"] is not None]
-            interval = _interval_beside(slots, eligible, track, min_display_ms)
+            beside.add(track.index)
+            interval = _interval_beside(slots, eligible, track, min_display_ms, media_end_ms)
             if interval is not None:
                 slots.append({"start": interval[0], "end": interval[1], "cue": None, "template": track,
                               "active": [track.index], "lines": list(page), "spoken": 0,
@@ -388,17 +394,31 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
             "coverage_gaps_ms": _coverage_gaps(track.start_ms, track.end_ms, intervals), "pages": pages,
             "pagination_policy": "ordered_visual_pages",
         }
-        if track.index in beside:
-            side = ("before" if intervals[-1][1] <= track.start_ms else "after") if intervals else None
+        original = f"{format_timestamp(track.start_ms)} --> {format_timestamp(track.end_ms)}"
+        if track.index in beside and not intervals:
+            # The customer's screen text is not in the delivery. It is never
+            # lost silently: an error review item at its own time (named by
+            # the caption's cue id), and QC logs it as a removed line.
             flags.append(QCFlag(
-                kind="annotation_display_full", severity="warning",
-                cue_ids=[*metadata[track.index]["display_cue_ids"], *beside[track.index]],
-                message=(f"Spoken lines fill the two-line display for this screen text's whole time, so it is shown on its own just {side} that speech instead; check it against the picture."
-                         if intervals else
-                         "Spoken lines fill the two-line display for this screen text's whole time and no free interval beside them can hold it, so it is not in the delivered subtitle; restore it if the picture needs it."),
-                old_text=track.text, new_text="\n".join(pages[0]["lines"]) if intervals else None,
-                start=(intervals[0][0] if intervals else track.start_ms) / 1000,
-                end=(intervals[-1][1] if intervals else track.end_ms) / 1000))
+                kind="annotation_display_full", severity="error", cue_ids=[track.index],
+                message=(f'The screen text "{" ".join(track.lines)}" could not be displayed: spoken lines fill the '
+                         f"two-line display for its whole time ({original}) and no free interval of at least "
+                         f"{min_display_ms / 1000:g} s beside that speech can hold it, so it is not in the delivered "
+                         "subtitle. Add it back where the picture needs it."),
+                old_text=track.text, new_text=None, start=track.start_ms / 1000, end=track.end_ms / 1000))
+        elif track.index in beside:
+            # Shown on its own beside the full speech: a display change whose
+            # page lineage and change-log entry say where it went.
+            side = "before" if intervals[-1][1] <= track.start_ms else "after"
+            shown = f"{format_timestamp(intervals[0][0])} --> {format_timestamp(intervals[-1][1])}"
+            flags.append(QCFlag(
+                kind="annotation_line_limit_pagination", severity="info",
+                cue_ids=metadata[track.index]["display_cue_ids"],
+                message=(f"Spoken lines fill the two-line display for this screen text's whole time ({original}), "
+                         f"so it is shown on its own just {side} that speech instead ({shown}); its interval and "
+                         "coverage gap are recorded in caption provenance."),
+                old_text=track.text, new_text="\n\n".join("\n".join(page["lines"]) for page in pages),
+                start=intervals[0][0] / 1000, end=intervals[-1][1] / 1000))
         elif len(pages) > 1 or metadata[track.index]["coverage_gaps_ms"]:
             flags.append(QCFlag(kind="annotation_line_limit_pagination", cue_ids=metadata[track.index]["display_cue_ids"], severity="info",
                                 message="Visual caption wording was shown as ordered pages to keep the display within two lines; actual page intervals and any delayed visual onset are recorded in caption provenance.",
