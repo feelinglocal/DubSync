@@ -190,6 +190,11 @@ def repair_asr_word_edges(
     identify which burst contains that word. The returned list keeps the order
     and length of ``words``.
 
+    A word that starts in silence and reaches the burst after it by less than
+    the ownership minimum keeps its provider start, unless ``levels`` verify
+    that nothing is heard before that burst: then the provider start is the
+    error and the word starts at the burst onset.
+
     Scribe's Japanese character timestamps start phrases 100-650 ms after the
     voice. ``levels`` (the VAD's level track of the same audio) lets such a
     recording be recognised and its late phrase starts moved onto their burst
@@ -211,13 +216,12 @@ def repair_asr_word_edges(
     # on the word itself, so neighbours can be consulted afterwards.
     repaired: list[tuple[float, float]] = []
     ambiguous: dict[int, list[tuple[float, float]]] = {}
+    silent_lead_onsets: dict[int, float] = {}
     for index, word in enumerate(words):
         start, end = word.start, word.end
         if isfinite(start) and isfinite(end) and end > start and ordered_regions:
-            candidates = _anchor_candidates(
-                word,
-                _speech_chains(word, ordered_regions, region_starts, prefix_max_ends, max_region_gap),
-            )
+            chains = _speech_chains(word, ordered_regions, region_starts, prefix_max_ends, max_region_gap)
+            candidates = _anchor_candidates(word, chains)
             if len(candidates) > 1:
                 # A duration cap or phrase snap would silently pick one of the
                 # possible utterances too. Preserve both provider edges.
@@ -230,6 +234,12 @@ def repair_asr_word_edges(
                 anchored_end = min(end, anchor[1])
                 if anchored_end > anchored_start:
                     start, end = anchored_start, anchored_end
+            elif levels is not None:
+                onset = _silent_lead_onset(word, chains, levels)
+                if onset is not None:
+                    # Applied with the snaps below, so the lag statistics and
+                    # the neighbours' snaps see the provider start as before.
+                    silent_lead_onsets[index] = onset
         if isfinite(start) and isfinite(end) and end - start > max_word_duration:
             end = start + max_word_duration
         repaired.append((start, end))
@@ -269,6 +279,8 @@ def repair_asr_word_edges(
             ))
             continue
         start, end = repaired[index]
+        if index in silent_lead_onsets and silent_lead_onsets[index] < end:
+            start = silent_lead_onsets[index]
         if isfinite(start) and isfinite(end) and end > start and ordered_regions:
             previous_end = repaired[index - 1][1] if index > 0 else float("-inf")
             next_start = repaired[index + 1][0] if index + 1 < len(words) else float("inf")
@@ -432,6 +444,22 @@ def _anchor_candidates(word: Word, chains: list[tuple[float, float]]) -> list[tu
     # Several short overlaps may be separate utterances or split phonemes.
     # Choosing the longest would still guess the word's acoustic ownership.
     return owned
+
+
+def _silent_lead_onset(word: Word, chains: list[tuple[float, float]], levels: SpeechLevels) -> float | None:
+    """The onset of the burst a word belongs to although the burst covers too little of it.
+
+    The provider started the word in silence and only its tail reaches the one
+    burst after it. When the level track shows that nothing is heard before that
+    burst (verified silence, not speech the detector missed), the provider start
+    is the error and the word starts at the burst onset, for every stage alike.
+    """
+    if len(chains) != 1:
+        return None
+    onset, burst_end = chains[0]
+    if not word.start < onset < word.end <= burst_end:
+        return None
+    return onset if levels.lead_is_silent(word.start, onset, burst_end) else None
 
 
 def has_sufficient_speech_overlap(word: Word, start: float, end: float) -> bool:

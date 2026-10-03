@@ -36,6 +36,15 @@ MIN_LEAD_SPEECH_SHARE = 0.5
 # vowel, or a burst the detector opened before the voice (EP11 "Cinco.", "Um.").
 TRAILING_LEAD_HOPS = 5
 MIN_TRAILING_SPEECH_HOPS = 4
+# The audio before a burst is verified silence when no hop of it is louder than
+# SILENT_LEAD_MAX_DBFS and its loudest hop is at least SILENT_LEAD_MARGIN_DB
+# under the burst's median. Measured on the words that start before a burst and
+# reach it by less than word repair's ownership minimum: on clean stems the
+# lead peaks at -56.6 to -120 dBFS, 33-79 dB under its burst (digital zero but
+# for the onset hop); on the ep02 full mix it peaks at -31 to -48 dBFS, at most
+# 21 dB under, where the detector misses real speech.
+SILENT_LEAD_MAX_DBFS = -50.0
+SILENT_LEAD_MARGIN_DB = 30.0
 
 # Energy VAD defaults (measured on clean dub stems; see EnergySpeechActivityAdapter).
 DEFAULT_HOP_MS = 10
@@ -100,6 +109,15 @@ class SpeechLevels:
             return False
         floor = median(body) - LEAD_SPEECH_MARGIN_DB
         return sum(level >= floor for level in lead) >= MIN_LEAD_SPEECH_SHARE * len(lead)
+
+    def lead_is_silent(self, start: float, onset: float, burst_end: float) -> bool:
+        """Whether nothing is heard from ``start`` up to a burst's ``onset``: verified silence, not quiet speech."""
+        lead = self.between(start, onset)
+        body = self.between(onset, burst_end)
+        if not lead or not body:
+            return False
+        loudest = max(lead)
+        return loudest <= SILENT_LEAD_MAX_DBFS and median(body) - loudest >= SILENT_LEAD_MARGIN_DB
 
     def lead_ends_in_speech(self, onset: float, start: float, burst_end: float) -> bool:
         """Whether the phrase's own voice is already sounding right before its start at ``start``.

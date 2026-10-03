@@ -240,3 +240,97 @@ def test_generation_never_moves_a_cue_edge_inside_its_own_words(tmp_path, case):
 def _srt_time(milliseconds: int) -> str:
     seconds, millis = divmod(milliseconds, 1000)
     return f"00:00:{seconds:02d},{millis:03d}"
+
+
+# W3R-2: a provider word that starts in digital silence and reaches the burst after it by less than
+# word repair's ownership minimum. Matrix webjob-9b4dfd MAI #46 "Was?" (origin 130 s removed) and
+# testing-002 MAI #51 "Ja!" (origin 110 s removed): the lead before the burst measured -120 dBFS
+# with at most -56.6 / -67.2 dBFS in its last hop, the burst -23.5 / -23.9 dBFS.
+SILENT_LEAD_CASES = {
+    "webjob-was": ("Was?", 5500, 7000, ("Was?", 5.680, 6.360), (6.335, 7.045), -56.6, -23.5),
+    "testing-002-ja": ("Ja!", 3300, 4500, ("Ja!", 3.480, 3.699), (3.675, 4.205), -67.2, -23.9),
+}
+
+
+def _level_track(burst, lead_peak_db, burst_db, *, lead_db=-120.0, seconds=9.0):
+    from array import array
+
+    from dubsync.vad import SpeechLevels
+
+    hops = array("f", [-120.0]) * round(seconds * 100)
+    first, last = round(burst[0] * 100), round(burst[1] * 100)
+    for hop in range(first, last):
+        hops[hop] = burst_db
+    for hop in range(first - 80, first):
+        hops[hop] = lead_db
+    hops[first - 1] = max(lead_db, lead_peak_db)
+    return SpeechLevels(levels=hops, hop_seconds=0.01, offset_seconds=0.0)
+
+
+def _timed_with_levels(raw: list[Word], regions: list[SpeechRegion], cue: Cue, levels):
+    words, repair_flags = repair_asr_word_edges(raw, regions, max_region_overrun=0.3, snap=SNAP, levels=levels)
+    alignment = AlignmentResult(cue_word_indices={cue.index: list(range(len(words)))})
+    rebuilt, _ = rebuild_cues([cue], words, alignment, PROFILE)
+    refined, flags = refine_cues_to_speech_activity(
+        rebuilt, regions, PROFILE, BoundaryRefinementConfig(), words=words, alignment=alignment,
+        ambiguous_word_indices=set(), source_words=raw,
+    )
+    final, _ = finalize_cues_for_output(
+        refined, PROFILE, preserve_timing=True, spoken_spans=cue_spoken_spans(refined, words, alignment),
+    )
+    return words, final[0], [*repair_flags, *flags]
+
+
+@pytest.mark.parametrize("case", sorted(SILENT_LEAD_CASES))
+def test_a_word_that_starts_in_verified_silence_belongs_to_the_burst_after_it(case):
+    # The provider put the word 100-650 ms early, in digital silence. Word repair moves its start onto
+    # the burst, so rebuild and refinement time the cue from the same word: the cue starts just before
+    # the burst, not up to 0.65 s before any sound, and no cue edge lies inside the word.
+    text, start_ms, end_ms, word, burst, lead_peak_db, burst_db = SILENT_LEAD_CASES[case]
+    raw, regions = _words([word]), _regions([burst])
+    cue = Cue(index=1, start_ms=start_ms, end_ms=end_ms, lines=[text])
+
+    words, delivered, flags = _timed_with_levels(raw, regions, cue, _level_track(burst, lead_peak_db, burst_db))
+
+    assert (words[0].start, words[0].end) == (burst[0], raw[0].end)
+    _assert_cue_covers_its_own_words(delivered, words)
+    assert burst[0] * 1000 - 100 <= delivered.start_ms <= burst[0] * 1000
+    clamped = [flag for flag in flags if flag.kind == "asr_word_clamped"]
+    if burst[0] - raw[0].start > 0.3:
+        assert clamped and clamped[0].old_text.startswith(f"{text} {raw[0].start:.3f}")
+
+
+@pytest.mark.parametrize("case", sorted(SILENT_LEAD_CASES))
+@pytest.mark.parametrize("lead", [(-35.0, -35.0), (-120.0, -45.0)], ids=["audible-lead", "audible-onset"])
+def test_a_word_whose_lead_is_not_verified_silence_keeps_its_provider_start(case, lead):
+    # A full mix (ep02: leads -31 to -48 dBFS, at most 21 dB under the burst) can hide the start of
+    # the word from the detector: the provider start stays and the cue is not cut after it.
+    text, start_ms, end_ms, word, burst, _, burst_db = SILENT_LEAD_CASES[case]
+    raw, regions = _words([word]), _regions([burst])
+    cue = Cue(index=1, start_ms=start_ms, end_ms=end_ms, lines=[text])
+    lead_db, lead_peak_db = lead
+
+    words, delivered, _ = _timed_with_levels(
+        raw, regions, cue, _level_track(burst, lead_peak_db, burst_db, lead_db=lead_db),
+    )
+
+    assert words[0].start == raw[0].start
+    _assert_cue_covers_its_own_words(delivered, words)
+
+
+def test_a_silent_lead_does_not_move_a_word_that_reaches_past_a_short_burst():
+    # The burst lies wholly inside the word: it is no onset of this word, whatever the lead.
+    raw, regions = _words([("por", 4.855, 4.956)]), _regions([(4.865, 4.895)])
+    cue = Cue(index=1, start_ms=4700, end_ms=5200, lines=["por"])
+
+    words, _, _ = _timed_with_levels(raw, regions, cue, _level_track((4.865, 4.895), -120.0, -25.0))
+
+    assert words[0].start == raw[0].start
+
+
+def test_word_repair_without_a_level_track_keeps_a_word_that_starts_in_silence():
+    raw, regions = _words([("Was?", 5.680, 6.360)]), _regions([(6.335, 7.045)])
+
+    words, _ = repair_asr_word_edges(raw, regions, max_region_overrun=0.3, snap=SNAP)
+
+    assert words == raw
