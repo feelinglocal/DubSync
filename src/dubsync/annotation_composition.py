@@ -196,9 +196,13 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
                          if cue.start_ms <= track.start_ms and track.end_ms <= cue.end_ms]
             requested = max(1, sum(len(_caption_pages(track, profile, budget, enforce_width))
                                    for track in contained))
+            # Speech that can be neither divided nor fitted to the line left
+            # beside the caption keeps its own lines (never one over-wide
+            # line or joined dialogue turns); the caption takes another slot.
             segmented = split_crowded_output_cues([cue], words, ownership, profile, max_lines=budget,
                                                   min_parts=requested, protected_cue_ids=protected,
-                                                  enforce_width=enforce_width, reserved_cue_ids=reserved)
+                                                  enforce_width=enforce_width, reserved_cue_ids=reserved,
+                                                  hold_unfitting=True)
             speech.extend(segmented.cues)
             ownership = segmented.cue_word_indices
             flags.extend(segmented.flags)
@@ -235,11 +239,14 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
         pages = _caption_pages(track, profile, page_limit, enforce_width)
         if len(pages) > len(available) or not available:
             # A single word, held cue or simultaneous speech cannot always
-            # supply enough child envelopes. Keep all visual wording and the
-            # hard line cap; the existing width linter exposes the compromise.
+            # supply enough child envelopes. Keep all visual wording; the
+            # existing width and line-count linter exposes the compromise.
             pages = [compact_lines(track.text, page_limit, profile.max_chars_per_line)]
+            spoken = len(eligible[0]["cue"].lines) if not available and eligible[0]["cue"] is not None else 0
             flags.append(QCFlag(kind="annotation_line_limit_reflow", cue_ids=[track.index], severity="info",
-                                message="All visual caption wording was retained within the two-line display limit; any width overflow remains visible to style QC.",
+                                message=("All visual caption wording was retained within the two-line display limit; any width overflow remains visible to style QC."
+                                         if spoken < limit else
+                                         "The spoken lines fill the display, so all visual caption wording was kept on a line of its own beside them; this display is over the two-line limit."),
                                 old_text=track.text, new_text="\n".join(pages[0]),
                                 start=track.start_ms / 1000, end=track.end_ms / 1000))
         records = [{"page": position + 1, "lines": list(page), "display_cue_ids": [], "display_intervals": []}
@@ -247,7 +254,12 @@ def _compose_bounded_annotations(cues: list[Cue], incoming: Mapping[int, list[in
         track_pages[track.index] = records
         if not available:
             slot = eligible[0]
-            slot["lines"] = compact_lines("\n".join([*slot["lines"], *pages[0]]), limit, profile.max_chars_per_line)
+            # Screen text never shares a line with dialogue: captions compact
+            # into the lines the speech leaves, or one line of their own.
+            spoken = len(slot["cue"].lines) if slot["cue"] is not None else 0
+            shown = compact_lines("\n".join([*slot["lines"][spoken:], *pages[0]]), max(1, limit - spoken),
+                                  profile.max_chars_per_line)
+            slot["lines"] = [*slot["lines"][:spoken], *shown]
             slot["annotations"].append(track.index)
             slot["page_refs"].append((track.index, 0))
             slot["capacity"] = 0
