@@ -58,11 +58,14 @@ def min_duration_policy_from_config(provider_config: dict[str, object]) -> str:
 def boundary_refinement_config_from_config(provider_config: dict[str, object]) -> BoundaryRefinementConfig:
     """Read the same acoustic-boundary policy for synchronization and generation."""
     vad_config = provider_config.get("vad", {}) if isinstance(provider_config, dict) else {}
+    # The minimum-duration policy is a timing setting; it applies whether or
+    # not boundary refinement runs, exactly as synchronization reads it.
+    min_duration_policy = min_duration_policy_from_config(provider_config)
     if not isinstance(vad_config, dict):
-        return BoundaryRefinementConfig(enabled=False)
+        return BoundaryRefinementConfig(enabled=False, min_duration_policy=min_duration_policy)
     value = vad_config.get("boundary_refinement", False)
     if value in (False, None):
-        return BoundaryRefinementConfig(enabled=False)
+        return BoundaryRefinementConfig(enabled=False, min_duration_policy=min_duration_policy)
     if value is not True and not isinstance(value, dict):
         raise ValueError("vad.boundary_refinement must be a mapping or boolean")
     options = {} if value is True else value
@@ -79,7 +82,7 @@ def boundary_refinement_config_from_config(provider_config: dict[str, object]) -
         max_trailing_silence_ms=_boundary_milliseconds(options, "max_trailing_silence_ms", 300),
         max_word_duration_ms=int(_timing_seconds(timing_config, "max_word_duration", 2.0) * 1000),
         max_intra_cue_gap_ms=int(_timing_seconds(timing_config, "max_intra_cue_gap", 1.5) * 1000),
-        min_duration_policy=min_duration_policy_from_config(provider_config),
+        min_duration_policy=min_duration_policy,
     )
 
 

@@ -12,11 +12,12 @@ from dubsync.models import Cue, Word
 from dubsync.srt_io import parse_srt_text, write_srt
 from dubsync.style_profile import GenerationConstraints, StyleProfile
 from dubsync.text_metrics import wrap_visual_width
+from dubsync.timing_refinement import BoundaryRefinementConfig, boundary_refinement_config_from_config
 from dubsync.transcription import build_cues_from_words, generate_srt_from_audio
 from dubsync.web.generation_styles import GenerationStyleRequest, resolve_generation_style
 
 
-def _generate(tmp_path, words, *, regions=None, profile=None, constraints=None, boundary_enabled=True):
+def _generate(tmp_path, words, *, regions=None, profile=None, constraints=None, boundary_enabled=True, timing=None):
     audio = tmp_path / "episode.wav"
     with wave.open(str(audio), "wb") as wav:
         wav.setnchannels(1)
@@ -25,11 +26,14 @@ def _generate(tmp_path, words, *, regions=None, profile=None, constraints=None, 
         wav.writeframes(b"\0\0" * 16000 * 5)
     fixture = tmp_path / "words.json"
     fixture.write_text(json.dumps({"words": words}), encoding="utf-8")
-    config = {"asr": {"fixture_path": str(fixture)}, "timing": {"phrase_edge_snap": False}}
+    config = {"asr": {"fixture_path": str(fixture)}, "timing": {"phrase_edge_snap": False, **(timing or {})}}
     if regions is not None:
         regions_path = tmp_path / "regions.json"
         regions_path.write_text(json.dumps({"regions": regions}), encoding="utf-8")
-        config["vad"] = {"fixture_path": str(regions_path), "boundary_refinement": {"enabled": boundary_enabled}}
+        config["vad"] = {"fixture_path": str(regions_path)}
+        # None leaves the block out, as in providers.example.yaml.
+        if boundary_enabled is not None:
+            config["vad"]["boundary_refinement"] = {"enabled": boundary_enabled}
     providers = tmp_path / "providers.yaml"
     providers.write_text(yaml.safe_dump(config), encoding="utf-8")
     result = generate_srt_from_audio(
@@ -47,6 +51,25 @@ def test_generation_resolves_padding_overlap_without_vad(tmp_path):
     assert cues[0].end_ms <= cues[1].start_ms
     assert cues[0].end_ms >= 1610
     assert cues[1].start_ms <= 1650
+    assert not any(flag["kind"] == "output_overlap_unresolved" for flag in result.report["flags"])
+
+
+# No VAD, and one energy burst that bridges the short pause between the turns.
+@pytest.mark.parametrize("regions", [None, [{"start": 1.0, "end": 2.6}]])
+def test_generation_trims_a_custom_lead_in_instead_of_reporting_a_real_pause_as_overlap(tmp_path, regions):
+    cues, result = _generate(tmp_path, [
+        {"text": "Where", "start": 1.0, "end": 1.25, "speaker_id": "A"},
+        {"text": "were", "start": 1.3, "end": 1.55, "speaker_id": "A"},
+        {"text": "you?", "start": 1.6, "end": 1.85, "speaker_id": "A"},
+        {"text": "At", "start": 2.05, "end": 2.3, "speaker_id": "B"},
+        {"text": "home.", "start": 2.35, "end": 2.6, "speaker_id": "B"},
+    ], regions=regions, profile=StyleProfile(fps=25, lead_in_ms=300, tail_ms=40, min_cue_dur=0.5))
+
+    assert [cue.plain_text for cue in cues] == ["Where were you?", "At home."]
+    assert cues[0].start_ms <= 1000
+    # The 200 ms pause holds the boundary: the first frame after "you?" ends.
+    assert (cues[0].end_ms, cues[1].start_ms) == (1880, 1880)
+    assert cues[1].end_ms >= 2600
     assert not any(flag["kind"] == "output_overlap_unresolved" for flag in result.report["flags"])
 
 
@@ -68,6 +91,23 @@ def test_generation_minimum_duration_uses_silence_even_without_boundary_refineme
         profile=StyleProfile(fps=25, min_cue_dur=1.0, tail_ms=0))
     assert cues[0].start_ms == 1000
     assert cues[0].duration_ms >= 1000
+
+
+def test_generation_acoustic_minimum_duration_policy_applies_without_boundary_refinement(tmp_path):
+    cues, result = _generate(tmp_path, [{"text": "Yes.", "start": 1.0, "end": 1.2}],
+        regions=[{"start": 1.0, "end": 1.2}], boundary_enabled=None,
+        timing={"min_duration_policy": "acoustic"},
+        profile=StyleProfile(fps=25, min_cue_dur=1.0, tail_ms=0))
+    assert [(cue.start_ms, cue.end_ms) for cue in cues] == [(1000, 1200)]
+    assert not any(flag["kind"] == "cps_duration_extended" for flag in result.report["flags"])
+
+
+@pytest.mark.parametrize("boundary_refinement", [False, None])
+def test_disabled_boundary_refinement_keeps_the_configured_minimum_duration_policy(boundary_refinement):
+    config = {"vad": {"boundary_refinement": boundary_refinement}, "timing": {"min_duration_policy": "acoustic"}}
+    assert boundary_refinement_config_from_config(config) == BoundaryRefinementConfig(
+        enabled=False, min_duration_policy="acoustic",
+    )
 
 
 @pytest.mark.parametrize("regions", [None, [{"start": 1.0, "end": 4.0}]])
@@ -147,6 +187,19 @@ def test_generation_does_not_split_nonterminal_punctuation(words):
         Word(text=text, start=i * 0.3, end=i * 0.3 + 0.25) for i, text in enumerate(words)
     ], StyleProfile(max_chars_per_line=50))
     assert len(cues) == 1
+
+
+@pytest.mark.parametrize("words", [
+    ["Das", "kostet", "uns", "jetzt", "drei", "Mio.", "im", "Jahr."],
+    ["Ruf", "mich", "bitte", "unter", "Tel.", "Nummer", "drei", "an."],
+    ["Hoje", "à", "noite", "joga", "o", "Brasil", "vs.", "Alemanha", "ao", "vivo."],
+    ["They", "said", "that", "Martin", "Luther", "King", "Jr.", "was", "here."],
+])
+def test_generation_does_not_split_after_an_abbreviation_inside_a_sentence(words):
+    cues = build_cues_from_words([
+        Word(text=text, start=i * 0.3, end=i * 0.3 + 0.25) for i, text in enumerate(words)
+    ], StyleProfile(max_chars_per_line=80))
+    assert [cue.plain_text for cue in cues] == [" ".join(words)]
 
 
 def test_srt_period_timestamps_and_empty_cues_are_ingestible():

@@ -161,7 +161,8 @@ def _resolve_overlaps_with_speech_evidence(
     * a cue timed from its words never starts later, so the boundary is its
       start and the earlier cue's end is trimmed to it, provided that removes
       only display padding or a frame-snap margin and not the earlier cue's
-      last word;
+      last word; when that start is a lead-in before its own first word, the
+      lead-in instead yields up to the first frame after the earlier word;
     * a later cue kept at source timing (a hold or an unmatched cue) instead
       starts where the earlier cue ends, as long as its own first word, when
       known, is not cut;
@@ -197,6 +198,13 @@ def _resolve_overlaps_with_speech_evidence(
             earliest = max(earliest, earlier.start_ms + kept_ms(earlier, yields_to_speech=True))
         if acoustic(later):
             boundary = later.start_ms
+            if boundary < earliest and boundary < later_span[0]:
+                # A display lead-in before the first word is padding, not
+                # speech: it may yield up to that word, never into the
+                # earlier cue's last word.
+                lowest = profile.snap_ceil(max(earliest, earlier_span[1]) if earlier_span is not None else earliest)
+                if max(boundary, lowest) <= profile.snap_floor(later_span[0]):
+                    boundary = max(boundary, lowest)
         else:
             latest = later.end_ms - kept_ms(later)
             if later_span is not None:

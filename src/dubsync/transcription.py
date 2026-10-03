@@ -26,11 +26,11 @@ from .profanity import apply_german_profanity_censorship, censor_german_profanit
 from .punctuation import apply_punctuation_pass
 from .recue import ambiguous_word_cue_ids, ambiguous_word_timing_flags
 from .reports import write_qc_report
-from .semantic_output import expand_output_flags, split_crowded_output_cues
+from .semantic_output import expand_output_flags, split_crowded_output_cues, wrap_generated_lines
 from .speaker_evidence import speakers_known_different
 from .srt_io import write_srt
 from .style_profile import GenerationConstraints, StyleProfile
-from .text_metrics import join_word_texts, wrap_visual_width
+from .text_metrics import join_word_texts
 from .timing_refinement import boundary_refinement_config_from_config, refine_cues_to_speech_activity
 from .vad import (
     late_start_flags_for_cues,
@@ -462,7 +462,7 @@ def _cue_from_group(
     index: int, group: list[Word], profile: StyleProfile, *, preserve_timing: bool = False
 ) -> Cue:
     text = join_word_texts(word.text for word in group)
-    lines = wrap_visual_width(text, profile.max_chars_per_line) or [text]
+    lines = wrap_generated_lines(text, profile.max_chars_per_line) or [text]
     start_ms = profile.snap_floor(max(0, group[0].start * 1000 - profile.lead_in_ms))
     spoken_end_ms = profile.snap_ceil(max(word.end for word in group) * 1000 + profile.tail_ms)
     minimum_end_ms = spoken_end_ms if preserve_timing else profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)

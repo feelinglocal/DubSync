@@ -764,6 +764,32 @@ def test_final_order_trims_padding_and_snap_margin_to_the_next_start():
     assert flags == []
 
 
+def test_final_order_trims_the_next_cues_lead_in_at_a_real_pause():
+    # A display lead-in reaches back over a 200 ms pause into the previous
+    # cue's last word; only that padding is removed, at a frame after the word.
+    cues = [
+        Cue(index=1, start_ms=700, end_ms=1900, lines=["Where were you?"], speaker_id="A"),
+        Cue(index=2, start_ms=1750, end_ms=2600, lines=["At home."], speaker_id="B"),
+    ]
+
+    finalized, flags = _finalize(cues, spans={1: (1000, 1850), 2: (2050, 2600)})
+
+    assert [(cue.start_ms, cue.end_ms) for cue in finalized] == [(700, 1867), (1867, 2600)]
+    assert flags == []
+
+
+def test_final_order_keeps_a_lead_in_overlap_when_the_words_themselves_overlap():
+    cues = [
+        Cue(index=1, start_ms=700, end_ms=1900, lines=["Where were you?"], speaker_id="A"),
+        Cue(index=2, start_ms=1500, end_ms=2600, lines=["At home."], speaker_id="B"),
+    ]
+
+    finalized, flags = _finalize(cues, spans={1: (1000, 1850), 2: (1820, 2600)})
+
+    assert finalized == cues
+    assert [(flag.kind, flag.severity, flag.cue_ids) for flag in flags] == [("output_overlap_unresolved", "error", [1, 2])]
+
+
 def test_final_order_clips_a_source_hold_at_its_acoustic_neighbours():
     # Held cues keep unsynchronized source timing; the retimed neighbours do
     # not move and keep every word.

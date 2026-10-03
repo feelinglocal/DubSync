@@ -78,6 +78,39 @@ def test_japanese_narrow_cues_keep_standalone_punctuation_with_dialogue():
     assert "".join(cue.plain_text for cue in cues) == "今日は「東京です。」"
 
 
+@pytest.mark.parametrize(("sentence", "width", "expected"), [
+    ("今日はとても良い天気ですね。", 26, ["今日はとても", "良い天気ですね。"]),
+    ("明日の朝、駅で会いましょう。", 26, ["明日の朝、", "駅で会いましょう。"]),
+    ("散歩に行きませんか？", 16, ["散歩に", "行きませんか？"]),
+    ("ちょっと待ってくださいね。", 16, ["ちょっと待って", "くださいね。"]),
+    ("俺はただ正当防衛をしたまでだ。", 16, ["俺はただ正当防衛", "をしたまでだ。"]),
+])
+def test_japanese_generation_wraps_like_synchronized_output(tmp_path, sentence, width, expected):
+    # MAI and Scribe return one Japanese character per word.
+    words = [
+        Word(text=character, start=1.0 + index * 0.1, end=1.08 + index * 0.1, speaker_id="A")
+        for index, character in enumerate(sentence)
+    ]
+    words_path = tmp_path / "words.json"
+    words_path.write_text(json.dumps({"words": [word.model_dump() for word in words]}, ensure_ascii=False), encoding="utf-8")
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(f"asr:\n  fixture_path: '{words_path.as_posix()}'\n", encoding="utf-8")
+    profile = StyleProfile(fps=25, max_chars_per_line=width, tail_ms=0)
+    audio_path = tmp_path / "ja.wav"
+    audio_path.write_bytes(b"fixture audio")
+
+    generate_srt_from_audio(
+        audio_path, tmp_path / "ja.srt", tmp_path / "work", providers_path=providers_path,
+        no_llm=True, language="ja", style_profile=profile,
+    )
+
+    cues = parse_srt_text((tmp_path / "ja.srt").read_text(encoding="utf-8"))
+    # Balanced lines at phrase boundaries: no orphaned final kana, no break
+    # inside a kanji run, no line opening with closing punctuation.
+    assert [cue.lines for cue in cues] == [expected]
+    assert (cues[0].start_ms, cues[0].end_ms) == (1000, profile.snap_ceil(words[-1].end * 1000))
+
+
 def test_japanese_generation_pipeline_writes_utf8_srt_and_keeps_asr_evidence(tmp_path):
     words = _words(["今日", "は", "晴れ", "です。", "明日", "は", "雨", "です。"])
     audio_path = tmp_path / "日本語.wav"

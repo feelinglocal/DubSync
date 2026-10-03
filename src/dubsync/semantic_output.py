@@ -281,6 +281,17 @@ def wrap_semantic_lines(text: str, max_width: int) -> list[str]:
     return _greedy_lines(text, spans, max_width)
 
 
+def wrap_generated_lines(text: str, max_width: int) -> list[str]:
+    """Wrap a cue joined from ASR words in audio-to-SRT generation.
+
+    Unspaced Japanese/Chinese text takes the same balanced, kinsoku-legal
+    layout as synchronized output; spaced text keeps the balanced word wrap.
+    """
+    if len(text.split()) == 1 and contains_character_level_script(text):
+        return wrap_semantic_lines(text, max_width)
+    return wrap_visual_width(text, max_width)
+
+
 def _display_clusters(text: str) -> list[str]:
     """Retain kana marks and common emoji graphemes as indivisible units."""
     clusters: list[str] = []
@@ -315,7 +326,18 @@ def _unspaced_break_cost(clusters: list[str], end: int) -> int:
         return -32
     if previous in _NONSTARTING_KANA:
         return 64
+    script = _japanese_run_script(previous)
+    if script is not None and script == _japanese_run_script(unicodedata.normalize("NFKC", clusters[end])[0]):
+        # A kanji or katakana run is mostly one word or compound.
+        return 32
     return 0
+
+
+def _japanese_run_script(character: str) -> str | None:
+    name = unicodedata.name(character, "")
+    if character in "々〆" or name.startswith(("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")):
+        return "kanji"
+    return "katakana" if "KATAKANA" in name and character != "・" else None
 
 
 def _unspaced_lines(text: str, max_width: int) -> list[str]:

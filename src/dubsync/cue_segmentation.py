@@ -1206,8 +1206,11 @@ def _starts_new_cue(
     current_text = join_word_texts(words[index].text for index in current)
     if _ends_sentence(current_text, next_text=word.text) and previous.end - words[current[0]].start >= profile.min_cue_dur:
         return True
+    # Count the lines generation delivers; imported here because semantic_output imports this module.
+    from .semantic_output import wrap_generated_lines
+
     candidate = join_word_texts(words[index].text for index in [*current, *unit])
-    return len(wrap_visual_width(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
+    return len(wrap_generated_lines(candidate, profile.max_chars_per_line)) > profile.max_lines_per_cue
 
 
 def _snapped_duration_ms(first: Word, last: Word, profile: StyleProfile) -> int:
@@ -1224,6 +1227,7 @@ _NONTERMINAL_ABBREVIATIONS = frozenset({
     "dr", "dra", "prof", "sr", "sra", "srta", "mr", "mrs", "ms", "st", "nr",
     "hr", "fr", "bzw", "ca", "vgl", "inkl", "zzgl", "geb", "jan", "feb", "apr",
     "jun", "jul", "aug", "sep", "sept", "okt", "nov", "dez", "mme", "mlle",
+    "mio", "mrd", "str", "tel", "ggf", "evtl", "vs", "jr", "av",
 })
 
 
