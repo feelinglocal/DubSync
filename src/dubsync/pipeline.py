@@ -3050,7 +3050,6 @@ def _run_verify_stage(
                          if reconciled.resolved_cue_ids.intersection(flag.cue_ids))
             rebuilt = sorted(rebuilt, key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
         missing_dialogue_outcomes = reconciled.outcomes
-    pre_source_pair_cues, pre_source_pair_alignment, pre_source_pair_flags = rebuilt, alignment, list(flags)
     accepted_anchor_outcomes = []
     accepted_anchor_guards = {
         "uncertain_word_indices": sorted(uncertain_word_indices),
@@ -3363,11 +3362,8 @@ def _run_verify_stage(
         "accepted_anchor_ordinary_sha256": (_sha256_file(episode_workdir / "adjudicate.json")
                                            if _accepted_anchor_omission_digest(accepted_anchor_outcomes) else None),
         **({"accepted_anchor_omission_guards": accepted_anchor_guards} if accepted_anchor_outcomes else {}),
+        # Resume verify replays verify_input; no earlier stage copy is written for it.
         **({
-            "pre_source_pair_cues": [cue.model_dump() for cue in pre_source_pair_cues],
-            "pre_source_pair_alignment": pre_source_pair_alignment.model_dump(),
-            "pre_source_pair_flags": [flag.model_dump() for flag in pre_source_pair_flags],
-            "pre_source_pair_decisions": [decision.model_dump() for decision in decisions],
             "collapsed_singleton_guards": {
                 "uncertain_word_indices": sorted(uncertain_word_indices),
                 "protected_cue_ids": sorted(singleton_protected),

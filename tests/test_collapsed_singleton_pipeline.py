@@ -57,6 +57,9 @@ def test_singleton_pipeline_hears_complete_word_and_replays_bound_secondary_proo
         assert adapter.seen == []
         assert result.output_srt.read_bytes() == original_output
     rebuilt = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
+    # W3R-8: resume verify replays verify_input; the unread pre-source-pair copies are not written.
+    assert not [key for key in rebuilt if key.startswith("pre_source_pair_")]
+    assert "collapsed_singleton_guards" in rebuilt and "verify_input" in rebuilt
     target = next(cue for cue in rebuilt["cues"] if cue["index"] == 601)
     assert target["start_ms"] <= 6975 and 7245 <= target["end_ms"] < 8630
     assert target["lines"] == ["É."]
