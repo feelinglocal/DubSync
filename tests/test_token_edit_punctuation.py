@@ -78,6 +78,95 @@ def test_quote_the_source_cue_already_has_is_not_an_editorial_addition(final_tex
     assert kinds == ["text_changed"]
 
 
+_QUOTE_FAMILIES = {
+    "straight-double": ('"', '"'), "curly-double": ("“", "”"), "low-high": ("„", "“"),
+    "guillemets": ("«", "»"), "curly-single": ("‘", "’"), "straight-single": ("'", "'"),
+}
+_FAMILIES = pytest.mark.parametrize("opening, closing", list(_QUOTE_FAMILIES.values()), ids=list(_QUOTE_FAMILIES))
+
+
+@_FAMILIES
+def test_deleting_every_quoted_word_removes_the_quotation_marks(opening, closing):
+    # R1.11h: the actor skips the quoted phrase. The marks stayed ('Ele disse “” e saiu.'),
+    # or two straight marks collapsed into one and the guard rejected the omission.
+    text, kinds = _edit(f"Ele disse {opening}vamos embora{closing} e saiu.", [2, 3], "vamos embora", "", asr_text="")
+
+    assert text == "Ele disse e saiu."
+    assert kinds == ["text_changed"]
+
+
+@_FAMILIES
+@pytest.mark.parametrize("tokens, removed, kept", [([3], "embora", "vamos"), ([2], "vamos", "embora")])
+def test_deleting_part_of_a_quotation_keeps_both_marks_beside_the_kept_words(opening, closing, tokens, removed, kept):
+    text, kinds = _edit(f"Ele disse {opening}vamos embora{closing} e saiu.", tokens, removed, "", asr_text="")
+
+    assert text == f"Ele disse {opening}{kept}{closing} e saiu."
+    assert kinds == ["text_changed"]
+
+
+@pytest.mark.parametrize("opening, closing", [("‘", "’"), ("'", "'")], ids=["curly-single", "straight-single"])
+@pytest.mark.parametrize("tokens, removed, expected", [
+    ([1, 2], "disse vamos", "Ele {o}embora{c} e saiu."),
+    ([3, 4], "embora e", "Ele disse {o}vamos{c} saiu."),
+])
+def test_a_deletion_across_one_single_quote_puts_the_mark_back_beside_the_kept_words(
+    opening, closing, tokens, removed, expected,
+):
+    # R1.11: 'Ele embora’ e saiu.' kept half of the quotation and the guard rejected the cue.
+    text, kinds = _edit(f"Ele disse {opening}vamos embora{closing} e saiu.", tokens, removed, "", asr_text="")
+
+    assert text == expected.format(o=opening, c=closing)
+    assert kinds == ["text_changed"]
+
+
+@pytest.mark.parametrize("text, tokens, removed, expected", [
+    ("Ele gritou “socorro!” e correu.", [2], "socorro", "Ele gritou e correu."),
+    ("“Vamos embora”, disse ele.", [0, 1], "Vamos embora", "disse ele."),
+])
+def test_a_deleted_quotation_leaves_no_punctuation_of_its_own(text, tokens, removed, expected):
+    assert _edit(text, tokens, removed, "", asr_text="")[0] == expected
+
+
+def test_replacing_every_quoted_word_keeps_the_quotation():
+    assert _edit("Ele disse “vamos embora” e saiu.", [2, 3], "vamos embora", "bora")[0] == (
+        "Ele disse “bora” e saiu."
+    )
+
+
+@pytest.mark.parametrize("text, tokens, removed, expected", [
+    # Apostrophes at word edges are not a quotation around the deleted words.
+    ("Tryin' to go 'cause I'm late.", [1, 2], "to go", "Tryin' 'cause I'm late."),
+    # An apostrophe inside a word is not the closing mark of the quotation around it.
+    ("Ele disse ‘copo d’água’ e saiu.", [2], "copo", "Ele disse ‘d’água’ e saiu."),
+    ("Ele disse ‘copo d’água’ e saiu.", [2, 3, 4], "copo d água", "Ele disse e saiu."),
+])
+def test_apostrophes_are_not_quotation_marks(text, tokens, removed, expected):
+    edited, kinds = _edit(text, tokens, removed, "", asr_text="")
+
+    assert edited == expected
+    assert kinds == ["text_changed"]
+
+
+@pytest.mark.parametrize("opening, closing", [('"', '"'), ("“", "”")], ids=["straight", "curly"])
+def test_actor_skipping_a_quoted_phrase_is_delivered_without_empty_marks(tmp_path, opening, closing):
+    # The review's sync_episode repro: a native answer deletes exactly the quoted words.
+    srt = (
+        "1\n00:00:00,500 --> 00:00:01,100\nBom dia.\n\n"
+        f"2\n00:00:02,000 --> 00:00:04,200\nEle disse {opening}vamos embora{closing} e saiu.\n\n"
+        "3\n00:00:05,500 --> 00:00:06,000\nTchau.\n"
+    )
+    words = [("Bom", .5, .7), ("dia.", .75, 1.0), ("Ele", 2.0, 2.2), ("disse", 2.25, 2.6),
+             ("e", 3.6, 3.7), ("saiu.", 3.75, 4.1), ("Tchau.", 5.5, 5.9)]
+    answer = {"case_id": "case-1", "verdict": "use_audio", "final_text": "", "heard_text": "",
+              "evidence": "heard_clearly", "confidence": 1.0, "reason": "The actor skips the quoted line."}
+
+    cues, flags = _sync(tmp_path, srt, words, responses={"case-1": answer})
+
+    assert [cue.plain_text for cue in cues] == ["Bom dia.", "Ele disse e saiu.", "Tchau."]
+    assert "editorial_guard_rejected" not in [flag["kind"] for flag in flags]
+    assert [flag["new_text"] for flag in flags if flag["kind"] == "text_changed"] == ["Ele disse e saiu."]
+
+
 @pytest.mark.parametrize("text, tokens, source, final_text", [
     ("Olha a cheirosa aqui.", [2], "cheirosa", '"linda"'),
     # A partly repeated quotation cannot be told from a second one.
@@ -137,7 +226,7 @@ def test_authored_punctuation_clusters_are_not_rewritten():
 # --- leftover duplicate cue -------------------------------------------------------------------
 
 
-def _sync(tmp_path, srt: str, words: list[tuple], *, no_llm: bool = True):
+def _sync(tmp_path, srt: str, words: list[tuple], *, responses: dict | None = None):
     source = tmp_path / "episode.srt"
     source.write_text(srt, encoding="utf-8")
     audio = tmp_path / "episode.wav"
@@ -147,10 +236,13 @@ def _sync(tmp_path, srt: str, words: list[tuple], *, no_llm: bool = True):
         {"text": text, "start": start, "end": end, "confidence": None} for text, start, end in words
     ]}, ensure_ascii=False), encoding="utf-8")
     providers = tmp_path / "providers.yaml"
-    providers.write_text(yaml.safe_dump({"asr": {"fixture_path": str(fixture)}}, allow_unicode=True), encoding="utf-8")
+    config = {"asr": {"fixture_path": str(fixture)}}
+    if responses is not None:
+        config["llm"] = {"provider": "fixture", "responses": responses}
+    providers.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
     output = tmp_path / "episode.synced.srt"
     result = pipeline.sync_episode(
-        source, audio, output, tmp_path / "work", providers_path=providers, no_llm=no_llm,
+        source, audio, output, tmp_path / "work", providers_path=providers, no_llm=responses is None,
         style_profile=StyleProfile(fps=30, min_cue_dur=0.5),
     )
     return parse_srt_text(output.read_text(encoding="utf-8")), result.report["flags"]

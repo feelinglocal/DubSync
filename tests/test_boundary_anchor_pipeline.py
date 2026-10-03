@@ -2,9 +2,12 @@
 import json
 
 import pytest
+import yaml
 
 from dubsync import pipeline
 from dubsync.models import AlignmentResult, Cue, DivergenceSpan, SpeechRegion, TokenMatch, Word
+from dubsync.srt_io import parse_srt_text, write_srt
+from test_boundary_anchor_regions import CUES_657, MAI_657, SCRIBE_657
 from test_missing_dialogue_reconciliation import _pipeline_case
 
 
@@ -129,6 +132,57 @@ def test_interrupted_scope_refresh_cannot_promote_old_partial_answer(tmp_path, m
     with pytest.raises(ValueError, match="resume from adjudicate"):
         run(resume=mode)
     assert adapter.seen == []
+
+
+def _sync_657(tmp_path, stream, responses, *, anchor_confidence=None):
+    """EP11 cue 657 through the real aligner and pipeline, text-only fixture answers keyed by case."""
+    source, audio, config, fixture = [tmp_path / name for name in ("source.srt", "audio.wav", "provider.yaml", "words.json")]
+    source.write_text(write_srt([cue.model_copy(update={"index": number}) for number, cue in enumerate(CUES_657, 1)]),
+                      encoding="utf-8")
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    fixture.write_text(json.dumps({"words": [
+        {"text": text, "start": start, "end": end, "speaker_id": "s",
+         "confidence": anchor_confidence if (text, start) in {("E", 8.9), ("e", 9.35)} else None}
+        for text, start, end in stream
+    ]}, ensure_ascii=False), encoding="utf-8")
+    config.write_text(yaml.safe_dump({"asr": {"fixture_path": str(fixture)}, "llm": {"provider": "fixture", "responses": {
+        case_id: {"case_id": case_id, "verdict": "keep_srt" if text is None else "use_audio", "final_text": text or "",
+                  "confidence": 1.0, "reason": "heard"} for case_id, text in responses.items()
+    }}}, allow_unicode=True), encoding="utf-8")
+    result = pipeline.sync_episode(source, audio, tmp_path / "output.srt", tmp_path / "work", providers_path=config,
+                                   language="pt")
+    delivered = {cue.index: " ".join(cue.plain_text.split())
+                 for cue in parse_srt_text((tmp_path / "output.srt").read_text(encoding="utf-8"))}
+    questions = json.loads((result.episode_workdir / "align.json").read_text(encoding="utf-8"))["divergence_spans"]
+    return delivered, {span["case_id"]: span["srt_text"] for span in questions}, result.report["flags"]
+
+
+@pytest.mark.parametrize("stream, responses, question", [
+    (MAI_657, {"case-1": "E", "case-3": "ia lá saber"}, "Como é que"),
+    (SCRIBE_657, {"case-1": "E eu ia lá saber"}, "Como é que eu sabia"),
+])
+def test_edits_around_a_retained_accent_anchor_are_heard_in_one_question(tmp_path, stream, responses, question):
+    # EP11 cue 657 was delivered as "é eu ia lá saber ..." (MAI) and "E eu é ia lá saber ..." (Scribe).
+    delivered, questions, flags = _sync_657(tmp_path, stream, responses)
+
+    assert questions["case-1"] == question and "case-2" not in questions
+    assert delivered[2] == "E eu ia lá saber que ele tinha namorada?"
+    assert "adjudication_span_edit_held" not in [flag["kind"] for flag in flags]
+
+
+def test_edit_beside_an_anchor_outside_every_question_holds_the_cue(tmp_path):
+    # An uncertain anchor word cannot join a question; the approved edits around it would deliver
+    # the script's "é" inside new wording, so the cue keeps its script wording for review.
+    delivered, questions, flags = _sync_657(
+        tmp_path, MAI_657, {"case-1": "", "case-2": "", "case-3": "ia lá saber"}, anchor_confidence=.5,
+    )
+
+    assert [questions[case] for case in ("case-1", "case-2", "case-3")] == ["Como", "que", "sabia"]
+    assert delivered[2] == "Como é que eu sabia que ele tinha namorada?"
+    held = [flag for flag in flags if flag["kind"] == "adjudication_span_edit_held"]
+    assert held and {cue for flag in held for cue in flag["cue_ids"]} == {2}
+    assert all(flag["severity"] == "error" for flag in held)
+    assert not [flag for flag in flags if flag["kind"] == "text_changed" and 2 in flag["cue_ids"]]
 
 
 @pytest.mark.parametrize("mode", ["rebuild", "verify"])

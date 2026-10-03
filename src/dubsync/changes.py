@@ -7,6 +7,8 @@ from math import isfinite
 from .adjudication_regions import is_joint_region
 from .editorial_guard import (
     EditorialGuardError,
+    _is_word_character,
+    _quotation_mark_signature,
     validate_adjudication_editorial_contract,
     validate_editorial_text,
 )
@@ -594,13 +596,15 @@ def apply_adjudication_decisions(
             continue
         if any(start < end and not text.strip() for start, end, text in edits):
             changed_text = _remove_deleted_dialogue_turn_markers(cues_by_id[cue_id], changed_text)
+        opening = cues_by_id[cue_id].text.lstrip()[:1]
         if (
             any(start == 0 and end > 0 and not text.strip() for start, end, text in edits)
             and not cue_has_bracketed_screen_text(cues_by_id[cue_id])
-            and cues_by_id[cue_id].text.lstrip()[:1].isalnum()
+            and (opening.isalnum() or bool(opening) and opening in _DOUBLE_QUOTATION_MARKS + _SINGLE_QUOTATION_MARKS)
         ):
-            # A removed opening word can leave its separator before the next
-            # spoken word. Preserve authored leading punctuation and markup.
+            # A removed opening word (or quotation) can leave its separator
+            # before the next spoken word. Preserve authored leading punctuation
+            # and markup.
             changed_text = re.sub(r"^[,;:]+\s*", "", changed_text.lstrip())
         final_token_edit_text_by_cue[cue_id] = changed_text
         if not alphanumeric_signature(changed_text):
@@ -2168,9 +2172,9 @@ def _apply_token_edits_with_spans(
             if stripped_replacement:
                 stripped_replacement = f" {stripped_replacement}"
         restored_before = restored_after = ""
-        if bounded_end > bounded_start and not any(mark in stripped_replacement for mark in _DOUBLE_QUOTATION_MARKS):
+        if bounded_end > bounded_start and not _quotation_mark_signature(stripped_replacement):
             start_character, end_character, restored_before, restored_after = _balanced_quote_removal(
-                source_text, start_character, end_character,
+                source_text, start_character, end_character, deletion=not stripped_replacement, floor=cursor,
             )
         if (
             ends_with_title
@@ -2241,6 +2245,7 @@ def _apply_token_edits_with_spans(
 
 _DANGLING_SEPARATOR_RE = re.compile(r"[,;:]+(?=[.!?\u2026,;:])")
 _DOUBLE_QUOTATION_MARKS = '"\u201c\u201d\u201e\u201f\u00ab\u00bb'
+_SINGLE_QUOTATION_MARKS = "'\u2018\u2019\u201a\u2039\u203a"
 # English and German contraction suffixes; the word before them is complete.
 _CONTRACTION_SUFFIXES = frozenset({"s", "t", "m", "d", "re", "ve", "ll"})
 # Written title abbreviations and the words actors say for them (accent-folded).
@@ -2266,17 +2271,23 @@ def _is_spoken_title(abbreviation: str, replacement: str) -> bool:
     return len(spoken) == 1 and spoken[0] in _TITLE_ABBREVIATIONS.get(abbreviation.casefold(), frozenset())
 
 
-def _balanced_quote_removal(text: str, start: int, end: int) -> tuple[int, int, str, str]:
+def _balanced_quote_removal(
+    text: str, start: int, end: int, *, deletion: bool = False, floor: int = 0,
+) -> tuple[int, int, str, str]:
     """Never leave half of a quotation behind when an edit removes one of its marks.
 
     The partner directly beside the removed range goes with it (the whole
     quotation is gone). A partner farther away still encloses retained words:
-    the removed mark is named so the caller puts it back beside them. Returns
-    the adjusted range, a mark to restore before it and one to restore after.
+    the removed mark is named so the caller puts it back beside them. A
+    deletion of every word between two marks removes the quotation, marks and
+    its own punctuation included; a deletion at one end of a quotation takes
+    the space between the mark and the kept words (never before ``floor``,
+    where the text already given out ends). Returns the adjusted range, a mark
+    to restore before it and one to restore after.
     """
-    positions = [index for index, character in enumerate(text) if character in _DOUBLE_QUOTATION_MARKS]
+    pairs = _quotation_pairs(text)
     restored_before = restored_after = ""
-    for opening, closing in zip(positions[0::2], positions[1::2]):
+    for opening, closing in pairs:
         if start <= opening < end <= closing:
             if closing == end:
                 end += 1
@@ -2287,7 +2298,46 @@ def _balanced_quote_removal(text: str, start: int, end: int) -> tuple[int, int, 
                 start -= 1
             else:
                 restored_before = text[closing]
+    if not deletion:
+        return start, end, restored_before, restored_after
+    # Innermost first: an emptied quotation can empty the one around it.
+    for opening, closing in sorted(pairs, key=lambda pair: pair[1] - pair[0]):
+        if not opening < start or not end <= closing:
+            continue
+        before, after = text[opening + 1:start], text[end:closing]
+        if not any(character.isalnum() for character in before + after):
+            start, end = opening, closing + 1
+        elif not before.strip():
+            while end < closing and text[end] in " \t":
+                end += 1
+        elif not after.strip():
+            while start > max(floor, opening + 1) and text[start - 1] in " \t":
+                start -= 1
     return start, end, restored_before, restored_after
+
+
+def _quotation_pairs(text: str) -> list[tuple[int, int]]:
+    """Opening and closing positions of the quotations in ``text``.
+
+    Double marks pair in order. Single marks are the ones the editorial guard
+    counts: one inside a word is an apostrophe (``d’água``). A single mark
+    opens only after a non-word character and closes only before one, so an
+    apostrophe at a word edge (``tryin'``, ``'cause``) never pairs with a quote.
+    """
+    doubles = [index for index, character in enumerate(text) if character in _DOUBLE_QUOTATION_MARKS]
+    pairs = list(zip(doubles[0::2], doubles[1::2]))
+    opening = None
+    for index, character in enumerate(text):
+        if character not in _SINGLE_QUOTATION_MARKS:
+            continue
+        after_word = index > 0 and _is_word_character(text[index - 1])
+        before_word = index + 1 < len(text) and _is_word_character(text[index + 1])
+        if opening is not None and not before_word:
+            pairs.append((opening, index))
+            opening = None
+        elif not after_word:
+            opening = index
+    return sorted(pairs)
 
 
 def _protect_text_fragments(

@@ -8,8 +8,10 @@ import yaml
 
 from dubsync import pipeline
 from dubsync.changes import apply_adjudication_decisions
-from dubsync.edit_consistency import hold_fragmenting_replacements, settle_edits_with_held_timing
-from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag
+from dubsync.edit_consistency import (
+    hold_edits_beside_accent_anchors, hold_fragmenting_replacements, settle_edits_with_held_timing,
+)
+from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, TokenMatch, Word
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
 
@@ -188,6 +190,59 @@ def test_complete_one_letter_answer_is_not_a_leftover():
     decisions, flags = hold_fragmenting_replacements(cues, [span], [decision], _apply(cues, span))
 
     assert decisions == [decision] and flags == []
+
+
+def _anchor_case(anchor="é", heard="E", *, claimed=False):
+    """'Como é que eu sabia.' heard as 'E eu sabia': two source-only cases around a retained anchor."""
+    cues = [Cue(index=7, start_ms=0, end_ms=2000, lines=[f"Como {anchor} que eu sabia."])]
+    words = [Word(text=text, start=start, end=end, speaker_id="s")
+             for text, start, end in [(heard, .1, .18), ("eu", .3, .38), ("sabia.", .4, .7)]]
+    matches = [TokenMatch(cue_id=7, srt_token_index=source, asr_word_index=audio, score=1)
+               for source, audio in [(1, 0), (3, 1), (4, 2)]]
+    spans = [
+        DivergenceSpan(case_id="case-1", cue_ids=[7], srt_text="Como", asr_text="", srt_token_indices=[0],
+                       start=0, end=.1, right_anchor_cue_id=7, right_anchor_start=.1),
+        DivergenceSpan(case_id="case-2", cue_ids=[7], srt_text="que", asr_text="", srt_token_indices=[2],
+                       start=.18, end=.3, left_anchor_cue_id=7, left_anchor_end=.18),
+    ]
+    if claimed:
+        spans[0] = spans[0].model_copy(update={"srt_text": f"Como {anchor}", "asr_text": heard,
+                                               "srt_token_indices": [0, 1], "asr_word_indices": [0]})
+    return cues, spans, matches, words
+
+
+def _decisions(*texts):
+    return [AdjudicationDecision(case_id=f"case-{number}", verdict="keep_srt" if text is None else "use_audio",
+                                 final_text="" if text is None else text, confidence=1.0, reason="heard",
+                                 evidence="heard_clearly", heard_text=text or "")
+            for number, text in enumerate(texts, 1)]
+
+
+def test_approved_edit_beside_an_unheard_accent_anchor_holds_the_cue():
+    # EP11 MAI cue 657: "Como" and "que" were deleted around the retained "é" (ASR "E") and
+    # "é eu ia lá saber ..." was delivered without review.
+    cues, spans, matches, words = _anchor_case()
+
+    decisions, flags = hold_edits_beside_accent_anchors(cues, spans, _decisions("", ""), matches, words)
+
+    assert [decision.verdict for decision in decisions] == ["keep_srt", "keep_srt"]
+    assert [(flag.kind, flag.severity, flag.cue_ids) for flag in flags] == [("adjudication_span_edit_held", "error", [7])] * 2
+    assert "'é'" in flags[0].message and "'E'" in flags[0].message
+    changed, _ = apply_adjudication_decisions(cues, spans, decisions, StyleProfile())
+    assert changed == cues
+
+
+@pytest.mark.parametrize("anchor, heard, claimed, texts", [
+    ("é", "E", False, (None, None)),   # nothing approved beside the anchor
+    ("é", "E", True, ("E", "")),       # the anchor is part of the question that decided it
+    ("à", "a", False, ("", "")),       # homophones: the ASR spelling is no evidence
+    ("é", "é", False, ("", "")),       # the anchor is literally what was heard
+])
+def test_anchor_that_needs_no_hold(anchor, heard, claimed, texts):
+    cues, spans, matches, words = _anchor_case(anchor, heard, claimed=claimed)
+    decisions = _decisions(*texts)
+
+    assert hold_edits_beside_accent_anchors(cues, spans, decisions, matches, words) == (decisions, [])
 
 
 def test_replacement_without_unique_word_ownership_keeps_text_and_timing_together(tmp_path):

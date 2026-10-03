@@ -51,7 +51,7 @@ from .cue_segmentation import (
 )
 from .detached_speech import separate_detached_speech
 from .edit_consistency import (
-    held_decisions as decisions_with_held_cases, hold_fragmenting_replacements,
+    held_decisions as decisions_with_held_cases, hold_edits_beside_accent_anchors, hold_fragmenting_replacements,
     settle_edits_with_held_timing, settle_one_letter_residues,
 )
 from .editorial_guard import episode_editorial_addition_flags
@@ -918,6 +918,10 @@ def sync_episode(
         cues, alignment.divergence_spans, decisions, apply_text,
     )
     flags.extend(fragment_hold_flags)
+    decisions, accent_anchor_hold_flags = hold_edits_beside_accent_anchors(
+        cues, alignment.divergence_spans, decisions, alignment.token_matches, words,
+    )
+    flags.extend(accent_anchor_hold_flags)
     mapping_held_case_ids: set[str] = set()
     alignment = _alignment_with_decision_words(
         alignment,

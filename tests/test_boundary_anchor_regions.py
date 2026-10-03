@@ -84,7 +84,7 @@ def test_adjacent_accent_collision_explicitly_enters_fresh_scope_without_changin
     "literal_same", "case_only", "different_non_accent", "multitoken_anchor", "shared_owner", "unowned_anchor",
     "wrong_owner", "missing_match", "duplicate_match", "shared_match", "wrong_match_cue", "weak_match",
     "stale_tokens", "wrong_source_text", "wrong_asr_text", "noncontiguous_source", "noncontiguous_audio",
-    "missing_anchor_cue", "wrong_anchor_time", "wrong_anchor_speaker", "overlap", "large_gap", "collapsed_anchor",
+    "missing_anchor_cue", "wrong_anchor_time", "wrong_anchor_speaker", "overlap", "large_gap",
     "low_confidence", "unknown_speaker", "different_speaker", "same_word_repetition", "protected_cue",
     "protected_other_cue", "song", "bracketed_text", "derived", "anchor_claimed_source", "anchor_claimed_audio",
     "duplicate_cases", "competing_scope", "extra_retained_source", "incorrect_span_start", "incorrect_span_end",
@@ -111,9 +111,9 @@ def test_uncertain_or_readonly_boundary_evidence_does_not_expand(fault):
     elif fault == "missing_anchor_cue": span.left_anchor_cue_id = None
     elif fault == "wrong_anchor_time": span.left_anchor_end = 1.190
     elif fault == "wrong_anchor_speaker": span.left_anchor_speaker_id = "other"
-    elif fault in {"overlap", "large_gap", "collapsed_anchor", "low_confidence", "unknown_speaker", "different_speaker"}:
+    elif fault in {"overlap", "large_gap", "low_confidence", "unknown_speaker", "different_speaker"}:
         update = {"overlap": {"end": 1.250}, "large_gap": {"start": .620, "end": .799},
-                  "collapsed_anchor": {"start": 1.198}, "low_confidence": {"confidence": .6},
+                  "low_confidence": {"confidence": .6},
                   "unknown_speaker": {"speaker_id": None}, "different_speaker": {"speaker_id": "other"}}[fault]
         case["words"][1] = case["words"][1].model_copy(update=update)
         if "end" in update: span.left_anchor_end = update["end"]
@@ -153,12 +153,115 @@ def test_an_adjacent_case_cannot_borrow_the_other_cues_accent_anchor():
     assert _extend(case) == case["spans"]
 
 
-def test_accent_candidate_shared_between_adjacent_partial_cases_is_not_consumed_twice():
-    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=["antes E depois"])]
-    words = [Word(text=t, start=a, end=b, speaker_id="s") for t, a, b in [("antes", 0, .2), ("É", .24, .32), ("depois", .36, .55)]]
+@pytest.mark.parametrize("source, heard", [("E", "É"), ("A", "À")])
+def test_accent_candidate_shared_between_adjacent_partial_cases_is_not_consumed_twice(source, heard):
+    cues = [Cue(index=1, start_ms=0, end_ms=1000, lines=[f"antes {source} depois"])]
+    words = [Word(text=t, start=a, end=b, speaker_id="s") for t, a, b in [("antes", 0, .2), (heard, .24, .32), ("depois", .36, .55)]]
     spans = [DivergenceSpan(case_id="a", cue_ids=[1], srt_text="antes", asr_text="antes", srt_token_indices=[0], asr_word_indices=[0],
                 start=0, end=.2, right_anchor_cue_id=1, right_anchor_start=.24, right_anchor_speaker_id="s"),
              DivergenceSpan(case_id="b", cue_ids=[1], srt_text="depois", asr_text="depois", srt_token_indices=[2], asr_word_indices=[2],
                 start=.36, end=.55, left_anchor_cue_id=1, left_anchor_end=.32, left_anchor_speaker_id="s")]
-    assert _extend(dict(spans=spans, matches=[TokenMatch(cue_id=1, srt_token_index=1, asr_word_index=1, score=1)],
-        cues=cues, tokens=tokenize_cues(cues), words=words, protected_cue_ids=set(), cue_word_indices={1: [1]})) == spans
+    case = dict(spans=spans, matches=[TokenMatch(cue_id=1, srt_token_index=1, asr_word_index=1, score=1)],
+                cues=cues, tokens=tokenize_cues(cues), words=words, protected_cue_ids=set(), cue_word_indices={1: [1]})
+    result = _extend(case)
+    if source == "A":
+        # "à" and "a" sound alike: the ASR spelling is no evidence, the script word stays read-only.
+        assert result == spans
+        return
+    # Both cases edit the anchor's cue: one question hears all three words once.
+    assert [span.case_id for span in result] == ["a"]
+    joined = result[0]
+    assert joined.srt_token_indices == [0, 1, 2] and joined.asr_word_indices == [0, 1, 2]
+    assert joined.srt_text == "antes E depois" and joined.asr_text == "antes É depois"
+    assert (joined.start, joined.end) == (0, .55)
+    assert joined.right_anchor_cue_id is None and joined.left_anchor_cue_id is None
+    assert _extend({**case, "spans": result}) == result
+
+
+def test_collapsed_accent_anchor_still_enters_the_question():
+    # Scribe ep11 cue 657: the retained "é" was matched to a 1 ms "e" and stayed out of every question.
+    case = _case()
+    case["words"][1] = case["words"][1].model_copy(update={"start": 1.198})
+    result = _extend(case)
+    assert result[0].srt_token_indices == list(range(1, 10)) and result[0].asr_word_indices == [1, 2, 3, 4]
+    assert result[0].start == 1.198 and result[0].left_anchor_cue_id is None
+
+
+def _aligned(cues, raw_words, **word_fields):
+    from dubsync.aligner import align_cues_to_words
+    words = [Word(text=text, start=start, end=end, speaker_id="s", **word_fields) for text, start, end in raw_words]
+    alignment = align_cues_to_words(cues, words, language="pt")
+    return {"spans": alignment.divergence_spans, "matches": alignment.token_matches, "cues": cues,
+            "tokens": tokenize_cues(cues), "words": words, "protected_cue_ids": set(),
+            "cue_word_indices": alignment.cue_word_indices}
+
+
+CUES_657 = [
+    Cue(index=656, start_ms=250, end_ms=1290, lines=["Vai lá ver."]),
+    Cue(index=657, start_ms=9050, end_ms=11010, lines=["Como é que eu sabia que ele tinha namorada?"]),
+    Cue(index=658, start_ms=15620, end_ms=16340, lines=["Zang Yao,"]),
+]
+# The recorded EP11 word streams, 1769.5 s earlier.
+MAI_657 = [("Vai", .620, .779), ("lá", .820, .940), ("ver.", 1.020, 1.260), ("E", 8.900, 8.980),
+           ("eu", 9.120, 9.199), ("ia", 9.260, 9.380), ("lá", 9.420, 9.540), ("saber", 9.620, 9.779),
+           ("que", 9.820, 9.899), ("ele", 9.920, 10.019), ("tinha", 10.060, 10.199),
+           ("namorado?", 10.260, 10.699), ("Zang", 15.779, 15.959), ("Yao,", 16.060, 16.339)]
+SCRIBE_657 = [("Vai", .670, .790), ("lá", .830, .930), ("ver.", .970, 1.150), ("Gui", 9.010, 9.310),
+              ("e", 9.350, 9.351), ("ela", 9.390, 9.510), ("saber", 9.550, 9.830), ("que", 9.870, 9.910),
+              ("ele", 9.910, 10.010), ("tinha", 10.070, 10.190), ("namorada?", 10.230, 10.630),
+              ("Zang", 15.810, 15.970), ("Yao,", 15.980, 16.170)]
+
+
+@pytest.mark.parametrize("stream, question, heard, removed", [
+    (MAI_657, "Como é que", "E", ["que"]),
+    (SCRIBE_657, "Como é que eu sabia", "Gui e ela saber", ["que eu sabia"]),
+])
+def test_anchor_between_two_edits_of_its_cue_is_heard_in_one_question(stream, question, heard, removed):
+    # EP11 cue 657 was delivered as "é eu ia lá saber..." (MAI) and "E eu é ia lá saber..." (Scribe).
+    case = _aligned(CUES_657, stream)
+    before = deepcopy(case)
+    result = _extend(case)
+    assert case == before
+    old = {span.case_id: span for span in case["spans"]}
+    first = result[0]
+    assert first.case_id == "case-1" and first.srt_text == question and first.asr_text == heard
+    assert first.left_anchor_cue_id == 656 and first.left_anchor_end == old["case-1"].left_anchor_end
+    assert first.right_anchor_cue_id == 657 and first.right_anchor_start == old["case-2"].right_anchor_start
+    assert first.speaker_ids == ["s"]
+    assert [span.srt_text for span in result if span.srt_text in removed] == []
+    assert result[1:] == case["spans"][2:]
+    cache = dict(model="test", params={}, policy_context={}, source_cues=case["cues"], source_words=case["words"])
+    assert case_cache_key(first, **cache) != case_cache_key(old["case-1"], **cache)
+    assert _extend({**case, "spans": result}) == result
+
+
+def test_heard_accent_anchor_joins_the_source_only_deletion_beside_it():
+    # EP11 cue 461: "A recomendação" was deleted and the retained "é" was delivered where "e" is spoken.
+    cues = [
+        Cue(index=460, start_ms=0, end_ms=1200, lines=["é planejar com antecedência,"]),
+        Cue(index=461, start_ms=1240, end_ms=2700, lines=["A recomendação é usar o transporte público."]),
+    ]
+    case = _aligned(cues, [("é", 0, .08), ("planejar", .16, .5), ("com", .52, .619), ("antecedência", .639, 1.199),
+                           ("e", 1.24, 1.279), ("usar", 1.32, 1.479), ("o", 1.52, 1.58),
+                           ("transporte", 1.6, 2.039), ("público.", 2.12, 2.599)])
+    assert [(span.srt_text, span.asr_text) for span in case["spans"]] == [("A recomendação", "")]
+    old = case["spans"][0]
+    result = _extend(case)
+    assert len(result) == 1 and result[0].case_id == old.case_id
+    widened = result[0]
+    assert widened.srt_text == "A recomendação é" and widened.asr_text == "e"
+    assert widened.srt_token_indices == [4, 5, 6] and widened.asr_word_indices == [4]
+    assert (widened.start, widened.end) == (1.24, 1.279)
+    assert widened.right_anchor_cue_id is None and widened.right_anchor_start is None
+    assert widened.left_anchor_cue_id == 460 and widened.left_anchor_end == 1.199
+    assert widened.speaker_ids == ["s"]
+    assert _extend({**case, "spans": result}) == result
+
+
+def test_homophone_accent_anchor_beside_a_partial_edit_stays_read_only():
+    # EP17 cue 91: "à" and the ASR "a" sound alike; neither spelling is evidence against the other.
+    cues = [Cue(index=91, start_ms=0, end_ms=2500, lines=["Peça à Lumi para continuar investigando."])]
+    case = _aligned(cues, [("Pede", 0, .3), ("a", .34, .359), ("Lumi", .4, .7), ("para", .75, .9),
+                           ("continuar", .95, 1.4), ("investigando.", 1.45, 2.2)])
+    assert [(span.srt_text, span.asr_text) for span in case["spans"]] == [("Peça", "Pede")]
+    assert _extend(case) == case["spans"]

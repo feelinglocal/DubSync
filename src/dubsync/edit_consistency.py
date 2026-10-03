@@ -9,14 +9,16 @@ the adjudicator heard, or source text and source timing are kept together.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable
 
+from .adjudication_regions import heard_accent_collision
 from .cue_segmentation import join_one_letter_residues
-from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, Word
+from .models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, QCFlag, TokenMatch, Word
 from .style_profile import StyleProfile
 from .subtitle_annotations import speech_text_for_alignment
 from .text_metrics import join_word_texts
-from .tokenize import alphanumeric_signature
+from .tokenize import alphanumeric_signature, tokenize_cues
 
 ApplyText = Callable[[list[AdjudicationDecision]], tuple[list[Cue], list[QCFlag]]]
 Rebuild = Callable[[list[Cue]], tuple[list[Cue], list[QCFlag]]]
@@ -83,6 +85,87 @@ def hold_fragmenting_replacements(
     return held_decisions(
         decisions, spans, held_case_ids,
         "The replacement would leave a one-letter cue; source text was kept for review.",
+    ), hold_flags
+
+
+def hold_edits_beside_accent_anchors(
+    cues: list[Cue], spans: list[DivergenceSpan], decisions: list[AdjudicationDecision],
+    token_matches: list[TokenMatch], words: list[Word],
+) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
+    """Hold every edit of a cue that would keep an unheard accent anchor beside new wording.
+
+    A retained one-letter match whose accent differs from the ASR word
+    ("é" / "E") is no evidence for its spelling; the audio question of the
+    adjacent case normally includes it (``extend_boundary_anchor_regions``).
+    When it could not, an approved edit beside it delivered the script's word
+    inside the new wording ("é eu ia lá saber"). The cue keeps its script
+    wording and timing, and the held proposals are listed for review.
+    """
+    tokens = tokenize_cues(cues)
+    first_token: dict[int, int] = {}
+    for token in tokens:
+        first_token.setdefault(token.cue_id, token.token_index)
+    claimed = {index for span in spans for index in span.srt_token_indices}
+    matched: dict[int, list[TokenMatch]] = defaultdict(list)
+    for match in token_matches:
+        matched[match.srt_token_index].append(match)
+    by_case = {decision.case_id: decision for decision in decisions}
+
+    def edited(span: DivergenceSpan) -> tuple[list[int], list[tuple[int, int]]]:
+        """The cues a case edits and the retained (token, cue) positions on both sides of it."""
+        source = span.srt_token_indices
+        if source:
+            if not 0 <= source[0] <= source[-1] < len(tokens):
+                return list(span.cue_ids), []
+            return list(span.cue_ids), [
+                (source[0] - 1, tokens[source[0]].cue_id), (source[-1] + 1, tokens[source[-1]].cue_id),
+            ]
+        cue_id = span.right_anchor_cue_id
+        if span.insertion_token_offset is None or cue_id != span.left_anchor_cue_id or cue_id not in first_token:
+            return [], []
+        position = first_token[cue_id] + span.insertion_token_offset
+        return [cue_id], [(position - 1, cue_id), (position, cue_id)]
+
+    edits = [
+        (span, decision, *edited(span)) for span in spans
+        if (decision := by_case.get(span.case_id)) is not None and decision.verdict != "keep_srt"
+        and alphanumeric_signature(decision.final_text) != alphanumeric_signature(span.srt_text)
+    ]
+    anchors: dict[int, tuple[str, str]] = {}
+    for _, _, _, neighbours in edits:
+        for neighbour, cue_id in neighbours:
+            if (
+                not 0 <= neighbour < len(tokens) or neighbour in claimed or tokens[neighbour].cue_id != cue_id
+                or len(matched[neighbour]) != 1 or matched[neighbour][0].score != 1.0
+                or not 0 <= matched[neighbour][0].asr_word_index < len(words)
+            ):
+                continue
+            word = words[matched[neighbour][0].asr_word_index]
+            if heard_accent_collision(tokens[neighbour], word):
+                anchors.setdefault(cue_id, (tokens[neighbour].text, word.text))
+    if not anchors:
+        return decisions, []
+    held_case_ids: set[str] = set()
+    hold_flags: list[QCFlag] = []
+    for span, decision, cue_ids, _ in edits:
+        cue_id = next((cue_id for cue_id in cue_ids if cue_id in anchors), None)
+        if cue_id is None:
+            continue
+        written, heard = anchors[cue_id]
+        held_case_ids.add(span.case_id)
+        hold_flags.append(QCFlag(
+            kind="adjudication_span_edit_held", cue_ids=cue_ids, severity="error",
+            message=(
+                f"The script word '{written}' beside this approved wording was heard as '{heard}' but was not "
+                "part of the AI question, so the cue would show it inside the new wording. The script wording "
+                "was kept for review."
+            ),
+            confidence=decision.confidence, old_text=span.srt_text, new_text=decision.final_text,
+            start=span.start, end=span.end,
+        ))
+    return held_decisions(
+        decisions, spans, held_case_ids,
+        "A retained word beside the edit has an accent the audio does not confirm; source text was kept for review.",
     ), hold_flags
 
 
