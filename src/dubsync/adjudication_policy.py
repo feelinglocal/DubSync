@@ -18,7 +18,7 @@ from .text_metrics import markup_spans, token_character_spans, token_texts
 from .tokenize import alphanumeric_signature, normalize_token, tokenize_cues
 
 
-DETERMINISTIC_ADJUDICATION_POLICY_VERSION = 2
+DETERMINISTIC_ADJUDICATION_POLICY_VERSION = 3
 DETERMINISTIC_KEEP_CONFIDENCE = 1.0
 
 # Deliberately finite, language-scoped spellings. Compact-string equality alone
