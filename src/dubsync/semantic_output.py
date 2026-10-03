@@ -820,6 +820,13 @@ def split_crowded_output_cues(cues: list[Cue], words: list[Word],
             flags.append(QCFlag(kind="output_line_limit_reflow", cue_ids=[cue.index], severity="info",
                                 message="A safe spoken split was unavailable. Text was reflowed within its existing interval; width overflow remains visible to style QC.",
                                 old_text=cue.text, new_text=reflowed.text, start=cue.start_ms / 1000, end=cue.end_ms / 1000))
+            if turns is not None and len(reflowed.lines) < len(turns):
+                # More turns than lines and no word timing to divide them:
+                # two speakers now share a line, which only a person can check.
+                flags.append(QCFlag(kind="output_dialogue_turns_joined", cue_ids=[cue.index], severity="warning",
+                                    message="The cue has more dialogue turns than display lines and no safe spoken split; whole turns share a line. Check who speaks each part.",
+                                    old_text=cue.text, new_text=reflowed.text,
+                                    start=cue.start_ms / 1000, end=cue.end_ms / 1000))
     output.sort(key=lambda cue: (cue.start_ms, cue.end_ms, cue.index))
     return OutputSegmentation(output, ownership, flags, expansions, visual_pages)
 

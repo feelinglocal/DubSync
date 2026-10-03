@@ -166,6 +166,9 @@ KIND_REGISTRY: dict[str, KindSpec] = {
         "No spoken words matched this cue", "Check that the line is spoken and timed correctly.", 38, "warning"),
     "speaker_turn_split_held": _review_kind(
         "Speaker change inside a cue", "Check whether the cue should be split between speakers.", 40, "warning"),
+    "output_dialogue_turns_joined": _review_kind(
+        "Two dialogue turns share one line", "Check who speaks each part; split the cue between the speakers if needed.",
+        40, "warning"),
     "shared_word_timing_preserved": _review_kind(
         "Cue boundary falls inside one recognised word", "Check the boundary between these cues.", 40, "warning"),
     "generated_adlib_word_mapping_unavailable": _review_kind(

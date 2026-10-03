@@ -141,6 +141,26 @@ def test_more_dialogue_turns_than_lines_without_word_timing_join_only_whole_turn
         assert any(turn in line for line in result.cues[0].lines), f"turn divided: {turn!r}"
 
 
+def test_whole_turns_that_share_a_line_are_a_review_item():
+    # Two speakers on one line need their attribution checked; the info-level
+    # reflow alone says only that the layout changed (review W4C-2).
+    source = Cue(index=7, start_ms=20000, end_ms=23000,
+                 lines=["- Wohin gehst du?", "- Nach Hause.", "- Warte auf mich!"])
+    result = split_crowded_output_cues([source], [], {7: []}, _PROFILE)
+    joined = [flag for flag in result.flags if flag.kind == "output_dialogue_turns_joined"]
+    assert [(flag.severity, flag.cue_ids, flag.new_text) for flag in joined] == [
+        ("warning", [7], result.cues[0].text)]
+    review = build_review(result.flags, [], result.cues, source_cues=[source])
+    item, = [item for item in review.review if item.kind == "output_dialogue_turns_joined"]
+    assert item.severity == "warning"
+
+    # One line per turn, or a timed split between turns, is no such item.
+    for lines in (["- Wohin gehst du?", "- Nach Hause."], ["- Kommst du mit?", "- Nein, ich bleibe", "heute zu Hause."]):
+        cue = Cue(index=5, start_ms=10000, end_ms=13000, lines=lines)
+        flags = split_crowded_output_cues([cue], [], {5: []}, _PROFILE).flags
+        assert "output_dialogue_turns_joined" not in [flag.kind for flag in flags]
+
+
 @pytest.mark.parametrize("text", [
     "- Halt die Klappe, du Tr*ttel! - Ah!",
     "- Kommst du mit? - Nein, ich bleibe heute zu Hause.",
