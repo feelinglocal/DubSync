@@ -462,7 +462,7 @@ def _cue_from_group(
     index: int, group: list[Word], profile: StyleProfile, *, preserve_timing: bool = False
 ) -> Cue:
     text = join_word_texts(word.text for word in group)
-    lines = wrap_generated_lines(text, profile.max_chars_per_line) or [text]
+    lines = wrap_generated_lines(text, profile.max_chars_per_line, [word.text for word in group]) or [text]
     start_ms = profile.snap_floor(max(0, group[0].start * 1000 - profile.lead_in_ms))
     spoken_end_ms = profile.snap_ceil(max(word.end for word in group) * 1000 + profile.tail_ms)
     minimum_end_ms = spoken_end_ms if preserve_timing else profile.snap_ceil(start_ms + profile.min_cue_dur * 1000)

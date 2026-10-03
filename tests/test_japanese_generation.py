@@ -5,6 +5,7 @@ import json
 import pytest
 
 from dubsync.models import Word
+from dubsync.semantic_output import wrap_generated_lines
 from dubsync.srt_io import parse_srt_text
 from dubsync.style_profile import StyleProfile
 from dubsync.transcription import build_cues_from_words, generate_srt_from_audio
@@ -112,6 +113,51 @@ def test_japanese_generation_wraps_like_synchronized_output(tmp_path, sentence, 
     # inside a kanji run, no line opening with closing punctuation.
     assert [cue.lines for cue in cues] == [expected]
     assert (cues[0].start_ms, cues[0].end_ms) == (1000, profile.snap_ceil(words[-1].end * 1000))
+
+
+_MORPHEMES = ["テーブル", "を", "ひっくり返した", "の", "は", "誰", "だ？"]
+
+
+@pytest.mark.parametrize("width", [24, 26])
+def test_japanese_generation_never_breaks_inside_a_multi_character_asr_word(tmp_path, width):
+    # 'ひっくり返した' is one ASR word: 'テーブルをひっく' / 'り返したのは誰だ？'
+    # broke inside it although 'テーブルを' / 'ひっくり返したのは誰だ？' fits (review W4C-3).
+    words = [Word(text=text, start=1.0 + index * 0.3, end=1.25 + index * 0.3, speaker_id="A")
+             for index, text in enumerate(_MORPHEMES)]
+    words_path = tmp_path / "words.json"
+    words_path.write_text(json.dumps({"words": [word.model_dump() for word in words]}, ensure_ascii=False),
+                          encoding="utf-8")
+    providers_path = tmp_path / "providers.yaml"
+    providers_path.write_text(f"asr:\n  fixture_path: '{words_path.as_posix()}'\n", encoding="utf-8")
+    audio_path = tmp_path / "ja.wav"
+    audio_path.write_bytes(b"fixture audio")
+
+    generate_srt_from_audio(
+        audio_path, tmp_path / "ja.srt", tmp_path / "work", providers_path=providers_path,
+        no_llm=True, language="ja", style_profile=StyleProfile(fps=25, max_chars_per_line=width, tail_ms=0),
+    )
+
+    cues = parse_srt_text((tmp_path / "ja.srt").read_text(encoding="utf-8"))
+    assert [cue.lines for cue in cues] == [["テーブルを", "ひっくり返したのは誰だ？"]]
+
+
+def test_a_break_inside_an_asr_word_remains_only_when_no_other_layout_fits_the_lines():
+    text = "".join(_MORPHEMES[:-1])
+    # At width 16 every two-line layout divides a word; a third line is never added.
+    assert wrap_generated_lines(text, 16, word_texts=_MORPHEMES[:-1]) == wrap_generated_lines(text, 16)
+    assert len(wrap_generated_lines(text, 16)) == 2
+    # One character per ASR word (MAI, Scribe) is unchanged: every boundary is a word edge.
+    sentence = "テーブルをひっくり返したのは誰だ？"
+    for width in (16, 24, 26):
+        assert wrap_generated_lines(sentence, width, word_texts=list(sentence)) == wrap_generated_lines(sentence, width)
+    # Punctuation glued to the next ASR word ('。3') still allows the sentence break.
+    glued = ["山", "下", "盛", "彦", "に", "伝", "え", "ろ", "。3", "分", "以", "内", "に",
+             "静", "川", "市", "南", "港", "の", "屋", "台", "に"]
+    text = "".join(glued)
+    assert wrap_generated_lines(text, 37, word_texts=glued) == wrap_generated_lines(text, 37) == [
+        "山下盛彦に伝えろ。", "3分以内に静川市南港の屋台に"]
+    # Words that are not the text's own pieces give no boundaries.
+    assert wrap_generated_lines(sentence, 24, word_texts=["テーブル", "が"]) == wrap_generated_lines(sentence, 24)
 
 
 def test_japanese_generation_pipeline_writes_utf8_srt_and_keeps_asr_evidence(tmp_path):

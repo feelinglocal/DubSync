@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from math import ceil, floor, isfinite
 import re
@@ -285,15 +285,34 @@ def wrap_semantic_lines(text: str, max_width: int) -> list[str]:
     return _greedy_lines(text, spans, max_width)
 
 
-def wrap_generated_lines(text: str, max_width: int) -> list[str]:
+def wrap_generated_lines(text: str, max_width: int, word_texts: Sequence[str] | None = None) -> list[str]:
     """Wrap a cue joined from ASR words in audio-to-SRT generation.
 
     Unspaced Japanese/Chinese text takes the same balanced, kinsoku-legal
     layout as synchronized output; spaced text keeps the balanced word wrap.
+    Given the ASR words the text was joined from, an unspaced line never
+    breaks inside a multi-character word ('ひっくり返した') while a layout
+    within the width and with no more lines breaks only between words.
     """
     if len(text.split()) == 1 and contains_character_level_script(text):
+        edges = _word_edges(text, word_texts) if word_texts is not None else None
+        if edges is not None and _display_text(text) == text and not _MARKUP.search(text):
+            return _unspaced_lines(text, max_width, word_edges=edges)
         return wrap_semantic_lines(text, max_width)
     return wrap_visual_width(text, max_width)
+
+
+def _word_edges(text: str, word_texts: Sequence[str]) -> frozenset[int] | None:
+    """Character offsets where the words joined into ``text`` meet, if they are its pieces."""
+    edges, cursor = {0, len(text)}, 0
+    for word in (word.strip() for word in word_texts):
+        if not word:
+            continue
+        if not text.startswith(word, cursor):
+            return None
+        cursor += len(word)
+        edges.add(cursor)
+    return frozenset(edges) if cursor == len(text) else None
 
 
 def _display_clusters(text: str) -> list[str]:
@@ -344,8 +363,13 @@ def _japanese_run_script(character: str) -> str | None:
     return "katakana" if "KATAKANA" in name and character != "・" else None
 
 
-def _unspaced_lines(text: str, max_width: int) -> list[str]:
-    """Balance short character-level lines without widening the style limit."""
+def _unspaced_lines(text: str, max_width: int, word_edges: frozenset[int] | None = None) -> list[str]:
+    """Balance short character-level lines without widening the style limit.
+
+    With ``word_edges`` (character offsets between ASR words) a break between
+    two letters of a word that fits a line is not taken while a layout of no
+    more lines within the width breaks only between words.
+    """
     if display_width(text) <= max_width:
         return [text]
     if _MARKUP.search(text):
@@ -355,6 +379,28 @@ def _unspaced_lines(text: str, max_width: int) -> list[str]:
     for cluster in clusters:
         prefix.append(prefix[-1] + display_width(cluster))
     legal = [True, *(_can_break_between(left, right) for left, right in zip(clusters, clusters[1:])), True]
+    layout = _balanced_unspaced(clusters, prefix, legal, max_width)
+    if not word_edges:
+        return layout
+    ordered, offset, inside = sorted(word_edges), 0, [False] * (len(clusters) + 1)
+    for position, cluster in enumerate(clusters[:-1], start=1):
+        offset += len(cluster)
+        # Punctuation an ASR word carries ('。3') is no part of a word to keep whole.
+        if offset in word_edges or not (cluster[-1].isalnum() and clusters[position][0].isalnum()):
+            continue
+        after = bisect_right(ordered, offset)
+        if 0 < after < len(ordered):
+            inside[position] = display_width(text[ordered[after - 1]:ordered[after]]) <= max_width
+    if not any(inside):
+        return layout
+    restricted = _balanced_unspaced(
+        clusters, prefix, [ok and not within for ok, within in zip(legal, inside)], max_width)
+    if len(restricted) <= len(layout) and all(display_width(line) <= max_width for line in restricted):
+        return restricted
+    return layout
+
+
+def _balanced_unspaced(clusters: list[str], prefix: list[int], legal: list[bool], max_width: int) -> list[str]:
     greedy, start = [], 0
     while start < len(clusters):
         end = start + 1
