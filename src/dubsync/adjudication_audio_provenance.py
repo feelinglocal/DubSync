@@ -2,7 +2,8 @@
 
 Only an active loader capture can originate provenance. Cached receipts may
 outlive the deleted WAV, but must still match the current case key, decision,
-span and verified full-audio context. Legacy manifests are never upgraded.
+span and verified full-audio context. Legacy manifests are never upgraded, and a
+snippet row of the right shape is never a receipt.
 """
 from __future__ import annotations
 
@@ -221,5 +222,37 @@ def cached_case_audio_snippet(
         return None
     record = provenance.get("snippet")
     if not _valid_record(record, span.model_copy(update={"case_id": original_id})):
+        return None
+    return {**deepcopy(record), "case_id": span.case_id}
+
+
+def receipt_audio_snippet(
+    receipt: object, span: DivergenceSpan, decision: AdjudicationDecision, audio_sha256: str | None,
+) -> dict | None:
+    """Return the clip a receipt binds to exactly this question, answer and audio.
+
+    ``receipt`` must be one the caller bound or validated against the current
+    case key in this run (``bind_case_audio_provenance`` or a matched
+    ``cached_case_audio_snippet``). This rechecks its digest, the clip bytes
+    digest and interval, and that it was captured for this span and answer.
+    """
+    if (not isinstance(receipt, dict) or not _sha256(audio_sha256) or decision.case_id != span.case_id
+            or decision.evidence is None or decision.reason.startswith("Dual ASR cross-check:")):
+        return None
+    content = {name: value for name, value in receipt.items() if name != "receipt_sha256"}
+    try:
+        if (receipt.get("policy_version") != AUDIO_PROVENANCE_POLICY_VERSION
+                or receipt.get("receipt_sha256") != _digest(content)
+                or not _sha256(receipt.get("case_key_sha256")) or not _sha256(receipt.get("audio_context_sha256"))
+                or receipt.get("audio_sha256") != audio_sha256
+                or receipt.get("span_sha256") != _digest(span.model_dump(mode="json", exclude={"case_id"}))
+                or receipt.get("decision_sha256") != _digest(decision.model_dump(mode="json", exclude={"case_id"}))):
+            return None
+    except (TypeError, ValueError):
+        return None
+    original_id = receipt.get("case_id")
+    record = receipt.get("snippet")
+    if (not isinstance(original_id, str) or not original_id
+            or not _valid_record(record, span.model_copy(update={"case_id": original_id}))):
         return None
     return {**deepcopy(record), "case_id": span.case_id}

@@ -3,7 +3,8 @@ import json
 import pytest
 
 from dubsync import pipeline
-from dubsync.models import AdjudicationDecision
+from dubsync.models import AdjudicationDecision, AlignmentResult, Cue, DivergenceSpan, SpeechRegion, TokenMatch
+from dubsync.tokenize import alphanumeric_signature, tokenize_cues
 from test_missing_dialogue_reconciliation import _pipeline_case
 from test_source_pair_timing import _case
 
@@ -46,7 +47,11 @@ def test_pipeline_merges_complete_native_source_pair_and_replays_the_bound_recei
         result = run(**({} if mode == "cache" else {"resume": mode}))
         assert adapter.seen == []
         assert result.output_srt.read_bytes() == first_output
-        assert clip_manifest.read_bytes() == first_manifest
+        if mode == "cache":
+            # A cached hearing run rewrites the manifest for itself: the same bound clip, no audio loaded.
+            assert json.loads(clip_manifest.read_bytes())["snippets"] == json.loads(first_manifest)["snippets"]
+        else:
+            assert clip_manifest.read_bytes() == first_manifest
     rebuilt = json.loads((result.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
     output = {cue["index"]: cue for cue in rebuilt["cues"]}
     assert 11 not in output
@@ -58,6 +63,67 @@ def test_pipeline_merges_complete_native_source_pair_and_replays_the_bound_recei
     assert rebuilt["source_pair_receipt_sha256"] == receipt["receipt_sha256"]
     assert receipt["outcomes"][0]["outcome"] == "audio_confirmed_source_pair"
     assert receipt["outcomes"][0]["source_cue_ids"] == [10, 11]
+
+
+def _two_pairs():
+    """The 1B pair and a copy 20 s later, so one episode asks two pair questions."""
+    _, source_a, alignment_a, words_a, regions_a = _case()
+    offset = len(words_a)
+    source = [*source_a, *(Cue(index=cue.index + 20, start_ms=cue.start_ms + 20000, end_ms=cue.end_ms + 20000,
+                               lines=list(cue.lines)) for cue in source_a)]
+    words = [*words_a, *(word.model_copy(update={"start": word.start + 20, "end": word.end + 20}) for word in words_a)]
+    regions = [*regions_a, *(SpeechRegion(start=region.start + 20, end=region.end + 20) for region in regions_a)]
+    ownership = dict(alignment_a.cue_word_indices)
+    ownership.update({cue_id + 20: [i + offset for i in indices] for cue_id, indices in alignment_a.cue_word_indices.items()})
+    tokens = tokenize_cues(source)
+    matches = []
+    for cue_id, indices in ownership.items():
+        own, cursor = [token for token in tokens if token.cue_id == cue_id], 0
+        for word_index in indices:
+            for normalized in alphanumeric_signature(words[word_index].text):
+                token = next(token for token in own[cursor:] if token.normalized == normalized)
+                cursor = own.index(token) + 1
+                matches.append(TokenMatch(cue_id=cue_id, srt_token_index=token.token_index, asr_word_index=word_index, score=1))
+    spans = [DivergenceSpan(case_id=f"parent-{laugh}", cue_ids=[laugh], srt_text="ははは", asr_text="？",
+                            srt_token_indices=[token.token_index for token in tokens if token.cue_id == laugh],
+                            asr_word_indices=[mark], start=words[mark].start, end=words[mark].end)
+             for laugh, mark in ((11, 7), (31, 7 + offset))]
+    alignment = AlignmentResult(cue_word_indices=ownership, token_matches=matches, divergence_spans=spans,
+                                unmatched_cue_ids=[11, 31],
+                                diagnostics={"missing_audio_cue_ids": [11, 31],
+                                             "missing_audio_guard_version": pipeline.MISSING_AUDIO_GUARD_VERSION})
+    return source, words, alignment, regions
+
+
+def test_partial_pair_rehearing_keeps_every_delivered_pair_clip_record(tmp_path, monkeypatch):
+    _, adapter, run = _pipeline_case(tmp_path, monkeypatch, case_override=_two_pairs())
+    def hear(spans, snippets):
+        adapter.seen.extend(spans)
+        return [AdjudicationDecision(
+            case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text, heard_text=span.srt_text,
+            evidence="heard_clearly", confidence=1, speaker=span.speaker_ids[0],
+            source_pair_evidence={
+                "first_text": span.srt_text.splitlines()[0], "second_text": span.srt_text.splitlines()[1],
+                "sequence": "first_then_second", "voice_relation": "same", "intervening_speech": False,
+                "candidate_complete": True, "candidate_start_clipped": False, "candidate_end_clipped": False,
+                "laugh_outside_candidate": False, "candidate_audio_id": span.case_id + "-candidate"},
+            reason="Fixture confirms both parts in the supplied voice.").model_dump() for span in spans]
+    adapter.adjudicate_with_audio = hear
+    first = run()
+    path = first.episode_workdir / "source_pair_timing_audio_snippets.json"
+    heard = {row["case_id"]: row["sha256"] for row in json.loads(path.read_text(encoding="utf-8"))["snippets"]}
+    assert sorted(heard) == ["source-pair-timing-v2-10-11", "source-pair-timing-v2-30-31"]
+    removed = []
+    for item in (first.episode_workdir / "llm-case-cache").glob("*.json"):
+        if json.loads(item.read_text(encoding="utf-8"))["value"]["decision"]["case_id"] == "source-pair-timing-v2-30-31":
+            item.unlink()
+            removed.append(item)
+    assert len(removed) == 1
+    adapter.seen.clear()
+    second = run()
+    assert [span.case_id for span in adapter.seen] == ["source-pair-timing-v2-30-31"]
+    assert second.output_srt.read_bytes() == first.output_srt.read_bytes()
+    assert {row["case_id"]: row["sha256"] for row in json.loads(path.read_text(encoding="utf-8"))["snippets"]} == heard
 
 
 def test_disabled_hearing_does_not_cache_an_unasked_pair_as_complete(tmp_path, monkeypatch):

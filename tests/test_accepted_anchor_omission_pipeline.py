@@ -1,4 +1,6 @@
+from copy import deepcopy
 import json
+import shutil
 
 import pytest
 import yaml
@@ -113,6 +115,132 @@ def test_partial_native_cache_reuse_preserves_only_bound_anchor_clip_provenance(
         rebuilt = json.loads((second.episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
         assert 441 in {cue["index"] for cue in rebuilt["cues"]}
         assert [row["case_id"] for row in current_manifest["snippets"]] == [missing_case.case_id]
+
+
+_MISSING_441 = "missing-dialogue-v1-case-mixed-cue-441"
+
+
+def _omission_state(result):
+    workdir = result.episode_workdir
+    rebuilt = json.loads((workdir / "rebuild.json").read_text(encoding="utf-8"))
+    receipt = json.loads((workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
+    outcome = next(item for item in receipt["outcomes"] if item.get("cue_id") == 441)
+    proof = outcome.get("accepted_anchor_omission_proof")
+    return outcome["outcome"], 441 in {cue["index"] for cue in rebuilt["cues"]}, proof["native_clip"] if proof else None
+
+
+def _case_receipt_clip(workdir, case_id):
+    for path in (workdir / "llm-case-cache").glob("*.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))["value"]
+        if value["decision"]["case_id"] == case_id:
+            return {**value["audio_provenance"]["snippet"], "case_id": case_id}
+    return None
+
+
+def _full_cache_rerun(run, workdir, cache):
+    if cache == "case":
+        shutil.rmtree(workdir / "llm-cache")
+    return run(**({"resume": "adjudicate"} if cache == "adjudicate" else {}))
+
+
+@pytest.mark.parametrize("cache", ["batch", "case", "adjudicate"])
+@pytest.mark.parametrize("manifest", ["fabricated", "missing"])
+def test_full_cache_hit_takes_the_omission_clip_from_case_receipts_not_the_manifest_file(
+        tmp_path, monkeypatch, cache, manifest):
+    _, adapter, run = _native_case(tmp_path, monkeypatch)
+    first = run()
+    output = first.output_srt.read_bytes()
+    state = _omission_state(first)
+    assert state[:2] == ("audio_confirmed_omission", False)
+    assert state[2] == _case_receipt_clip(first.episode_workdir, _MISSING_441)
+    path = first.episode_workdir / "audio_snippets.json"
+    original = json.loads(path.read_text(encoding="utf-8"))
+    if manifest == "missing":
+        path.unlink()
+    else:
+        # A row of the right shape, and any saved copy of its receipt, is not proof.
+        payload = deepcopy(original)
+        for row in [*payload["snippets"], *(r["snippet"] for r in payload.get("receipts", {}).values())]:
+            if row["case_id"] == _MISSING_441:
+                row.update(sha256="ab" * 32, size_bytes=44)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    adapter.seen.clear()
+    second = _full_cache_rerun(run, first.episode_workdir, cache)
+    assert adapter.seen == []
+    assert _omission_state(second) == state
+    assert second.output_srt.read_bytes() == output
+    rewritten = json.loads(path.read_text(encoding="utf-8"))
+    assert {row["case_id"]: row["sha256"] for row in rewritten["snippets"]} == {
+        row["case_id"]: row["sha256"] for row in original["snippets"]}
+    run(resume="verify")
+
+
+@pytest.mark.parametrize("cache", ["batch", "case", "adjudicate"])
+@pytest.mark.parametrize("receipts", ["stripped", "tampered"])
+def test_full_cache_hit_holds_the_cue_when_its_case_receipt_is_unbound(tmp_path, monkeypatch, cache, receipts):
+    _, adapter, run = _native_case(tmp_path, monkeypatch)
+    first = run()
+    for path in (first.episode_workdir / "llm-case-cache").glob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if receipts == "stripped":
+            payload["value"].pop("audio_provenance")
+        else:
+            payload["value"]["audio_provenance"]["snippet"]["sha256"] = "0" * 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    adapter.seen.clear()
+    second = _full_cache_rerun(run, first.episode_workdir, cache)
+    assert adapter.seen == []
+    assert _omission_state(second) == ("untranscribed_activity_remains", True, None)
+    report = json.loads((second.episode_workdir / "qc_report.json").read_text(encoding="utf-8"))
+    assert any(flag["kind"] == "missing_audio_source_cue_held" and 441 in flag["cue_ids"] for flag in report["flags"])
+    manifest = json.loads((second.episode_workdir / "audio_snippets.json").read_text(encoding="utf-8"))
+    assert manifest["snippets"] == []
+
+
+def test_resume_adjudicate_restores_the_receipt_bound_clip_after_the_manifest_was_altered(tmp_path, monkeypatch):
+    _, adapter, run = _native_case(tmp_path, monkeypatch)
+    first = run()
+    state = _omission_state(first)
+    path = first.episode_workdir / "audio_snippets.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for row in [*payload["snippets"], *(r["snippet"] for r in payload.get("receipts", {}).values())]:
+        row.update(sha256="ab" * 32, size_bytes=44)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    for mode in ("verify", "rebuild"):
+        with pytest.raises(ValueError, match="resume from adjudicate"):
+            run(resume=mode)
+    adapter.seen.clear()
+    resumed = run(resume="adjudicate")
+    assert adapter.seen == []
+    assert _omission_state(resumed) == state
+    run(resume="verify")
+
+
+def test_rerun_after_other_settings_binds_the_clip_actually_heard_with_these_settings(tmp_path, monkeypatch):
+    _, adapter, run = _native_case(tmp_path, monkeypatch)
+    config_path = tmp_path / "provider.yaml"
+    original = config_path.read_text(encoding="utf-8")
+    first = run()
+    state = _omission_state(first)
+    padded = pipeline.extract_audio_snippets
+    config = yaml.safe_load(original)
+    config["llm"]["audio_snippet_double_check"] = {"enabled": True, "pad_seconds": 2.5}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    def wider(audio, spans, output, **kwargs):
+        duration = pipeline.audio_seconds(audio)
+        return padded(audio, [span.model_copy(update={"start": max(0, span.start - .1),
+                                                      "end": min(duration, span.end + .1)}) for span in spans],
+                      output, **kwargs)
+    monkeypatch.setattr(pipeline, "extract_audio_snippets", wider)
+    adapter.seen.clear()
+    other = run()
+    assert adapter.seen and _omission_state(other)[2] != state[2]
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(pipeline, "extract_audio_snippets", padded)
+    adapter.seen.clear()
+    third = run()
+    assert adapter.seen == []
+    assert _omission_state(third) == state
 
 
 @pytest.mark.parametrize("mode", ["rebuild", "verify"])

@@ -3,7 +3,8 @@
 This narrowly handles a quiet raw-VAD gap hidden by the speech-chain join rule.
 It does not claim that either neighbour owns an entire joined chain, infer an
 absence from ASR agreement, or issue a new hearing question. The caller first
-validates the saved native receipt and the source-audio identity.
+validates the saved native receipt and the source-audio identity, and supplies
+only the clip receipts it bound or validated against current case keys.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from math import isfinite
 import re
 
+from .adjudication_audio_provenance import receipt_audio_snippet
 from .adjudication_case_cache import flag_applies_to_case
 from .adjudication_regions import is_song_caption_cue
 from .asr_crosscheck import compare_word_streams
@@ -92,12 +94,13 @@ class _Evidence:
     owners: dict
     agreement: object
     decisions: dict
-    clips: dict
+    receipts: dict
     flags: list[QCFlag]
     duration: float
     uncertain: set
     protected: set
     resolved: set
+    audio_hash: str
 
     def word_records(self, indices, *, secondary=False):
         words = self.secondary if secondary else self.words
@@ -106,11 +109,11 @@ class _Evidence:
     def failure(self, span):
         return any(f.kind in _AUDIO_FAILURES and flag_applies_to_case(f, span) for f in self.flags)
 
-    def clip(self, case_id, start, end):
-        clips = self.clips.get(case_id, [])
-        if len(clips) != 1:
+    def clip(self, span, answer, start, end):
+        # A captured receipt for this exact question and answer, never a bare row.
+        clip = receipt_audio_snippet(self.receipts.get(span.case_id), span, answer, self.audio_hash)
+        if clip is None:
             return None
-        clip = clips[0]
         a, b, size = clip.get("start"), clip.get("end"), clip.get("size_bytes")
         if (not isinstance(a, (int, float)) or not isinstance(b, (int, float))
                 or not isfinite(a) or not isfinite(b) or not 0 <= a < b <= self.duration
@@ -170,7 +173,7 @@ class _Evidence:
                     or indices and (span.start > self.words[indices[0]].start + _EPSILON
                                     or span.end < self.words[indices[-1]].end - _EPSILON)):
                 return None
-            clip = self.clip(span.case_id, span.start, span.end)
+            clip = self.clip(span, answer, span.start, span.end)
             if clip is None:
                 return None
             edited_tokens.update(token_ids)
@@ -233,9 +236,9 @@ class _Evidence:
 
 
 def _prepare(current, sources, alignment, words, regions, missing, secondary, context, decisions,
-             audio_hash, manifest, duration, uncertain, protected, resolved, flags):
-    if (missing is None or not secondary or not isinstance(context, dict) or not isinstance(manifest, dict)
-            or not isinstance(manifest.get("snippets"), list) or not _sha256(audio_hash)
+             audio_hash, receipts, duration, uncertain, protected, resolved, flags):
+    if (missing is None or not secondary or not isinstance(context, dict) or not isinstance(receipts, dict)
+            or not _sha256(audio_hash)
             or not isfinite(duration) or duration <= 0 or alignment.diagnostics.unresolved
             or len({c.index for c in sources}) != len(sources) or len({c.index for c in current}) != len(current)
             or any(not _word_valid(w) for w in (*words, *secondary))
@@ -263,16 +266,13 @@ def _prepare(current, sources, alignment, words, regions, missing, secondary, co
     ordered_regions = sorted(regions, key=lambda r: (r.start, r.end))
     if any(a.end > b.start + _EPSILON for a, b in zip(ordered_regions, ordered_regions[1:])):
         return None
-    by_case, clips = {}, {}
+    by_case = {}
     for decision in decisions:
         by_case.setdefault(decision.case_id, []).append(decision)
-    for clip in manifest["snippets"]:
-        if isinstance(clip, dict) and isinstance(clip.get("case_id"), str):
-            clips.setdefault(clip["case_id"], []).append(clip)
     return _Evidence({c.index: c for c in current}, {c.index: c for c in sources}, [c.index for c in current],
                      [c.index for c in sources], tokenize_cues(sources), alignment, words, secondary, ordered_regions,
-                     _owners(alignment), compare_word_streams(words, secondary), by_case, clips,
-                     [*flags, *missing.flags], duration, uncertain, protected, resolved)
+                     _owners(alignment), compare_word_streams(words, secondary), by_case, deepcopy(receipts),
+                     [*flags, *missing.flags], duration, uncertain, protected, resolved, audio_hash)
 
 
 def _proof(question, answer, evidence, missing, secondary_context, audio_hash):
@@ -331,7 +331,7 @@ def _proof(question, answer, evidence, missing, secondary_context, audio_hash):
             or not 0 <= span.start <= a < b <= span.end <= evidence.duration
             or span.end - span.start > _MAX_QUESTION_SECONDS):
         return None, "unverified_audio_receipt"
-    clip = evidence.clip(span.case_id, min(span.start, evidence.secondary[left["secondary_word_indices"][0]].start),
+    clip = evidence.clip(span, answer, min(span.start, evidence.secondary[left["secondary_word_indices"][0]].start),
                          max(span.end, evidence.secondary[right["secondary_word_indices"][-1]].end))
     if clip is None:
         return None, "unverified_audio_receipt"
@@ -355,21 +355,23 @@ def reconcile_accepted_anchor_omissions(
     regions: list[SpeechRegion], missing_dialogue: MissingDialogueEvidence | None, *,
     secondary_words: list[Word] | None, secondary_context: dict[str, object] | None,
     decisions: list[AdjudicationDecision], verified_audio_sha256: str | None,
-    audio_snippet_manifest: dict[str, object] | None, audio_duration_seconds: float,
+    audio_receipts: dict[str, dict] | None, audio_duration_seconds: float,
     uncertain_word_indices: set[int] | None = None, protected_cue_ids: set[int] | None = None,
     resolved_cue_ids: set[int] | None = None, flags: list[QCFlag] | None = None,
 ) -> MissingDialogueResolution:
     """Remove only a complete native-confirmed absence with a fresh raw-gap proof.
 
     ``missing_dialogue`` must already have passed the pipeline's original
-    source/audio receipt validation. ``verified_audio_sha256`` and the snippet
-    manifest describe that same audio. Ordinary ``decisions`` establish only
-    accepted current anchor wording; no ASR or model timestamp is rewritten.
+    source/audio receipt validation. ``audio_receipts`` maps each current case
+    ID to the clip receipt the caller bound or validated against its current
+    case key; each must also bind that same audio, question and answer.
+    Ordinary ``decisions`` establish only accepted current anchor wording; no
+    ASR or model timestamp is rewritten.
     """
     existing = list(flags or ())
     uncertain, protected, resolved = set(uncertain_word_indices or ()), set(protected_cue_ids or ()), set(resolved_cue_ids or ())
     evidence = _prepare(current_cues, source_cues, alignment, words, regions, missing_dialogue, secondary_words,
-                        secondary_context, decisions, verified_audio_sha256, audio_snippet_manifest, audio_duration_seconds,
+                        secondary_context, decisions, verified_audio_sha256, audio_receipts, audio_duration_seconds,
                         uncertain, protected, resolved, existing)
     removed, outcomes, added = set(), [], []
     questions = missing_dialogue.questions if missing_dialogue is not None else []

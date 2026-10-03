@@ -5,7 +5,9 @@ from copy import deepcopy
 
 import pytest
 
+from dubsync.adjudication_audio_provenance import _digest, bind_case_audio_provenance
 from dubsync.asr_crosscheck_config import cross_check_context
+from dubsync.cache import CacheKey
 from dubsync.missing_dialogue_reconciliation import (
     MissingDialogueEvidence, MissingDialogueQuestion, reconcile_missing_dialogue, reconciliation_context,
 )
@@ -67,12 +69,30 @@ def _case():
         "missing_dialogue":missing,"secondary_words":secondary,
         "secondary_context":cross_check_context(secondary,{"asr":{"provider":"openrouter","model":"microsoft/mai-transcribe-2","language_code":"pt"}}),
         "decisions":ordinary,"verified_audio_sha256":audio_hash,"audio_duration_seconds":10.0,
-        "audio_snippet_manifest":{"audio_duration_seconds":10.0,"snippets":[
-            {"case_id":caseid,"mime_type":"audio/wav","start":1.525,"end":6.618,"sha256":"b"*64,"size_bytes":163080,"persisted":False}
-            for caseid in [question.span.case_id,"case-left","case-right"]]},
+        "audio_receipts":{span.case_id:_receipt(span,decision,audio_hash)
+            for span,decision in [(question.span,missing.decisions[0]),(left,ordinary[0]),(right,ordinary[1])]},
         "uncertain_word_indices":set(),"protected_cue_ids":set(),"resolved_cue_ids":set(),
         "flags":[hold,QCFlag(kind="missing_audio_timing_held",cue_ids=[441],message="Fixture timing hold."),
                  QCFlag(kind="timing_evidence_held",cue_ids=[999],message="Unrelated hold.")]}
+
+
+def _receipt(span, decision, audio_hash):
+    """The receipt the pipeline binds to an actually captured clip for this hearing."""
+    record = {"case_id":span.case_id,"mime_type":"audio/wav","start":1.525,"end":6.618,"sha256":"b"*64,
+              "size_bytes":163080,"persisted":False}
+    key = CacheKey.from_payload({"case":span.case_id}, model="native-test", params={})
+    receipt = bind_case_audio_provenance(key, span, decision, {"capture_policy_version":1,"snippets":[record]},
+                                         {"strategy":"bounded_batches_v3","audio_sha256":audio_hash})
+    assert receipt is not None
+    return receipt
+
+
+def _resigned(receipt, **changes):
+    """A self-consistent receipt whose content differs only by ``changes``."""
+    content = {key:value for key,value in receipt.items() if key != "receipt_sha256"}
+    content.update({key:value for key,value in changes.items() if key != "snippet"})
+    content["snippet"] = {**content["snippet"], **changes.get("snippet", {})}
+    return {**content, "receipt_sha256":_digest(content)}
 
 
 def _resolve(case):
@@ -116,6 +136,7 @@ def test_existing_guard_restores_false_overlap_but_proven_raw_gap_allows_saved_a
     "partial_edit_wrong_source","partial_edit_wrong_words","duplicate_anchor_decision","overlapping_anchor_edits",
     "missing_absence","unclear_absence","nonempty_absence","non_native_absence","wrong_absence_case","duplicate_absence",
     "missing_manifest","missing_clip","clipped_audio","wrong_clip_case","bad_clip_hash","duplicate_clip","missing_verified_hash",
+    "bare_clip_row","tampered_receipt","receipt_of_other_hearing","receipt_of_other_audio","missing_anchor_receipt",
     "wrong_audio_hash","stale_source_context","stale_question_context","audio_not_required","wrong_question_owner","wrong_question_target",
     "duplicate_question","non_missing_purpose","long_primary_gap","source_pair_deleted_target","provider_failure",
 ])
@@ -164,12 +185,20 @@ def test_uncertain_audio_receipts_words_anchors_or_raw_activity_cannot_remove_cu
         update={"evidence":"heard_unclear"} if fault=="unclear_absence" else {"heard_text":"Tao","final_text":"Tao"} if fault=="nonempty_absence" else {"reason":"Dual ASR cross-check: automatic absence."} if fault=="non_native_absence" else {"case_id":"unrelated"}
         evidence.decisions[0]=evidence.decisions[0].model_copy(update=update)
     elif fault=="duplicate_absence":evidence.decisions.append(deepcopy(evidence.decisions[0]))
-    elif fault=="missing_manifest":case["audio_snippet_manifest"]=None
-    elif fault=="missing_clip":case["audio_snippet_manifest"]["snippets"].pop(0)
-    elif fault in {"clipped_audio","wrong_clip_case","bad_clip_hash"}:
-        key,value={"clipped_audio":("end",4.5),"wrong_clip_case":("case_id","unrelated"),"bad_clip_hash":("sha256","")}[fault]
-        case["audio_snippet_manifest"]["snippets"][0][key]=value
-    elif fault=="duplicate_clip":case["audio_snippet_manifest"]["snippets"].append(deepcopy(case["audio_snippet_manifest"]["snippets"][0]))
+    elif fault=="missing_manifest":case["audio_receipts"]=None
+    elif fault=="missing_clip":case["audio_receipts"].pop(q.span.case_id)
+    elif fault in {"clipped_audio","bad_clip_hash"}:
+        key,value={"clipped_audio":("end",4.5),"bad_clip_hash":("sha256","")}[fault]
+        receipts=case["audio_receipts"];receipts[q.span.case_id]=_resigned(receipts[q.span.case_id],snippet={key:value})
+    elif fault=="wrong_clip_case":case["audio_receipts"]["unrelated"]=case["audio_receipts"].pop(q.span.case_id)
+    elif fault=="duplicate_clip":case["audio_receipts"][q.span.case_id]=[deepcopy(case["audio_receipts"][q.span.case_id])]*2
+    elif fault=="bare_clip_row":
+        receipts=case["audio_receipts"];receipts[q.span.case_id]=deepcopy(receipts[q.span.case_id]["snippet"])
+    elif fault=="tampered_receipt":case["audio_receipts"][q.span.case_id]["snippet"]["sha256"]="c"*64
+    elif fault=="receipt_of_other_hearing":case["audio_receipts"][q.span.case_id]=deepcopy(case["audio_receipts"]["case-right"])
+    elif fault=="receipt_of_other_audio":
+        receipts=case["audio_receipts"];receipts[q.span.case_id]=_resigned(receipts[q.span.case_id],audio_sha256="c"*64)
+    elif fault=="missing_anchor_receipt":case["audio_receipts"].pop("case-left")
     elif fault in {"missing_verified_hash","wrong_audio_hash"}:case["verified_audio_sha256"]=None if fault=="missing_verified_hash" else "c"*64
     elif fault in {"stale_source_context","stale_question_context","audio_not_required"}:
         key,value={"stale_source_context":("source_sha256","f"*64),"stale_question_context":("questions_sha256","f"*64),"audio_not_required":("audio_required",False)}[fault]

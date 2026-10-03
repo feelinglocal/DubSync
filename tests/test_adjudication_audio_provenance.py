@@ -113,6 +113,30 @@ def test_cached_receipt_rejects_metadata_tampering(tmp_path, change):
     assert cached_case_audio_snippet(receipt, key, span, decision, context) is None
 
 
+@pytest.mark.parametrize("change", ["none", "bare_row", "snippet", "decision", "span", "audio", "key"])
+def test_receipt_clip_is_only_the_one_bound_to_this_question_answer_and_audio(tmp_path, change):
+    from dubsync.adjudication_audio_provenance import bind_case_audio_provenance, receipt_audio_snippet
+    span, decision, _, context, key, manifest = _record(tmp_path)
+    receipt = bind_case_audio_provenance(key, span, decision, manifest, context)
+    renamed = span.model_copy(update={"case_id": "case-157"})
+    answer = decision.model_copy(update={"case_id": renamed.case_id})
+    audio = context["audio_sha256"]
+    if change == "bare_row":
+        receipt = deepcopy(manifest["snippets"][0])
+    elif change == "snippet":
+        receipt["snippet"]["sha256"] = "c" * 64
+    elif change == "decision":
+        answer = answer.model_copy(update={"reason": "Different native evidence."})
+    elif change == "span":
+        renamed = renamed.model_copy(update={"srt_text": "other"})
+    elif change == "audio":
+        audio = "b" * 64
+    elif change == "key":
+        receipt.pop("case_key_sha256")
+    clip = receipt_audio_snippet(receipt, renamed, answer, audio)
+    assert clip == ({**manifest["snippets"][0], "case_id": "case-157"} if change == "none" else None)
+
+
 @pytest.mark.parametrize("change", ["tamper_during_hearing", "truncated", "wrong_rate", "wrong_id", "duplicate_span", "exception"])
 def test_recorder_rejects_invalid_or_changed_actual_clip_bytes(tmp_path, change):
     from dubsync.adjudication_audio_provenance import AudioProvenanceRecorder

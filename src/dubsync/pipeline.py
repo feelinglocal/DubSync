@@ -487,6 +487,7 @@ def sync_episode(
             output_path=output_path,
             audio_path=audio_path,
             audio_for_asr=_resume_audio_for_verify(audio_path, episode_workdir),
+            audio_receipts=_saved_adjudication_audio_receipts(episode_workdir),
             provider_config=provider_config,
             profile=profile,
             source_cues=cues,
@@ -566,6 +567,8 @@ def sync_episode(
     if long_audio_llm_flag is not None:
         flags.append(long_audio_llm_flag)
     decisions: list[AdjudicationDecision] = []
+    # Native clip receipts bound or validated against this run's case keys.
+    adjudication_audio_receipts: dict[str, dict] = {}
     if resume_stage == "rebuild":
         assert resume_adjudication is not None
         decisions, adjudication_flags = resume_adjudication
@@ -639,6 +642,7 @@ def sync_episode(
             cached_case_decisions: list[AdjudicationDecision] = []
             cached_case_flags: list[QCFlag] = []
             cached_audio_snippets: list[dict] = []
+            audio_provenance_recorder = None
             pending_spans = provider_spans
             case_keys: dict[str, CacheKey] = {}
             case_cache = None
@@ -655,14 +659,12 @@ def sync_episode(
                     else:
                         cached_case_decisions.append(cached_case[0])
                         cached_case_flags.extend(cached_case[1])
-                        cached_value = case_cache.read(case_keys[span.case_id])
-                        cached_snippet = cached_case_audio_snippet(
-                            cached_value.get("audio_provenance") if isinstance(cached_value, dict) else None,
-                            case_keys[span.case_id], span,
-                            cached_case[0], audio_snippet_context,
+                        cached_receipt = _cached_case_audio_receipt(
+                            case_cache, case_keys[span.case_id], span, cached_case[0], audio_snippet_context,
                         )
-                        if cached_snippet is not None:
-                            cached_audio_snippets.append(cached_snippet)
+                        if cached_receipt is not None:
+                            cached_audio_snippets.append(cached_receipt[0])
+                            adjudication_audio_receipts[span.case_id] = cached_receipt[1]
                 if not pending_spans:
                     cached_adjudication = cached_case_decisions, _unique_flags(cached_case_flags)
             if cached_adjudication is None:
@@ -727,24 +729,18 @@ def sync_episode(
                         }
                     for span in pending_spans:
                         if span.case_id in by_case:
+                            provenance = bind_case_audio_provenance(
+                                case_keys[span.case_id], span, by_case[span.case_id],
+                                audio_provenance_recorder.manifest() if audio_provenance_recorder is not None else {},
+                                audio_snippet_context,
+                            )
                             write_case(case_cache, case_keys[span.case_id], span, by_case[span.case_id],
                                        _flags_for_adjudication_case(span, provider_flags, review_outages),
-                                       audio_provenance=bind_case_audio_provenance(
-                                           case_keys[span.case_id], span, by_case[span.case_id],
-                                           audio_provenance_recorder.manifest() if audio_provenance_recorder is not None else {},
-                                           audio_snippet_context,
-                                       ))
+                                       audio_provenance=provenance)
+                            if provenance is not None:
+                                adjudication_audio_receipts[span.case_id] = provenance
                 provider_decisions = [*cached_case_decisions, *provider_decisions]
                 provider_flags = _unique_flags([*cached_case_flags, *provider_flags])
-                if audio_snippet_source is not None:
-                    snippet_manifest = audio_snippet_source.manifest()
-                    snippet_manifest["snippets"] = [
-                        *cached_audio_snippets, *audio_provenance_recorder.manifest()["snippets"],
-                    ]
-                    _write_json(
-                        episode_workdir / "audio_snippets.json",
-                        snippet_manifest,
-                    )
                 if not llm_disabled_for_episode:
                     _write_cached_adjudication(
                         episode_workdir,
@@ -766,6 +762,34 @@ def sync_episode(
                 )
             else:
                 provider_decisions, provider_flags = cached_adjudication
+                if case_cache is None and audio_snippet_source is not None:
+                    # A batch hit still binds clips only through this run's
+                    # per-case receipts, never through an earlier manifest.
+                    case_cache = JsonDiskCache(episode_workdir / "llm-case-cache")
+                    case_keys = _adjudication_case_keys(
+                        provider_spans, provider_config, cues, words, audio_snippet_context,
+                    )
+                    batch_decisions = {decision.case_id: decision for decision in provider_decisions}
+                    for span in provider_spans:
+                        cached_receipt = (_cached_case_audio_receipt(
+                            case_cache, case_keys[span.case_id], span, batch_decisions[span.case_id],
+                            audio_snippet_context,
+                        ) if span.case_id in batch_decisions else None)
+                        if cached_receipt is not None:
+                            cached_audio_snippets.append(cached_receipt[0])
+                            adjudication_audio_receipts[span.case_id] = cached_receipt[1]
+            if audio_snippet_source is not None:
+                # Written on every hearing run, so it never describes another run's clips.
+                snippet_manifest = audio_snippet_source.manifest()
+                snippet_manifest["snippets"] = [
+                    *cached_audio_snippets,
+                    *(audio_provenance_recorder.manifest()["snippets"] if audio_provenance_recorder is not None else []),
+                ]
+                snippet_manifest["receipts"] = dict(sorted(adjudication_audio_receipts.items()))
+                _write_json(
+                    episode_workdir / "audio_snippets.json",
+                    snippet_manifest,
+                )
         else:
             _write_json(episode_workdir / "audio_snippets.json", {"snippets": []})
         decisions_by_case = {
@@ -1160,6 +1184,8 @@ def sync_episode(
         source_pair_hearing_mode=("disabled" if llm_disabled_for_episode else "rebuild" if resume_stage == "rebuild" else "fresh"),
         secondary_words=secondary_words, secondary_context=secondary_context,
         enforce_line_width=enforce_line_width,
+        audio_receipts=(_saved_adjudication_audio_receipts(episode_workdir) if resume_stage == "rebuild"
+                        else adjudication_audio_receipts),
     )
 
 
@@ -1220,6 +1246,31 @@ def _accepted_anchor_omission_digest(outcomes) -> str | None:
     return (hashlib.sha256(json.dumps(proofs, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode("utf-8")).hexdigest()
             if proofs else None)
+
+
+def _cached_case_audio_receipt(
+    case_cache: JsonDiskCache, key: CacheKey, span: DivergenceSpan, decision: AdjudicationDecision,
+    audio_context: dict[str, object] | None,
+) -> tuple[dict, dict] | None:
+    """The clip row and receipt a matched case-cache entry binds to this decision."""
+    value = case_cache.read(key)
+    provenance = value.get("audio_provenance") if isinstance(value, dict) else None
+    snippet = cached_case_audio_snippet(provenance, key, span, decision, audio_context)
+    return None if snippet is None else (snippet, provenance)
+
+
+def _saved_adjudication_audio_receipts(episode_workdir: Path) -> dict[str, dict]:
+    """Receipts the adjudicating run validated, for rebuild and verify replay only.
+
+    Those stages accept a recomputed omission proof only when it equals the
+    one bound in rebuild.json, so a lost or altered copy cannot become proof.
+    """
+    try:
+        payload = json.loads((episode_workdir / "audio_snippets.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    receipts = payload.get("receipts") if isinstance(payload, dict) else None
+    return receipts if isinstance(receipts, dict) else {}
 
 
 def _validate_accepted_anchor_omission_binding(episode_workdir: Path, outcomes) -> None:
@@ -1294,7 +1345,7 @@ def _late_timing_hearing(
             decisions, flags = [], []
             if mode == "fresh":
                 cache = JsonDiskCache(episode_workdir / "llm-case-cache")
-                pending = []
+                pending, cached_snippets = [], []
                 for span in spans:
                     cached = read_case(cache, keys[span.case_id], span)
                     if cached is None:
@@ -1302,6 +1353,10 @@ def _late_timing_hearing(
                     else:
                         decisions.append(cached[0])
                         flags.extend(cached[1])
+                        cached_receipt = _cached_case_audio_receipt(cache, keys[span.case_id], span, cached[0], audio_context)
+                        if cached_receipt is not None:
+                            cached_snippets.append(cached_receipt[0])
+                recorder = AudioProvenanceRecorder(snippet_source.load) if snippet_source is not None else None
                 if pending:
                     adapter = llm_adapter_from_config(provider_config, pass_name="adjudication")
                     _set_adapter_episode_context(adapter, current_cues, words=words)
@@ -1318,7 +1373,7 @@ def _late_timing_hearing(
                     engine = AdjudicationEngine(
                         hearing_adapter, confidence_gate=_adjudication_confidence_gate(provider_config),
                         scene_gap_seconds=_adjudication_scene_gap_seconds(provider_config),
-                        audio_snippet_batches=snippet_source.load if snippet_source is not None else None,
+                        audio_snippet_batches=recorder.load if recorder is not None else None,
                         require_audio_snippets=True, required_audio_case_ids={span.case_id for span in pending},
                         max_batch_spans=llm_config.get("max_batch_spans", 25),
                         max_concurrent_batches=llm_config.get("max_concurrent_batches", 1),
@@ -1349,12 +1404,20 @@ def _late_timing_hearing(
                         decision = next((item for item in new_decisions if item.case_id == span.case_id), None)
                         if decision is not None:
                             write_case(cache, keys[span.case_id], span, decision,
-                                       _flags_for_adjudication_case(span, new_flags, review_outages))
+                                       _flags_for_adjudication_case(span, new_flags, review_outages),
+                                       audio_provenance=bind_case_audio_provenance(
+                                           keys[span.case_id], span, decision,
+                                           recorder.manifest() if recorder is not None else {}, audio_context,
+                                       ))
                     decisions.extend(new_decisions)
                     flags.extend(new_flags)
                     flags.extend(_record_llm_usage_events(cost_meter, adapter, provider_config, pass_name="adjudication"))
-                if snippet_source is not None and pending:
-                    _write_json(episode_workdir / f"{kind}_audio_snippets.json", snippet_source.manifest())
+                if recorder is not None:
+                    # Every hearing run names only its own questions' bound clips,
+                    # including those reused from the case cache.
+                    manifest = snippet_source.manifest()
+                    manifest["snippets"] = [*cached_snippets, *recorder.manifest()["snippets"]]
+                    _write_json(episode_workdir / f"{kind}_audio_snippets.json", manifest)
             evidence = MissingDialogueEvidence(questions, context, decisions, _unique_flags(flags))
     if mode == "verify":
         rebuilt = json.loads((episode_workdir / "rebuild.json").read_text(encoding="utf-8"))
@@ -2915,6 +2978,7 @@ def _run_verify_stage(
     secondary_words: list[Word] | None = None,
     secondary_context: dict[str, object] | None = None,
     enforce_line_width: bool = False,
+    audio_receipts: dict[str, dict] | None = None,
 ) -> PipelineResult:
     decisions = list(decisions or [])
     # Verify-resume replays this stage from exactly these inputs. Its finished
@@ -3095,12 +3159,12 @@ def _run_verify_stage(
         "resolved_cue_ids": sorted(independently_resolved_cue_ids),
     }
     if missing_dialogue is not None and secondary_words and speech_regions:
-        manifest_path = episode_workdir / "audio_snippets.json"
+        # A fresh or adjudicate run passes only receipts it validated itself;
+        # rebuild and verify replay saved ones against their bound proof.
         omission = reconcile_accepted_anchor_omissions(
             rebuilt, source_cues, alignment, effective_words, speech_regions, missing_dialogue,
             secondary_words=secondary_words, secondary_context=secondary_context, decisions=decisions,
-            verified_audio_sha256=_sha256_file(audio_for_asr),
-            audio_snippet_manifest=json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None,
+            verified_audio_sha256=_sha256_file(audio_for_asr), audio_receipts=audio_receipts,
             audio_duration_seconds=audio_seconds(audio_for_asr), flags=flags,
             **{key: set(values) for key, values in accepted_anchor_guards.items()},
         )

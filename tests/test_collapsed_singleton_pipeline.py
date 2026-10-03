@@ -69,6 +69,27 @@ def test_singleton_pipeline_hears_complete_word_and_replays_bound_secondary_proo
     assert receipt["outcomes"][0]["outcome"] == "audio_confirmed_utterance"
 
 
+def test_singleton_cache_replay_clip_manifest_names_only_the_delivered_question(tmp_path, monkeypatch):
+    _, adapter, run, _ = _native_case(tmp_path, monkeypatch)
+    result = run()
+    workdir = result.episode_workdir
+    question_ids = [question["span"]["case_id"] for question in json.loads(
+        (workdir / "collapsed_singleton_timing.json").read_text(encoding="utf-8"))["questions"]]
+    path = workdir / "collapsed_singleton_timing_audio_snippets.json"
+    heard = {row["case_id"]: row["sha256"] for row in json.loads(path.read_text(encoding="utf-8"))["snippets"]}
+    assert list(heard) == question_ids
+    cached = [json.loads(item.read_text(encoding="utf-8"))["value"] for item in (workdir / "llm-case-cache").glob("*.json")]
+    assert any(value["decision"]["case_id"] in question_ids and "audio_provenance" in value for value in cached)
+    # An earlier hearing of the same cue under an older proof id left its manifest behind.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["snippets"][0]["case_id"] = question_ids[0][:-16] + "db13f3c120e9ad85"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    adapter.seen.clear()
+    run()
+    assert adapter.seen == []
+    assert {row["case_id"]: row["sha256"] for row in json.loads(path.read_text(encoding="utf-8"))["snippets"]} == heard
+
+
 @pytest.mark.parametrize("mode", ["rebuild", "verify"])
 def test_singleton_replay_rejects_modified_receipt_without_native_retry(tmp_path, monkeypatch, mode):
     _, adapter, run, _ = _native_case(tmp_path, monkeypatch)
