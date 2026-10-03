@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from dubsync import pipeline
-from dubsync.models import AdjudicationDecision
+from dubsync.models import AdjudicationDecision, Word
 from test_accepted_anchor_omission import _case
 from test_missing_dialogue_reconciliation import _pipeline_case
 
@@ -285,3 +285,28 @@ def test_accepted_anchor_route_preserves_an_already_confirmed_ordinary_omission(
     receipt = json.loads((result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
     assert receipt["outcomes"][0]["outcome"] == "audio_confirmed_omission"
     assert "accepted_anchor_omission_proof" not in receipt["outcomes"][0]
+
+
+@pytest.mark.parametrize("secondary_heard_target", [False, True])
+def test_ordinary_omission_keeps_the_cue_when_the_secondary_asr_heard_a_word_in_its_gap(
+        tmp_path, monkeypatch, secondary_heard_target):
+    case, _, run = _pipeline_case(tmp_path, monkeypatch)
+    secondary = [word.model_copy(update={"speaker_id": "secondary"}) for word in case[1]]
+    if secondary_heard_target:
+        secondary.insert(2, Word(text="Tao", start=1.7, end=1.9, speaker_id="secondary"))
+    config_path = tmp_path / "provider.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["asr"].update(provider="elevenlabs", model_id="scribe_v2", cross_check={
+        "provider": "openrouter", "model": "microsoft/mai-transcribe-2",
+        "fixture_path": _secondary_fixture(tmp_path, secondary)})
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    result = run()
+    receipt = json.loads((result.episode_workdir / "missing_dialogue_reconciliation.json").read_text(encoding="utf-8"))
+    outcome = next(item for item in receipt["outcomes"] if item["cue_id"] == 2)
+    assert outcome["outcome"] == ("secondary_evidence_in_gap" if secondary_heard_target else "audio_confirmed_omission")
+    assert ("Tao," in result.output_srt.read_text(encoding="utf-8")) is secondary_heard_target
+    held = [item for item in result.report["review"] if 2 in item.get("cue_ids", [])
+            and item["kind"] in {"missing_audio_source_cue_held", "missing_audio_timing_held"}]
+    assert bool(held) is secondary_heard_target
+    assert any(flag["kind"] == "missing_dialogue_audio_reconciled" and flag["cue_ids"] == [2]
+               for flag in result.report["flags"]) is not secondary_heard_target

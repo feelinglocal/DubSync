@@ -274,3 +274,19 @@ def test_a_sentence_initial_common_word_is_still_preaccepted():
 
     assert (decision.verdict, decision.final_text) == ("use_audio", "Blue boats")
     assert _triage(item, policy) == {}
+
+
+def test_secondary_hearing_of_words_the_primary_omitted_holds_an_unheard_deletion():
+    primary = [Word(text="hello", start=0, end=0.3), Word(text="goodbye.", start=1.6, end=1.9)]
+    secondary = [primary[0], Word(text="green", start=0.6, end=0.9), Word(text="apples", start=1.0, end=1.3), primary[1]]
+    item = DivergenceSpan(case_id="case", cue_ids=[1], srt_text="green apples", asr_text="", asr_word_indices=[],
+                          left_anchor_end=0.3, right_anchor_start=1.6)
+    evidence = classify_spans([item], compare_word_streams(primary, secondary))[0]
+    assert (evidence.label, evidence.secondary_text) == ("secondary_matches_script", "green apples")
+    legacy = AdjudicationDecision(case_id="case", verdict="use_audio", final_text="", confidence=0.99, reason="Reviewed")
+    assert enforce_crosscheck_decisions([item], [legacy], [evidence])[0].verdict == "keep_srt"
+    native = legacy.model_copy(update={"evidence": "heard_clearly", "heard_text": ""})
+    assert enforce_crosscheck_decisions([item], [native], [evidence]) == [native]
+    silent = classify_spans([item], compare_word_streams(primary, primary))[0]
+    assert silent.label == "ambiguous"
+    assert silent.reason.startswith("The primary has no words for these script words")

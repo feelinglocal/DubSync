@@ -107,7 +107,35 @@ def test_scribe_null_word_timestamp_is_typed_failure_without_retry(
     assert "fixture-key" not in str(caught.value)
     assert caught.value.__suppress_context__
     assert calls == [b"fixture-audio"]
-    assert adapter.last_usage == {"request_count": 1}
+    assert adapter.last_usage == {"request_count": 1, "rejected_response_count": 1}
+
+
+def test_rejected_billed_scribe_response_is_metered_at_the_catalog_rate(monkeypatch, tmp_path):
+    import wave
+
+    from dubsync.cache import JsonDiskCache
+    from dubsync.cost import CostMeter
+    from dubsync.providers import CachedASRAdapter
+
+    response = SimpleNamespace(words=[{"type": "word", "text": "Hallo", "start": None, "end": 0.2}])
+    monkeypatch.setitem(sys.modules, "elevenlabs", SimpleNamespace(
+        ElevenLabs=lambda **kwargs: SimpleNamespace(speech_to_text=SimpleNamespace(convert=lambda **kwargs: response)),
+    ))
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(bytes(2 * 16000 * 60))
+    meter = CostMeter()
+    adapter = CachedASRAdapter(ElevenLabsScribeAdapter(api_key="fixture-key"), JsonDiskCache(tmp_path / "cache"),
+                               model="scribe_v2", params={}, cost_meter=meter, dollars_per_hour=0.22)
+
+    with pytest.raises(ProviderError, match="missing or invalid word timing"):
+        adapter.transcribe(audio)
+
+    assert [(item.kind, item.units["seconds"]) for item in meter.items] == [("audio", pytest.approx(60))]
+    assert meter.total_usd == pytest.approx(0.22 / 60, abs=1e-6)
 
 
 def test_scribe_null_audio_event_timestamp_keeps_valid_words(monkeypatch, tmp_path):

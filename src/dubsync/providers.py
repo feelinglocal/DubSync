@@ -155,7 +155,9 @@ class CachedASRAdapter:
                 float(self.last_usage["reported_cost"]),
                 partial=True,
             )
-        elif succeeded and self.dollars_per_hour is not None and self.dollars_per_hour > 0:
+        elif ((succeeded or self.last_usage.get("rejected_response_count"))
+              and self.dollars_per_hour is not None and self.dollars_per_hour > 0):
+            # A completed response rejected after billing still costs its audio.
             self.cost_meter.add_audio(
                 self.cost_provider,
                 float(seconds) if isinstance(seconds, (int, float)) else audio_seconds(audio_path),
@@ -189,7 +191,7 @@ def _safe_asr_usage(value: object) -> dict[str, object]:
     result: dict[str, object] = {}
     for name in (
         "seconds", "cost", "reported_seconds", "reported_cost", "request_count",
-        "uncertain_request_count", "uncertain_seconds",
+        "uncertain_request_count", "uncertain_seconds", "rejected_response_count",
     ):
         number = value.get(name)
         if name in value and number is None:
@@ -270,7 +272,9 @@ class ElevenLabsScribeAdapter:  # pragma: no cover - live provider path
                 end = float(_field(item, "end"))
             except (TypeError, ValueError, OverflowError):
                 # Missing timestamps are provider failures, not zero-time
-                # words. Never retry a successfully billed response here.
+                # words. Never retry a successfully billed response here,
+                # but let the caller meter it.
+                self.last_usage["rejected_response_count"] = 1
                 raise ProviderError(
                     "ElevenLabs Scribe returned missing or invalid word timing.",
                     code="invalid_response",

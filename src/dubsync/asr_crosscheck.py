@@ -160,6 +160,26 @@ def _secondary_window(agreement: StreamAgreement, first: int, last: int) -> tupl
     return indices
 
 
+def _primary_omission(span: DivergenceSpan, agreement: StreamAgreement) -> SpanCrossCheck:
+    """Compare script words the primary did not transcribe with the secondary's unmatched gap words."""
+    start, end = span.left_anchor_end, span.right_anchor_start
+    if start is None or end is None or not math.isfinite(start) or not math.isfinite(end) or start >= end:
+        return SpanCrossCheck(span.case_id, "ambiguous", (),
+                              reason="The primary has no words for these script words, and the span has no anchored gap.")
+    matched = {index for index in agreement.token_matches if index is not None}
+    indices = tuple(index for index, token in enumerate(agreement.secondary_tokens)
+                    if index not in matched and _valid_time(token) and start <= (token.start + token.end) / 2 <= end)
+    secondary_words = tuple(dict.fromkeys(agreement.secondary_tokens[index].word_index for index in indices))
+    secondary_text = " ".join(agreement.secondary_words[index].text for index in secondary_words)
+    if (indices and indices == tuple(range(indices[0], indices[-1] + 1))
+            and tuple(agreement.secondary_tokens[index].text for index in indices) == _keys(span.srt_text)):
+        return SpanCrossCheck(span.case_id, "secondary_matches_script", (), secondary_words, secondary_text,
+                              "The secondary heard the script words that the primary omitted.")
+    return SpanCrossCheck(span.case_id, "ambiguous", (), secondary_words, secondary_text,
+                          "The primary has no words for these script words, and the secondary does not hear "
+                          "exactly them in the anchored gap.")
+
+
 def classify_spans(spans: Sequence[DivergenceSpan], agreement: StreamAgreement) -> list[SpanCrossCheck]:
     """Describe corroboration for already aligned primary divergence spans."""
     results: list[SpanCrossCheck] = []
@@ -168,6 +188,10 @@ def classify_spans(spans: Sequence[DivergenceSpan], agreement: StreamAgreement) 
         tokens_by_word[token.word_index].append(index)
     for span in spans:
         owned = tuple(span.asr_word_indices)
+        if not owned and _keys(span.srt_text):
+            # A primary omission: the secondary may have heard the script words.
+            results.append(_primary_omission(span, agreement))
+            continue
         if (not owned or owned != tuple(range(owned[0], owned[-1] + 1))
                 or owned[0] < 0 or owned[-1] >= len(agreement.primary_words)):
             results.append(SpanCrossCheck(span.case_id, "ambiguous", owned, reason="Primary ownership is not a contiguous word group."))

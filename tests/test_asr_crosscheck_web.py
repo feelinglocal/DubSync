@@ -114,3 +114,63 @@ def test_processor_passes_explicit_cross_check_preference_to_sync(tmp_path, monk
                          language="de", style="source", retention_hours=24, asr_cross_check=enabled)
     default_processor(job, settings(tmp_path))
     assert calls[0]["asr_cross_check"] is enabled
+
+
+def test_job_failing_at_the_secondary_asr_keeps_its_cost_and_failure_record(tmp_path, monkeypatch):
+    import json
+    import wave
+
+    import dubsync.asr_crosscheck_runtime as runtime
+    from dubsync import pipeline
+    from dubsync.models import Word
+    from dubsync.providers import ProviderError
+    from dubsync.web.jobs import JobService
+
+    class Primary:
+        last_usage = {"cost": .01, "seconds": 2}
+        def transcribe(self, path):
+            return [Word(text="Hallo", start=.1, end=.5)]
+    class Secondary:
+        api_key = "fixture-key"
+        last_usage = {"cost": None, "reported_cost": .02, "reported_seconds": 2}
+        def transcribe(self, path):
+            raise ProviderError("Temporary secondary provider failure", code="temporary")
+    monkeypatch.setattr(pipeline, "adapter_from_config", lambda *a, **kw: Primary())
+    monkeypatch.setattr(runtime, "adapter_from_config", lambda *a, **kw: Secondary())
+    monkeypatch.setattr(runtime, "normalize_audio", lambda source, *a, **kw: source)
+    web = settings(tmp_path)
+    web.providers_path.write_text(
+        "asr:\n  provider: openrouter\n  model: microsoft/mai-transcribe-2\n"
+        "  cross_check:\n    provider: elevenlabs\n    model_id: scribe_v2\n", encoding="utf-8")
+    directory = web.data_dir / "job-secondary-failure"
+    directory.mkdir(parents=True)
+    audio, source = directory / "audio.wav", directory / "source.srt"
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(bytes(2 * 32000))
+    source.write_text("1\n00:00:00,100 --> 00:00:00,500\nHallo\n", encoding="utf-8")
+
+    def process(job, _settings):
+        pipeline.sync_episode(job.srt_path, job.audio_path, job.directory / "synced.srt", job.directory / "work",
+                              providers_path=web.providers_path, language="de", asr_cross_check=True, no_llm=True)
+
+    service = JobService(web, process)
+    job = new_job_record(job_id="secondary-failure", token_hash="token", mode="sync", directory=directory,
+                         audio_path=audio, srt_path=source, fps=30, language="de", style="source",
+                         retention_hours=24, asr_cross_check=True)
+    try:
+        service.store.create(job)
+        service.submit(job)
+        failed = service.store.get(job.id)
+    finally:
+        service.shutdown()
+    episode = directory / "work" / "source"
+    cost = json.loads((episode / "cost.json").read_text(encoding="utf-8"))
+    failure = json.loads((episode / "asr_cross_check_failure.json").read_text(encoding="utf-8"))
+    assert failed.status == "failed"
+    assert cost["total_usd"] == pytest.approx(.03) and failure["cost"] == cost
+    assert failed.cost_usd == pytest.approx(cost["total_usd"])
+    assert sorted(path.name for path in episode.iterdir()) == ["asr_cross_check_failure.json", "cost.json"]
+    assert audio.exists() and source.exists()

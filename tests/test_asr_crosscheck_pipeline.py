@@ -101,6 +101,20 @@ def test_agreement_can_preaccept_only_wording_and_preserves_primary_timing(tmp_p
     assert secondary["metadata"]["cost_items"] == []
 
 
+def test_no_llm_keeps_agreed_source_wording_and_reports_the_divergence(tmp_path, monkeypatch):
+    options = _inputs(tmp_path)
+    monkeypatch.setattr(pipeline, "llm_adapter_from_config", lambda *a, **kw: pytest.fail("No-LLM mode needs no LLM"))
+    result = pipeline.sync_episode(**options, no_llm=True)
+    assert "hello green apples goodbye." in result.output_srt.read_text(encoding="utf-8")
+    adjudication = _json(result.episode_workdir / "adjudicate.json")
+    assert [(decision["case_id"], decision["verdict"]) for decision in adjudication["decisions"]] == [("case-1", "keep_srt")]
+    assert any(flag["kind"] == "divergence_unresolved" and flag["new_text"] == "blue boats"
+               for flag in result.report["flags"])
+    analysis = _json(result.episode_workdir / "asr_cross_check_analysis.json")
+    assert [(case["case_id"], case["label"]) for case in analysis["cases"]] == [("case-1", "both_agree")]
+    assert analysis["preaccepted_case_ids"] == []
+
+
 @pytest.mark.parametrize("resume", ["align", "adjudicate", "rebuild", "verify"])
 def test_resume_loads_both_saved_streams_without_creating_provider(tmp_path, monkeypatch, resume):
     options = _inputs(tmp_path)

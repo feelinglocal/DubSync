@@ -432,6 +432,37 @@ def test_empty_native_hearing_does_not_delete_detected_untranscribed_activity(bu
     assert result.cues == case[0] and result.resolved_cue_ids == set()
 
 
+_RAW_PRIMARY = (("Wait", 1.0, 1.15), ("here", 1.16, 1.3), ("closer", 2.1, 2.4))
+
+
+@pytest.mark.parametrize("left_end, secondary, outcome", [
+    (1.3, _RAW_PRIMARY, "audio_confirmed_omission"),
+    (1.3, (*_RAW_PRIMARY, ("now", 2.45, 2.6)), "audio_confirmed_omission"),
+    (1.3, (*_RAW_PRIMARY[:2], ("Tao", 1.7, 1.9), _RAW_PRIMARY[2]), "secondary_evidence_in_gap"),
+    # Edge repair extended the primary anchor word over the secondary's word.
+    (1.55, (*_RAW_PRIMARY[:2], ("Tao", 1.33, 1.53), _RAW_PRIMARY[2]), "secondary_evidence_in_gap"),
+    # Secondary timestamps drift past the anchor; its word order still places it in the gap.
+    (1.3, (*_RAW_PRIMARY[:2], ("Tao", 2.41, 2.44), ("closer", 2.45, 2.75)), "secondary_evidence_in_gap"),
+])
+def test_empty_native_hearing_does_not_delete_a_cue_the_secondary_asr_heard_in_the_gap(left_end, secondary, outcome):
+    cues, words, alignment, regions = case = _case(bursts=())
+    words[1] = words[1].model_copy(update={"end": left_end})
+    regions[0] = SpeechRegion(start=1, end=left_end)
+    questions = _questions(case)
+    assert questions[0].span.left_anchor_end == left_end
+    result = reconcile_missing_dialogue(
+        cues, cues, alignment, words, regions, questions, [_decision(questions[0], "")], StyleProfile(fps=30),
+        flags=list(alignment.flags), secondary_words=[Word(text=text, start=start, end=end) for text, start, end in secondary],
+    )
+    assert result.outcomes[0]["outcome"] == outcome
+    if outcome == "audio_confirmed_omission":
+        assert result.cues == [cues[0], cues[2]] and result.resolved_cue_ids == {2}
+    else:
+        assert result.cues == cues and result.resolved_cue_ids == set()
+        assert result.alignment.diagnostics.missing_audio_cue_ids == [2]
+        assert not any(flag.kind == "missing_dialogue_audio_reconciled" for flag in result.flags)
+
+
 @pytest.mark.parametrize("tamper", ["audio", "words", "regions", "questions", "policy", "decision_case"])
 def test_reconciliation_resume_rejects_stale_or_tampered_bindings(tamper):
     case = _case()

@@ -14,6 +14,7 @@ from math import ceil, floor, isfinite
 
 from .adjudication_regions import is_song_caption_cue
 from .adjudication_case_cache import flag_applies_to_case
+from .asr_crosscheck import StreamAgreement, compare_word_streams
 from .asr_timing import (MIN_OWNED_OVERLAP_SECONDS, MIN_SECONDS_PER_LETTER, MIN_WHOLE_WORD_SECONDS,
                          has_sufficient_speech_overlap)
 from .models import AdjudicationDecision, AlignmentResult, Cue, CueContext, DivergenceSpan, QCFlag, SpeechRegion, Word
@@ -460,7 +461,32 @@ def _unowned_omission_activity(question, sources, alignment, words, regions):
     return remaining
 
 
-def _resolution_reason(question, decision, sources, alignment, words, regions, flags):
+def _secondary_words_in_gap(question, words, agreement):
+    """Whether the secondary ASR heard a word that no neighbour anchor accounts for.
+
+    The window spans both boundary anchor words, so a word absorbed into an
+    edge-repaired anchor still counts. Secondary word order also places a word
+    in the gap when its own timestamps drift past an anchor.
+    """
+    anchors = {*question.left_word_indices, *question.right_word_indices}
+    heard_as = {target: token.word_index for token, target in zip(agreement.primary_tokens, agreement.token_matches)
+                if target is not None}
+    primary_by_word: dict[int, list[int | None]] = {}
+    for index, token in enumerate(agreement.secondary_tokens):
+        primary_by_word.setdefault(token.word_index, []).append(heard_as.get(index))
+    accounted = {index for index, primary in primary_by_word.items() if all(item in anchors for item in primary)}
+    left_last, right_first = question.left_word_indices[-1], question.right_word_indices[0]
+    after_left = [index for index, primary in primary_by_word.items() if left_last in primary]
+    before_right = [index for index, primary in primary_by_word.items() if right_first in primary]
+    between = range(max(after_left) + 1, min(before_right)) if after_left and before_right else range(0)
+    start, end = words[left_last].start, words[right_first].end
+    return any(alphanumeric_signature(word.text) and index not in accounted
+               and (index in between or not isfinite(word.start) or not isfinite(word.end)
+                    or (word.start < end - _EPSILON and word.end > start + _EPSILON))
+               for index, word in enumerate(agreement.secondary_words))
+
+
+def _resolution_reason(question, decision, sources, alignment, words, regions, flags, secondary=None):
     if decision is None:
         return "pending_audio_question", None
     if decision.evidence != "heard_clearly" or decision.confidence != 1:
@@ -504,8 +530,12 @@ def _resolution_reason(question, decision, sources, alignment, words, regions, f
     if not heard:
         if decision.final_text.strip() or (decision.heard_text or "").strip() or decision.verdict == "keep_srt":
             return "wording_does_not_match_hearing", None
-        remaining = _unowned_omission_activity(question, sources, alignment, words, regions)
-        return ("audio_confirmed_omission", None) if not remaining else ("untranscribed_activity_remains", None)
+        if _unowned_omission_activity(question, sources, alignment, words, regions):
+            return "untranscribed_activity_remains", None
+        if secondary is not None and _secondary_words_in_gap(question, words, secondary):
+            # Native absence cannot outweigh lexical evidence the run already holds.
+            return "secondary_evidence_in_gap", None
+        return "audio_confirmed_omission", None
     bursts = _independent_gap_activity(question, words, regions, bursts)
     read_only = list(question.read_only_source_tokens)
     target = alphanumeric_signature(span.srt_text)
@@ -546,9 +576,14 @@ def _resolution_reason(question, decision, sources, alignment, words, regions, f
 def reconcile_missing_dialogue(
     rebuilt: list[Cue], source_cues: list[Cue], alignment: AlignmentResult, words: list[Word],
     regions: list[SpeechRegion], questions: list[MissingDialogueQuestion], decisions: list[AdjudicationDecision],
-    profile: StyleProfile, *, flags: list[QCFlag],
+    profile: StyleProfile, *, flags: list[QCFlag], secondary_words: list[Word] | None = None,
 ) -> MissingDialogueResolution:
     sources = {cue.index: cue for cue in source_cues}
+    # The optional secondary stream is evidence only; an absence answer never
+    # deletes a cue whose gap holds a secondary word the primary missed.
+    secondary: StreamAgreement | None = (
+        compare_word_streams(words, secondary_words) if secondary_words is not None and questions else None
+    )
     by_case = {decision.case_id: decision for decision in decisions}
     replacement: dict[int, Cue | None] = {}
     spoken: dict[int, tuple[int, int]] = {}
@@ -563,7 +598,7 @@ def reconcile_missing_dialogue(
                  alphanumeric_signature(sources[question.cue_id].plain_text))):
             outcome, burst = "source_or_wording_changed", None
         else:
-            outcome, burst = _resolution_reason(question, decision, sources, alignment, words, regions, flags)
+            outcome, burst = _resolution_reason(question, decision, sources, alignment, words, regions, flags, secondary)
         outcomes.append({"case_id": question.span.case_id, "cue_id": question.cue_id, "outcome": outcome,
                          "native_evidence": decision.evidence if decision else None,
                          "heard_text": decision.heard_text if decision else None})
@@ -639,6 +674,8 @@ def reconcile_missing_dialogue(
                         "Audio confirmed the target wording, but no unique independent speech chain established its timing; retained the source cue for review."
                         if target_outcomes <= {"no_unique_speech_burst", "speech_burst_crosses_anchor",
                                                "speech_burst_too_short", "no_safe_frame_boundary"}
+                        else "The audio answer heard no speech, but the secondary ASR transcribed a word in this gap; retained the source cue for review."
+                        if target_outcomes == {"secondary_evidence_in_gap"}
                         else "The bounded audio question did not establish both the whole cue's wording and independent acoustic ownership; retained the source cue for review."
                     )
                     cleaned.append(flag.model_copy(update={"message": message}))

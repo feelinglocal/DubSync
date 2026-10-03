@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 import re
 import shutil
 import sqlite3
@@ -51,6 +53,8 @@ PROVIDER_JOB_ERRORS = {
 }
 STORAGE_RESERVATION_FILENAME = ".storage-reservation"
 STORAGE_RESERVATION_TEMP_FILENAME = ".storage-reservation.tmp"
+# Small records a failed job keeps so its provider spend is never erased.
+_FAILED_JOB_RECORD_NAMES = ("cost.json", "asr_failure.json", "asr_cross_check_failure.json")
 AUTO_FPS_DB_SENTINEL = 0.0
 TRANSCRIPTION_PROVIDER_CHECK = (
     "CHECK(transcription_provider IN "
@@ -487,6 +491,7 @@ class JobStore:
         *,
         failure: Exception | None = None,
         expires_at: datetime | None = None,
+        cost_usd: float | None = None,
     ) -> JobRecord:
         # Only known provider codes may select public text; exception messages can
         # contain upstream response bodies or credentials and must stay private.
@@ -500,6 +505,7 @@ class JobStore:
             progress=100,
             error=error,
             **({"expires_at": _iso(expires_at)} if expires_at is not None else {}),
+            **({"cost_usd": cost_usd} if cost_usd is not None else {}),
         )
 
     def fail_stale_active(
@@ -746,8 +752,9 @@ class JobService:
             self.store.mark_complete(job.id, artifacts, expires_at=terminal_expiry())
         except Exception as exc:
             logger.exception("DubSync job %s failed", job.id)
+            cost_usd = _failed_job_cost(job)
             _remove_generated_job_files(job)
-            self.store.mark_failed(job.id, failure=exc, expires_at=terminal_expiry())
+            self.store.mark_failed(job.id, failure=exc, expires_at=terminal_expiry(), cost_usd=cost_usd)
         finally:
             self.store.release_job_storage(job.directory)
 
@@ -858,23 +865,59 @@ def default_processor(job: JobRecord, settings: WebSettings) -> ProcessedArtifac
     )
 
 
+def _failed_job_records(job: JobRecord) -> set[Path]:
+    """Cost and provider-failure records that outlive a failed job's outputs."""
+    try:
+        root = job.directory.resolve()
+        return {
+            resolved for name in _FAILED_JOB_RECORD_NAMES for path in (job.directory / "work").glob(f"*/{name}")
+            if path.is_file() and not path.is_symlink() and (resolved := path.resolve()).is_relative_to(root)
+        }
+    except OSError:
+        logger.exception("Could not inspect failed job records: %s", job.directory)
+        return set()
+
+
+def _failed_job_cost(job: JobRecord) -> float | None:
+    """The pipeline's own spend for a failed job, read before its outputs are removed."""
+    total = None
+    for path in sorted(record for record in _failed_job_records(job) if record.name == "cost.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")).get("total_usd")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            total = (total or 0.0) + float(value)
+    return total
+
+
 def _remove_generated_job_files(job: JobRecord) -> None:
+    records = _failed_job_records(job)
     preserved = {
         job.audio_path.resolve(),
         *((job.srt_path.resolve(),) if job.srt_path is not None else ()),
         (job.directory / "style-example.srt").resolve(),
         (job.directory / STORAGE_RESERVATION_FILENAME).resolve(),
         (job.directory / STORAGE_RESERVATION_TEMP_FILENAME).resolve(),
+        *records,
     }
+    _remove_children(job.directory, preserved, {parent for record in records for parent in record.parents})
+
+
+def _remove_children(directory: Path, preserved: set[Path], record_parents: set[Path]) -> None:
     try:
-        children = tuple(job.directory.iterdir())
+        children = tuple(directory.iterdir())
     except OSError:
-        logger.exception("Could not inspect failed job output directory: %s", job.directory)
+        logger.exception("Could not inspect failed job output directory: %s", directory)
         return
     for child in children:
         try:
             resolved = child.resolve()
             if resolved in preserved:
+                continue
+            if resolved in record_parents and child.is_dir() and not child.is_symlink():
+                # Keep only the cost and failure records inside this directory.
+                _remove_children(child, preserved, record_parents)
                 continue
             if child.is_symlink() or child.is_file():
                 child.unlink(missing_ok=True)

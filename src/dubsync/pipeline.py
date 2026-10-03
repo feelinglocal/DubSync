@@ -599,7 +599,9 @@ def sync_episode(
         )
         provider_decisions: list[AdjudicationDecision] = []
         provider_flags: list[QCFlag] = []
-        if cross_checks:
+        if cross_checks and not llm_disabled_for_episode:
+            # Agreement is not hearing. Without the LLM the span keeps its
+            # source wording and divergence finding; its label is still recorded.
             provider_spans, cross_check_preaccepted = preaccept_cross_checked_spans(
                 provider_spans, cross_checks, policy=cross_check_policy, uncertain_word_indices=uncertain_word_indices,
             )
@@ -3132,7 +3134,7 @@ def _run_verify_stage(
         reconciled = reconcile_missing_dialogue(
             rebuilt, source_cues, alignment, effective_words, speech_regions,
             missing_dialogue.questions, missing_dialogue.decisions, profile,
-            flags=_unique_flags([*flags, *missing_dialogue.flags]),
+            flags=_unique_flags([*flags, *missing_dialogue.flags]), secondary_words=secondary_words,
         )
         rebuilt, alignment, flags = reconciled.cues, reconciled.alignment, reconciled.flags
         protected_cue_ids -= reconciled.resolved_cue_ids
