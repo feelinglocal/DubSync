@@ -19,7 +19,7 @@ from .text_metrics import token_texts
 from .tokenize import alphanumeric_signature, normalize_token, number_value
 
 
-HYBRID_POLICY_VERSION = 5
+HYBRID_POLICY_VERSION = 6
 Reviewer = Callable[..., tuple[list[dict[str, object]], list[dict[str, object]]]]
 _NEGATIONS = frozenset({
     "no", "not", "never", "nothing", "nobody", "neither", "nor", "without",
