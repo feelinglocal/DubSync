@@ -30,7 +30,7 @@ from .adjudication_snippets import BoundedAudioSnippetBatchSource
 from .aligner import MISSING_AUDIO_GUARD_VERSION, _decoded_twice, _words_touch, align_cues_to_words
 from .annotation_composition import AnnotationComposition, compose_bracketed_annotations
 from .audio import AudioNormalizationLimits, normalize_audio
-from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, extract_audio_snippets
+from .audio_snippets import DEFAULT_MAX_COVERING_SNIPPET_SECONDS, _snippet_window, extract_audio_snippets
 from .asr_timing import PhraseEdgeSnap, ambiguous_word_indices, has_sufficient_speech_overlap
 from .asr_crosscheck import classify_spans, compare_word_streams
 from .asr_crosscheck_config import resolve_cross_check_config
@@ -2062,10 +2062,15 @@ def _alignment_with_unheard_cue_edges(
     """Ask about a partly retained cue's unmatched edge where the cue is spoken."""
     if alignment.diagnostics.unresolved:
         return alignment
+    # A case whose configured clip already holds the cue's retained edge and
+    # the pause after it is heard there: it stays one question.
+    clips, pad, max_seconds, _, _ = _adjudication_audio_snippet_options(provider_config)
+    covering = _adjudication_covering_snippet_seconds(provider_config)
     spans = separate_unheard_cue_edges(
         alignment.divergence_spans, cues, words,
         max_intra_cue_gap=_timing_float_config(provider_config, "max_intra_cue_gap", 1.5),
         protected_cue_ids=set(alignment.diagnostics.missing_audio_cue_ids),
+        clip_window=(lambda start, end: _snippet_window(start, end, pad, max_seconds, covering)) if clips else None,
     )
     if spans == alignment.divergence_spans:
         return alignment

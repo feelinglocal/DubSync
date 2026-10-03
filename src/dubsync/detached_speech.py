@@ -18,6 +18,7 @@ time: a clip cut around those words would not contain the cue.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 
@@ -120,6 +121,7 @@ def separate_unheard_cue_edges(
     *,
     max_intra_cue_gap: float = 1.5,
     protected_cue_ids: set[int] | None = None,
+    clip_window: Callable[[float, float], tuple[float, float]] | None = None,
 ) -> list[DivergenceSpan]:
     """Ask about a partly retained cue's unmatched edge at the cue's own time.
 
@@ -134,19 +136,25 @@ def separate_unheard_cue_edges(
     rest keeps the case id and every word, as a pure insertion when no source
     token is left, so a far word is still heard and placed or held at its own
     time. A cue whose retained words surround the case keeps its own pause.
+    ``clip_window`` gives the audio clip a case is asked with (its padded
+    word interval); when that clip already holds the retained edge and the
+    whole pause to the case's words, the reviewer hears the cue there and the
+    case stays one question.
     """
     tokens = tokenize_cues(cues)
     cues_by_id = {cue.index: cue for cue in cues}
     protected = protected_cue_ids or set()
     result: list[DivergenceSpan] = []
     for span in spans:
-        result.extend(_unheard_edge_questions(span, cues_by_id, tokens, words, max_intra_cue_gap, protected))
+        result.extend(_unheard_edge_questions(span, cues_by_id, tokens, words, max_intra_cue_gap, protected,
+                                              clip_window))
     return result
 
 
 def _unheard_edge_questions(
     span: DivergenceSpan, cues_by_id: dict[int, Cue], tokens: list[SRTToken], words: list[Word],
     max_gap: float, protected: set[int],
+    clip_window: Callable[[float, float], tuple[float, float]] | None = None,
 ) -> list[DivergenceSpan]:
     source, audio = span.srt_token_indices, span.asr_word_indices
     if (
@@ -168,12 +176,18 @@ def _unheard_edge_questions(
     first_start, last_end = min(word.start for word in spoken), max(word.end for word in spoken)
     tail = [index for index in source if tokens[index].cue_id == left_cue]
     head = [index for index in source if tokens[index].cue_id == right_cue]
-    split_tail = bool(tail) and source[:len(tail)] == tail and _finite(span.left_anchor_end) and (
-        first_start - span.left_anchor_end > max_gap
-    )
+    clip = (clip_window(span.start, span.end)
+            if clip_window is not None and _finite(span.start) and _finite(span.end) and span.end > span.start
+            else None)
+
+    def unheard(start: float, end: float) -> bool:
+        # A pause longer than a cue's own pauses, outside the case's clip.
+        return end - start > max_gap and not (clip is not None and clip[0] <= start and end <= clip[1])
+
+    split_tail = bool(tail) and source[:len(tail)] == tail and _finite(span.left_anchor_end) and unheard(
+        span.left_anchor_end, first_start)
     split_head = bool(head) and source[len(source) - len(head):] == head and _finite(span.right_anchor_start) and (
-        span.right_anchor_start - last_end > max_gap
-    )
+        unheard(last_end, span.right_anchor_start))
     if not split_tail and not split_head:
         return [span]
     rest = source[len(tail) if split_tail else 0:len(source) - len(head) if split_head else len(source)]

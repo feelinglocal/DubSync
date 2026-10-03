@@ -489,6 +489,38 @@ def test_words_near_the_cue_or_inside_its_own_pause_keep_the_shared_case():
     assert separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5) == spans
 
 
+# ep17 case-104 shape: the far word follows the retained edge by 1.57 s, more
+# than the cue's own pause limit (1.5 s) but inside the 2-s clip pad.
+_PADDED_TAIL_WORDS = [*_FAR_TAIL_WORDS[:2], ("Ah!", 7.45, 7.65), *_FAR_TAIL_WORDS[3:]]
+
+
+def test_a_case_whose_clip_already_holds_the_retained_edge_stays_one_question():
+    # W4R-2: splitting such a case only buys a second question about the same
+    # audio, and the two answers can contradict each other.
+    def clip(start, end):
+        return _snippet_window(start, end, 2.0, 20.0)
+
+    cues, words, spans = _aligned(_FAR_TAIL_SRT, _PADDED_TAIL_WORDS)
+    (shared,) = spans
+    assert (shared.cue_ids, shared.srt_text, shared.asr_text) == ([1], "primeiro", "Ah!")
+    assert separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5, clip_window=clip) == spans
+    # Without a clip, or when the pause reaches past the clip, the tail is still asked alone.
+    assert len(separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5)) == 2
+    cues, words, spans = _aligned(_FAR_TAIL_SRT, _FAR_TAIL_WORDS)
+    tail, far = separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5, clip_window=clip)
+    assert (tail.case_id, far.case_id) == (f"{DETACHED_SPEECH_PREFIX}tail-case-1", "case-1")
+
+
+def test_a_padded_clip_that_holds_the_cue_edge_asks_one_question_in_the_pipeline(tmp_path, monkeypatch):
+    adapter = _ClipRecordingAdapter(approve=False)
+    _hearing_run(tmp_path, monkeypatch, _FAR_TAIL_SRT, _PADDED_TAIL_WORDS, adapter)()
+    # An unanswered question is asked again; it is still the one case.
+    asked = {span.case_id: (span, clip) for span, clip in adapter.questions}
+    ((span, clip),) = asked.values()
+    assert (span.case_id, span.cue_ids, span.srt_text, span.asr_text) == ("case-1", [1], "primeiro", "Ah!")
+    assert _contains(clip, 5.88, 7.65)  # the retained edge, the pause and the far word
+
+
 class _ClipRecordingAdapter:
     """Records each question with its clip; answers like a reviewer who heard it."""
 
