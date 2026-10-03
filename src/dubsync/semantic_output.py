@@ -216,8 +216,12 @@ def wrap_semantic_lines(text: str, max_width: int) -> list[str]:
 
     Lines keep the text's own separators: a no-break or ideographic space is
     never rewritten as an ASCII space, and authored Japanese lines join
-    without one.
+    without one. A line opened by a dialogue dash starts another speaker's
+    turn: each turn is wrapped on lines of its own.
     """
+    turns = _dialogue_turns(text.splitlines())
+    if turns is not None:
+        return [line for turn in turns for line in wrap_semantic_lines(turn, max_width)]
     text = _display_text(text)
     spans = _unit_spans(text)
     if not spans:

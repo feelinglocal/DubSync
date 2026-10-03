@@ -161,6 +161,18 @@ def test_whole_turns_that_share_a_line_are_a_review_item():
         assert "output_dialogue_turns_joined" not in [flag.kind for flag in flags]
 
 
+@pytest.mark.parametrize("width", [12, 16, 20, 26, 60])
+def test_wrapping_raw_dialogue_lines_starts_each_turn_on_a_line(width):
+    # A turn whose previous turn does not end a sentence still opens a line
+    # with its dash; it never dangles at the previous line's end (review W4C-6).
+    text = "- Du João vielleicht Ich Müller 42 não Haus,\n- Ich vocês R$."
+    lines = wrap_semantic_lines(text, width)
+    assert " ".join(lines) == text.replace("\n", " ")
+    assert not any(line.split()[-1] in {"-", "–", "—"} for line in lines), lines
+    assert sum(bool(_TURN.match(line)) for line in lines) == 2, lines
+    assert any(line.startswith("- Ich") for line in lines), lines
+
+
 @pytest.mark.parametrize("text", [
     "- Halt die Klappe, du Tr*ttel! - Ah!",
     "- Kommst du mit? - Nein, ich bleibe heute zu Hause.",
