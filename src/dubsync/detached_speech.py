@@ -13,11 +13,14 @@ by the words at its own time.
 
 Before adjudication, a partly retained cue whose unmatched tail or head shares
 a case with words spoken seconds away gets its own question at the cue's own
-time: a clip cut around those words would not contain the cue.
+time: a clip cut around those words would not contain the cue. The far
+words' own answer may then not carry a source word of the cues they stand
+between: that word has no ASR word at the far time and is asked about apart.
 """
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
@@ -85,12 +88,20 @@ def separate_detached_speech(
     """
     by_case = {decision.case_id: decision for decision in decisions}
     protected = protected_cue_ids or set()
+    edge_case_ids = {span.case_id for span in alignment.divergence_spans}
     spans: list[DivergenceSpan] = []
     replaced: dict[str, list[AdjudicationDecision]] = {}
     held_case_ids: set[str] = set()
+    echo_held_case_ids: set[str] = set()
     flags: list[QCFlag] = []
     for span in alignment.divergence_spans:
         decision = by_case.get(span.case_id)
+        echo = _echoed_cue_edge_flag(span, decision, cues, words, edge_case_ids)
+        if echo is not None:
+            flags.append(echo)
+            echo_held_case_ids.add(span.case_id)
+            spans.append(span)
+            continue
         result = _separate(span, decision, cues, alignment, words, max_intra_cue_gap, protected, speech_regions)
         if result is None:
             spans.append(span)
@@ -102,11 +113,16 @@ def separate_detached_speech(
             continue
         spans.extend(result.spans)
         replaced[span.case_id] = result.decisions
-    if not replaced and not held_case_ids:
+    if not replaced and not held_case_ids and not echo_held_case_ids:
         return alignment, decisions, flags
     decisions = held_decisions(
         decisions, alignment.divergence_spans, held_case_ids,
         "The approved wording spans speech groups that are seconds apart and cannot be divided between them.",
+    )
+    decisions = held_decisions(
+        decisions, alignment.divergence_spans, echo_held_case_ids,
+        "The approved wording for words spoken seconds away from a cue repeats a source word of that cue "
+        "or its neighbour, which no ASR word there supports.",
     )
     divided: list[AdjudicationDecision] = []
     for decision in decisions:
@@ -149,6 +165,46 @@ def separate_unheard_cue_edges(
         result.extend(_unheard_edge_questions(span, cues_by_id, tokens, words, max_intra_cue_gap, protected,
                                               clip_window))
     return result
+
+
+def _echoed_cue_edge_flag(
+    span: DivergenceSpan, decision: AdjudicationDecision | None, cues: list[Cue], words: list[Word],
+    edge_case_ids: set[str],
+) -> QCFlag | None:
+    """Hold the far rest of a divided case when its wording repeats a cue's source word.
+
+    The cue edge was asked about at the cue's own time, so a source word in
+    the far words' approved text ("Natal, alô?" for the ASR word "Alô?") has
+    no ASR word behind it there and would show the cue's word twice.
+    """
+    if (
+        decision is None or decision.verdict == "keep_srt" or not decision.final_text.strip()
+        or not _ALIGNER_CASE_ID.fullmatch(span.case_id)
+        or not {f"{DETACHED_SPEECH_PREFIX}{edge}-{span.case_id}" for edge in ("tail", "head")} & edge_case_ids
+        or any(not 0 <= index < len(words) for index in span.asr_word_indices)
+    ):
+        return None
+    own = Counter(alphanumeric_signature(span.srt_text))
+    for index in span.asr_word_indices:
+        own.update(alphanumeric_signature(words[index].text))
+    extra = Counter(alphanumeric_signature(decision.final_text)) - own
+    anchors = {span.left_anchor_cue_id, span.right_anchor_cue_id} - {None}
+    source = {
+        token for cue in cues if cue.index in anchors
+        for token in alphanumeric_signature(speech_text_for_alignment(cue))
+    }
+    if not set(extra) & source:
+        return None
+    return QCFlag(
+        kind=_HELD_KIND, cue_ids=list(span.cue_ids), severity="warning",
+        message=(
+            "The approved wording for words spoken seconds away from a cue repeats a source word of that "
+            "cue or its neighbour, which no ASR word there supports; it was not placed. The cue's own words "
+            "were asked about at the cue's time."
+        ),
+        confidence=decision.confidence, old_text=span.srt_text, new_text=decision.final_text,
+        start=span.start, end=span.end,
+    )
 
 
 def _unheard_edge_questions(

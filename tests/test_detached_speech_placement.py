@@ -368,8 +368,28 @@ def test_far_word_directly_before_the_next_line_still_joins_that_line(tmp_path):
     assert _near(cues[0].end_ms, 8.96) and _near(cues[1].start_ms, 13.04)
 
 
-def test_far_wording_with_other_words_than_the_audio_is_not_placed():
+@pytest.mark.parametrize("verdict", ["hybrid", "use_audio"])
+@pytest.mark.parametrize("tail_answer", ["keep", "none"])
+def test_far_wording_with_other_words_than_the_audio_is_not_placed(tmp_path, verdict, tail_answer):
     # The approved text keeps a source word: it is not the far speech alone.
+    # 'Natal' is asked about at the cue's own time; the far "Alô?" is then a
+    # pure insertion whose wording must not show 'Natal' again 14 s later,
+    # where no ASR word is behind it (review W4C-1).
+    tail = f"{DETACHED_SPEECH_PREFIX}tail-case-1"
+    responses = {"case-1": _decide("case-1", "Natal, alô?", verdict)}
+    if tail_answer == "keep":
+        responses[tail] = _decide(tail, "Natal", "keep_srt")
+    cues, flags = _sync(tmp_path, _NEW_YEAR_SRT, _ONLY_FAR_WORDS, responses)
+
+    assert [cue.plain_text for cue in cues][1] in {"no Natal, alô?", "no Natal."}
+    assert sum(cue.plain_text.count("Natal") for cue in cues) == 1
+    assert "adlib_inserted" not in _kinds(flags)
+    held = [flag for flag in flags if flag["kind"] == "adjudication_replacement_ownership_held"]
+    assert [(flag["severity"], flag["new_text"]) for flag in held] == [("warning", "Natal, alô?")]
+    assert _near(round(held[0]["start"] * 1000), 15.90) and _near(round(held[0]["end"] * 1000), 16.30)
+
+
+def test_far_only_wording_with_more_words_than_the_audio_is_not_divided():
     # (An aligner case asks about 'Natal' and "Alô?" apart before hearing; a
     # derived question is still divided only after it.)
     far_only = _span(asr_text="Alô?", asr_word_indices=[6], start=15.90, end=16.30)
@@ -650,3 +670,34 @@ def test_answer_heard_away_from_the_cue_cannot_resume_without_its_own_questions(
     cues, _ = run(resume="adjudicate")
     assert sorted(span.case_id for span, _ in adapter.questions) == ["case-1", f"{DETACHED_SPEECH_PREFIX}tail-case-1"]
     assert [cue.plain_text for cue in cues] == ["Vou voltar.", "Ah!", "O que você quer?"]
+
+
+def test_far_remainder_wording_that_repeats_a_cue_word_is_held_not_placed():
+    # The far word's own answer may not carry a source word of the cues it
+    # stands between: 'na Lime. Oi.' was inserted 90 s after '... cargos na Lime.'.
+    cues, words, spans = _aligned(_FAR_TAIL_SRT, _FAR_TAIL_WORDS)
+    split = separate_unheard_cue_edges(spans, cues, words, max_intra_cue_gap=1.5)
+    alignment = AlignmentResult(divergence_spans=split, cue_word_indices={1: [0, 1], 2: [3, 4, 5, 6]})
+    tail_id = f"{DETACHED_SPEECH_PREFIX}tail-case-1"
+
+    def answer(far_text: str):
+        return separate_detached_speech(cues, alignment, [
+            AdjudicationDecision(case_id=tail_id, verdict="keep_srt", final_text="primeiro", confidence=0.9,
+                                 reason="kept"),
+            AdjudicationDecision(case_id="case-1", verdict="use_audio", final_text=far_text, confidence=0.9,
+                                 reason="heard"),
+        ], words, max_intra_cue_gap=1.5)
+
+    for far_text in ("primeiro. Ah!", "Ah! O que"):
+        result, decisions, flags = answer(far_text)
+        assert result.divergence_spans == split
+        far = next(decision for decision in decisions if decision.case_id == "case-1")
+        assert (far.verdict, far.final_text) == ("keep_srt", "")
+        assert [(flag.kind, flag.severity, flag.new_text, flag.start, flag.end) for flag in flags] == [
+            ("adjudication_replacement_ownership_held", "warning", far_text, 8.88, 9.08)]
+
+    # The far word's own wording, or a word of no neighbouring cue, is placed as approved.
+    for far_text in ("Ah!", "Ah, sim!"):
+        result, decisions, flags = answer(far_text)
+        assert flags == [] and result.divergence_spans == split
+        assert next(decision for decision in decisions if decision.case_id == "case-1").final_text == far_text
