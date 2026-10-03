@@ -1,8 +1,17 @@
-import pytest
+import json
+import sys
+import types
+import wave
 
-from dubsync.adjudication import confidence_gated_decision
-from dubsync.models import AdjudicationDecision, Cue, DivergenceSpan
+import pytest
+import yaml
+
+from dubsync import pipeline
+from dubsync.adjudication import AdjudicationEngine, confidence_gated_decision
+from dubsync.llm_providers import OpenAILLMAdapter
+from dubsync.models import AdjudicationDecision, AudioSnippet, Cue, DivergenceSpan
 from dubsync.qc_review import build_review
+from dubsync.srt_io import parse_srt_text
 
 
 @pytest.mark.parametrize("evidence,heard", [("heard_unclear", "maybe"), ("not_audible", "")])
@@ -103,3 +112,111 @@ def test_other_confident_rewrites_still_apply(srt_text, final_text):
 
     assert flag is None
     assert selected.final_text == final_text
+
+
+def _text_only_openai(monkeypatch, prompts):
+    """The real OpenAI adapter over a fake SDK whose model claims to hear the ASR wording."""
+    class Response:
+        status = "completed"
+
+        def __init__(self, parsed):
+            self.output_parsed, self.usage, self.output = parsed, {"input_tokens": 10, "output_tokens": 5}, []
+
+    class Responses:
+        def parse(self, **kwargs):
+            payload = json.loads(kwargs["input"])
+            prompts.append(payload)
+            return Response(kwargs["text_format"].model_validate({"decisions": [dict(
+                case_id=case["case_id"], verdict="use_audio", final_text=case["asr_text"],
+                heard_text=case["asr_text"], evidence="heard_clearly", speaker=None, character="unknown",
+                reason="Clearly heard.",
+            ) for case in payload["spans"]]}))
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.responses = Responses()
+
+    module = types.ModuleType("openai")
+    module.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", module)
+
+
+def _orange_span(case_id="case-1", cue_id=4, start=8.0):
+    return DivergenceSpan(case_id=case_id, cue_ids=[cue_id], srt_text="old orange anchor",
+                          asr_text="fresh orange anchor", start=start, end=start + 1)
+
+
+def test_a_text_only_route_holds_a_claimed_hearing_for_review(monkeypatch):
+    # Fable review F22: no audio was attached, yet heard_clearly became confidence 1.0.
+    prompts = []
+    _text_only_openai(monkeypatch, prompts)
+    span = _orange_span()
+
+    decisions, flags = AdjudicationEngine(
+        OpenAILLMAdapter(api_key="test-key"), require_audio_for_hearing=True).adjudicate([span])
+
+    assert [payload["audio_snippets"] for payload in prompts] == [[]]
+    held = decisions[0]
+    assert (held.verdict, held.final_text, held.confidence, held.evidence, held.heard_text) == (
+        "keep_srt", "old orange anchor", 0.0, None, None)
+    assert [(flag.kind, flag.cue_ids, flag.old_text, flag.new_text) for flag in flags] == [
+        ("adjudication_hearing_unverified", [4], "old orange anchor", "fresh orange anchor")]
+    review = build_review(flags, [], [Cue(index=4, start_ms=8000, end_ms=9000, lines=["old orange anchor"])])
+    assert [item.raw_flags for item in review.review] == [[0]]
+
+
+def test_only_the_case_without_a_covering_clip_is_held(tmp_path):
+    clipped, unclipped = _orange_span(), _orange_span("case-2", 6, 12.0)
+    clip = tmp_path / "case-1.wav"
+    clip.write_bytes(b"clip")
+
+    class Adapter:
+        def adjudicate_with_audio(self, spans, snippets):
+            return [dict(case_id=span.case_id, verdict="use_audio", final_text=span.asr_text,
+                         heard_text=span.asr_text, evidence="heard_clearly", reason="heard") for span in spans]
+
+    engine = AdjudicationEngine(
+        Adapter(), require_audio_for_hearing=True,
+        audio_snippets={"case-1": AudioSnippet(case_id="case-1", path=str(clip), start=7.5, end=9.5)})
+    decisions, flags = engine.adjudicate([clipped, unclipped])
+
+    assert [(item.verdict, item.final_text) for item in decisions] == [
+        ("use_audio", "fresh orange anchor"), ("keep_srt", "old orange anchor")]
+    assert [(flag.kind, flag.cue_ids) for flag in flags] == [("adjudication_hearing_unverified", [6])]
+
+
+def test_text_only_openai_route_never_applies_unheard_wording(tmp_path, monkeypatch):
+    # The documented text default (llm.provider: openai) sends no clip and no episode audio.
+    prompts = []
+    _text_only_openai(monkeypatch, prompts)
+    lines = ["old orange anchor", "middle cue number two", "old purple anchor"]
+    source = tmp_path / "episode.srt"
+    source.write_text("".join(f"{index}\n00:00:0{index * 2},000 --> 00:00:0{index * 2 + 1},500\n{line}\n\n"
+                              for index, line in enumerate(lines, 1)), encoding="utf-8")
+    words = [dict(text=token, start=index * 2 + position * .3, end=index * 2 + position * .3 + .25)
+             for index, line in enumerate(lines, 1)
+             for position, token in enumerate(line.replace("old", "fresh").split())]
+    (tmp_path / "words.json").write_text(json.dumps({"words": words}), encoding="utf-8")
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes((1000).to_bytes(2, "little", signed=True) * 16000 * 9)
+    providers = tmp_path / "providers.yaml"
+    providers.write_text(yaml.safe_dump({
+        "asr": {"fixture_path": str(tmp_path / "words.json")},
+        "llm": {"provider": "openai", "api_key": "test-key", "model": "gpt-5.6-luna"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "punctuation_adapter_from_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline, "speaker_mapping_adapter_from_config", lambda *_args, **_kwargs: None)
+
+    result = pipeline.sync_episode(source, audio, tmp_path / "out.srt", tmp_path / "work",
+                                   providers_path=providers, language="en")
+
+    assert prompts and all(payload["audio_snippets"] == [] for payload in prompts)
+    assert [cue.plain_text for cue in parse_srt_text((tmp_path / "out.srt").read_text(encoding="utf-8"))] == lines
+    held = [flag for flag in result.report["flags"] if flag["kind"] == "adjudication_hearing_unverified"]
+    assert sorted(cue for flag in held for cue in flag["cue_ids"]) == [1, 3]
+    decisions = json.loads((result.episode_workdir / "adjudicate.json").read_text(encoding="utf-8"))["decisions"]
+    assert all(item.get("evidence") is None for item in decisions)

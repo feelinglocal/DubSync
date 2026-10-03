@@ -384,6 +384,38 @@ def test_invalid_llm_payload_degrades_after_retry_with_qc_flag():
     assert "invalid_llm_response" in {flag.kind for flag in flags}
 
 
+
+def _contradictory_answers():
+    span = DivergenceSpan(case_id="case-2", cue_ids=[4], srt_text="source text", asr_text="spoken text",
+                          start=1.0, end=2.0, confidence=0.80, speaker_ids=[])
+    keep = {"case_id": "case-2", "verdict": "keep_srt", "final_text": "source text", "confidence": 0.95,
+            "speaker": None, "character": "unknown", "reason": "the script is right"}
+    change = {**keep, "verdict": "use_audio", "final_text": "spoken text", "reason": "the actor says this"}
+    return span, keep, change
+
+
+def test_two_answers_for_one_case_are_retried_never_last_wins():
+    # Fable review F21 (P3): the later of two contradictory answers was applied silently.
+    span, keep, change = _contradictory_answers()
+    llm = SequencedLLMAdapter([[keep, change], [change, keep]])
+
+    decisions, flags = AdjudicationEngine(llm).adjudicate([span])
+
+    assert llm.calls == 2
+    assert (decisions[0].verdict, decisions[0].final_text, decisions[0].confidence) == ("keep_srt", "source text", 0.0)
+    assert "invalid_llm_response" in {flag.kind for flag in flags}
+
+
+def test_a_single_retry_answer_resolves_a_duplicated_case():
+    span, keep, change = _contradictory_answers()
+    llm = SequencedLLMAdapter([[keep, change], [change]])
+
+    decisions, flags = AdjudicationEngine(llm).adjudicate([span])
+
+    assert llm.calls == 2
+    assert (decisions[0].verdict, decisions[0].final_text) == ("use_audio", "spoken text")
+    assert "invalid_llm_response" not in {flag.kind for flag in flags}
+
 def test_provider_failure_degrades_to_source_srt_with_qc_flag():
     span = DivergenceSpan(
         case_id="case-2",

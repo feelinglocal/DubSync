@@ -251,7 +251,9 @@ def test_invalid_or_failed_review_preserves_source_once(tmp_path, failure):
     assert result["final_text"] == item.srt_text
     assert result["confidence"] == 0
     assert result["reason"].startswith("[hybrid:held]")
-    assert len(calls) == len(primary.calls) == 1
+    # A reply without one usable decision is asked once more (Fable review F21).
+    assert len(primary.calls) == 1
+    assert len(calls) == (2 if failure in {"missing", "duplicate", "invalid"} else 1)
 
 
 def test_missing_review_id_holds_only_that_case(tmp_path):

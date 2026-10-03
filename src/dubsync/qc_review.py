@@ -154,6 +154,8 @@ KIND_REGISTRY: dict[str, KindSpec] = {
         "AI review had no audio for this passage", _LISTEN, 35, "warning"),
     "low_confidence_adjudication": _review_kind(
         "AI review was not confident; script wording kept", _LISTEN, 35, "warning"),
+    "adjudication_hearing_unverified": _review_kind(
+        "AI proposal was not checked against the audio; script wording kept", _LISTEN, 35, "warning"),
     "generated_adlib_word_window_refined": _review_kind(
         "Some spoken words were left out of an added line", "Listen and add the missing words.", 35, "warning"),
     "dropped_line_candidate": _review_kind(

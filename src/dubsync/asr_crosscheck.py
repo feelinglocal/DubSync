@@ -202,6 +202,7 @@ def classify_spans(spans: Sequence[DivergenceSpan], agreement: StreamAgreement) 
 def preaccepted_decision(
     span: DivergenceSpan, check: SpanCrossCheck, *, language: str | None = None,
     source_names: frozenset[tuple[str, ...]] = frozenset(),
+    policy: DeterministicAdjudicationPolicy | None = None,
 ) -> AdjudicationDecision | None:
     """Pre-accept only low-risk multiword substitutions within one source cue.
 
@@ -221,7 +222,7 @@ def preaccepted_decision(
     if (span.case_id != check.case_id or check.label != "both_agree"
             or tuple(span.asr_word_indices) != check.primary_word_indices
             or len(span.cue_ids) != 1 or min(len(source), len(spoken)) < 2
-            or source == spoken or _risk_reasons(span, language=language, source_names=source_names)):
+            or source == spoken or _risk_reasons(span, language=language, source_names=source_names, policy=policy)):
         return None
     for tag, first, last, other_first, other_last in SequenceMatcher(None, source, spoken, autojunk=False).get_opcodes():
         if tag != "replace":

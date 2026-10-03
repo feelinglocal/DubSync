@@ -73,7 +73,8 @@ def test_real_factory_does_not_turn_malformed_confidence_into_a_confident_approv
         item.case_id: AudioSnippet(case_id=item.case_id, path=str(clip), start=0.8, end=2.2),
     })
 
-    assert len(calls) == 2
+    # A malformed review decision is asked once more (Fable review F21).
+    assert len(calls) == (2 if stage == "primary" else 3)
     if stage == "primary":
         assert result[0]["reason"].startswith("[hybrid:fallback]")
         assert result[0]["final_text"] == "Yes"
@@ -83,7 +84,8 @@ def test_real_factory_does_not_turn_malformed_confidence_into_a_confident_approv
         assert result[0]["final_text"] == "No"
         assert result[0]["confidence"] == 0
     # Rejected structured responses still incurred separately attributed usage.
-    assert sorted(event["adjudication_route"] for event in adapter.drain_usage_events()) == ["fallback", "primary"]
+    assert sorted(event["adjudication_route"] for event in adapter.drain_usage_events()) == (
+        ["fallback", "primary"] if stage == "primary" else ["fallback", "fallback", "primary"])
 
 
 def test_local_review_context_keeps_original_indices_for_repeated_source_words():

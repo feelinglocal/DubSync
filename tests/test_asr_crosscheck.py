@@ -4,13 +4,16 @@ import copy
 
 import pytest
 
+from dubsync.adjudication_policy import DeterministicAdjudicationPolicy
 from dubsync.asr_crosscheck import (
     classify_spans,
     compare_word_streams,
     enforce_crosscheck_decisions,
     preaccepted_decision,
 )
-from dubsync.models import AdjudicationDecision, DivergenceSpan, Word
+from dubsync.hybrid_adjudication import triage_decisions
+from dubsync.models import AdjudicationDecision, Cue, DivergenceSpan, Word
+from dubsync.tokenize import alphanumeric_signature, tokenize_cues
 
 
 def words(text, *, offset=0.0, spacing=0.8):
@@ -214,3 +217,60 @@ def test_preaccept_support_depends_on_text_evidence_not_the_language_picker():
     primary = words("Katze kommt")
     item, evidence = check("Hund rennt", "Katze kommt", primary, primary, [0, 1])
     assert preaccepted_decision(item, evidence, language="ja") is not None
+
+
+def _cues(*lines):
+    return [Cue(index=index, start_ms=index * 3000, end_ms=index * 3000 + 2000, lines=[line])
+            for index, line in enumerate(lines, 1)]
+
+
+def _agreed_cue_span(cues, cue_id, source, audio, language):
+    """A both-agree span bound to its source tokens, with the episode policy."""
+    tokens = [token for token in tokenize_cues(cues) if token.cue_id == cue_id]
+    keys = alphanumeric_signature(source)
+    first = next(index for index in range(len(tokens))
+                 if [token.normalized for token in tokens[index:index + len(keys)]] == keys)
+    item = DivergenceSpan(case_id="case", cue_ids=[cue_id], srt_text=source, asr_text=audio,
+                          srt_token_indices=[token.token_index for token in tokens[first:first + len(keys)]],
+                          asr_word_indices=list(range(len(audio.split()))))
+    primary = words(audio)
+    evidence = classify_spans([item], compare_word_streams(primary, primary))[0]
+    assert evidence.label == "both_agree"
+    return item, evidence, DeterministicAdjudicationPolicy(cues, language)
+
+
+def _triage(item, policy):
+    decision = dict(case_id=item.case_id, verdict="use_audio", final_text=item.asr_text, heard_text=item.asr_text,
+                    evidence="heard_clearly", reason="Heard in the clip")
+    return triage_decisions([item], [decision], language=policy.language,
+                            source_names=policy.source_names, policy=policy)
+
+
+@pytest.mark.parametrize("language,lines,cue_id,source,audio", [
+    # Fable review F24: a vocative is always sentence-initial, so the recurring-name
+    # lexicon never learns it, and the span starts at the name.
+    ("pt", ("Bom dia a todos.", "Rafael, vem cá agora.", "Ele saiu cedo hoje.", "Rafael, espera."),
+     2, "Rafael, vem cá", "Gabriel, vai lá"),
+    # A one-off name that opens its sentence.
+    ("pt", ("Bom dia a todos.", "Rafael ontem.", "Ele saiu cedo hoje."), 2, "Rafael ontem", "Gabriel hoje"),
+    # A mid-sentence name that starts the divergence span.
+    ("en", ("Hello there.", "Then Tom went home.", "It was late."), 2, "Tom went", "Peter goes"),
+    # The recognisers agree on a new mid-sentence name.
+    ("en", ("Hello there.", "Then they went home.", "It was late."), 2, "they went", "Peter goes"),
+])
+def test_a_name_that_starts_the_span_is_never_preaccepted(language, lines, cue_id, source, audio):
+    item, evidence, policy = _agreed_cue_span(_cues(*lines), cue_id, source, audio, language)
+
+    assert preaccepted_decision(item, evidence, language=language, source_names=policy.source_names,
+                                policy=policy) is None
+    assert _triage(item, policy) == {"case": ["risky_name"]}
+
+
+def test_a_sentence_initial_common_word_is_still_preaccepted():
+    lines = ("Green apples fall.", "I like green apples.")
+    item, evidence, policy = _agreed_cue_span(_cues(*lines), 1, "Green apples", "Blue boats", "en")
+
+    decision = preaccepted_decision(item, evidence, language="en", source_names=policy.source_names, policy=policy)
+
+    assert (decision.verdict, decision.final_text) == ("use_audio", "Blue boats")
+    assert _triage(item, policy) == {}

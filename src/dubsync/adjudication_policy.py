@@ -258,6 +258,45 @@ def _source_name_lexicon(
     return recurring, frozenset(observed)
 
 
+def _source_capitalisation(
+    source_cues: Sequence[Cue],
+) -> tuple[tuple[str, ...], frozenset[int], frozenset[str]]:
+    """Source token keys, the tokens that open a sentence of their cue, and
+    the words the script writes capitalised but never in lower case.
+
+    Token indices follow ``tokenize_cues``, so a divergence span finds its first
+    source token. Unlike the recurring-name lexicon, the capitalised words
+    include sentence starts and one-off words: a vocative name always opens its
+    sentence. They only route a case to review and never change text.
+    """
+    keys: list[str] = []
+    starts: set[int] = set()
+    titled: set[str] = set()
+    lowered: set[str] = set()
+    for cue in source_cues:
+        text = speech_text_for_alignment(cue)
+        words = token_texts(text)
+        bounds = token_character_spans(text, words)
+        first = True
+        for position, word in enumerate(words):
+            key = word.casefold()
+            if word.isalpha():
+                if word.istitle():
+                    titled.add(key)
+                elif word[:1].islower():
+                    lowered.add(key)
+            normalized = normalize_token(word)
+            if not normalized:
+                continue
+            if first or (bounds is not None and words[position - 1].casefold() not in _NAME_TITLES
+                         and _SENTENCE_END_RE.search(text[bounds[position - 1][1]:bounds[position][0]])):
+                starts.add(len(keys))
+            first = False
+            keys.append(normalized)
+    capitalised = frozenset(key for key in titled - lowered if len(key) >= 3 and key not in _NAME_STOPWORDS)
+    return tuple(keys), frozenset(starts), capitalised
+
+
 def _japanese_run_script(token: str) -> str | None:
     name = unicodedata.name(token[0], "")
     if token[0] in "々〆" or name.startswith(("CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")):
@@ -353,6 +392,7 @@ class DeterministicAdjudicationPolicy:
         self._japanese_names, self._japanese_name_ranges, self._source_token_keys = _japanese_source_names(
             source_cues or (), self.language,
         )
+        self._token_keys, self._sentence_starts, self.capitalised_words = _source_capitalisation(source_cues or ())
 
     def cache_context(self) -> dict[str, object]:
         """Every source-derived policy input, including ambiguous name spellings."""
@@ -363,6 +403,30 @@ class DeterministicAdjudicationPolicy:
             "name_forms": dict(sorted(self._name_forms.items())),
             "japanese_names": sorted(self._japanese_names),
         }
+
+    def opens_sentence(self, span: DivergenceSpan) -> bool | None:
+        """Whether the span's first source token starts a sentence of its cue.
+
+        None when the span has no source token or its indices belong to other text.
+        """
+        indices = span.srt_token_indices
+        if not indices or min(indices) < 0 or max(indices) >= len(self._token_keys):
+            return None
+        if [self._token_keys[index] for index in indices] != alphanumeric_signature(span.srt_text):
+            return None
+        return indices[0] in self._sentence_starts
+
+    def span_initial_name(self, span: DivergenceSpan, token: str) -> bool:
+        """Whether ``token``, the first word on either side of ``span``, may be a name.
+
+        A capital at a sentence start of the cue proves nothing, unless the
+        script never writes the word in lower case. Common capitalised words
+        are never names; an unknown source position keeps the sentence reading.
+        """
+        key = token.casefold()
+        if not token.istitle() or key in _NAME_STOPWORDS:
+            return False
+        return key in self.capitalised_words or self.opens_sentence(span) is False
 
     def _inside_japanese_name(self, span: DivergenceSpan) -> bool:
         """The span's source tokens all lie in one occurrence of a source name."""

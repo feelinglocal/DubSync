@@ -29,6 +29,15 @@ _NEGATIONS = frozenset({
     "keinen", "keinem", "keiner", "keines", "ohne", "ningún", "ningun", "nadie",
     "non", "pas", "jamais", "rien", "aucun", "sans", "ない", "ません", "ぬ",
 })
+# A review reply without exactly one valid decision for a case (truncated or
+# empty JSON, a missing envelope, an omitted, duplicate or schema-invalid
+# decision) carries no model opinion. Like the direct route's invalid replies
+# it is asked once more, and then held as a transient fault that is never cached.
+_REVIEW_REPLY_FAULTS = frozenset({
+    "review_invalid_batch", "review_invalid_decision", "review_unexpected_case_id",
+    "review_duplicate_decision", "review_missing_decision", "review_contradictory_audio_evidence",
+    "review_invalid_source_keep",
+})
 
 
 def _confidence_gate(value: float) -> float:
@@ -98,6 +107,13 @@ def _indexed_decisions(
     return decisions, faults
 
 
+def transient_hold(trace: object) -> bool:
+    """A held route trace that a later run must ask again: an outage or an unusable review reply."""
+    return (isinstance(trace, dict) and trace.get("route") == "held" and "case_id" in trace
+            and any(str(reason).endswith("_provider_failure") or reason in _REVIEW_REPLY_FAULTS
+                    for reason in trace.get("reasons", [])))
+
+
 def _evidence_supports_wording(
     decision: AdjudicationDecision, policy: DeterministicAdjudicationPolicy | None = None,
 ) -> bool:
@@ -118,6 +134,7 @@ def _evidence_supports_wording(
 def _risk_reasons(
     span: DivergenceSpan, *, language: str | None = None,
     source_names: frozenset[tuple[str, ...]] = frozenset(),
+    policy: DeterministicAdjudicationPolicy | None = None,
 ) -> list[str]:
     source, spoken = token_texts(span.srt_text), token_texts(span.asr_text)
     if alphanumeric_signature(span.srt_text) == alphanumeric_signature(span.asr_text):
@@ -131,6 +148,10 @@ def _risk_reasons(
     # recurring-name lexicon. This routes to review; it never changes text.
     possible_name = any(token.istitle() and token.casefold() != phrase[0].casefold()
                         for phrase in (source, spoken) if phrase for token in phrase[1:])
+    # So may the first word when it does not open a sentence of the cue, or
+    # when the script never writes it in lower case (a vocative, a one-off name).
+    possible_name = possible_name or (policy is not None and any(
+        policy.span_initial_name(span, phrase[0]) for phrase in (source, spoken) if phrase))
     if known_name or possible_name:
         risks.append("risky_name")
     if any(any(char.isnumeric() for char in token) or number_value(normalize_token(token), language) is not None
@@ -178,7 +199,7 @@ def triage_decisions(
         elif alphanumeric_signature(decision["final_text"]) != alphanumeric_signature(span.asr_text):
             reasons[cid] = ["wording_differs_from_owned_asr"]
         if cid not in reasons:
-            risks = _risk_reasons(span, language=language, source_names=source_names)
+            risks = _risk_reasons(span, language=language, source_names=source_names, policy=policy)
             if risks:
                 reasons[cid] = risks
     return reasons
@@ -390,27 +411,41 @@ class HybridAdjudicationAdapter:
             if span.case_id not in reasons:
                 record(span, _routed(indexed[span.case_id], "primary"), "primary", [])
         if selected:
-            selected_clips = {span.case_id: exact_clips[span.case_id] for span in selected}
-            selected_clips.update({span.case_id + "-candidate": exact_clips[span.case_id + "-candidate"]
-                                   for span in selected if span.case_id.startswith("source-pair-timing-v2-")})
-            stray_review_entries = False
-            try:
-                review_raw, events = self.reviewer(
-                    spans=tuple(_frozen(span, _ReadOnlySpan) for span in selected),
-                    audio_snippets=selected_clips,
-                    reasons=deepcopy(reasons),
-                    primary_decisions={span.case_id: deepcopy(indexed[span.case_id]) for span in selected if span.case_id in indexed},
-                    batch_spans=batch_snapshot,
-                    episode_context=deepcopy(context), episode_words=deepcopy(words),
-                    language=language, register_policy=register_policy,
-                )
-                self._record_usage(events, "fallback")
-                reviewed, invalid = _indexed_decisions(
-                    selected, review_raw, prefix="review", tolerate_stray=True, policy=wording_policy)
-                stray_review_entries = _has_stray_entries(selected, review_raw)
-            except ProviderError:
-                reviewed = {}
-                invalid = {span.case_id: ["review_provider_failure"] for span in selected}
+            reviewed: dict[str, dict[str, object]] = {}
+            invalid: dict[str, list[str]] = {}
+            stray_ignored: set[str] = set()
+            pending = selected
+            # One retry, for the cases whose reply carried no usable decision.
+            for _attempt in range(2):
+                pending_clips = {span.case_id: exact_clips[span.case_id] for span in pending}
+                pending_clips.update({span.case_id + "-candidate": exact_clips[span.case_id + "-candidate"]
+                                      for span in pending if span.case_id.startswith("source-pair-timing-v2-")})
+                try:
+                    review_raw, events = self.reviewer(
+                        spans=tuple(_frozen(span, _ReadOnlySpan) for span in pending),
+                        audio_snippets=pending_clips,
+                        reasons={span.case_id: deepcopy(reasons[span.case_id]) for span in pending},
+                        primary_decisions={span.case_id: deepcopy(indexed[span.case_id])
+                                           for span in pending if span.case_id in indexed},
+                        batch_spans=batch_snapshot,
+                        episode_context=deepcopy(context), episode_words=deepcopy(words),
+                        language=language, register_policy=register_policy,
+                    )
+                    self._record_usage(events, "fallback")
+                    accepted, faults = _indexed_decisions(
+                        pending, review_raw, prefix="review", tolerate_stray=True, policy=wording_policy)
+                    if _has_stray_entries(pending, review_raw):
+                        stray_ignored.update(accepted)
+                except ProviderError:
+                    accepted, faults = {}, {span.case_id: ["review_provider_failure"] for span in pending}
+                reviewed.update(accepted)
+                for cid in accepted:
+                    invalid.pop(cid, None)
+                invalid.update(faults)
+                pending = [span for span in pending
+                           if _REVIEW_REPLY_FAULTS.intersection(faults.get(span.case_id, []))]
+                if not pending:
+                    break
             for span in selected:
                 cid = span.case_id
                 proposal = reviewed.get(cid)
@@ -422,7 +457,7 @@ class HybridAdjudicationAdapter:
                 if failure:
                     record(span, _held(span, ", ".join(failure), proposal), "held", reasons[cid] + failure, True)
                 else:
-                    accepted_reasons = reasons[cid] + (["review_stray_decision_ignored"] if stray_review_entries else [])
+                    accepted_reasons = reasons[cid] + (["review_stray_decision_ignored"] if cid in stray_ignored else [])
                     record(span, _routed(proposal, "fallback"), "fallback", accepted_reasons, True)
         with self._lock:
             self._routes.extend(traces[span.case_id] for span in batch)

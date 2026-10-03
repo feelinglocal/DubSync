@@ -118,10 +118,10 @@ def test_configured_adjudication_and_optional_hybrid_use_measured_routes(gemini_
     request = gemini_audio_sdk.calls[0]
     assert request["model"] == ("gemini-3.5-flash-lite" if hybrid else "gemini-3.8-flash")
     assert request["config"]["thinking_config"] == {"thinking_level": "high" if hybrid else "medium"}
-    # The fake primary omits its decision; only the opt-in hybrid invokes review.
-    assert len(gemini_audio_sdk.calls) == (2 if hybrid else 1)
-    if hybrid:
-        review = gemini_audio_sdk.calls[1]
+    # The fake primary omits its decision; only the opt-in hybrid invokes review,
+    # and asks its empty review reply once more (Fable review F21).
+    assert len(gemini_audio_sdk.calls) == (3 if hybrid else 1)
+    for review in gemini_audio_sdk.calls[1:]:
         assert review["model"] == "gemini-3.8-flash"
         assert review["config"]["thinking_config"] == {"thinking_level": "medium"}
     assert all("cached_content" not in call["config"] for call in gemini_audio_sdk.calls)

@@ -247,3 +247,41 @@ def test_default_off_keeps_existing_adjudication_cache_identity():
     config = {"llm": {"provider": "fixture"}}
     default = pipeline._adjudication_cache_key([span], config)
     assert default == pipeline._adjudication_cache_key([span], {**config, "_asr_cross_check_context": None})
+
+
+def test_agreed_replacement_of_a_span_initial_name_is_reviewed(tmp_path, monkeypatch):
+    # Fable review F24: 'Rafael' is a vocative, so the recurring-name lexicon
+    # never holds it; both recognisers hear 'Gabriel' and the name was replaced
+    # with no audio review.
+    lines = ["Bom dia a todos.", "Rafael, vem cá agora.", "Ele saiu cedo hoje.", "Rafael, espera."]
+    heard = ["Bom dia a todos.", "Gabriel, vai lá agora.", "Ele saiu cedo hoje.", "Rafael, espera."]
+    starts = [1.0, 4.0, 8.0, 11.0]
+    options = _inputs(tmp_path)
+    options["language"] = "pt"
+    options["srt_path"].write_text("".join(
+        f"{index}\n00:00:{int(start):02d},000 --> 00:00:{int(start) + 2:02d},500\n{line}\n\n"
+        for index, (start, line) in enumerate(zip(starts, lines), 1)), encoding="utf-8")
+    with wave.open(str(options["audio_path"]), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes((1000).to_bytes(2, "little", signed=True) * 16000 * 14)
+    primary = [dict(text=token, start=round(start + position * .45, 3), end=round(start + position * .45 + .35, 3))
+               for start, line in zip(starts, heard) for position, token in enumerate(line.split())]
+    secondary = [dict(word, start=word["start"] + .04, end=word["end"] + .04) for word in primary]
+    (tmp_path / "primary.json").write_text(json.dumps({"words": primary}), encoding="utf-8")
+    (tmp_path / "secondary.json").write_text(json.dumps({"words": secondary}), encoding="utf-8")
+    seen = []
+
+    class Reviewer:
+        def adjudicate(self, spans):
+            seen.extend(span.srt_text for span in spans)
+            return [dict(case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text, confidence=1.0,
+                         reason="The reviewer keeps the customer's name.") for span in spans]
+
+    monkeypatch.setattr(pipeline, "llm_adapter_from_config", lambda *a, **kw: Reviewer())
+    result = pipeline.sync_episode(**options)
+
+    assert any("Rafael" in text for text in seen)
+    assert _json(result.episode_workdir / "asr_cross_check_analysis.json")["preaccepted_case_ids"] == []
+    assert "Rafael, vem cá agora." in result.output_srt.read_text(encoding="utf-8")

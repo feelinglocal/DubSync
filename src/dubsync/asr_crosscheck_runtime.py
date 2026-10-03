@@ -121,7 +121,7 @@ def preaccept_cross_checked_spans(
         if (span.case_id in by_id and not uncertain_word_indices.intersection(span.asr_word_indices)
                 and policy.decide(span) is None):
             decision = preaccepted_decision(span, by_id[span.case_id], language=policy.language,
-                                            source_names=policy.source_names)
+                                            source_names=policy.source_names, policy=policy)
         if decision is None:
             pending.append(span)
         else:

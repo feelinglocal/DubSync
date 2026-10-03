@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from difflib import SequenceMatcher
 from math import isfinite
+from threading import Lock
 from typing import Protocol
 
 from pydantic import ValidationError
@@ -90,6 +91,7 @@ class AdjudicationEngine:
         source_cues: Sequence[Cue] | None = None,
         language: str | None = None,
         register_policy: str = "spoken",
+        require_audio_for_hearing: bool = False,
     ):
         self.llm = llm
         self.confidence_gate = confidence_gate
@@ -111,9 +113,19 @@ class AdjudicationEngine:
             raise ValueError("adjudication.require_audio_snippets must be boolean")
         self.require_audio_snippets = require_audio_snippets
         self.required_audio_case_ids = frozenset(required_audio_case_ids or ())
+        if not isinstance(require_audio_for_hearing, bool):
+            raise ValueError("adjudication.require_audio_for_hearing must be boolean")
+        # Set for a real provider that has no full episode audio: it hears only
+        # the case clips it is sent, so a hearing reported for any other case
+        # is the model's guess and is held for review.
+        self.require_audio_for_hearing = require_audio_for_hearing
+        self._clip_case_ids: set[str] = set()
+        self._clip_lock = Lock()
         self.deterministic_policy = DeterministicAdjudicationPolicy(source_cues, language, register_policy)
 
     def adjudicate(self, spans: list[DivergenceSpan]) -> tuple[list[AdjudicationDecision], list[QCFlag]]:
+        with self._clip_lock:
+            self._clip_case_ids = set()
         decisions_by_case: dict[str, AdjudicationDecision] = {}
         llm_spans: list[DivergenceSpan] = []
         deterministic_case_ids: set[str] = set()
@@ -223,6 +235,25 @@ class AdjudicationEngine:
                     )
                 )
 
+            if (not held_by_engine and span.case_id not in deterministic_case_ids
+                    and self.require_audio_for_hearing and decision.evidence is not None
+                    and span.case_id not in self._clip_case_ids):
+                held_by_engine = True
+                proposed = decision.final_text if decision.final_text != span.srt_text else span.asr_text
+                flags.append(QCFlag(
+                    kind="adjudication_hearing_unverified", cue_ids=span.cue_ids,
+                    message=(
+                        "The adjudication route sent no audio for this passage, so its reported hearing is "
+                        f"not evidence; source SRT was preserved. Proposed verdict: {decision.verdict}."
+                    ),
+                    severity="warning", confidence=0.0, old_text=span.srt_text, new_text=proposed,
+                    start=span.start, end=span.end,
+                ))
+                decision = AdjudicationDecision(
+                    case_id=span.case_id, verdict="keep_srt", final_text=span.srt_text, confidence=0.0,
+                    speaker=span.speaker_ids[0] if span.speaker_ids else None, character="unknown",
+                    reason="Reported hearing had no audio on this route; preserved source SRT for review.",
+                )
             if not held_by_engine and span.case_id not in deterministic_case_ids:
                 decision, confidence_flag = confidence_gated_decision(
                     span, decision, self.confidence_gate, policy=self.deterministic_policy,
@@ -298,6 +329,8 @@ class AdjudicationEngine:
             # approval. Each missing case remains held even with a zero gate.
             try:
                 selected_snippets = {span.case_id: snippets[span.case_id] for span in available if span.case_id in snippets}
+                if available and selected_snippets and callable(audio_method):
+                    self._record_case_clips(available, selected_snippets)
                 raw = (audio_method(available, selected_snippets)
                        if selected_snippets and callable(audio_method)
                        else self.llm.adjudicate(available)) if available else []
@@ -305,8 +338,14 @@ class AdjudicationEngine:
                 raise _RequiredAudioBatchError(unavailable_ids) from exc
             return ([*raw, *held] if isinstance(raw, list) else raw), unavailable_ids
         if snippets and callable(audio_method):
+            self._record_case_clips(batch, snippets)
             return audio_method(batch, snippets), set()
         return self.llm.adjudicate(batch), set()
+
+    def _record_case_clips(self, batch: list[DivergenceSpan], snippets: dict[str, AudioSnippet]) -> None:
+        covered = {span.case_id for span in batch if _snippet_covers_span(snippets.get(span.case_id), span)}
+        with self._clip_lock:
+            self._clip_case_ids.update(covered)
 
     def _validate_raw(
         self,
@@ -319,11 +358,18 @@ class AdjudicationEngine:
         by_case = {span.case_id: span for span in spans}
         decisions: dict[str, AdjudicationDecision] = {}
         invalid_spans: dict[str, DivergenceSpan] = {}
+        answered: set[str] = set()
 
         for index, payload in enumerate(raw):
             span = self._span_for_payload(payload, index, spans, by_case)
             if span is None:
                 continue
+            if span.case_id in answered:
+                # Two answers for one case: neither is used, the case is asked again.
+                decisions.pop(span.case_id, None)
+                invalid_spans[span.case_id] = span
+                continue
+            answered.add(span.case_id)
 
             try:
                 decision = AdjudicationDecision.model_validate(payload)

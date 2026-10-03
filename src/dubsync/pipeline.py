@@ -57,7 +57,7 @@ from .edit_consistency import (
 from .editorial_guard import episode_editorial_addition_flags
 from .forced_alignment import apply_forced_alignment, forced_alignment_adapter_from_config, usable_forced_alignments_by_cue
 from .gemini_audio_context import validate_audio_context_config
-from .hybrid_adjudication import HYBRID_POLICY_VERSION
+from .hybrid_adjudication import HYBRID_POLICY_VERSION, transient_hold
 from .llm_providers import (
     _ADJUDICATION_PROMPT_VERSION,
     _ADJUDICATION_REVIEW_PROMPT_VERSION,
@@ -704,6 +704,7 @@ def sync_episode(
                     source_cues=cues,
                     language=episode_language,
                     register_policy="script" if llm_disabled_for_episode else register_policy,
+                    require_audio_for_hearing=_hearing_requires_case_audio(provider_config, llm_adapter),
                 )
                 with _adjudication_audio_session(
                     llm_adapter, audio_path, audio_for_asr,
@@ -723,9 +724,7 @@ def sync_episode(
                     review_outages = None
                     if callable(route_report):
                         review_outages = {
-                            item["case_id"] for item in route_report().get("decisions", [])
-                            if isinstance(item, dict) and item.get("route") == "held" and "case_id" in item
-                            and any(str(reason).endswith("_provider_failure") for reason in item.get("reasons", []))
+                            item["case_id"] for item in route_report().get("decisions", []) if transient_hold(item)
                         }
                     for span in pending_spans:
                         if span.case_id in by_case:
@@ -1396,9 +1395,7 @@ def _late_timing_hearing(
                     review_outages = None
                     if callable(route_report):
                         review_outages = {
-                            item["case_id"] for item in route_report().get("decisions", [])
-                            if isinstance(item, dict) and item.get("route") == "held" and "case_id" in item
-                            and any(str(reason).endswith("_provider_failure") for reason in item.get("reasons", []))
+                            item["case_id"] for item in route_report().get("decisions", []) if transient_hold(item)
                         }
                     for span in pending:
                         decision = next((item for item in new_decisions if item.case_id == span.case_id), None)
@@ -1664,6 +1661,7 @@ _SOURCE_TIMING_HOLD_FLAG_KINDS = frozenset({
 _HELD_WORDING_FLAG_KINDS = frozenset({
     "low_confidence_adjudication",
     "adjudication_audio_unavailable",
+    "adjudication_hearing_unverified",
     "llm_provider_unavailable",
     "invalid_llm_response",
 })
@@ -2534,6 +2532,17 @@ def _episode_audio_options(provider_config: dict[str, object]) -> dict[str, obje
     return options if options.get("enabled", True) else None
 
 
+def _hearing_requires_case_audio(provider_config: dict[str, object], adapter: object) -> bool:
+    """Whether a reported hearing needs its case clip because no episode audio is attached.
+
+    Fixture answers are offline test or replay evidence recorded with their audio.
+    """
+    provider = str(llm_config_for_pass(provider_config, "adjudication").get("provider", "gemini")).lower()
+    if provider == "fixture":
+        return False
+    return _episode_audio_options(provider_config) is None or not callable(getattr(adapter, "set_audio_context", None))
+
+
 def _adjudication_audio_cache_context(
     original_audio: Path,
     normalized_audio: Path,
@@ -2619,20 +2628,17 @@ def _write_hybrid_adjudication_report(adapter: object, episode_workdir: Path, fl
             f"and held {counts.get('held', 0)}. See hybrid_adjudication.json for case routes."
         ),
     ))
-    # The hybrid route turns a failed review call into ordinary held
-    # decisions. Without this transient marker the hold would be cached and
-    # replayed by every later run although the outage is long over.
-    outage_held = sum(
-        1 for item in report.get("decisions", [])
-        if isinstance(item, dict) and item.get("route") == "held"
-        and any(str(reason).endswith("_provider_failure") for reason in item.get("reasons", []))
-    )
+    # The hybrid route turns a failed review call or an unusable review reply
+    # into ordinary held decisions. Without this transient marker the hold would
+    # be cached and replayed by every later run although nothing was decided.
+    outage_held = sum(1 for item in report.get("decisions", []) if transient_hold(item))
     if outage_held:
         flags.append(QCFlag(
             kind="adjudication_review_unavailable", severity="warning", cue_ids=[],
             message=(
-                f"The adjudication review provider failed for {outage_held} cases; their source text "
-                "was preserved for review and the result was not cached, so a re-run asks again."
+                f"The adjudication review provider failed or returned no usable decision for {outage_held} "
+                "cases; their source text was preserved for review and the result was not cached, so a "
+                "re-run asks again."
             ),
         ))
 
