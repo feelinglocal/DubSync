@@ -745,9 +745,9 @@ def test_refinement_keeps_the_boundary_rebuild_chose_for_words_less_than_a_frame
     assert flags == []
 
 
-def _finalize(cues, *, protected=(), spans):
+def _finalize(cues, *, protected=(), spans, lead_in_ms=0):
     return finalize_cues_for_output(
-        cues, StyleProfile(fps=30, min_cue_dur=0.5), no_overlaps=True, preserve_timing=True,
+        cues, StyleProfile(fps=30, min_cue_dur=0.5, lead_in_ms=lead_in_ms), no_overlaps=True, preserve_timing=True,
         protected_cue_ids=set(protected), spoken_spans=spans,
     )
 
@@ -772,10 +772,26 @@ def test_final_order_trims_the_next_cues_lead_in_at_a_real_pause():
         Cue(index=2, start_ms=1750, end_ms=2600, lines=["At home."], speaker_id="B"),
     ]
 
-    finalized, flags = _finalize(cues, spans={1: (1000, 1850), 2: (2050, 2600)})
+    finalized, flags = _finalize(cues, spans={1: (1000, 1850), 2: (2050, 2600)}, lead_in_ms=300)
 
     assert [(cue.start_ms, cue.end_ms) for cue in finalized] == [(700, 1867), (1867, 2600)]
     assert flags == []
+
+
+@pytest.mark.parametrize("lead_in_ms", [0, 200])
+def test_final_order_never_trims_a_measured_onset_before_the_first_word_without_review(lead_in_ms):
+    # W4R-4: a sync cue can start before its first ASR word at a measured
+    # burst onset, not padding. Reaching back more than the configured
+    # lead-in, it is not moved silently; the overlap stays for review.
+    cues = [
+        Cue(index=1, start_ms=700, end_ms=1900, lines=["Where were you?"], speaker_id="A"),
+        Cue(index=2, start_ms=1750, end_ms=2600, lines=["At home."], speaker_id="B"),
+    ]
+
+    finalized, flags = _finalize(cues, spans={1: (1000, 1850), 2: (2050, 2600)}, lead_in_ms=lead_in_ms)
+
+    assert finalized == cues
+    assert [(flag.kind, flag.severity, flag.cue_ids) for flag in flags] == [("output_overlap_unresolved", "error", [1, 2])]
 
 
 def test_final_order_keeps_a_lead_in_overlap_when_the_words_themselves_overlap():

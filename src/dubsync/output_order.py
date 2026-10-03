@@ -201,9 +201,12 @@ def _resolve_overlaps_with_speech_evidence(
             if boundary < earliest and boundary < later_span[0]:
                 # A display lead-in before the first word is padding, not
                 # speech: it may yield up to that word, never into the
-                # earlier cue's last word.
+                # earlier cue's last word. Only the configured lead-in (and
+                # its frame snap) is known padding; a start earlier still is
+                # a measured onset and its overlap stays for review.
                 lowest = profile.snap_ceil(max(earliest, earlier_span[1]) if earlier_span is not None else earliest)
-                if max(boundary, lowest) <= profile.snap_floor(later_span[0]):
+                if (later_span[0] - boundary <= profile.lead_in_ms + snap_slack_ms
+                        and max(boundary, lowest) <= profile.snap_floor(later_span[0])):
                     boundary = max(boundary, lowest)
         else:
             latest = later.end_ms - kept_ms(later)
